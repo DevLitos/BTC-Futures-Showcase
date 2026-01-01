@@ -1,0 +1,25 @@
+[project]
+name = "daytrader"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiokafka>=0.12.0",
+    "ccxt>=4.5.21",
+    "fastapi>=0.122.0",
+    "ib-insync>=0.9.86",
+    "kafka-python>=2.3.0",
+    "numba>=0.62.1",
+    "numpy>=2.3.5",
+    "pandas>=2.3.3",
+    "polygon-api-client>=1.16.3",
+    "prometheus-client>=0.23.1",
+    "psycopg2-binary>=2.9.11",
+    "pyarrow>=22.0.0",
+    "python-telegram-bot>=22.5",
+    "sqlalchemy>=2.0.44",
+    "ta-lib>=0.6.8",
+    "uvicorn[standard]>=0.38.0",
+    "websockets>=15.0.1",
+]
