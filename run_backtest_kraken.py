@@ -247,19 +247,29 @@ class MockTradeLogger:
 # DATA LOADER - Descarga de Kraken
 # =============================================================================
 
-def download_kraken_data(symbol: str = 'BTC/USD:USD', days: int = 7) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def download_kraken_data(symbol: str = 'BTC/USD:USD', days: int = 7, offset_days: int = 0) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Descarga datos históricos de Kraken Futures
     Retorna DataFrames para 1m, 5m, 1h
+    
+    Args:
+        symbol: Trading pair
+        days: Number of days to download
+        offset_days: Offset from today (0=last N days, 7=from 7 days ago to 14 days ago)
     """
-    logger.info(f"📥 Downloading {days} days of data for {symbol}...")
+    if offset_days > 0:
+        logger.info(f"📥 Downloading {days} days of data for {symbol} (offset: -{offset_days} days)...")
+    else:
+        logger.info(f"📥 Downloading {days} days of data for {symbol}...")
     
     # Usar Kraken Futures
     exchange = ccxt.krakenfutures({
         'enableRateLimit': True,
     })
     
-    since = exchange.parse8601((datetime.now(UTC) - timedelta(days=days)).isoformat())
+    end_date = datetime.now(UTC) - timedelta(days=offset_days)
+    start_date = end_date - timedelta(days=days)
+    since = exchange.parse8601(start_date.isoformat())
     
     def fetch_all_ohlcv(tf: str) -> pd.DataFrame:
         ohlcv = []
@@ -547,11 +557,12 @@ async def main():
     parser = argparse.ArgumentParser(description='Backtest with Kraken data using REAL strategy classes')
     parser.add_argument('--symbol', default='BTC/USD:USD', help='Kraken Futures symbol')
     parser.add_argument('--days', type=int, default=7, help='Days of history')
+    parser.add_argument('--offset', type=int, default=0, help='Offset days from today (0=recent, 7=week ago)')
     parser.add_argument('--capital', type=float, default=10000, help='Initial capital')
     args = parser.parse_args()
     
     # Descargar datos
-    df_1m, df_5m, df_1h = download_kraken_data(args.symbol, args.days)
+    df_1m, df_5m, df_1h = download_kraken_data(args.symbol, args.days, args.offset)
     
     if len(df_1m) < 1000:
         logger.error("Not enough data downloaded. Check symbol or connection.")

@@ -10,7 +10,7 @@ Edge and state multipliers are coordinated through state_types module.
 import asyncio
 import numpy as np
 import pandas as pd
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from prometheus_client import Counter
 import logging
 
@@ -149,6 +149,14 @@ class SignalEngine:
         self.setup_discard_cooldown = 10  # Cooldown reducido: solo 10s para evitar thrashing
         # Position management flags
         self._stops_set = False  # Flag para evitar intentar establecer SL/TP múltiples veces
+        
+        # =====================================================================
+        # LOSS STREAK COOLDOWN - Protection against chop regimes
+        # =====================================================================
+        self._consecutive_losses = 0  # Tracks consecutive SL hits
+        self._cooldown_until = None  # Timestamp when cooldown ends
+        self._cooldown_minutes = 90  # Cooldown duration after 3 consecutive losses
+        self._max_consecutive_losses = 3  # Trigger cooldown after N losses
         
         # Evaluation counter (para debug - verificar que evalúa continuamente)
         self._idle_eval_count = 0
@@ -839,12 +847,47 @@ class SignalEngine:
         
         bias = self.current_bias
         
+        # Get market time for cooldown checks
+        market_time = self.market_data.get_market_time()
+        
         # Get 5m data for support/resistance
         candles_5m = self.market_data.get_candles('5m')
         if not candles_5m or len(candles_5m) < 20:
             logger.warning("Not enough 5m data for entry execution")
             return
         df_5m = pd.DataFrame(candles_5m)
+        
+        # Get 1m data for volatility check
+        candles_1m = self.market_data.get_candles('1m')
+        if not candles_1m or len(candles_1m) < 200:
+            logger.debug("Not enough 1m data for volatility filter")
+            df_1m = pd.DataFrame(candles_1m) if candles_1m else None
+        else:
+            df_1m = pd.DataFrame(candles_1m)
+        
+        # ==================================================================
+        # 🛡️ LOSS COOLDOWN - Block trades after consecutive losses
+        # ==================================================================
+        # 🛡️ LOSS COOLDOWN - Block trades after consecutive losses
+        # TEMPORARILY DISABLED - Testing baseline
+        # ==================================================================
+        # cooldown_ok, cooldown_reason = self._check_loss_cooldown(market_time)
+        # if not cooldown_ok:
+        #     logger.warning(f"⛔ {cooldown_reason}")
+        #     self._reset_trade_state("Loss cooldown active")
+        #     return
+        
+        # ==================================================================
+        # 🛡️ VOLATILITY MINIMUM - Block trades in low-vol chop regimes
+        # TEMPORARILY DISABLED - Testing if this kills good trades in P1/P2
+        # ==================================================================
+        # if df_1m is not None and len(df_1m) >= 200:
+        #     vol_ok, vol_reason = self._check_volatility_minimum(df_1m)
+        #     if not vol_ok:
+        #         logger.warning(f"⛔ {vol_reason}")
+        #         self._reset_trade_state("Low volatility regime")
+        #         return
+        #     logger.info(f"✅ {vol_reason}")
         
         # ==================================================================
         # 🛡️ ATR REGIME FILTER - Block entries when ATR already expanded
@@ -908,6 +951,21 @@ class SignalEngine:
             take_profit = current_price - (risk * tp_multiplier)
         
         logger.info(f"Levels: Entry={current_price:.2f} | SL={stop_loss:.2f} | TP={take_profit:.2f} | Risk={risk:.2f} | RR={tp_multiplier}R")
+        
+        # ==================================================================
+        # 🎯 EXPECTED R FILTER - THE CRITICAL FILTER
+        # Only enter if potential reward >= 1.5R based on HTF structure
+        # This kills P3-type trades (middle of range, no asymmetry)
+        # ==================================================================
+        candles_1h = self.market_data.get_candles('1h')
+        if candles_1h and len(candles_1h) >= 20:
+            df_1h = pd.DataFrame(candles_1h)
+            expected_r_ok, expected_r_reason = self._check_expected_r(current_price, risk, bias, df_1h)
+            if not expected_r_ok:
+                logger.warning(f"⛔ EXPECTED R BLOCKED: {expected_r_reason}")
+                self._reset_trade_state("Expected R too low")
+                return
+            logger.info(f"✅ {expected_r_reason}")
         
         # 🔥 REFRESH CAPITAL BEFORE POSITION SIZING
         # This ensures we use ACTUAL free margin, not stale capital value
@@ -1544,8 +1602,12 @@ class SignalEngine:
             # Record full-close only
             pnl = exit_action.get('pnl', 0)
             is_win = pnl > 0
+            exit_reason = exit_action.get('reason', 'unknown')
 
             self.state_machine.record_trade_close(pnl, is_win)
+            
+            # Record for loss cooldown tracking
+            self._record_trade_result(exit_reason, pnl, market_time)
             
             # Record trade for edge enforcement degradation monitoring
             if self._current_trade_entry_time:
@@ -1726,6 +1788,162 @@ class SignalEngine:
             return False, f"ATR regime HIGH: {current_atr:.2f} > P50 {atr_p50:.2f} (move already happened)"
         
         return True, f"ATR regime OK: {current_atr:.2f} <= P50 {atr_p50:.2f}"
+    
+    def _check_volatility_minimum(self, df_1m: pd.DataFrame) -> tuple[bool, str]:
+        """
+        VOLATILITY MINIMUM FILTER: Block trades in low volatility regimes
+        
+        Problem in P3 (Dec 15-22): ATR was low, market in micro-range/chop.
+        Low ATR → small SL → appears "cheap" → overtrading → stops accumulate
+        
+        Solution: Compare current ATR to its own 200-period SMA.
+        If atr_ratio < 0.75, we're in a low-vol regime where sweeps don't expand.
+        
+        atr_ratio = atr_current / sma(atr, 200)
+        
+        Returns: (can_enter, reason)
+        """
+        if len(df_1m) < 200:
+            return True, "Not enough data for volatility filter"
+        
+        # Calculate ATR for each candle
+        highs = df_1m['high'].values
+        lows = df_1m['low'].values
+        closes = df_1m['close'].values
+        
+        atrs = []
+        for i in range(1, len(highs)):
+            hl = highs[i] - lows[i]
+            hc = abs(highs[i] - closes[i-1])
+            lc = abs(lows[i] - closes[i-1])
+            atrs.append(max(hl, hc, lc))
+        
+        if len(atrs) < 200:
+            return True, "Not enough ATR samples"
+        
+        # Current ATR (last 14 periods average)
+        current_atr = sum(atrs[-14:]) / 14
+        
+        # SMA of ATR over last 200 periods
+        atr_sma_200 = sum(atrs[-200:]) / 200
+        
+        if atr_sma_200 <= 0:
+            return True, "ATR SMA is zero"
+        
+        atr_ratio = current_atr / atr_sma_200
+        
+        # Threshold: 0.75 = 25% below normal volatility
+        MIN_VOL_RATIO = 0.75
+        
+        if atr_ratio < MIN_VOL_RATIO:
+            return False, f"LOW VOL REGIME: ATR ratio {atr_ratio:.2f} < {MIN_VOL_RATIO} (chop zone)"
+        
+        return True, f"Volatility OK: ATR ratio {atr_ratio:.2f} >= {MIN_VOL_RATIO}"
+    
+    def _check_loss_cooldown(self, market_time: datetime) -> tuple[bool, str]:
+        """
+        LOSS STREAK COOLDOWN: Block trades after consecutive losses
+        
+        After 3 consecutive SL hits, enter 90-minute cooldown.
+        This protects against chop regimes where stops cluster.
+        
+        Returns: (can_enter, reason)
+        """
+        # Check if we're still in cooldown
+        if self._cooldown_until is not None:
+            if market_time < self._cooldown_until:
+                remaining = (self._cooldown_until - market_time).total_seconds() / 60
+                return False, f"LOSS COOLDOWN: {remaining:.0f} min remaining ({self._consecutive_losses} consecutive losses)"
+            else:
+                # Cooldown expired, reset
+                logger.info("✅ Loss cooldown expired, trading resumed")
+                self._cooldown_until = None
+                self._consecutive_losses = 0
+        
+        return True, f"No cooldown active (streak: {self._consecutive_losses})"
+    
+    def _record_trade_result(self, exit_reason: str, pnl: float, market_time: datetime):
+        """
+        Record trade result for cooldown tracking.
+        Called when a trade closes.
+        """
+        if exit_reason == 'STOP_LOSS' or pnl < 0:
+            self._consecutive_losses += 1
+            logger.info(f"📉 Loss recorded: {self._consecutive_losses} consecutive losses")
+            
+            if self._consecutive_losses >= self._max_consecutive_losses:
+                self._cooldown_until = market_time + timedelta(minutes=self._cooldown_minutes)
+                logger.warning(f"🚫 COOLDOWN ACTIVATED: {self._max_consecutive_losses} consecutive losses → {self._cooldown_minutes} min pause until {self._cooldown_until}")
+        else:
+            # Win or breakeven resets the streak
+            if self._consecutive_losses > 0:
+                logger.info(f"✅ Win/BE recorded: resetting loss streak from {self._consecutive_losses}")
+            self._consecutive_losses = 0
+    
+    def _check_expected_r(self, current_price: float, sl_distance: float, bias: str, df_1h: pd.DataFrame) -> tuple[bool, str]:
+        """
+        EXPECTED R FILTER: Only enter if potential reward >= 1.5R
+        
+        This is THE critical filter that P3 needs.
+        
+        Problem: System enters setups that can only produce 1R max.
+        With SL 2-2.5 ATR, if market can only give 1R, we're mathematically doomed.
+        
+        Solution: Calculate distance to next HTF level (resistance/support).
+        If expected_move / sl_distance < 1.5 → NO trade.
+        
+        This kills trades in the middle of ranges where there's no asymmetry.
+        
+        Returns: (can_enter, reason)
+        """
+        if len(df_1h) < 20:
+            return True, "Not enough HTF data for Expected R"
+        
+        if sl_distance <= 0:
+            return True, "Invalid SL distance"
+        
+        highs = df_1h['high'].values
+        lows = df_1h['low'].values
+        
+        # Find recent swing high and swing low (last 20 1h candles = 20 hours)
+        recent_high = max(highs[-20:])
+        recent_low = min(lows[-20:])
+        range_size = recent_high - recent_low
+        
+        if range_size <= 0:
+            return True, "No valid range"
+        
+        # Calculate position in range (0 = at low, 1 = at high)
+        position_in_range = (current_price - recent_low) / range_size
+        
+        if bias == 'LONG':
+            # For LONG: target is recent high (or higher)
+            # Distance to target = recent_high - current_price
+            distance_to_target = recent_high - current_price
+            
+            # If we're already near the top (>70% of range), very little upside
+            if position_in_range > 0.70:
+                return False, f"LONG near range top: {position_in_range:.0%} (no upside room)"
+            
+        else:  # SHORT
+            # For SHORT: target is recent low (or lower)
+            # Distance to target = current_price - recent_low
+            distance_to_target = current_price - recent_low
+            
+            # If we're already near the bottom (<30% of range), very little downside
+            if position_in_range < 0.30:
+                return False, f"SHORT near range bottom: {position_in_range:.0%} (no downside room)"
+        
+        # Calculate Expected R
+        expected_r = distance_to_target / sl_distance
+        
+        # Minimum threshold: 1.5R
+        MIN_EXPECTED_R = 1.5
+        
+        if expected_r < MIN_EXPECTED_R:
+            return False, f"Expected R too low: {expected_r:.2f}R < {MIN_EXPECTED_R}R (target ${distance_to_target:.0f} vs SL ${sl_distance:.0f})"
+        
+        return True, f"Expected R OK: {expected_r:.2f}R >= {MIN_EXPECTED_R}R (pos {position_in_range:.0%} in range)"
     
     def _check_not_post_impulse(self, df_1m: pd.DataFrame, atr_1m: float) -> tuple[bool, str]:
         """
