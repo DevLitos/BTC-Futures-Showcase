@@ -184,14 +184,15 @@ class TradingSystemOrchestrator:
         self.trade_logger = TradeLogger(PERSISTENCE, DB_URL)
         self.reconciler = PositionReconciler(self.execution)
         
+        # 5.5 OUTPUT MANAGER
+        self.output_manager = OutputManager()
+
         # 6. SIGNAL ENGINE
         self.signal_engine = SignalEngine(market_data=self.market_data,
                                          execution=self.execution,
                                          external_data=self.external_data,
-                                         trade_logger=self.trade_logger)
-        
-        # Legacy
-        self.output_manager = OutputManager()
+                                         trade_logger=self.trade_logger,
+                                         output_manager=self.output_manager)
         
         self.tasks = []
         self.demo_mode = DEMO_MODE
@@ -568,10 +569,14 @@ class TradingSystemOrchestrator:
                 logger.info("Stopping reconciliation...")
                 await self.reconciler.stop()
             
-            # 4. Cancel all orders
+            # 4. Cancel all orders - CRITICAL for clean shutdown
             if self.execution:
-                logger.info("Cancelling all orders...")
-                # TODO: implement in execution engine
+                logger.info("Cancelling all open orders...")
+                try:
+                    cancelled = await self.execution.cancel_all_orders(CCXT_SYMBOL)
+                    logger.info(f"✓ Cancelled {cancelled} open orders")
+                except Exception as e:
+                    logger.error(f"Error cancelling orders on shutdown: {e}")
             
             # 5. Stop and flush trade logger
             if self.trade_logger:

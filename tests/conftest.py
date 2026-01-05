@@ -40,6 +40,69 @@ def make_candles(
     return candles
 
 
+def make_candles_with_sweep(
+    n: int,
+    start_ts_ms: int = 1_700_000_000_000,
+    start_price: float = 50_000.0,
+    step: float = 1.0,
+    spread: float = 10.0,
+    volume: float = 100.0,
+    sweep_index: int = -4,  # Index to insert sweep candle (from end)
+) -> List[Dict[str, Any]]:
+    """
+    Create candles with a SWEEP pattern suitable for long entries.
+    
+    Creates a range-bound pattern where price oscillates, then
+    a sweep candle breaks below the range lows and recovers.
+    """
+    candles: List[Dict[str, Any]] = []
+    base_price = start_price
+    
+    for i in range(n):
+        # Create range-bound oscillation (not constantly ascending)
+        # This makes the recent_low meaningful
+        oscillation = (i % 4 - 1.5) * step * 2  # Oscillate around base
+        
+        center = base_price + oscillation
+        open_ = center - step / 2
+        close = center + step / 2
+        high = max(open_, close) + spread / 2
+        low = min(open_, close) - spread / 2
+        
+        candles.append(
+            {
+                "timestamp": start_ts_ms + i * 60_000,
+                "open": float(open_),
+                "high": float(high),
+                "low": float(low),
+                "close": float(close),
+                "volume": float(volume),
+            }
+        )
+    
+    # Now modify the sweep candle (index -3, which is in the -5 to -1 range checked by filter)
+    # The sweep must go below the minimum low of candles[-12:-2] (the "recent" range)
+    if n >= 15:
+        # Calculate recent_low from candles[-12:-2]
+        recent_lows = [c['low'] for c in candles[-12:-2]]
+        recent_low = min(recent_lows)
+        
+        # Modify candle at index -3 to be a sweep candle
+        sweep_idx = n - 3
+        
+        # Create a sweep candle: low wicks below recent_low, but close recovers above
+        candles[sweep_idx] = {
+            "timestamp": start_ts_ms + sweep_idx * 60_000,
+            "open": float(recent_low + step),      # Open above recent_low
+            "high": float(recent_low + spread),    # High well above
+            "low": float(recent_low - spread),     # LOW SWEEPS BELOW recent_low  
+            "close": float(recent_low + step * 3), # CLOSE RECOVERS above recent_low
+            "volume": float(volume),
+        }
+    
+    return candles
+
+
 @dataclass
 class FakeMarketData:
     candles: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
@@ -121,7 +184,8 @@ class FakeTradeLogger:
 def fake_market_data():
     md = FakeMarketData()
     md.candles["1m"] = make_candles(30, start_price=50_000, step=5)
-    md.candles["5m"] = make_candles(30, start_price=50_000, step=10)
+    # Use candles with sweep pattern for 5m to pass sweep filter
+    md.candles["5m"] = make_candles_with_sweep(30, start_price=50_000, step=10, spread=20)
     md.candles["1h"] = make_candles(60, start_price=50_000, step=20)
     return md
 

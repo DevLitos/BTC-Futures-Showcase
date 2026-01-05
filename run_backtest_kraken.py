@@ -200,7 +200,7 @@ class MockExecution:
     
     async def get_available_capital(self) -> float:
         """Return available capital for position sizing"""
-        return 10000.0  # Fixed capital for backtest
+        return 1000.0  # Fixed capital for backtest (1000 EUR)
     
     async def get_account_balance(self) -> dict:
         """Return mock account balance for backtest"""
@@ -311,7 +311,7 @@ def download_kraken_data(symbol: str = 'BTC/USD:USD', days: int = 7, offset_days
 class BacktestRunner:
     """Ejecuta backtest usando las clases REALES del sistema"""
     
-    def __init__(self, symbol: str = 'BTC/USD:USD', capital: float = 10000.0):
+    def __init__(self, symbol: str = 'BTC/USD:USD', capital: float = 1000.0):
         self.symbol = symbol
         self.capital = capital
         
@@ -558,7 +558,7 @@ async def main():
     parser.add_argument('--symbol', default='BTC/USD:USD', help='Kraken Futures symbol')
     parser.add_argument('--days', type=int, default=7, help='Days of history')
     parser.add_argument('--offset', type=int, default=0, help='Offset days from today (0=recent, 7=week ago)')
-    parser.add_argument('--capital', type=float, default=10000, help='Initial capital')
+    parser.add_argument('--capital', type=float, default=1000, help='Initial capital (EUR)')
     args = parser.parse_args()
     
     # Descargar datos

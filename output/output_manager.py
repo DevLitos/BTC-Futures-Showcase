@@ -93,3 +93,32 @@ class OutputManager:
             lines.append(f"💰 PnL: <b>{pnl:.2f}</b>")
 
         return "\n".join(lines)
+
+    async def send_exit_notification(self, exit_data: dict):
+        """Envia notificación de cierre de posición."""
+        logger.info(f"Enviando notificación de salida para {exit_data['symbol']}...")
+        if not self.bot:
+            return
+
+        message = self._format_exit_message(exit_data)
+
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=message,
+                parse_mode=ParseMode.HTML
+            )
+            logger.info("Notificación de salida enviada correctamente.")
+        except Exception as e:
+            logger.error(f"Error enviando notificación de salida: {e}")
+
+    def _format_exit_message(self, data: dict) -> str:
+        lines = [
+            "🚪 <b>Cierre de Posición</b>",
+            f"Símbolo: <b>{data['symbol']}</b>",
+            f"Razón: <b>{data.get('reason', 'N/A')}</b>",
+            f"PnL: <b>{data.get('pnl', 0):.2f}</b>",
+            f"Precio Salida: <b>{data.get('exit_price', 0):.2f}</b>",
+            f"⏰ Timestamp: <b>{data.get('timestamp', 'N/A')}</b>"
+        ]
+        return "\n".join(lines)

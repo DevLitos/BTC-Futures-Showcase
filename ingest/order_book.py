@@ -4,7 +4,9 @@ Limpia de spoofing básico
 """
 
 import logging
+import time
 from collections import defaultdict, deque
+from datetime import datetime, UTC
 from typing import Dict, Tuple, Optional
 
 logger = logging.getLogger(__name__)
@@ -44,9 +46,7 @@ class OrderBookManager:
         
         # Log para detectar spoofing
         self.order_history.append({
-            'timestamp': logging.Formatter().formatTime(logging.LogRecord(
-                name='', level=0, pathname='', lineno=0, msg='', args=(), exc_info=None
-            )),
+            'timestamp': datetime.now(UTC).isoformat(),
             'side': 'bid',
             'price': price,
             'qty': qty
@@ -61,9 +61,7 @@ class OrderBookManager:
             self.asks[price] = qty
         
         self.order_history.append({
-            'timestamp': logging.Formatter().formatTime(logging.LogRecord(
-                name='', level=0, pathname='', lineno=0, msg='', args=(), exc_info=None
-            )),
+            'timestamp': datetime.now(UTC).isoformat(),
             'side': 'ask',
             'price': price,
             'qty': qty

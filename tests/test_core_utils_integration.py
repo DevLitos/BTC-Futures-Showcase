@@ -162,7 +162,8 @@ class TestPositionSizer:
         reset_position_sizer()
     
     def test_calculate_base_size_risk_based(self):
-        sizer = PositionSizer(default_risk_pct=0.01, max_position_pct=1.0, leverage=10)
+        # Disable dynamic risk to test explicit risk_pct
+        sizer = PositionSizer(default_risk_pct=0.01, max_position_pct=1.0, leverage=10, use_dynamic_risk=False)
         
         # Capital: $10,000, Risk: 1% = $100
         # Entry: $50,000, SL: $49,000, Risk per unit: $1,000
@@ -175,7 +176,8 @@ class TestPositionSizer:
         assert abs(base - 0.1) < 0.001
     
     def test_calculate_base_size_margin_limited(self):
-        sizer = PositionSizer(default_risk_pct=0.5, max_position_pct=0.10, leverage=10)
+        # Disable dynamic risk to test explicit risk_pct, use leverage=10
+        sizer = PositionSizer(default_risk_pct=0.5, max_position_pct=0.10, leverage=10, use_dynamic_risk=False)
         
         # High risk % but margin limits it
         # Capital: $10,000, Leverage: 10x, Max position: 10%

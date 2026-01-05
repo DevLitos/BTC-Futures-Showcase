@@ -181,7 +181,7 @@ class TradeLogger:
             df = pd.DataFrame(self.trade_buffer)
             
             # Filename: trades_YYYYMMDD.parquet
-            today = datetime.now().strftime('%Y%m%d')
+            today = datetime.now(UTC).strftime('%Y%m%d')
             filename = f"storage/trades/trades_{today}.parquet"
             
             df.to_parquet(filename, compression='snappy')
@@ -257,14 +257,25 @@ class TradeLogger:
         
         try:
             import pandas as pd
+            import os
             
-            df = pd.DataFrame([metrics])
+            new_df = pd.DataFrame([metrics])
             
             today = datetime.now(UTC).strftime('%Y%m%d')
             filename = f"storage/metrics/metrics_{today}.parquet"
             
-            df.to_parquet(filename, compression='snappy', append=True)
-            logger.info(f"Metrics logged: PF={metrics['profit_factor']}")
+            # Read existing file and append (parquet doesn't support append directly)
+            if os.path.exists(filename):
+                try:
+                    existing_df = pd.read_parquet(filename)
+                    df = pd.concat([existing_df, new_df], ignore_index=True)
+                except Exception:
+                    df = new_df
+            else:
+                df = new_df
+            
+            df.to_parquet(filename, compression='snappy')
+            logger.info(f"Metrics logged: PF={metrics.get('profit_factor', 'N/A')}")
         
         except Exception as e:
             logger.error(f"Error logging metrics: {e}")

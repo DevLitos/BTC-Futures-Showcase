@@ -2,12 +2,40 @@
 Emergency script to cancel ALL open orders on Kraken Futures
 """
 import asyncio
+import os
+from pathlib import Path
 import ccxt.async_support as ccxt
 
+
+def load_env_file():
+    """Load environment variables from ~/.trad2_env"""
+    env_file = Path.home() / '.trad2_env'
+    if env_file.exists():
+        with open(env_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    if line.startswith('export '):
+                        line = line[7:].strip()
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        value = value.strip().strip('"').strip("'")
+                        os.environ[key.strip()] = value
+
+
 async def main():
+    load_env_file()
+    
+    api_key = os.getenv('KRAKEN_API_KEY', '')
+    api_secret = os.getenv('KRAKEN_SECRET', '')
+    
+    if not api_key or not api_secret:
+        print("❌ Error: KRAKEN_API_KEY or KRAKEN_SECRET not found in ~/.trad2_env")
+        return
+    
     creds = {
-        'apiKey': 'Y/fLIzH4FN0KqB+FMNDTDq43ycRRG2tWdIEeXDSg0LQjdoKR1ky/tDC4',
-        'secret': 'BILhZhxLKyJDOsU3RkzfITvvjVCCF+w3a33BcCRpvohqKxODDJDaXLPR24BQCcN59d8uYSzg5jZs4pdjpPwUPA==',
+        'apiKey': api_key,
+        'secret': api_secret,
         'options': {'defaultType': 'swap'}
     }
     

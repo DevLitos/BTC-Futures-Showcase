@@ -283,17 +283,48 @@ class KrakenFuturesWebSocket:
     async def _handle_book(self, data: dict):
         """Procesar order book depth"""
         try:
-            # Kraken Futures book keys vary. Usually 'bids' and 'asks' in snapshot, or just updates.
-            # But the 'feed': 'book' structure needs parsing.
-            # Provided log didn't show book structure, assuming standard.
-            # previous code assumed: 
-            # symbol = data.get('symbol')
-            # side = data.get('side')
-            # price = float(data.get('price', 0))
+            # Kraken Futures book format:
+            # { "feed": "book", "product_id": "PF_XBTUSD", "side": "buy"/"sell", "price": ..., "qty": ... }
+            # Or snapshot: { "feed": "book_snapshot", "bids": [...], "asks": [...] }
             
-            # If structure is different, we might be failing here.
-            # But for now let's keep it safe.
-            pass
+            feed_type = data.get('feed', '')
+            
+            if feed_type == 'book_snapshot':
+                # Full snapshot - process bids and asks arrays
+                bids = data.get('bids', [])
+                asks = data.get('asks', [])
+                
+                for bid in bids:
+                    if len(bid) >= 2:
+                        price, qty = float(bid[0]), float(bid[1])
+                        depth_event = {'side': 'bid', 'price': price, 'qty': qty}
+                        self.depth_buffer.append(depth_event)
+                        if self.on_depth:
+                            await self.on_depth(depth_event)
+                
+                for ask in asks:
+                    if len(ask) >= 2:
+                        price, qty = float(ask[0]), float(ask[1])
+                        depth_event = {'side': 'ask', 'price': price, 'qty': qty}
+                        self.depth_buffer.append(depth_event)
+                        if self.on_depth:
+                            await self.on_depth(depth_event)
+            
+            elif feed_type == 'book':
+                # Incremental update
+                side = data.get('side', '')
+                price = float(data.get('price', 0))
+                qty = float(data.get('qty', 0))
+                
+                if price > 0:
+                    depth_event = {
+                        'side': 'bid' if side.lower() == 'buy' else 'ask',
+                        'price': price,
+                        'qty': qty
+                    }
+                    self.depth_buffer.append(depth_event)
+                    if self.on_depth:
+                        await self.on_depth(depth_event)
         
         except Exception as e:
             logger.error(f"Error processing book: {e}")

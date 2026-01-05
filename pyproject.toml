@@ -21,6 +21,7 @@ dependencies = [
     "prometheus-client>=0.23.1",
     "psycopg2-binary>=2.9.11",
     "pyarrow>=22.0.0",
+    "pytest>=9.0.2",
     "python-telegram-bot>=22.5",
     "sqlalchemy>=2.0.44",
     "ta-lib>=0.6.8",

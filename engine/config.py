@@ -137,15 +137,60 @@ class LTFFilters:
 
 
 # ============================================================================
+# DYNAMIC RISK MANAGEMENT (V2.1 - Palancas de Multiplicación)
+# ============================================================================
+class DynamicRiskConfig:
+    """
+    PALANCA 1: Riesgo dinámico por equity
+    PALANCA 2: Compounding obligatorio
+    PALANCA 3: Parciales inteligentes (50/30/20)
+    PALANCA 4: Leverage funcional 2x
+    
+    Esto NO cambia el edge, solo el multiplicador.
+    Cuanto menor el capital, más agresivo el riesgo porcentual.
+    """
+    # PALANCA 1: Risk tiers by equity (in base currency)
+    # Format: (max_equity, risk_pct)
+    RISK_TIERS = [
+        (2000.0, 1.0),    # < 2k€: 1.0% risk per trade
+        (5000.0, 0.75),   # 2k-5k€: 0.75% risk per trade  
+        (float('inf'), 0.5),  # > 5k€: 0.5% risk per trade
+    ]
+    
+    # PALANCA 4: Leverage funcional (libera capital, NO aumenta riesgo real)
+    # El SL sigue determinando el riesgo máximo
+    DEFAULT_LEVERAGE = 2  # 2x leverage (conservative, functional)
+    MAX_LEVERAGE = 3      # Never exceed 3x
+    
+    # PALANCA 2: Compounding obligatorio
+    COMPOUNDING_ENABLED = True  # position_size = risk_pct * equity_actual / stop_distance
+    
+    # PALANCA 3: Parciales inteligentes (consolidado aquí para centralización)
+    SMART_PARTIALS_ENABLED = True
+    PARTIAL_TP1_PCT = 50.0   # 50% → TP1 (bloqueo de riesgo)
+    PARTIAL_TP2_PCT = 30.0   # 30% → TP2 (estructura)
+    PARTIAL_RUNNER_PCT = 20.0  # 20% → runner (trailing estructural)
+    TP1_R_TARGET = 1.0       # TP1 a 1R
+    TP2_R_TARGET = 2.0       # TP2 a 2R
+    
+    # Minimum risk floor (never risk less than this)
+    MIN_RISK_PCT = 0.25   # 0.25% minimum (avoid dust trades)
+    
+    # Emergency risk cap (never risk more than this regardless of tier)
+    MAX_RISK_PCT = 1.5    # 1.5% absolute maximum
+
+
+# ============================================================================
 # RISK MANAGEMENT
 # ============================================================================
 class RiskManagement:
     # Leverage (configurable via LEVERAGE env var)
     # FIX (Jan 3, 2026): Changed from 0 to 2 - 0x caused invalid position sizes
-    DEFAULT_LEVERAGE = 2  # 2x leverage (conservative start)
+    DEFAULT_LEVERAGE = DynamicRiskConfig.DEFAULT_LEVERAGE  # Use dynamic config
     
     # Risk per session - RETUNED (Jan 4, 2026)
-    # Slightly reduced base risk to allow more frequent trading
+    # These are NOW OVERRIDDEN by DynamicRiskConfig.RISK_TIERS based on equity
+    # Kept for backward compatibility and session-based adjustments
     RISK_LONDON_NY_PCT = 0.8        # Was 1.0% - reduced for higher frequency
     RISK_NY_OPEN_PCT = 0.4          # Was 0.5% - reduced for volatility
     RISK_ASIA_WEEKEND_PCT = 0.4     # Was 0.5% - reduced
@@ -159,6 +204,28 @@ class RiskManagement:
     # Take profits - Balance between achievable and profitable
     TP1_RISK_MULTIPLE = 1.8         # TP at 1.8R (balance between hit rate and payoff)
     TP1_CLOSE_PCT = 60              # Close 60% at TP1, leave 40% runner
+    
+    # =========================================================================
+    # PALANCA 3: PARCIALES INTELIGENTES (sin tocar entrada)
+    # =========================================================================
+    # Redistribución de tamaño para maximizar expectancy sin cambiar edge
+    # Old: 100% TP1 o trailing
+    # New: 50% TP1 + 30% TP2 + 20% runner con trailing estructural
+    SMART_PARTIALS_ENABLED = True
+    
+    # Distribución de parciales (debe sumar 100)
+    PARTIAL_TP1_PCT = 50            # 50% → TP1 (bloqueas riesgo)
+    PARTIAL_TP2_PCT = 30            # 30% → TP2 (estructura)
+    PARTIAL_RUNNER_PCT = 20         # 20% → runner con trailing estructural
+    
+    # TP targets en R-múltiples
+    TP1_R_TARGET = 1.0              # TP1 a 1R (bloqueo de riesgo)
+    TP2_R_TARGET = 2.0              # TP2 a 2R (estructura)
+    # Runner: trailing estructural (no ATR, sino swings)
+    
+    # Trailing estructural para runner
+    RUNNER_TRAILING_ATR_MULT = 2.5  # 2.5x ATR para el runner
+    RUNNER_SWING_BASED = True       # Usa swings en lugar de ATR puro
     
     # Trailing stop
     TRAILING_STOP_ATR_MULTIPLIER = 2.0  # 2x ATR(1m) - fue 1.0x (AUMENTADO para menos falsas salidas)

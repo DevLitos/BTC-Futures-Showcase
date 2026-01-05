@@ -597,7 +597,7 @@ class RESTExecutionEngine:
                 )
                 logger.info(f"✅ SL placed: {stop_loss:.2f}")
             except Exception:
-                logger.error(f"❌ SL failed")
+                logger.error(f"❌ SL failed: {e}")
                 return False
             
             # TP: Intento directo (secondary)
@@ -608,8 +608,8 @@ class RESTExecutionEngine:
                     params={'reduceOnly': True, 'postOnly': False}
                 )
                 logger.info(f"✅ TP placed: {take_profit:.2f}")
-            except Exception:
-                logger.warning(f"⚠️  TP failed (SL is OK)")
+            except Exception as e:
+                logger.warning(f"⚠️  TP failed (SL is OK): {e}")
             
             return True
             
@@ -691,47 +691,78 @@ class RESTExecutionEngine:
             logger.error(f"Error verifying stops on exchange: {e}")
             return {'has_sl': False, 'has_tp': False, 'orders': []}
     
-    async def close_position_market(self, symbol: str, side: str) -> Optional[Dict]:
+    async def close_position_market(self, symbol: str = None, side: str = None, amount: float = None) -> Optional[Dict]:
         """
-        Cerrar posición a mercado (EMERGENCIA) con timeout
-        side: 'buy' (close short) o 'sell' (close long)
+        Cerrar posición a mercado (EMERGENCIA) con timeout y retry
+        
+        Args:
+            symbol: Trading pair (uses self.current_symbol if not provided)
+            side: 'buy' (close short) o 'sell' (close long)
+            amount: Position size to close (fetches from exchange if not provided)
+        
+        Returns: Order dict or None if failed after retries
         """
         if not self.exchange:
             return None
         
-        try:
-            position = await self.get_position(symbol)
-            
-            if not position:
-                logger.warning("No position to close")
-                return None
-            
-            amount = abs(position.get('contracts', 0))
-            
-            if amount == 0:
-                return None
-            
-            logger.critical(f"EMERGENCY MARKET CLOSE: {amount} {symbol}")
-            
-            order = await asyncio.wait_for(
-                self.exchange.create_market_order(
-                    symbol=symbol,
-                    type='market',
-                    side=side.lower(),
-                    amount=amount
-                ),
-                timeout=EXCHANGE_TIMEOUT_MEDIUM
-            )
-            
-            logger.critical(f"Position closed: {order}")
-            return order
+        # Use stored symbol if not provided
+        if symbol is None:
+            symbol = getattr(self, 'current_symbol', 'BTC/USD:USD')
         
-        except asyncio.TimeoutError:
-            logger.critical(f"TIMEOUT closing position - MANUAL INTERVENTION REQUIRED!")
-            return None
-        except Exception as e:
-            logger.error(f"Error closing position: {e}")
-            return None
+        MAX_RETRIES = 3
+        RETRY_DELAY = 2.0
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                position = await self.get_position(symbol)
+                
+                if not position:
+                    logger.warning("No position to close")
+                    return None
+                
+                # Use provided amount or get from position
+                close_amount = amount if amount else abs(position.get('contracts', 0))
+                
+                if close_amount == 0:
+                    logger.warning("Position amount is 0, nothing to close")
+                    return None
+                
+                # Determine side from position if not provided
+                if side is None:
+                    position_contracts = position.get('contracts', 0)
+                    side = 'sell' if position_contracts > 0 else 'buy'
+                
+                logger.critical(f"EMERGENCY MARKET CLOSE (attempt {attempt + 1}/{MAX_RETRIES}): {close_amount} {symbol} side={side}")
+                
+                order = await asyncio.wait_for(
+                    self.exchange.create_market_order(
+                        symbol=symbol,
+                        type='market',
+                        side=side.lower(),
+                        amount=close_amount
+                    ),
+                    timeout=EXCHANGE_TIMEOUT_MEDIUM
+                )
+                
+                logger.critical(f"Position closed: {order}")
+                return order
+            
+            except asyncio.TimeoutError:
+                logger.critical(f"TIMEOUT closing position (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    logger.warning(f"Retrying in {RETRY_DELAY}s...")
+                    await asyncio.sleep(RETRY_DELAY)
+                else:
+                    logger.critical("❌ FAILED TO CLOSE POSITION AFTER ALL RETRIES - MANUAL INTERVENTION REQUIRED!")
+                    return None
+            except Exception as e:
+                logger.error(f"Error closing position (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY)
+                else:
+                    return None
+        
+        return None
     
     async def get_account_balance(self) -> Optional[Dict]:
         """Obtener balance de cuenta con timeout"""

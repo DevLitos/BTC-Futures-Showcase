@@ -69,7 +69,7 @@ class SignalEngine:
     - trade_logger: TradeLogger (persistence)
     """
     
-    def __init__(self, market_data, execution, external_data, trade_logger, enforcement_mode: str = 'forward'):
+    def __init__(self, market_data, execution, external_data, trade_logger, output_manager=None, enforcement_mode: str = 'forward'):
         """
         Initialize SignalEngine.
         
@@ -78,12 +78,14 @@ class SignalEngine:
             execution: Execution engine (real or mock)
             external_data: External data manager
             trade_logger: Trade logger
+            output_manager: Output manager for notifications (Telegram)
             enforcement_mode: Edge enforcement mode ('backtest', 'forward', 'live')
         """
         self.market_data = market_data
         self.execution = execution
         self.external_data = external_data
         self.trade_logger = trade_logger
+        self.output_manager = output_manager
         
         # Store enforcement mode for edge enforcement initialization
         self._enforcement_mode = enforcement_mode
@@ -868,26 +870,22 @@ class SignalEngine:
         # ==================================================================
         # 🛡️ LOSS COOLDOWN - Block trades after consecutive losses
         # ==================================================================
-        # 🛡️ LOSS COOLDOWN - Block trades after consecutive losses
-        # TEMPORARILY DISABLED - Testing baseline
-        # ==================================================================
-        # cooldown_ok, cooldown_reason = self._check_loss_cooldown(market_time)
-        # if not cooldown_ok:
-        #     logger.warning(f"⛔ {cooldown_reason}")
-        #     self._reset_trade_state("Loss cooldown active")
-        #     return
+        cooldown_ok, cooldown_reason = self._check_loss_cooldown(market_time)
+        if not cooldown_ok:
+            logger.warning(f"⛔ {cooldown_reason}")
+            self._reset_trade_state("Loss cooldown active")
+            return
         
         # ==================================================================
         # 🛡️ VOLATILITY MINIMUM - Block trades in low-vol chop regimes
-        # TEMPORARILY DISABLED - Testing if this kills good trades in P1/P2
         # ==================================================================
-        # if df_1m is not None and len(df_1m) >= 200:
-        #     vol_ok, vol_reason = self._check_volatility_minimum(df_1m)
-        #     if not vol_ok:
-        #         logger.warning(f"⛔ {vol_reason}")
-        #         self._reset_trade_state("Low volatility regime")
-        #         return
-        #     logger.info(f"✅ {vol_reason}")
+        if df_1m is not None and len(df_1m) >= 200:
+            vol_ok, vol_reason = self._check_volatility_minimum(df_1m)
+            if not vol_ok:
+                logger.warning(f"⛔ {vol_reason}")
+                self._reset_trade_state("Low volatility regime")
+                return
+            logger.info(f"✅ {vol_reason}")
         
         # ==================================================================
         # 🛡️ ATR REGIME FILTER - Block entries when ATR already expanded
@@ -1151,6 +1149,21 @@ class SignalEngine:
             if order_result:
                 self.pending_order_id = order_result.get('id')
                 self.entry_order_time = market_time  # Use market_time, not datetime.now()
+                
+                # Send Telegram notification
+                if self.output_manager:
+                    try:
+                        rec = {
+                            'symbol': self.symbol,
+                            'direction': bias,
+                            'status': 'OPENING',
+                            'entry_price': current_price,
+                            'stop_loss_price': stop_loss,
+                            'signal_timestamp': market_time.isoformat()
+                        }
+                        asyncio.create_task(self.output_manager.send_recommendation(rec))
+                    except Exception as e:
+                        logger.error(f"Failed to send Telegram notification: {e}")
                 
                 # Store entry data for position creation upon fill
                 self._last_entry_data = {
@@ -1485,6 +1498,16 @@ class SignalEngine:
                     'pnl': position.unrealized_pnl,
                     'reason': 'FUNDING_EXIT'
                 })
+                
+                if self.output_manager:
+                    asyncio.create_task(self.output_manager.send_exit_notification({
+                        'symbol': self.symbol,
+                        'reason': 'FUNDING_EXIT',
+                        'pnl': position.unrealized_pnl,
+                        'exit_price': current_price,
+                        'timestamp': market_time.isoformat()
+                    }))
+                
                 self.risk_engine.position = None
                 self._reset_trade_state(f"Trade closed: FUNDING_EXIT")
                 self.state_machine.start_cooldown()
@@ -1509,6 +1532,16 @@ class SignalEngine:
                     'pnl': position.unrealized_pnl,
                     'reason': 'TIME_BASED_EXIT'
                 })
+                
+                if self.output_manager:
+                    asyncio.create_task(self.output_manager.send_exit_notification({
+                        'symbol': self.symbol,
+                        'reason': f'TIME_EXIT ({time_exit_reason})',
+                        'pnl': position.unrealized_pnl,
+                        'exit_price': current_price,
+                        'timestamp': market_time.isoformat()
+                    }))
+                
                 self.risk_engine.position = None
                 self._reset_trade_state(f"Trade closed: TIME_BASED_EXIT")
                 self.state_machine.start_cooldown()
@@ -1601,6 +1634,16 @@ class SignalEngine:
 
             # Record full-close only
             pnl = exit_action.get('pnl', 0)
+            
+            if self.output_manager:
+                asyncio.create_task(self.output_manager.send_exit_notification({
+                    'symbol': self.symbol,
+                    'reason': exit_action.get('reason', 'FULL_CLOSE'),
+                    'pnl': pnl,
+                    'exit_price': current_price,
+                    'timestamp': market_time.isoformat()
+                }))
+            
             is_win = pnl > 0
             exit_reason = exit_action.get('reason', 'unknown')
 

@@ -60,6 +60,12 @@ def test_execute_entry_places_order_when_all_ok(monkeypatch, fake_market_data, f
         pass
     monkeypatch.setattr(se, "_update_edge_context", no_op_update)
     
+    # Mock the sweep filter to always pass (test focuses on order placement, not sweep detection)
+    monkeypatch.setattr(se, "_check_sweep_occurred", lambda df, bias: (True, "Sweep mocked for test"))
+    
+    # Mock the post-impulse filter to always pass
+    monkeypatch.setattr(se, "_check_not_post_impulse", lambda df, atr: (True, "Impulse mocked for test"))
+    
     # Create market_time for the test
     market_time = datetime.now(UTC)
 

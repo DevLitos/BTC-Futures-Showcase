@@ -8,3 +8,40 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Credentials and secrets (NEVER commit these!)
+.env
+.env.*
+*.env
+~/.trad2_env
+.trad2_env
+secrets/
+credentials/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs and data
+*.log
+logs/
+storage/
+output/
+*.parquet
+*.csv
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Docker
+docker-compose.override.yml
+
+# Backup files
+*.bak
+*.backup
