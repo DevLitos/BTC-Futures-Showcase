@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "daytrader"
 version = "0.1.0"
@@ -23,3 +27,6 @@ dependencies = [
     "uvicorn[standard]>=0.38.0",
     "websockets>=15.0.1",
 ]
+
+[tool.setuptools]
+packages = ["engine", "ingest", "output", "storage", "monitoring"]

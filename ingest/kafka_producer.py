@@ -23,6 +23,26 @@ class KafkaProducer:
             cls._instance = super(KafkaProducer, cls).__new__(cls)
         return cls._instance
 
+
+def get_kafka_producer(instance=None):
+    """
+    Get KafkaProducer instance. Supports DI for testing.
+    
+    Args:
+        instance: Optional explicit instance (for dependency injection)
+    
+    Returns:
+        KafkaProducer instance
+    """
+    if instance is not None:
+        return instance
+    return KafkaProducer()
+
+
+def reset_kafka_producer():
+    """Reset singleton for testing. Use with caution."""
+    KafkaProducer._instance = None
+
     async def initialize(self):
         if self._producer is None:
             self._loop = asyncio.get_running_loop()

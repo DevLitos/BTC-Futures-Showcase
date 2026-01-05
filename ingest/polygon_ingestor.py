@@ -44,9 +44,22 @@ class PolygonIngestor(BaseIngestor):
         logger.info(f"Subscribed to symbols: {subscription_params}")
     
     async def _listener(self):
-        async for raw_message in self.connection:
-            messages = json.loads(raw_message)
-                for messages  in messages:
+        while self.running:
+            try:
+                # Timeout para permitir verificar self.running
+                raw_message = await asyncio.wait_for(
+                    self.connection.recv(),
+                    timeout=30.0
+                )
+                messages = json.loads(raw_message)
+                
+                # Asegurar que messages es una lista
+                if not isinstance(messages, list):
+                    messages = [messages]
+                    
+                for message in messages:
+                    if not self.running:
+                        break
                     
                     if message.get("ev") == "T":  # Trade event
                         symbol = message.get("sym")
@@ -62,6 +75,19 @@ class PolygonIngestor(BaseIngestor):
                         }
 
                         await self.kafka_producer.send_message("raw_trades", trade_data)
+            except asyncio.TimeoutError:
+                # Timeout normal, continuar para verificar running
+                continue
+            except asyncio.CancelledError:
+                logger.info("Listener cancelled")
+                break
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("WebSocket connection closed in listener")
+                break
+            except Exception as e:
+                logger.error(f"Error in listener: {e}")
+                if self.running:
+                    await asyncio.sleep(1.0)
 
     async def run(self):
         # Implementation for polygon ingestion
@@ -81,10 +107,23 @@ class PolygonIngestor(BaseIngestor):
                 reconnect_delay = 1  # Reset delay on successful connection
         pass
 
-    def close(self):
-        # Cleanup resources if any
+    async def close(self):
+        """Cierre asíncrono con limpieza de recursos"""
+        logger.info("Closing PolygonIngestor...")
         self.running = False
-        pass
+        
+        if self.connection:
+            try:
+                await asyncio.wait_for(self.connection.close(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning(f"Error closing websocket: {e}")
+            self.connection = None
+        
+        logger.info("PolygonIngestor closed")
+
+    def stop(self):
+        """Detención síncrona (solo marca flag)"""
+        self.running = False
 
 async def main():
     kafka_producer = KafkaProducer()
@@ -100,7 +139,7 @@ async def main():
     try:
         await polygon_ingestor.run()
     finally:
-        polygon_ingestor.close()
+        await polygon_ingestor.close()
         await kafka_producer.close()
     
 if __name__ == "__main__":

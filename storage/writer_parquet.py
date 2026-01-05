@@ -23,6 +23,11 @@ class ParquetWriter:
         self.batch_size = 1000
         self.timeout_seconds = 15
         self.last_flush_time = time.time()
+        
+        # Control de flujo
+        self.is_running = False
+        self._consume_task = None
+        self._timeout_task = None
 
     async def start(self):
         logger.info(f"📁 Iniciando ParquetWriter escuchando el topic '{self.topic}'...")
@@ -36,34 +41,57 @@ class ParquetWriter:
             value_deserializer=lambda x: x.decode("utf-8")
         )
         await self.consumer.start()
-
-        asyncio.create_task(self._consume_loop())
-        asyncio.create_task(self._timeout_loop())
+        
+        self.is_running = True
+        self._consume_task = asyncio.create_task(self._consume_loop())
+        self._timeout_task = asyncio.create_task(self._timeout_loop())
 
     async def stop(self):
         logger.info("🛑 ParquetWriter apagándose...")
+        self.is_running = False
+        
+        # Cancelar tasks de background
+        for task in [self._consume_task, self._timeout_task]:
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+        
+        # Flush buffer restante antes de cerrar
+        await self._flush_buffer()
+        
         if self.consumer:
             await self.consumer.stop()
         logger.info("ParquetWriter apagado correctamente.")
 
     async def _consume_loop(self):
-        async for msg in self.consumer:
-            try:
-                data = json.loads(msg.value)
-                self.buffer.append(data)
+        try:
+            async for msg in self.consumer:
+                if not self.is_running:
+                    break
+                try:
+                    data = json.loads(msg.value)
+                    self.buffer.append(data)
 
-                if len(self.buffer) >= self.batch_size:
-                    await self._flush_buffer()
+                    if len(self.buffer) >= self.batch_size:
+                        await self._flush_buffer()
 
-            except Exception as e:
-                logger.error(f"Error procesando mensaje en ParquetWriter: {e}")
+                except Exception as e:
+                    logger.error(f"Error procesando mensaje en ParquetWriter: {e}")
+        except asyncio.CancelledError:
+            logger.info("Consume loop cancelled")
 
     async def _timeout_loop(self):
-        while True:
-            await asyncio.sleep(1)
-            if time.time() - self.last_flush_time >= self.timeout_seconds:
-                logger.info("⏱ Timeout alcanzado → escribiendo buffer...")
-                await self._flush_buffer()
+        try:
+            while self.is_running:
+                await asyncio.sleep(1)
+                if time.time() - self.last_flush_time >= self.timeout_seconds:
+                    logger.info("⏱ Timeout alcanzado → escribiendo buffer...")
+                    await self._flush_buffer()
+        except asyncio.CancelledError:
+            logger.info("Timeout loop cancelled")
 
     async def _flush_buffer(self):
         if not self.buffer:
@@ -90,7 +118,7 @@ class ParquetWriter:
                 def infer_ns(x):
                     try:
                         v = float(x)  # Use float first to handle large numbers
-                    except:
+                    except (ValueError, TypeError):
                         return None
                     if v > 1e18:  # ns
                         return int(v)

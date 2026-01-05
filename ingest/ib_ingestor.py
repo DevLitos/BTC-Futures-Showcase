@@ -1,8 +1,8 @@
 import asyncio
 from ib_insync import IB, util, Stock
 import logging
-import .base_ingestor as baseIngestor
-import .kafka_producer as kafkaProducer
+from . import base_ingestor as baseIngestor
+from . import kafka_producer as kafkaProducer
 
 logging = logging.getLogger(__name__)
 
@@ -16,20 +16,29 @@ class IBIngestor(baseIngestor.BaseIngestor):
         self.ib_host = ib_host
         self.ib_port = ib_port
         self.client_id = client_id
+        self._pending_tasks = []  # Track fire-and-forget tasks
     
-    def _on_pending_tickers(self, tickers):
-        last_trade = ticker.last_trade
-        last_size = ticker.last_size
-        timestamp_ns = util.time_ns()
+    async def _on_pending_tickers(self, tickers):
+        """Process ticker updates and send to Kafka with proper task tracking"""
+        for ticker in tickers:
+            last_trade = ticker.last_trade
+            last_size = ticker.last_size
+            timestamp_ns = util.time_ns()
 
-        if last_trade & last_size:
-            trade_data = {
-                "symbol": ticker.contract.symbol,
-                "last_trade": last_trade,
-                "last_size": last_size,
-                "timestamp_ns": timestamp_ns
-            }
-            asyncio.create_task(self.kafka_producer.send_message("raw_trades", trade_data))
+            if last_trade and last_size:
+                trade_data = {
+                    "symbol": ticker.contract.symbol,
+                    "last_trade": last_trade,
+                    "last_size": last_size,
+                    "timestamp_ns": timestamp_ns
+                }
+
+                # Track task for proper cleanup
+                task = asyncio.create_task(self.kafka_producer.send_message("raw_trades", trade_data))
+                self._pending_tasks.append(task)
+                
+                # Clean completed tasks periodically
+                self._pending_tasks = [t for t in self._pending_tasks if not t.done()]
 
     async def run(self):
         try:
@@ -45,13 +54,29 @@ class IBIngestor(baseIngestor.BaseIngestor):
                 await asyncio.sleep(1)
             
         except Exception as e:
-            logging.error(f"Error in IBIngestor: {e}")
+            logger.error(f"Error in IBIngestor: {e}")
         finally:
             if self.ib.isConnected():
                 self.ib.disconnect()
                 logger.info("Disconnected from IB Gateway/TWS")
+            
+            # Cancel pending tasks on shutdown
+            for task in self._pending_tasks:
+                if not task.done():
+                    task.cancel()
+            if self._pending_tasks:
+                await asyncio.gather(*self._pending_tasks, return_exceptions=True)
     
-    def close(self):
+    async def close(self):
+        """Async close with task cleanup"""
         if self.ib.isConnected():
             self.ib.disconnect()
             logger.info("Disconnected from IB Gateway/TWS")
+        
+        # Cancel and wait for pending tasks
+        for task in self._pending_tasks:
+            if not task.done():
+                task.cancel()
+        if self._pending_tasks:
+            await asyncio.gather(*self._pending_tasks, return_exceptions=True)
+        self._pending_tasks = []

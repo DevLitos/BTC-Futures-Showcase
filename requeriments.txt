@@ -10,6 +10,7 @@ ib_insync       # Para Interactive Brokers
 ccxt            # Para exchanges de criptomonedas (Binance, Kraken, etc.)
 polygon-api-client # Para Polygon.io
 websockets      # Para conexiones WebSocket genéricas
+aiohttp         # Cliente HTTP asincrónico para llamadas REST
 
 # --- Bus de Mensajería ---
 kafka-python    # Cliente de Python para Apache Kafka
@@ -17,6 +18,7 @@ kafka-python    # Cliente de Python para Apache Kafka
 # --- Base de Datos ---
 sqlalchemy      # ORM para interactuar con SQL
 psycopg2-binary # Driver para conectar con PostgreSQL / TimescaleDB
+asyncpg         # Driver asincrónico para PostgreSQL
 
 # --- Framework para Microservicios/API ---
 fastapi         # Framework web rápido para crear los servicios
