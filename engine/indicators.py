@@ -331,3 +331,28 @@ def calculate_price_velocity(prices: np.ndarray, period: int = 1) -> float:
 def is_price_between_emas(price: float, ema_fast: float, ema_slow: float) -> bool:
     """Check if price is between two EMAs"""
     return min(ema_fast, ema_slow) <= price <= max(ema_fast, ema_slow)
+
+
+def calculate_bollinger_bands(prices: np.ndarray, period: int = 20, std_dev: float = 2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Calculate Bollinger Bands
+    Returns: (upper_band, middle_band, lower_band)
+    """
+    n = len(prices)
+    if n < period:
+        return np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)
+    
+    middle = np.full(n, np.nan)
+    upper = np.full(n, np.nan)
+    lower = np.full(n, np.nan)
+    
+    for i in range(period - 1, n):
+        window = prices[i - period + 1:i + 1]
+        sma = np.mean(window)
+        std = np.std(window)
+        
+        middle[i] = sma
+        upper[i] = sma + std_dev * std
+        lower[i] = sma - std_dev * std
+    
+    return upper, middle, lower

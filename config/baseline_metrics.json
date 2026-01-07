@@ -1,0 +1,38 @@
+{
+  "timestamp": "2026-01-07T09:54:51.601948+00:00",
+  "symbol": "BTC/USD:USD",
+  "capital": 10000,
+  "p1": {
+    "period": "P1",
+    "trades": 21,
+    "wins": 6,
+    "win_rate": "28.57%",
+    "expectancy_r": "0.000R",
+    "total_pnl": "$-13.91",
+    "return_pct": "-0.14%",
+    "max_dd": "0.16%",
+    "profit_factor": "0.37"
+  },
+  "p2": {
+    "period": "P2",
+    "trades": 33,
+    "wins": 9,
+    "win_rate": "27.27%",
+    "expectancy_r": "0.000R",
+    "total_pnl": "$-12.38",
+    "return_pct": "-0.12%",
+    "max_dd": "0.15%",
+    "profit_factor": "0.44"
+  },
+  "p3": {
+    "period": "P3",
+    "trades": 46,
+    "wins": 15,
+    "win_rate": "32.61%",
+    "expectancy_r": "0.000R",
+    "total_pnl": "$-27.22",
+    "return_pct": "-0.27%",
+    "max_dd": "0.36%",
+    "profit_factor": "0.40"
+  }
+}

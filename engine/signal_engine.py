@@ -22,9 +22,9 @@ from engine.filters import (
 )
 from engine.risk_engine import RiskEngine
 from engine.indicators import (
-    calculate_ema, calculate_atr, calculate_adx
+    calculate_ema, calculate_atr, calculate_adx, calculate_rsi, calculate_bollinger_bands
 )
-from engine.config import HTFFilters  # For logging thresholds
+from engine.config import HTFFilters, RiskManagement  # For logging thresholds
 from engine.advanced_filters import (
     check_funding_rate_safe,
     should_exit_on_funding,
@@ -868,57 +868,82 @@ class SignalEngine:
             df_1m = pd.DataFrame(candles_1m)
         
         # ==================================================================
-        # 🛡️ LOSS COOLDOWN - Block trades after consecutive losses
+        # 🛡️ MASTER ENTRY FILTER CHAIN (Orden correcto de evaluación)
+        # 1. Sesión → 2. Tendencia HTF → 3. Momentum → 4. Volatilidad
+        # 5. Compresión → 6. Anti-reverso → 7. Estructura → 8. Duplicidad
+        # 9. Cooldown → 10. Sizing
         # ==================================================================
-        cooldown_ok, cooldown_reason = self._check_loss_cooldown(market_time)
-        if not cooldown_ok:
-            logger.warning(f"⛔ {cooldown_reason}")
-            self._reset_trade_state("Loss cooldown active")
+        
+        # 1️⃣ SESSION FILTER - Only trade London + NY hours
+        session_ok, session_reason = self._check_session_filter(market_time)
+        if not session_ok:
+            logger.warning(f"⛔ SESSION BLOCKED: {session_reason}")
+            self._reset_trade_state("Outside trading session")
             return
+        logger.info(f"✅ {session_reason}")
         
-        # ==================================================================
-        # 🛡️ VOLATILITY MINIMUM - Block trades in low-vol chop regimes
-        # ==================================================================
-        if df_1m is not None and len(df_1m) >= 200:
-            vol_ok, vol_reason = self._check_volatility_minimum(df_1m)
-            if not vol_ok:
-                logger.warning(f"⛔ {vol_reason}")
-                self._reset_trade_state("Low volatility regime")
-                return
-            logger.info(f"✅ {vol_reason}")
-        
-        # ==================================================================
-        # 🛡️ ATR REGIME FILTER - Block entries when ATR already expanded
-        # ==================================================================
-        atr_regime_ok, atr_regime_reason = self._check_atr_regime_allows_entry(df_5m)
-        if not atr_regime_ok:
-            logger.warning(f"⛔ ATR REGIME BLOCKED: {atr_regime_reason}")
-            self._reset_trade_state("ATR regime filter")
+        # 2️⃣ TREND FILTER (OBLIGATORIO) - Solo en dirección de tendencia clara
+        trend_ok, trend_reason = self._check_trend_filter(df_5m, bias, current_price)
+        if not trend_ok:
+            logger.warning(f"⛔ TREND BLOCKED: {trend_reason}")
+            self._reset_trade_state("Against trend")
             return
-        logger.info(f"✅ {atr_regime_reason}")
+        logger.info(f"✅ {trend_reason}")
         
-        # ==================================================================
-        # 🛡️ ANTI-IMPULSE FILTER - Block entries after impulsive candles
-        # ==================================================================
-        candles_1m = self.market_data.get_candles('1m')
-        if candles_1m and len(candles_1m) >= 5:
-            df_1m = pd.DataFrame(candles_1m)
-            impulse_ok, impulse_reason = self._check_not_post_impulse(df_1m, atr_1m)
-            if not impulse_ok:
-                logger.warning(f"⛔ IMPULSE BLOCKED: {impulse_reason}")
-                self._reset_trade_state("Post-impulse filter")
-                return
-            logger.info(f"✅ {impulse_reason}")
+        # 3️⃣ MOMENTUM FILTER - RSI debe confirmar dirección
+        momentum_ok, momentum_reason = self._check_momentum_filter(df_5m, bias)
+        if not momentum_ok:
+            logger.warning(f"⛔ MOMENTUM BLOCKED: {momentum_reason}")
+            self._reset_trade_state("Momentum not aligned")
+            return
+        logger.info(f"✅ {momentum_reason}")
         
-        # ==================================================================
-        # 🛡️ SWEEP FILTER - Entry only if liquidity sweep detected
-        # ==================================================================
+        # 4️⃣ VOLATILITY FILTER - ATR fast vs slow
+        vol_ok, vol_reason = self._check_volatility_expansion(df_5m)
+        if not vol_ok:
+            logger.warning(f"⛔ VOLATILITY BLOCKED: {vol_reason}")
+            self._reset_trade_state("Low volatility")
+            return
+        logger.info(f"✅ {vol_reason}")
+        
+        # 5️⃣ COMPRESSION FILTER - Bollinger Band width
+        compression_ok, compression_reason = self._check_not_compressed(df_5m)
+        if not compression_ok:
+            logger.warning(f"⛔ COMPRESSION BLOCKED: {compression_reason}")
+            self._reset_trade_state("Market compressed")
+            return
+        logger.info(f"✅ {compression_reason}")
+        
+        # 6️⃣ ANTI-REVERSO FILTER - Evita cuchillos (engulfing + rejection)
+        reverso_ok, reverso_reason = self._check_anti_reverso(df_5m, bias)
+        if not reverso_ok:
+            logger.warning(f"⛔ REVERSO BLOCKED: {reverso_reason}")
+            self._reset_trade_state("Reversal pattern detected")
+            return
+        logger.info(f"✅ {reverso_reason}")
+        
+        # 7️⃣ SWEEP FILTER - Entry only if liquidity sweep detected
         sweep_ok, sweep_reason = self._check_sweep_occurred(df_5m, bias)
         if not sweep_ok:
             logger.warning(f"⛔ SWEEP BLOCKED: {sweep_reason}")
             self._reset_trade_state("No sweep detected")
             return
         logger.info(f"✅ {sweep_reason}")
+        
+        # 8️⃣ DUPLICATE ZONE FILTER - No re-entry where we already lost
+        dup_ok, dup_reason = self._check_not_duplicate_zone(current_price)
+        if not dup_ok:
+            logger.warning(f"⛔ DUPLICATE BLOCKED: {dup_reason}")
+            self._reset_trade_state("Duplicate zone")
+            return
+        logger.info(f"✅ {dup_reason}")
+        
+        # 9️⃣ LOSS COOLDOWN - Block trades after consecutive losses
+        cooldown_ok, cooldown_reason = self._check_loss_cooldown(market_time)
+        if not cooldown_ok:
+            logger.warning(f"⛔ {cooldown_reason}")
+            self._reset_trade_state("Loss cooldown active")
+            return
         
         # FIX: Use ATR from 5m timeframe for SL (more stable, survives noise)
         # ATR 1m is too small for BTC intraday - gets stopped out in noise
@@ -938,10 +963,9 @@ class SignalEngine:
             atr_for_sl  # Use 5m ATR instead of 1m
         )
         
-        # Calculate take profit - Balance between achievable and profitable
-        # SL = 2.0 ATR, TP = 1.8R = 3.6 ATR expansion
+        # Calculate take profit - Use config value, not hardcoded
         risk = abs(current_price - stop_loss)
-        tp_multiplier = 1.8  # TP at 1.8R
+        tp_multiplier = RiskManagement.TP1_RISK_MULTIPLE  # Use config value
         
         if bias == 'LONG':
             take_profit = current_price + (risk * tp_multiplier)
@@ -1202,6 +1226,9 @@ class SignalEngine:
                     self.entry_order_time = None
                     self._last_entry_data = None
                     
+                    # Record trade price for duplicate zone filter
+                    self._record_trade_price(fill_price)
+                    
                     # Go directly to MANAGE
                     self.state_machine.transition_to(BotState.MANAGE, "Instant fill (backtest)")
                     
@@ -1256,6 +1283,9 @@ class SignalEngine:
                             atr_1m=entry_data['atr_1m'],
                             market_time=market_time
                         )
+                        
+                        # Record trade price for duplicate zone filter
+                        self._record_trade_price(fill.get('price', entry_data['entry_price']))
                         
                         self.state_machine.record_trade_open(self.pending_order_id)
                         self._reset_trade_state("Instant fill processed")
@@ -1496,7 +1526,11 @@ class SignalEngine:
                     'exit': current_price,
                     'size': position.size,
                     'pnl': position.unrealized_pnl,
-                    'reason': 'FUNDING_EXIT'
+                    'reason': 'FUNDING_EXIT',
+                    'r': position.calculate_r_realized(current_price),
+                    'mfe_r': position.calculate_mfe_r(),
+                    'mae_r': position.calculate_mae_r(),
+                    'direction': position.direction
                 })
                 
                 if self.output_manager:
@@ -1530,7 +1564,11 @@ class SignalEngine:
                     'exit': current_price,
                     'size': position.size,
                     'pnl': position.unrealized_pnl,
-                    'reason': 'TIME_BASED_EXIT'
+                    'reason': 'TIME_BASED_EXIT',
+                    'r': position.calculate_r_realized(current_price),
+                    'mfe_r': position.calculate_mfe_r(),
+                    'mae_r': position.calculate_mae_r(),
+                    'direction': position.direction
                 })
                 
                 if self.output_manager:
@@ -1669,7 +1707,11 @@ class SignalEngine:
                 'exit': current_price,
                 'size': exit_action.get('size', position.size),
                 'pnl': pnl,
-                'reason': exit_action.get('reason', 'unknown')
+                'reason': exit_action.get('reason', 'unknown'),
+                'r': position.calculate_r_realized(current_price),
+                'mfe_r': position.calculate_mfe_r(),
+                'mae_r': position.calculate_mae_r(),
+                'direction': position.direction
             })
 
             self._reset_trade_state(f"Trade closed: {exit_action.get('reason')}")
@@ -2078,6 +2120,214 @@ class SignalEngine:
             
             return False, f"No SHORT sweep: Recent high {recent_high:.2f} not swept and rejected"
     
+    def _check_session_filter(self, market_time: datetime) -> tuple[bool, str]:
+        """
+        SESSION FILTER: Only trade during London and NY sessions
+        BTC has best liquidity/trends during these hours
+        
+        London: 07:00-11:00 UTC
+        NY: 13:00-20:00 UTC
+        """
+        hour = market_time.hour
+        
+        in_london = 7 <= hour <= 11
+        in_ny = 13 <= hour <= 20
+        
+        if in_london or in_ny:
+            session = "London" if in_london else "NY"
+            return True, f"Session OK: {session} ({hour}:00 UTC)"
+        
+        return False, f"Outside trading sessions: {hour}:00 UTC (need 07-11 or 13-20)"
+    
+    def _check_trend_filter(self, df: pd.DataFrame, bias: str, current_price: float) -> tuple[bool, str]:
+        """
+        TREND FILTER (OBLIGATORIO): Solo operar en dirección de tendencia clara
+        
+        LONG: Price > EMA200 AND EMA50 > EMA200
+        SHORT: Price < EMA200 AND EMA50 < EMA200
+        """
+        if len(df) < 200:
+            return True, "Not enough data for trend filter"
+        
+        closes = df['close'].values
+        ema50 = calculate_ema(closes, 50)
+        ema200 = calculate_ema(closes, 200)
+        
+        if np.isnan(ema50[-1]) or np.isnan(ema200[-1]):
+            return True, "EMA values not ready"
+        
+        allow_long = current_price > ema200[-1] and ema50[-1] > ema200[-1]
+        allow_short = current_price < ema200[-1] and ema50[-1] < ema200[-1]
+        
+        if bias == 'LONG':
+            if allow_long:
+                return True, f"Trend OK: LONG aligned (P>{ema200[-1]:.0f}, EMA50>{ema200[-1]:.0f})"
+            return False, f"LONG against trend: P={current_price:.0f}, EMA50={ema50[-1]:.0f}, EMA200={ema200[-1]:.0f}"
+        else:
+            if allow_short:
+                return True, f"Trend OK: SHORT aligned (P<{ema200[-1]:.0f}, EMA50<{ema200[-1]:.0f})"
+            return False, f"SHORT against trend: P={current_price:.0f}, EMA50={ema50[-1]:.0f}, EMA200={ema200[-1]:.0f}"
+    
+    def _check_momentum_filter(self, df: pd.DataFrame, bias: str) -> tuple[bool, str]:
+        """
+        MOMENTUM FILTER: RSI debe confirmar dirección
+        
+        LONG: RSI > 48
+        SHORT: RSI < 52
+        
+        Evita entrar en "suelos" o "techos" (fade trading)
+        """
+        if len(df) < 20:
+            return True, "Not enough data for momentum"
+        
+        closes = df['close'].values
+        rsi = calculate_rsi(closes, 14)
+        
+        if np.isnan(rsi[-1]):
+            return True, "RSI not ready"
+        
+        rsi_val = rsi[-1]
+        
+        if bias == 'LONG':
+            if rsi_val >= 48:
+                return True, f"Momentum OK: RSI={rsi_val:.1f} >= 48"
+            return False, f"Weak momentum for LONG: RSI={rsi_val:.1f} < 48"
+        else:
+            if rsi_val <= 52:
+                return True, f"Momentum OK: RSI={rsi_val:.1f} <= 52"
+            return False, f"Weak momentum for SHORT: RSI={rsi_val:.1f} > 52"
+    
+    def _check_volatility_expansion(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """
+        VOLATILITY FILTER: ATR fast vs ATR slow
+        
+        Solo operar cuando BTC se mueve, no en compresión
+        
+        ATR(14) >= ATR(42) * 0.9
+        """
+        if len(df) < 50:
+            return True, "Not enough data for volatility"
+        
+        highs = df['high'].values
+        lows = df['low'].values
+        closes = df['close'].values
+        
+        atr_fast = calculate_atr(highs, lows, closes, 14)
+        atr_slow = calculate_atr(highs, lows, closes, 42)
+        
+        if np.isnan(atr_fast[-1]) or np.isnan(atr_slow[-1]):
+            return True, "ATR not ready"
+        
+        threshold = atr_slow[-1] * 0.9
+        
+        if atr_fast[-1] >= threshold:
+            return True, f"Volatility OK: ATR14={atr_fast[-1]:.2f} >= {threshold:.2f} (90% of ATR42)"
+        
+        return False, f"Low volatility: ATR14={atr_fast[-1]:.2f} < {threshold:.2f}"
+    
+    def _check_not_compressed(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """
+        COMPRESSION FILTER: Bollinger Band width > 0.5%
+        
+        Entrar en consolidación = STOP seguro
+        0.5% is typical for BTC (1% was too strict)
+        """
+        if len(df) < 25:
+            return True, "Not enough data for compression"
+        
+        closes = df['close'].values
+        bb_upper, bb_mid, bb_lower = calculate_bollinger_bands(closes, 20, 2.0)
+        
+        if np.isnan(bb_upper[-1]) or np.isnan(bb_mid[-1]) or np.isnan(bb_lower[-1]):
+            return True, "Bollinger not ready"
+        
+        band_width = (bb_upper[-1] - bb_lower[-1]) / bb_mid[-1]
+        
+        if band_width >= 0.005:  # 0.5% (reduced from 1%)
+            return True, f"Expansion OK: BB width={band_width*100:.2f}% >= 0.5%"
+        
+        return False, f"Market compressed: BB width={band_width*100:.2f}% < 0.5%"
+    
+    def _check_anti_reverso(self, df: pd.DataFrame, bias: str) -> tuple[bool, str]:
+        """
+        ANTI-REVERSO FILTER: Evita cuchillos (engulfing + rejection wicks)
+        
+        Bloquea entrada si:
+        - Engulfing bearish detectado para LONG
+        - Engulfing bullish detectado para SHORT
+        - Rejection wick > 60% del rango
+        """
+        if len(df) < 3:
+            return True, "Not enough data for reversal detection"
+        
+        last3 = df.iloc[-3:]
+        
+        # Candle properties
+        open1, close1 = last3.iloc[-2]['open'], last3.iloc[-2]['close']
+        open2, close2 = last3.iloc[-1]['open'], last3.iloc[-1]['close']
+        high2, low2 = last3.iloc[-1]['high'], last3.iloc[-1]['low']
+        
+        candle_range = high2 - low2
+        if candle_range <= 0:
+            return True, "No range"
+        
+        # Engulfing patterns
+        bearish_engulf = (close2 < open2 and  # Current bearish
+                         close2 < open1 and   # Close below prev open
+                         open2 > close1)      # Open above prev close
+        
+        bullish_engulf = (close2 > open2 and  # Current bullish
+                         close2 > open1 and   # Close above prev open
+                         open2 < close1)      # Open below prev close
+        
+        # Rejection wicks (upper wick for LONG rejection, lower for SHORT)
+        upper_wick = high2 - max(open2, close2)
+        lower_wick = min(open2, close2) - low2
+        
+        long_reject = upper_wick > candle_range * 0.6
+        short_reject = lower_wick > candle_range * 0.6
+        
+        if bias == 'LONG':
+            if bearish_engulf:
+                return False, "Bearish engulfing detected - LONG blocked"
+            if long_reject:
+                return False, f"Long rejection wick ({upper_wick/candle_range*100:.0f}% of range)"
+            return True, "No reversal patterns for LONG"
+        else:
+            if bullish_engulf:
+                return False, "Bullish engulfing detected - SHORT blocked"
+            if short_reject:
+                return False, f"Short rejection wick ({lower_wick/candle_range*100:.0f}% of range)"
+            return True, "No reversal patterns for SHORT"
+    
+    def _check_not_duplicate_zone(self, current_price: float) -> tuple[bool, str]:
+        """
+        DUPLICATE ZONE FILTER: No re-entry donde ya perdimos
+        
+        Si hay un trade reciente (últimos 5) dentro de 0.2% del precio actual,
+        bloqueamos para evitar repetir el mismo error.
+        """
+        if not hasattr(self, '_recent_trade_prices'):
+            self._recent_trade_prices = []
+        
+        # Clean up old entries (keep last 5)
+        self._recent_trade_prices = self._recent_trade_prices[-5:]
+        
+        for entry_price in self._recent_trade_prices:
+            distance = abs(entry_price - current_price) / current_price
+            if distance < 0.002:  # 0.2%
+                return False, f"Duplicate zone: Recent trade at {entry_price:.0f}, current {current_price:.0f} ({distance*100:.2f}% away)"
+        
+        return True, "No recent trades in this zone"
+    
+    def _record_trade_price(self, entry_price: float):
+        """Record trade price for duplicate zone detection"""
+        if not hasattr(self, '_recent_trade_prices'):
+            self._recent_trade_prices = []
+        self._recent_trade_prices.append(entry_price)
+        # Keep only last 5
+        self._recent_trade_prices = self._recent_trade_prices[-5:]
+    
     def _find_tp2_target(self) -> float:
         """Find TP2 target"""
         candles_5m = self.market_data.get_candles('5m')
@@ -2178,7 +2428,10 @@ class SignalEngine:
                     'size': position.size,
                     'pnl': pnl,
                     'direction': position.direction,
-                    'reason': 'EMERGENCY_CLOSE'
+                    'reason': 'EMERGENCY_CLOSE',
+                    'r': position.calculate_r_realized(current_price),
+                    'mfe_r': position.calculate_mfe_r(),
+                    'mae_r': position.calculate_mae_r()
                 })
                 
                 self.risk_engine.position = None

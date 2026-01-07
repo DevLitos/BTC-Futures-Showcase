@@ -23,6 +23,15 @@ from engine.market_data import SynchronizedMultiTimeframeBuffer
 from engine.risk_engine import RiskEngine
 from engine.state_machine import BotState
 
+# Import validation framework (optional slippage simulation)
+try:
+    from engine.backtest_validation import (
+        SlippageSimulator, SlippageConfig, FeatureFlag, is_feature_enabled
+    )
+    VALIDATION_AVAILABLE = True
+except ImportError:
+    VALIDATION_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)-8s - %(message)s'
@@ -37,7 +46,7 @@ logger = logging.getLogger('BacktestKraken')
 class MockExecution:
     """Simula ejecución de órdenes para backtest"""
     
-    def __init__(self):
+    def __init__(self, enable_slippage: bool = False):
         self.orders: Dict[str, dict] = {}
         self.order_counter = 0
         self.position: Optional[dict] = None
@@ -46,6 +55,16 @@ class MockExecution:
         self.open_orders: Dict[str, dict] = {}
         self.pending_sl: Optional[float] = None
         self.pending_tp: Optional[float] = None
+        
+        # Slippage simulation (more conservative backtests)
+        self.enable_slippage = enable_slippage
+        if enable_slippage and VALIDATION_AVAILABLE:
+            self.slippage_sim = SlippageSimulator()
+        else:
+            self.slippage_sim = None
+        
+        # Track last direction for slippage calculation
+        self._last_direction: str = "LONG"
         
     def set_price(self, price: float):
         """Actualiza precio actual (llamado cada tick)"""
@@ -68,9 +87,24 @@ class MockExecution:
     
     def _fill_order(self, order_id: str, order: dict):
         """Registra fill de orden"""
+        # Apply slippage if enabled (makes backtest more conservative)
+        fill_price = self.current_price
+        if self.slippage_sim:
+            is_entry = self.position is None
+            direction = "LONG" if order['side'] == 'buy' else "SHORT"
+            is_market = order.get('type') == 'market'
+            
+            fill_price = self.slippage_sim.apply_slippage(
+                price=self.current_price,
+                direction=direction,
+                is_entry=is_entry,
+                is_market_order=is_market
+            )
+            self._last_direction = direction
+        
         self.fills.append({
             'order_id': order_id,
-            'price': self.current_price,
+            'price': fill_price,
             'amount': order['amount'],
             'side': order['side'],
             'timestamp': datetime.now(UTC)
@@ -83,8 +117,8 @@ class MockExecution:
                     'contracts': order['amount'], 
                     'size': order['amount'], 
                     'side': 'long', 
-                    'entry': self.current_price,
-                    'entryPrice': self.current_price
+                    'entry': fill_price,
+                    'entryPrice': fill_price
                 }
             else:
                 self.position['contracts'] += order['amount']
@@ -95,8 +129,8 @@ class MockExecution:
                     'contracts': -order['amount'],  # Negative for short
                     'size': order['amount'], 
                     'side': 'short', 
-                    'entry': self.current_price,
-                    'entryPrice': self.current_price
+                    'entry': fill_price,
+                    'entryPrice': fill_price
                 }
             else:
                 self.position['contracts'] -= order['amount']
@@ -311,15 +345,23 @@ def download_kraken_data(symbol: str = 'BTC/USD:USD', days: int = 7, offset_days
 class BacktestRunner:
     """Ejecuta backtest usando las clases REALES del sistema"""
     
-    def __init__(self, symbol: str = 'BTC/USD:USD', capital: float = 1000.0):
+    def __init__(self, symbol: str = 'BTC/USD:USD', capital: float = 1000.0, 
+                 enable_slippage: bool = False):
         self.symbol = symbol
         self.capital = capital
         
+        # Check if slippage should be enabled via feature flag
+        if VALIDATION_AVAILABLE and is_feature_enabled(FeatureFlag.SLIPPAGE_SIM):
+            enable_slippage = True
+        
         # Componentes REALES
         self.market_data = SynchronizedMultiTimeframeBuffer(symbol)
-        self.execution = MockExecution()
+        self.execution = MockExecution(enable_slippage=enable_slippage)
         self.external_data = MockExternalData()
         self.trade_logger = MockTradeLogger()
+        
+        if enable_slippage:
+            logger.info("📉 Slippage simulation ENABLED (conservative backtest)")
         
         # Signal Engine REAL - with BACKTEST enforcement mode (relaxed thresholds)
         self.engine = SignalEngine(
@@ -532,25 +574,67 @@ class BacktestRunner:
 
 def print_results(results: dict):
     """Imprime resultados formateados"""
-    print("\n" + "="*60)
-    print("📊 BACKTEST RESULTS")
-    print("="*60)
+    trades = results.get('trades', [])
+    
+    # Calculate R metrics
+    r_values = [t['data'].get('r', 0) for t in trades if 'r' in t['data']]
+    mfe_values = [t['data'].get('mfe_r', 0) for t in trades if 'mfe_r' in t['data']]
+    mae_values = [t['data'].get('mae_r', 0) for t in trades if 'mae_r' in t['data']]
+    
+    avg_r = sum(r_values) / len(r_values) if r_values else 0
+    avg_mfe = sum(mfe_values) / len(mfe_values) if mfe_values else 0
+    avg_mae = sum(mae_values) / len(mae_values) if mae_values else 0
+    expectancy = avg_r if r_values else 0
+    
+    # Profit factor
+    gross_profit = sum(t['data'].get('pnl', 0) for t in trades if t['data'].get('pnl', 0) > 0)
+    gross_loss = abs(sum(t['data'].get('pnl', 0) for t in trades if t['data'].get('pnl', 0) < 0))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+    
+    # Exit reason breakdown
+    exit_reasons = {}
+    for t in trades:
+        reason = t['data'].get('reason', 'unknown')
+        if reason not in exit_reasons:
+            exit_reasons[reason] = {'count': 0, 'pnl': 0, 'r': []}
+        exit_reasons[reason]['count'] += 1
+        exit_reasons[reason]['pnl'] += t['data'].get('pnl', 0)
+        if 'r' in t['data']:
+            exit_reasons[reason]['r'].append(t['data']['r'])
+    
+    print("\n" + "="*70)
+    print("📊 BACKTEST RESULTS (WITH R-METRICS)")
+    print("="*70)
     print(f"Total Trades:    {results['total_trades']}")
     print(f"Wins:            {results['wins']}")
     print(f"Losses:          {results['losses']}")
     print(f"Win Rate:        {results['win_rate']:.2f}%")
+    print(f"Profit Factor:   {profit_factor:.2f}")
     print(f"Total PnL:       ${results['total_pnl']:.2f}")
     print(f"Final Equity:    ${results['final_equity']:.2f}")
     print(f"Return:          {results['return_pct']:.2f}%")
     print(f"Max Drawdown:    {results['max_drawdown_pct']:.2f}%")
-    print("="*60)
+    print("-"*70)
+    print(f"📈 R-METRICS:")
+    print(f"  Expectancy:    {expectancy:.3f}R")
+    print(f"  Avg R per trade: {avg_r:.3f}R")
+    print(f"  Avg MFE:       {avg_mfe:.2f}R (max favorable move)")
+    print(f"  Avg MAE:       {avg_mae:.2f}R (max adverse move)")
+    print(f"  R tracked:     {len(r_values)}/{len(trades)} trades")
+    print("-"*70)
+    print("📊 EXIT REASON BREAKDOWN:")
+    for reason, data in sorted(exit_reasons.items(), key=lambda x: x[1]['count'], reverse=True):
+        avg_r_reason = sum(data['r']) / len(data['r']) if data['r'] else 0
+        print(f"  {reason:20s}: {data['count']:3d} trades | PnL: ${data['pnl']:7.2f} | Avg R: {avg_r_reason:.2f}")
+    print("="*70)
     
-    if results['trades']:
-        print("\n📝 Trade Log:")
-        for i, t in enumerate(results['trades'][-10:], 1):  # Last 10 trades
+    if trades:
+        print("\n📝 Trade Log (last 10):")
+        for i, t in enumerate(trades[-10:], 1):
             d = t['data']
-            print(f"  {i}. Entry: {d.get('entry', 'N/A'):.2f} → Exit: {d.get('exit', 'N/A'):.2f} | "
-                  f"PnL: ${d.get('pnl', 0):.2f} | Reason: {d.get('reason', 'N/A')}")
+            r_val = d.get('r', 0)
+            print(f"  {i}. {d.get('direction', '?'):5s} Entry: {d.get('entry', 0):.0f} → Exit: {d.get('exit', 0):.0f} | "
+                  f"PnL: ${d.get('pnl', 0):6.2f} | R: {r_val:+.2f} | {d.get('reason', 'N/A')}")
 
 
 async def main():
@@ -559,6 +643,7 @@ async def main():
     parser.add_argument('--days', type=int, default=7, help='Days of history')
     parser.add_argument('--offset', type=int, default=0, help='Offset days from today (0=recent, 7=week ago)')
     parser.add_argument('--capital', type=float, default=1000, help='Initial capital (EUR)')
+    parser.add_argument('--slippage', action='store_true', help='Enable slippage simulation (conservative)')
     args = parser.parse_args()
     
     # Descargar datos
@@ -569,7 +654,11 @@ async def main():
         return
     
     # Ejecutar backtest
-    runner = BacktestRunner(symbol=args.symbol, capital=args.capital)
+    runner = BacktestRunner(
+        symbol=args.symbol, 
+        capital=args.capital,
+        enable_slippage=args.slippage
+    )
     results = await runner.run(df_1m, df_5m, df_1h)
     
     # Mostrar resultados

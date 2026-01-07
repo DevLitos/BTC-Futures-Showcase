@@ -15,6 +15,12 @@ FASE C: Optimización del Runner
 - Filtro: no aplicar si MFE histórico < 2R
 
 REGLA DE ORO: No actuar sobre métricas hasta n > 100-150 trades por setup.
+
+NEW FEATURES:
+- Trade Instrumenter: "Caja Negra" que captura todo en el momento de entrada
+- SL Bin Classification: MICRO (<0.6 ATR), NORMAL (0.6-1.2 ATR), WIDE (>1.2 ATR)
+- Real-time Edge Health Tracking
+- PPO Integration
 """
 
 import logging
@@ -33,6 +39,20 @@ try:
 except ImportError:
     _CAPITAL_WEIGHTING_AVAILABLE = False
 
+# Integration with Market Regime
+try:
+    from engine.market_regime import MarketRegime, get_regime_classifier
+    _MARKET_REGIME_AVAILABLE = True
+except ImportError:
+    _MARKET_REGIME_AVAILABLE = False
+
+# Integration with Risk Middleware
+try:
+    from engine.risk_middleware import SetupGrade, get_risk_middleware
+    _RISK_MIDDLEWARE_AVAILABLE = True
+except ImportError:
+    _RISK_MIDDLEWARE_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,7 +61,17 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class SLSizeBin:
-    """Stop Loss size bins for noise detection."""
+    """
+    Stop Loss size bins for noise detection.
+    
+    Lógica:
+    - Bin MICRO (< 0.6 ATR): Alta precisión, alta probabilidad de ser barridos por wick
+    - Bin NORMAL (0.6-1.2 ATR): Sweet spot donde estructura suele aguantar
+    - Bin WIDE (> 1.2 ATR): Trades conservadores o cambios de tendencia mayor
+    
+    Objetivo: Si Bin MICRO tiene Expectancy negativo tras 100 trades, 
+    deja de operarlos. No cambies el sistema, elimina el ruido.
+    """
     MICRO = "MICRO"       # < 0.6 ATR (probable ruido)
     NORMAL = "NORMAL"     # 0.6-1.2 ATR (estándar)
     WIDE = "WIDE"         # > 1.2 ATR (conservador)
@@ -53,30 +83,388 @@ class SLBinConfig:
     micro_max_atr: float = 0.6      # < 0.6 ATR = MICRO
     normal_max_atr: float = 1.2     # 0.6-1.2 ATR = NORMAL
     # > 1.2 ATR = WIDE
+    
+    # Action thresholds
+    min_trades_for_action: int = 100
+    negative_expectancy_threshold: float = 0.0  # Below this = problem
 
 
-def classify_sl_bin(sl_distance: float, atr: float) -> str:
+def classify_sl_bin(sl_distance: float, atr: float, config: SLBinConfig = None) -> str:
     """
-    Classify SL into size bins.
+    Classify SL into size bins at trade entry.
     
     Args:
-        sl_distance: Distance from entry to SL in price
+        sl_distance: Distance from entry to SL in price (absolute value)
         atr: ATR value at entry
+        config: Optional configuration
         
     Returns:
-        SL bin category
+        SL bin category: MICRO, NORMAL, or WIDE
     """
+    config = config or SLBinConfig()
+    
     if atr <= 0:
         return SLSizeBin.NORMAL
     
     sl_atr_ratio = sl_distance / atr
     
-    if sl_atr_ratio < SLBinConfig.micro_max_atr:
+    if sl_atr_ratio < config.micro_max_atr:
         return SLSizeBin.MICRO
-    elif sl_atr_ratio < SLBinConfig.normal_max_atr:
+    elif sl_atr_ratio < config.normal_max_atr:
         return SLSizeBin.NORMAL
     else:
         return SLSizeBin.WIDE
+
+
+# =============================================================================
+# TRADE INSTRUMENTER - "CAJA NEGRA"
+# =============================================================================
+
+@dataclass
+class TradeInstrumentationData:
+    """
+    Complete instrumentation data captured at trade entry.
+    
+    This is the "black box" that records everything we need to analyze later.
+    """
+    # Trade identification
+    trade_id: str = ""
+    symbol: str = ""
+    
+    # Entry details
+    entry_time: datetime = None
+    entry_price: float = 0.0
+    direction: str = ""  # LONG or SHORT
+    position_size: float = 0.0
+    stop_loss: float = 0.0
+    take_profit_1: float = 0.0
+    take_profit_2: float = 0.0
+    
+    # SL Classification
+    sl_distance: float = 0.0
+    sl_atr_ratio: float = 0.0
+    sl_bin: str = ""  # MICRO, NORMAL, WIDE
+    
+    # Market Context at Entry
+    atr_at_entry: float = 0.0
+    adx_at_entry: float = 0.0
+    market_regime: str = ""  # TREND_EXPANSION, MEAN_REVERSION, CHOPPY_DEAD
+    atr_ratio: float = 0.0  # Current ATR / Baseline ATR
+    
+    # Session Context
+    entry_hour: int = 0
+    entry_minute: int = 0
+    entry_day_of_week: int = 0
+    session: str = ""  # ASIA, LONDON, OVERLAP, NY, DEAD
+    
+    # Setup Classification
+    setup_type: str = ""
+    setup_grade: str = ""  # A, B, C
+    
+    # Risk Parameters Applied
+    base_risk_pct: float = 0.0
+    adjusted_risk_pct: float = 0.0
+    risk_multiplier: float = 0.0
+    regime_multiplier: float = 0.0
+    setup_multiplier: float = 0.0
+    
+    # Streak State
+    streak_at_entry: int = 0
+    escalation_active: bool = False
+    
+    # Candle Analysis
+    avg_body_ratio: float = 0.0  # Recent candles body/range
+    wick_dominance: float = 0.0  # % of wicky candles
+    
+    # Volume Context
+    volume_ratio: float = 0.0  # Current / Average volume
+    volume_decaying: bool = False
+
+
+class TradeInstrumenter:
+    """
+    The "Black Box" recorder for trades.
+    
+    Captures all relevant data at trade entry for later analysis.
+    """
+    
+    def __init__(self, output_dir: str = "logs/instrumentation"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Current trade being instrumented
+        self.current_trade: Optional[TradeInstrumentationData] = None
+        
+        # All recorded trades
+        self.trades: List[Dict] = []
+        
+        # Stats by SL bin (for quick lookup)
+        self.sl_bin_stats: Dict[str, Dict] = {
+            SLSizeBin.MICRO: {'count': 0, 'wins': 0, 'total_r': 0.0, 'total_pnl': 0.0},
+            SLSizeBin.NORMAL: {'count': 0, 'wins': 0, 'total_r': 0.0, 'total_pnl': 0.0},
+            SLSizeBin.WIDE: {'count': 0, 'wins': 0, 'total_r': 0.0, 'total_pnl': 0.0}
+        }
+    
+    def instrument_entry(self,
+                         trade_id: str,
+                         symbol: str,
+                         entry_price: float,
+                         direction: str,
+                         position_size: float,
+                         stop_loss: float,
+                         take_profit_1: float = 0.0,
+                         take_profit_2: float = 0.0,
+                         atr: float = 0.0,
+                         adx: float = 0.0,
+                         setup_type: str = "DEFAULT",
+                         market_time: datetime = None,
+                         **kwargs) -> TradeInstrumentationData:
+        """
+        Instrument a trade at entry time.
+        
+        This captures the "snapshot" of all conditions when the trade was taken.
+        """
+        market_time = market_time or datetime.now(UTC)
+        
+        # Calculate SL classification
+        sl_distance = abs(entry_price - stop_loss)
+        sl_atr_ratio = sl_distance / atr if atr > 0 else 0.0
+        sl_bin = classify_sl_bin(sl_distance, atr)
+        
+        # Get market regime if available
+        regime_str = ""
+        atr_ratio = 1.0
+        regime_mult = 1.0
+        
+        if _MARKET_REGIME_AVAILABLE:
+            classifier = get_regime_classifier()
+            regime = classifier.get_current_regime()
+            if regime:
+                regime_str = regime.value
+            atr_ratio = classifier.update_atr_baseline(atr) if atr > 0 else 1.0
+            guidance = classifier.get_regime_guidance(regime)
+            regime_mult = guidance.risk_multiplier if guidance else 1.0
+        
+        # Get setup grade if middleware available
+        setup_grade = "B"
+        setup_mult = 1.0
+        streak = 0
+        escalation = False
+        base_risk = 0.8
+        adjusted_risk = 0.8
+        
+        if _RISK_MIDDLEWARE_AVAILABLE:
+            middleware = get_risk_middleware()
+            grade = middleware.classify_setup(setup_type)
+            setup_grade = grade.value
+            setup_mult = middleware.setup_config.GRADE_MULTIPLIERS.get(grade, 1.0)
+            streak = middleware.streak_tracker.current_streak
+            escalation = middleware.streak_tracker.is_escalated
+            base_risk = middleware.streak_tracker.config.BASE_RISK_PCT
+            adjusted_risk = middleware.streak_tracker.get_current_risk_pct() * regime_mult * setup_mult
+        
+        # Session classification
+        hour = market_time.hour
+        session = SessionAnalyzer.get_session(hour)
+        
+        # Build instrumentation data
+        self.current_trade = TradeInstrumentationData(
+            trade_id=trade_id,
+            symbol=symbol,
+            entry_time=market_time,
+            entry_price=entry_price,
+            direction=direction,
+            position_size=position_size,
+            stop_loss=stop_loss,
+            take_profit_1=take_profit_1,
+            take_profit_2=take_profit_2,
+            sl_distance=sl_distance,
+            sl_atr_ratio=sl_atr_ratio,
+            sl_bin=sl_bin,
+            atr_at_entry=atr,
+            adx_at_entry=adx,
+            market_regime=regime_str,
+            atr_ratio=atr_ratio,
+            entry_hour=hour,
+            entry_minute=market_time.minute,
+            entry_day_of_week=market_time.weekday(),
+            session=session,
+            setup_type=setup_type,
+            setup_grade=setup_grade,
+            base_risk_pct=base_risk,
+            adjusted_risk_pct=adjusted_risk,
+            risk_multiplier=regime_mult * setup_mult,
+            regime_multiplier=regime_mult,
+            setup_multiplier=setup_mult,
+            streak_at_entry=streak,
+            escalation_active=escalation,
+            avg_body_ratio=kwargs.get('avg_body_ratio', 0.0),
+            wick_dominance=kwargs.get('wick_dominance', 0.0),
+            volume_ratio=kwargs.get('volume_ratio', 1.0),
+            volume_decaying=kwargs.get('volume_decaying', False)
+        )
+        
+        logger.info(f"📦 INSTRUMENTED: {trade_id} | SL Bin: {sl_bin} ({sl_atr_ratio:.2f} ATR) | "
+                   f"Regime: {regime_str} | Setup: {setup_type} ({setup_grade})")
+        
+        return self.current_trade
+    
+    def instrument_exit(self,
+                        exit_price: float,
+                        exit_time: datetime,
+                        exit_reason: str,
+                        pnl: float,
+                        mfe_r: float = 0.0,
+                        mae_r: float = 0.0,
+                        duration_minutes: float = 0.0) -> Dict:
+        """
+        Complete instrumentation at trade exit.
+        
+        Returns complete trade record.
+        """
+        if not self.current_trade:
+            logger.warning("No current trade to instrument exit")
+            return {}
+        
+        # Calculate R value
+        # Risk per unit = distance from entry to SL
+        # Total risk = risk_per_unit * position_size
+        risk_per_unit = abs(self.current_trade.entry_price - self.current_trade.stop_loss)
+        total_risk = risk_per_unit * self.current_trade.position_size
+        r_realized = pnl / total_risk if total_risk > 0 else 0.0
+        
+        # Build complete record
+        record = {
+            # Entry data
+            **{k: v for k, v in self.current_trade.__dict__.items() if not k.startswith('_')},
+            
+            # Exit data
+            'exit_time': exit_time.isoformat() if exit_time else '',
+            'exit_price': exit_price,
+            'exit_reason': exit_reason,
+            
+            # Performance
+            'pnl': pnl,
+            'net_pnl': pnl,
+            'r_realized': r_realized,
+            'mfe_r': mfe_r,
+            'mae_r': mae_r,
+            'duration_minutes': duration_minutes,
+            'is_win': pnl > 0
+        }
+        
+        # Convert datetime fields to strings
+        if 'entry_time' in record and record['entry_time']:
+            record['entry_time'] = record['entry_time'].isoformat() if isinstance(record['entry_time'], datetime) else record['entry_time']
+        
+        # Store trade
+        self.trades.append(record)
+        
+        # Update SL bin stats
+        sl_bin = self.current_trade.sl_bin
+        if sl_bin in self.sl_bin_stats:
+            stats = self.sl_bin_stats[sl_bin]
+            stats['count'] += 1
+            if pnl > 0:
+                stats['wins'] += 1
+            stats['total_r'] += r_realized
+            stats['total_pnl'] += pnl
+        
+        # Write to log file
+        self._append_to_log(record)
+        
+        # Clear current trade
+        self.current_trade = None
+        
+        logger.info(f"📦 EXIT INSTRUMENTED: {record.get('trade_id')} | "
+                   f"R: {r_realized:+.2f} | MFE: {mfe_r:.2f}R | Exit: {exit_reason}")
+        
+        return record
+    
+    def _append_to_log(self, record: Dict):
+        """Append trade record to JSONL log."""
+        log_file = self.output_dir / "trades.jsonl"
+        try:
+            with open(log_file, 'a') as f:
+                f.write(json.dumps(record, default=str) + '\n')
+        except Exception as e:
+            logger.error(f"Error writing to trade log: {e}")
+    
+    def get_sl_bin_analysis(self) -> Dict[str, Dict]:
+        """
+        Get analysis by SL bin.
+        
+        Returns expectancy and stats for each bin.
+        """
+        analysis = {}
+        
+        for bin_name, stats in self.sl_bin_stats.items():
+            count = stats['count']
+            if count == 0:
+                analysis[bin_name] = {
+                    'count': 0,
+                    'expectancy': 0.0,
+                    'win_rate': 0.0,
+                    'should_trade': True,
+                    'reason': 'NO_DATA'
+                }
+                continue
+            
+            expectancy = stats['total_r'] / count
+            win_rate = stats['wins'] / count
+            
+            # Check if should continue trading this bin
+            should_trade = True
+            reason = 'OK'
+            
+            config = SLBinConfig()
+            if count >= config.min_trades_for_action:
+                if expectancy < config.negative_expectancy_threshold:
+                    should_trade = False
+                    reason = f'NEGATIVE_EXPECTANCY ({expectancy:.2f}R)'
+            else:
+                reason = f'INSUFFICIENT_DATA ({count} < {config.min_trades_for_action})'
+            
+            analysis[bin_name] = {
+                'count': count,
+                'expectancy': expectancy,
+                'win_rate': win_rate,
+                'total_pnl': stats['total_pnl'],
+                'should_trade': should_trade,
+                'reason': reason
+            }
+        
+        return analysis
+    
+    def should_block_sl_bin(self, sl_bin: str) -> Tuple[bool, str]:
+        """
+        Check if an SL bin should be blocked based on performance.
+        
+        Returns:
+            Tuple of (should_block, reason)
+        """
+        analysis = self.get_sl_bin_analysis()
+        bin_data = analysis.get(sl_bin, {})
+        
+        should_trade = bin_data.get('should_trade', True)
+        reason = bin_data.get('reason', 'OK')
+        
+        return not should_trade, reason
+
+
+# =============================================================================
+# GLOBAL TRADE INSTRUMENTER
+# =============================================================================
+
+_trade_instrumenter: Optional[TradeInstrumenter] = None
+
+
+def get_trade_instrumenter() -> TradeInstrumenter:
+    """Get global TradeInstrumenter instance."""
+    global _trade_instrumenter
+    if _trade_instrumenter is None:
+        _trade_instrumenter = TradeInstrumenter()
+    return _trade_instrumenter
 
 
 # =============================================================================
@@ -665,3 +1053,160 @@ def classify_setup_tier(setup: str,
         return ("MEDIO", 0.75)
     else:
         return ("MARGINAL", 0.5)
+
+
+# =============================================================================
+# EDGE HEALTH TRACKER (Real-time monitoring for Grafana)
+# =============================================================================
+
+class EdgeHealthTracker:
+    """
+    Real-time Edge Health monitoring for Grafana integration.
+    
+    Tracks:
+    - Rolling expectancy (last 20 vs historical)
+    - Edge degradation alerts
+    - Automatic risk reduction when edge is compromised
+    
+    Alert: If rolling expectancy < 50% of historical → Observation Mode
+    """
+    
+    def __init__(self, 
+                 alert_threshold: float = 0.5,
+                 rolling_window: int = 20,
+                 min_trades_for_historical: int = 100):
+        self.alert_threshold = alert_threshold
+        self.rolling_window = rolling_window
+        self.min_trades_for_historical = min_trades_for_historical
+        
+        # Trade R values
+        self.r_history: List[float] = []
+        
+        # Historical baseline (calculated once we have enough data)
+        self.historical_expectancy: Optional[float] = None
+        
+        # Alert state
+        self.in_observation_mode: bool = False
+        self.observation_risk_mult: float = 0.5  # Reduce risk by 50% in observation
+        
+    def record_trade_r(self, r_value: float):
+        """Record a trade's R-multiple."""
+        self.r_history.append(r_value)
+        
+        # Update historical once we have enough data
+        if len(self.r_history) >= self.min_trades_for_historical:
+            if self.historical_expectancy is None:
+                self.historical_expectancy = sum(self.r_history) / len(self.r_history)
+            else:
+                # Slowly update historical (EWMA)
+                alpha = 0.01
+                self.historical_expectancy = (
+                    alpha * r_value + (1 - alpha) * self.historical_expectancy
+                )
+        
+        # Check for alert
+        self._check_alert()
+    
+    def _check_alert(self):
+        """Check if we should enter observation mode."""
+        if len(self.r_history) < self.rolling_window:
+            return
+        
+        if self.historical_expectancy is None:
+            return
+        
+        rolling = self.r_history[-self.rolling_window:]
+        rolling_expectancy = sum(rolling) / len(rolling)
+        
+        ratio = rolling_expectancy / self.historical_expectancy if self.historical_expectancy > 0 else 1.0
+        
+        if ratio < self.alert_threshold:
+            if not self.in_observation_mode:
+                logger.warning(f"⚠️ EDGE HEALTH ALERT: Rolling expectancy {rolling_expectancy:.2f}R "
+                             f"< {self.alert_threshold*100:.0f}% of historical {self.historical_expectancy:.2f}R")
+                logger.warning(f"   → Entering OBSERVATION MODE (risk x{self.observation_risk_mult})")
+            self.in_observation_mode = True
+        else:
+            if self.in_observation_mode:
+                logger.info(f"✅ EDGE HEALTH RECOVERED: Exiting observation mode")
+            self.in_observation_mode = False
+    
+    def get_risk_multiplier(self) -> float:
+        """Get risk multiplier based on edge health."""
+        if self.in_observation_mode:
+            return self.observation_risk_mult
+        return 1.0
+    
+    def get_health_metrics(self) -> Dict[str, Any]:
+        """Get current health metrics."""
+        rolling_expectancy = 0.0
+        if len(self.r_history) >= self.rolling_window:
+            rolling = self.r_history[-self.rolling_window:]
+            rolling_expectancy = sum(rolling) / len(rolling)
+        
+        ratio = 1.0
+        if self.historical_expectancy and self.historical_expectancy > 0:
+            ratio = rolling_expectancy / self.historical_expectancy
+        
+        return {
+            'rolling_expectancy': rolling_expectancy,
+            'historical_expectancy': self.historical_expectancy or 0.0,
+            'health_ratio': ratio,
+            'in_observation_mode': self.in_observation_mode,
+            'trade_count': len(self.r_history),
+            'risk_multiplier': self.get_risk_multiplier()
+        }
+    
+    def update_prometheus_metrics(self, symbol: str = "BTC/USDT"):
+        """Update Prometheus metrics for Grafana."""
+        try:
+            from monitoring.metrics import (
+                update_edge_health, 
+                check_edge_health_alert
+            )
+            
+            metrics = self.get_health_metrics()
+            update_edge_health(
+                symbol=symbol,
+                expectancy_last_20=metrics['rolling_expectancy'],
+                expectancy_historical=metrics['historical_expectancy']
+            )
+        except ImportError:
+            pass  # Metrics not available
+
+
+# Global Edge Health Tracker
+_edge_health_tracker: Optional[EdgeHealthTracker] = None
+
+
+def get_edge_health_tracker() -> EdgeHealthTracker:
+    """Get global EdgeHealthTracker instance."""
+    global _edge_health_tracker
+    if _edge_health_tracker is None:
+        _edge_health_tracker = EdgeHealthTracker()
+    return _edge_health_tracker
+
+
+def record_trade_for_edge_health(r_value: float, symbol: str = "BTC/USDT"):
+    """
+    Convenience function to record a trade and update edge health.
+    
+    Call this after every trade closes.
+    """
+    tracker = get_edge_health_tracker()
+    tracker.record_trade_r(r_value)
+    tracker.update_prometheus_metrics(symbol)
+    
+    return tracker.get_health_metrics()
+
+
+def get_edge_health_risk_multiplier() -> float:
+    """Get current risk multiplier based on edge health."""
+    tracker = get_edge_health_tracker()
+    return tracker.get_risk_multiplier()
+
+
+def is_in_observation_mode() -> bool:
+    """Check if system is in observation mode due to edge degradation."""
+    tracker = get_edge_health_tracker()
+    return tracker.in_observation_mode

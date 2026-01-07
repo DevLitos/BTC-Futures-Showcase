@@ -61,6 +61,48 @@ class Position:
         
         logger.info(f"Position opened: {direction} {size} {symbol} @ {entry_price:.2f} | SL: {stop_loss:.2f} | TP1: {self.tp1_price:.2f}")
     
+    def calculate_r_realized(self, exit_price: float) -> float:
+        """
+        Calculate realized R multiple for this trade.
+        R = PnL / Initial Risk
+        """
+        initial_risk_per_unit = abs(self.entry_price - self.initial_stop_loss)
+        if initial_risk_per_unit == 0:
+            return 0.0
+        
+        if self.direction == 'LONG':
+            price_move = exit_price - self.entry_price
+        else:
+            price_move = self.entry_price - exit_price
+        
+        return price_move / initial_risk_per_unit
+    
+    def calculate_mfe_r(self) -> float:
+        """Calculate Maximum Favorable Excursion in R."""
+        initial_risk = abs(self.entry_price - self.initial_stop_loss)
+        if initial_risk == 0:
+            return 0.0
+        
+        if self.direction == 'LONG':
+            mfe = self.highest_price - self.entry_price
+        else:
+            mfe = self.entry_price - self.lowest_price
+        
+        return mfe / initial_risk
+    
+    def calculate_mae_r(self) -> float:
+        """Calculate Maximum Adverse Excursion in R."""
+        initial_risk = abs(self.entry_price - self.initial_stop_loss)
+        if initial_risk == 0:
+            return 0.0
+        
+        if self.direction == 'LONG':
+            mae = self.entry_price - self.lowest_price
+        else:
+            mae = self.highest_price - self.entry_price
+        
+        return mae / initial_risk
+    
     def _calculate_tp1(self, entry: float, stop: float, direction: str) -> float:
         """Calculate TP1 at +1R"""
         risk = abs(entry - stop)
@@ -75,17 +117,21 @@ class Position:
         logger.info(f"TP2 set at {tp2_price:.2f} for {self.symbol}")
     
     def update_unrealized_pnl(self, current_price: float):
-        """Update unrealized PnL and track MFE (highest/lowest price)"""
+        """Update unrealized PnL and track MFE/MAE (highest/lowest price)"""
         if self.direction == 'LONG':
             self.unrealized_pnl = (current_price - self.entry_price) * self.size
-            # Track MFE for stagnation exit
+            # Track MFE (highest) and MAE (lowest) for LONG
             if current_price > self.highest_price:
                 self.highest_price = current_price
-        else:
-            self.unrealized_pnl = (self.entry_price - current_price) * self.size
-            # Track MFE for stagnation exit
             if current_price < self.lowest_price:
                 self.lowest_price = current_price
+        else:
+            self.unrealized_pnl = (self.entry_price - current_price) * self.size
+            # Track MFE (lowest) and MAE (highest) for SHORT
+            if current_price < self.lowest_price:
+                self.lowest_price = current_price
+            if current_price > self.highest_price:
+                self.highest_price = current_price
     
     def update_trailing_stop(self, current_price: float, atr_1m: float, market_time: datetime):
         """
@@ -708,7 +754,7 @@ class RiskEngine:
             return None
     
     async def _handle_tp1(self, current_price: float) -> dict:
-        """Handle TP1 hit - close 50% and move stop to BE"""
+        """Handle TP1 hit - close 60% and move stop to BE immediately"""
         pos = self.position
         
         # Calculate partial close
@@ -727,10 +773,16 @@ class RiskEngine:
         # Update position
         pos.size = remaining_size
         pos.tp1_hit = True
-        # NO mover a BE automáticamente - esperar a que estructura rompa (SMART BE)
+        
+        # MOVE TO BREAKEVEN IMMEDIATELY after TP1
+        # This protects the runner from giving back gains
+        old_sl = pos.stop_loss
+        pos.stop_loss = pos.entry_price
+        pos.trailing_stop = pos.entry_price
+        pos.be_moved = True
         
         logger.info(f"🎯 TP1 HIT - Closed {close_size:.4f} @ {current_price:.2f} | PnL: ${pnl:.2f} | Remaining: {remaining_size:.4f}")
-        logger.info(f"💡 SMART BE: Esperando rotura de estructura para mover SL a BE")
+        logger.info(f"🔒 SL moved to BE: {old_sl:.2f} → {pos.entry_price:.2f}")
         
         return {
             'action': 'PARTIAL_CLOSE',

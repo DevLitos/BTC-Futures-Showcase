@@ -201,9 +201,15 @@ class RiskManagement:
     # Stop loss
     STOP_LOSS_ATR_BUFFER = 0.3      # Buffer of 0.3x ATR(1m) above SL level
     
-    # Take profits - Balance between achievable and profitable
-    TP1_RISK_MULTIPLE = 1.8         # TP at 1.8R (balance between hit rate and payoff)
+    # Take profits - Based on empirical MFE analysis
+    # Data shows: avg MFE = 0.52R, so TP1 at 0.6R targets upper MFE range
+    # This captures wins while letting more trades hit target
+    TP1_RISK_MULTIPLE = 0.6         # TP at 0.6R (slightly above avg MFE)
     TP1_CLOSE_PCT = 60              # Close 60% at TP1, leave 40% runner
+    
+    # Exit management (FIXED - no inventos)
+    USE_PARTIALS = False            # Simple TP1 + runner
+    MOVE_TO_BE_AFTER_TP1 = True     # Always move SL to BE after TP1
     
     # =========================================================================
     # PALANCA 3: PARCIALES INTELIGENTES (sin tocar entrada)
