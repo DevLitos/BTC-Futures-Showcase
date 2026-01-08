@@ -922,13 +922,13 @@ class SignalEngine:
             return
         logger.info(f"✅ {reverso_reason}")
         
-        # 7️⃣ SWEEP FILTER - Entry only if liquidity sweep detected
-        sweep_ok, sweep_reason = self._check_sweep_occurred(df_5m, bias)
-        if not sweep_ok:
-            logger.warning(f"⛔ SWEEP BLOCKED: {sweep_reason}")
-            self._reset_trade_state("No sweep detected")
+        # 7️⃣ VOLUME FILTER - Entry must have above-average volume
+        vol_filter_ok, vol_filter_reason = self._check_volume_confirmation(df_5m)
+        if not vol_filter_ok:
+            logger.warning(f"⛔ VOLUME BLOCKED: {vol_filter_reason}")
+            self._reset_trade_state("Low volume signal")
             return
-        logger.info(f"✅ {sweep_reason}")
+        logger.info(f"✅ {vol_filter_reason}")
         
         # 8️⃣ DUPLICATE ZONE FILTER - No re-entry where we already lost
         dup_ok, dup_reason = self._check_not_duplicate_zone(current_price)
@@ -2122,22 +2122,12 @@ class SignalEngine:
     
     def _check_session_filter(self, market_time: datetime) -> tuple[bool, str]:
         """
-        SESSION FILTER: Only trade during London and NY sessions
-        BTC has best liquidity/trends during these hours
-        
-        London: 07:00-11:00 UTC
-        NY: 13:00-20:00 UTC
+        SESSION FILTER: Disabled for now to see real edge with more trades
+        BTC trades 24/7 - let's see what happens without session restriction
         """
         hour = market_time.hour
-        
-        in_london = 7 <= hour <= 11
-        in_ny = 13 <= hour <= 20
-        
-        if in_london or in_ny:
-            session = "London" if in_london else "NY"
-            return True, f"Session OK: {session} ({hour}:00 UTC)"
-        
-        return False, f"Outside trading sessions: {hour}:00 UTC (need 07-11 or 13-20)"
+        # Allow all hours for now to get more trades
+        return True, f"Session OK: 24/7 trading ({hour}:00 UTC)"
     
     def _check_trend_filter(self, df: pd.DataFrame, bias: str, current_price: float) -> tuple[bool, str]:
         """
@@ -2170,32 +2160,41 @@ class SignalEngine:
     
     def _check_momentum_filter(self, df: pd.DataFrame, bias: str) -> tuple[bool, str]:
         """
-        MOMENTUM FILTER: RSI debe confirmar dirección
+        MOMENTUM FILTER: RSI y ADX deben confirmar dirección
         
-        LONG: RSI > 48
-        SHORT: RSI < 52
+        LONG: RSI > 45 (relaxed) AND ADX > 20
+        SHORT: RSI < 55 (relaxed) AND ADX > 20
         
-        Evita entrar en "suelos" o "techos" (fade trading)
+        ADX > 20 confirms trending market
         """
-        if len(df) < 20:
+        if len(df) < 30:
             return True, "Not enough data for momentum"
         
         closes = df['close'].values
-        rsi = calculate_rsi(closes, 14)
+        highs = df['high'].values
+        lows = df['low'].values
         
-        if np.isnan(rsi[-1]):
-            return True, "RSI not ready"
+        rsi = calculate_rsi(closes, 14)
+        adx, _ = calculate_adx(highs, lows, closes, 14)
+        
+        if np.isnan(rsi[-1]) or np.isnan(adx[-1]):
+            return True, "RSI/ADX not ready"
         
         rsi_val = rsi[-1]
+        adx_val = adx[-1]
+        
+        # ADX must show trend (> 20)
+        if adx_val < 20:
+            return False, f"No trend: ADX={adx_val:.1f} < 20"
         
         if bias == 'LONG':
-            if rsi_val >= 48:
-                return True, f"Momentum OK: RSI={rsi_val:.1f} >= 48"
-            return False, f"Weak momentum for LONG: RSI={rsi_val:.1f} < 48"
+            if rsi_val >= 45:
+                return True, f"Momentum OK: RSI={rsi_val:.1f} >= 45, ADX={adx_val:.1f}"
+            return False, f"Weak LONG momentum: RSI={rsi_val:.1f} < 45"
         else:
-            if rsi_val <= 52:
-                return True, f"Momentum OK: RSI={rsi_val:.1f} <= 52"
-            return False, f"Weak momentum for SHORT: RSI={rsi_val:.1f} > 52"
+            if rsi_val <= 55:
+                return True, f"Momentum OK: RSI={rsi_val:.1f} <= 55, ADX={adx_val:.1f}"
+            return False, f"Weak SHORT momentum: RSI={rsi_val:.1f} > 55"
     
     def _check_volatility_expansion(self, df: pd.DataFrame) -> tuple[bool, str]:
         """
@@ -2227,26 +2226,9 @@ class SignalEngine:
     
     def _check_not_compressed(self, df: pd.DataFrame) -> tuple[bool, str]:
         """
-        COMPRESSION FILTER: Bollinger Band width > 0.5%
-        
-        Entrar en consolidación = STOP seguro
-        0.5% is typical for BTC (1% was too strict)
+        COMPRESSION FILTER: Disabled for now to get more trades
         """
-        if len(df) < 25:
-            return True, "Not enough data for compression"
-        
-        closes = df['close'].values
-        bb_upper, bb_mid, bb_lower = calculate_bollinger_bands(closes, 20, 2.0)
-        
-        if np.isnan(bb_upper[-1]) or np.isnan(bb_mid[-1]) or np.isnan(bb_lower[-1]):
-            return True, "Bollinger not ready"
-        
-        band_width = (bb_upper[-1] - bb_lower[-1]) / bb_mid[-1]
-        
-        if band_width >= 0.005:  # 0.5% (reduced from 1%)
-            return True, f"Expansion OK: BB width={band_width*100:.2f}% >= 0.5%"
-        
-        return False, f"Market compressed: BB width={band_width*100:.2f}% < 0.5%"
+        return True, "Compression filter disabled"
     
     def _check_anti_reverso(self, df: pd.DataFrame, bias: str) -> tuple[bool, str]:
         """
@@ -2302,23 +2284,64 @@ class SignalEngine:
     
     def _check_not_duplicate_zone(self, current_price: float) -> tuple[bool, str]:
         """
-        DUPLICATE ZONE FILTER: No re-entry donde ya perdimos
-        
-        Si hay un trade reciente (últimos 5) dentro de 0.2% del precio actual,
-        bloqueamos para evitar repetir el mismo error.
+        DUPLICATE ZONE FILTER: Disabled for now to get more trades
         """
-        if not hasattr(self, '_recent_trade_prices'):
-            self._recent_trade_prices = []
+        return True, "Duplicate zone filter disabled"
+    
+    def _check_volume_confirmation(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """
+        DELTA VOLUME FILTER: Entry needs INTENTION (directional volume)
         
-        # Clean up old entries (keep last 5)
-        self._recent_trade_prices = self._recent_trade_prices[-5:]
+        No RSI, no MACD, no pollas.
+        BTC moves with intention or doesn't move.
         
-        for entry_price in self._recent_trade_prices:
-            distance = abs(entry_price - current_price) / current_price
-            if distance < 0.002:  # 0.2%
-                return False, f"Duplicate zone: Recent trade at {entry_price:.0f}, current {current_price:.0f} ({distance*100:.2f}% away)"
+        Delta = Buy Volume - Sell Volume (approximated from candle structure)
+        If |delta| < threshold → NO TRADE (no clear direction)
+        """
+        if len(df) < 25 or 'volume' not in df.columns:
+            return True, "Not enough data for volume filter"
         
-        return True, "No recent trades in this zone"
+        # Calculate delta volume (approximation using candle body vs range)
+        # Bullish candle: close > open → delta positive
+        # Bearish candle: close < open → delta negative
+        # Delta strength = how much of the range is body (conviction)
+        
+        volumes = df['volume'].values
+        opens = df['open'].values
+        closes = df['close'].values
+        highs = df['high'].values
+        lows = df['low'].values
+        
+        # Current candle delta
+        current_vol = volumes[-1]
+        current_range = highs[-1] - lows[-1]
+        current_body = closes[-1] - opens[-1]  # Positive = bullish, negative = bearish
+        
+        if current_range <= 0:
+            return True, "Zero range candle"
+        
+        # Delta = volume * (body / range) * sign
+        # This gives us directional volume
+        body_ratio = abs(current_body) / current_range
+        delta = current_vol * body_ratio * (1 if current_body > 0 else -1)
+        
+        # Average volume for normalization
+        avg_vol_20 = np.mean(volumes[-21:-1])
+        if avg_vol_20 <= 0:
+            return True, "Zero average volume"
+        
+        # Normalized delta (as ratio of average volume)
+        norm_delta = abs(delta) / avg_vol_20
+        
+        # Threshold: need at least 0.3x average volume as clear delta
+        # This filters out indecision candles (dojis, spinning tops)
+        DELTA_THRESHOLD = 0.3
+        
+        if norm_delta >= DELTA_THRESHOLD:
+            direction = "BUY" if delta > 0 else "SELL"
+            return True, f"Delta OK: {norm_delta:.2f}x avg ({direction})"
+        
+        return False, f"No intention: delta {norm_delta:.2f}x < {DELTA_THRESHOLD}x (indecision)"
     
     def _record_trade_price(self, entry_price: float):
         """Record trade price for duplicate zone detection"""

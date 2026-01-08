@@ -59,6 +59,18 @@ class Position:
         self.open_time = market_time if market_time else datetime.now(UTC)
         self.unrealized_pnl = 0.0
         
+        # 2-PHASE STOP: Track stop phase
+        self.stop_phase = 1  # 1 = Exploration (0.7R), 2 = Validated (0.15R)
+        self.original_stop_distance = abs(entry_price - stop_loss)
+        
+        # DYNAMIC SIZING: Track if we've added to winner
+        self.added_to_winner = False
+        self.initial_size = size  # Track original size before adds
+        self.touched_minus_02r = False  # Track if price went -0.2R against
+        
+        # Candle counter for mediocre trade detection
+        self.candle_count = 0
+        
         logger.info(f"Position opened: {direction} {size} {symbol} @ {entry_price:.2f} | SL: {stop_loss:.2f} | TP1: {self.tp1_price:.2f}")
     
     def calculate_r_realized(self, exit_price: float) -> float:
@@ -135,70 +147,157 @@ class Position:
     
     def update_trailing_stop(self, current_price: float, atr_1m: float, market_time: datetime):
         """
-        FIX #3: 3-PHASE INTELLIGENT TRAILING STOP
+        STEPPED TRAILING - Wide steps, let winners breathe!
         
-        Phase 1 (0-5min after entry): Protection mode - tight SL (1.5x ATR)
-        Phase 2 (5-20min): Structure-based - use structure swings
-        Phase 3 (20min+): Extension mode - let winners run
+        BTC intraday needs ROOM. Don't cut winners.
         
-        Args:
-            current_price: Current market price
-            atr_1m: Current ATR value
-            market_time: Current market time (REQUIRED - never use datetime.now())
+        Steps (based on MFE reached, not current price):
+        - MFE >= 0.4R → stop = entry - 0.15R (slight protection)
+        - MFE >= 0.7R → stop = entry (breakeven)
+        - MFE >= 1.0R → stop = +0.4R  
+        - MFE >= 1.5R → stop = +0.9R
+        - MFE >= 2.2R → stop = +1.6R
         
-        Raises:
-            ValueError if market_time is None
+        NO ATR dynamic trailing. Just discrete levels.
         """
-        if not self.tp1_hit:
-            return
-        
-        # CRITICAL FIX: market_time is now REQUIRED
         if market_time is None:
-            logger.error("market_time is required for trailing stop calculation")
-            # Fallback to open_time which gives duration=0 (Phase 1)
             market_time = self.open_time
         
         market_time = ensure_utc(market_time)
         self.atr_1m = atr_1m
         
-        # Determine phase based on trade duration - use MARKET TIME
-        duration_minutes = (market_time - self.open_time).total_seconds() / 60
+        # Calculate MFE in R
+        risk = abs(self.entry_price - self.initial_stop_loss)
+        if risk <= 0:
+            return
         
-        # RELAXED TRAILING (Jan 4, 2026): All phases use wider stops to let winners run
-        # Phase 1 was 1.5x (too tight), now 2.5x
-        # Phase 2 was 2.0x, now 2.5x  
-        # Phase 3 was 2.5x, now 3.0x
-        if self.direction == 'LONG':
-            if duration_minutes < 5:
-                # PHASE 1: Entry Protection (now 2.5x ATR - was 1.5x)
-                new_trailing = current_price - (atr_1m * 2.5)
-                self.trailing_stop = max(self.trailing_stop, new_trailing)
-                
-            elif duration_minutes < 20:
-                # PHASE 2: Profit Protection (now 2.5x ATR - was 2.0x)
-                new_trailing = current_price - (atr_1m * 2.5)
-                self.trailing_stop = max(self.trailing_stop, new_trailing)
-                
+        mfe_r = self.calculate_mfe_r()
+        
+        # STEPPED TRAILING LEVELS (based on MFE reached, not current price)
+        # Once MFE hits a level, lock in that stop - don't give it back
+        
+        if mfe_r >= 2.2:
+            # Lock in +1.6R (new level for big runners)
+            if self.direction == 'LONG':
+                new_stop = self.entry_price + (risk * 1.6)
+                self.trailing_stop = max(self.trailing_stop, new_stop)
             else:
-                # PHASE 3: Extension Mode (now 3.0x ATR - was 2.5x)
-                new_trailing = current_price - (atr_1m * 3.0)
-                self.trailing_stop = max(self.trailing_stop, new_trailing)
-                
-        else:  # SHORT
-            if duration_minutes < 5:
-                # PHASE 1: Entry Protection (now 2.5x ATR - was 1.5x)
-                new_trailing = current_price + (atr_1m * 2.5)
-                self.trailing_stop = min(self.trailing_stop, new_trailing)
-                
-            elif duration_minutes < 20:
-                # PHASE 2: Profit Protection (now 2.5x ATR - was 2.0x)
-                new_trailing = current_price + (atr_1m * 2.5)
-                self.trailing_stop = min(self.trailing_stop, new_trailing)
-                
+                new_stop = self.entry_price - (risk * 1.6)
+                self.trailing_stop = min(self.trailing_stop, new_stop)
+            logger.debug(f"📈 TRAILING STEP 5: MFE {mfe_r:.2f}R >= 2.2R → Lock +1.6R")
+        
+        elif mfe_r >= 1.5:
+            # Lock in +0.9R
+            if self.direction == 'LONG':
+                new_stop = self.entry_price + (risk * 0.9)
+                self.trailing_stop = max(self.trailing_stop, new_stop)
             else:
-                # PHASE 3: Extension Mode (now 3.0x ATR - was 2.5x)
-                new_trailing = current_price + (atr_1m * 3.0)
-                self.trailing_stop = min(self.trailing_stop, new_trailing)
+                new_stop = self.entry_price - (risk * 0.9)
+                self.trailing_stop = min(self.trailing_stop, new_stop)
+            logger.debug(f"📈 TRAILING STEP 4: MFE {mfe_r:.2f}R >= 1.5R → Lock +0.9R")
+        
+        elif mfe_r >= 1.0:
+            # Lock in +0.4R
+            if self.direction == 'LONG':
+                new_stop = self.entry_price + (risk * 0.4)
+                self.trailing_stop = max(self.trailing_stop, new_stop)
+            else:
+                new_stop = self.entry_price - (risk * 0.4)
+                self.trailing_stop = min(self.trailing_stop, new_stop)
+            logger.debug(f"📈 TRAILING STEP 3: MFE {mfe_r:.2f}R >= 1.0R → Lock +0.4R")
+        
+        elif mfe_r >= 0.7:
+            # Lock in breakeven
+            if self.direction == 'LONG':
+                self.trailing_stop = max(self.trailing_stop, self.entry_price)
+            else:
+                self.trailing_stop = min(self.trailing_stop, self.entry_price)
+            logger.debug(f"📈 TRAILING STEP 2: MFE {mfe_r:.2f}R >= 0.7R → Lock BE")
+        
+        elif mfe_r >= 0.4:
+            # Early protection: Move stop to -0.15R (reduce loss if trade reverses)
+            if self.direction == 'LONG':
+                new_stop = self.entry_price - (risk * 0.15)
+                self.trailing_stop = max(self.trailing_stop, new_stop)
+            else:
+                new_stop = self.entry_price + (risk * 0.15)
+                self.trailing_stop = min(self.trailing_stop, new_stop)
+            logger.debug(f"📈 TRAILING STEP 1: MFE {mfe_r:.2f}R >= 0.4R → Lock -0.15R")
+    
+    def increment_candle_count(self):
+        """Increment candle count for mediocre trade detection"""
+        self.candle_count += 1
+    
+    def check_mediocre_trade_exit(self, n_candles: int = 6) -> bool:
+        """
+        KILL SWITCH: Exit stagnant trades early
+        
+        Condition: After N candles:
+          - MFE < 0.15R AND MAE < 0.15R
+        
+        This eliminates:
+        - Lateral trades that eat commissions
+        - False positives that never move
+        
+        Args:
+            n_candles: Number of candles before checking (default 6)
+        
+        Returns: True if trade should be killed
+        """
+        if self.candle_count < n_candles:
+            return False
+        
+        mfe_r = self.calculate_mfe_r()
+        mae_r = self.calculate_mae_r()
+        
+        # Trade is mediocre if it hasn't moved either direction
+        if mfe_r < 0.15 and mae_r < 0.15:
+            logger.warning(f"☠️ MEDIOCRE KILL: {self.candle_count} candles, MFE={mfe_r:.2f}R, MAE={mae_r:.2f}R - both < 0.15R")
+            return True
+        
+        return False
+    
+    def check_add_to_winner(self, current_price: float) -> dict:
+        """
+        DYNAMIC SIZING: Add 0.5x position when trade proves itself
+        
+        Condition:
+          - MFE >= 0.6R
+          - Never touched -0.2R (clean move)
+        
+        This increases R on clear winners without increasing drawdown.
+        
+        Returns: dict with add_size if should add, None otherwise
+        """
+        if self.added_to_winner:
+            return None  # Already added
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        # Track if we've been -0.2R against
+        risk = abs(self.entry_price - self.initial_stop_loss)
+        if risk > 0:
+            if self.direction == 'LONG':
+                worst_drawdown = (self.entry_price - self.lowest_price) / risk
+            else:
+                worst_drawdown = (self.highest_price - self.entry_price) / risk
+            
+            if worst_drawdown >= 0.2:
+                self.touched_minus_02r = True
+        
+        # Check conditions
+        if mfe_r >= 0.6 and not self.touched_minus_02r:
+            add_size = self.initial_size * 0.5
+            self.added_to_winner = True
+            logger.info(f"💪 ADD TO WINNER: MFE {mfe_r:.2f}R >= 0.6R, no -0.2R touch → Adding {add_size:.6f}")
+            return {
+                'action': 'ADD_POSITION',
+                'add_size': add_size,
+                'new_total_size': self.size + add_size,
+                'reason': f'Winner add at MFE {mfe_r:.2f}R'
+            }
+        
+        return None
     
     def move_stop_to_breakeven(self, reason: str = "Structure break"):
         """
@@ -259,19 +358,22 @@ class Position:
     def check_stop_hit(self, current_price: float, current_low: float = None, 
                        atr_1m: float = None, market_time: datetime = None) -> bool:
         """
-        Check SL hit with grace period and sweep detection
+        2-PHASE DYNAMIC STOP with sweep detection
         
-        GRACE PERIOD: In the first 10 minutes, only exit if price moves > 1.5x SL distance
-        This gives the trade time to develop without getting stopped on noise.
+        PHASE 1 (Exploration): While MFE < 0.25R
+        SIMPLE STOP LOSS CHECK - No complex phases!
+        
+        Just check if price hit the stop. The trailing_stop handles the rest.
         
         Args:
             current_price: Current price
             current_low: Candle low (optional, for sweep detection)
-            atr_1m: ATR for sweep validation
-            market_time: Current market time (for grace period check)
+            atr_1m: ATR (optional, for sweep detection)
+            market_time: Current market time
         
-        Returns: True if SL hit (and it's not a sweep, and not in grace period)
+        Returns: True if SL hit (and it's not a sweep)
         """
+        # Check if current price hits stop
         if self.direction == 'LONG':
             sl_hit = current_price <= self.stop_loss
         else:
@@ -324,9 +426,20 @@ class Position:
         return False
     
     def check_trailing_stop_hit(self, current_price: float) -> bool:
-        """Check if trailing stop hit"""
-        if not self.tp1_hit:
-            return False
+        """
+        Check if trailing stop hit.
+        
+        Works before AND after TP1 - the trailing_stop is updated by
+        update_trailing_stop() based on MFE levels.
+        
+        If trailing_stop has been moved from initial stop, check it.
+        """
+        # Check if trailing has moved (means MFE reached at least 0.4R)
+        initial_stop = self.initial_stop_loss
+        trailing_moved = abs(self.trailing_stop - initial_stop) > 0.01  # Small tolerance
+        
+        if not trailing_moved:
+            return False  # Trailing not active yet
         
         if self.direction == 'LONG':
             return current_price <= self.trailing_stop
@@ -701,55 +814,26 @@ class RiskEngine:
             if pos.check_trailing_stop_hit(current_price):
                 return await self._close_position(current_price, 'TRAILING_STOP')
             
-            # 4. Check TP2
-            if pos.check_tp2_hit(current_price):
-                return await self._close_position(current_price, 'TP2')
+            # ================================================================
+            # SIMPLIFIED EXIT LOGIC - ONLY 3 EXIT TYPES
+            # 1. STOP_LOSS (no tocar)
+            # 2. TRAILING_STOP (por fases, después de MFE >= 0.6R)
+            # 3. TIME_BASED_EXIT (solo para runners con MFE >= 1.2R)
+            # ================================================================
             
-            # 5. Check climactic volume exit
-            if self._check_climactic_exit(volume, avg_volume, pos):
-                return await self._close_position(current_price, 'CLIMACTIC_VOLUME')
-            
-            # 6. SMART STAGNATION EXIT - Based on MFE (Maximum Favorable Excursion), not just time
             time_in_trade = pos.get_time_in_trade_minutes(market_time)
             
-            # Calculate current R and MFE (max favorable excursion in R terms)
-            risk = abs(pos.entry_price - pos.initial_stop_loss)
-            if risk > 0:
-                if pos.direction == 'LONG':
-                    current_r = (current_price - pos.entry_price) / risk
-                    mfe_r = (pos.highest_price - pos.entry_price) / risk  # Best price reached
-                else:
-                    current_r = (pos.entry_price - current_price) / risk
-                    mfe_r = (pos.entry_price - pos.lowest_price) / risk
-            else:
-                current_r = 0
-                mfe_r = 0
-            
-            # SMART STAGNATION LOGIC:
-            # - Only exit if trade NEVER showed promise (MFE < 0.3R)
-            # - If MFE >= 0.5R, the trade showed expansion - let it play out
-            # - Time threshold: 45 min minimum before considering stagnation
-            
-            if not pos.tp1_hit:
-                # STAGNATION: 45+ min AND never made real progress (MFE < 0.3R)
-                # This catches truly dead trades, not ones that are building
-                if time_in_trade >= 45 and mfe_r < 0.3:
-                    logger.warning(f"⏱️ STAGNATION: {time_in_trade:.0f}min, MFE={mfe_r:.2f}R (never expanded) - cutting")
-                    return await self._close_position(current_price, 'STAGNATION_EXIT')
+            # TIME_BASED_EXIT: Only for GOOD trades that need to be harvested
+            # Condition: MFE >= 1.2R AND trade still open after 90min
+            if time_in_trade >= RiskManagement.MAX_TRADE_DURATION_MINUTES:
+                mfe_r = pos.calculate_mfe_r()
                 
-                # MOMENTUM_DEAD: 60+ min, showed some promise (MFE 0.3-0.8R) but faded
-                # The trade tried but failed to continue
-                if time_in_trade >= 60 and mfe_r >= 0.3 and mfe_r < 0.8 and current_r < 0.3:
-                    logger.warning(f"⏱️ MOMENTUM_DEAD: {time_in_trade:.0f}min, MFE={mfe_r:.2f}R but now {current_r:.2f}R - fading")
-                    return await self._close_position(current_price, 'MOMENTUM_DEAD')
-                
-                # If MFE >= 0.8R, trade showed real expansion - only exit via SL/trailing
-                # This lets winners run
-                
-                # Hard time exit: 90 min - if still no TP1 after 90 min, thesis failed
-                if time_in_trade >= RiskManagement.MAX_TRADE_DURATION_MINUTES:
-                    logger.warning(f"⏱️ TIME_EXIT: {time_in_trade:.0f}min, MFE={mfe_r:.2f}R, current={current_r:.2f}R")
-                    return await self._close_position(current_price, 'TIME_EXIT')
+                # Only exit via TIME if trade showed strong momentum (MFE >= 1.2R)
+                # This captures clean intraday BTC trends
+                if mfe_r >= 1.2:
+                    logger.info(f"⏱️ TIME_BASED_EXIT: {time_in_trade:.0f}min, MFE={mfe_r:.2f}R >= 1.2R - harvesting runner")
+                    return await self._close_position(current_price, 'TIME_BASED_EXIT')
+                # Otherwise just let it run - trailing will handle it
             
             return None
     

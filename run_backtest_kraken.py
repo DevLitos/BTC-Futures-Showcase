@@ -442,6 +442,10 @@ class BacktestRunner:
             candle_1m = self._row_to_candle(row, '1m')
             self.market_data.add_candle(candle_1m)
             
+            # INCREMENT CANDLE COUNT for mediocre trade detection
+            if self.engine.risk_engine.position:
+                self.engine.risk_engine.position.increment_candle_count()
+            
             # Actualizar 5m si hay nueva vela (solo cuando cambia el timestamp 5m)
             ts_5m = ts.floor('5min')
             if ts_5m != last_5m_ts and ts_5m in df_5m_indexed.index:
