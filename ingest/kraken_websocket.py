@@ -36,6 +36,25 @@ class KrakenFuturesWebSocket:
         self.heartbeat_warning_threshold = 30.0  # segundos
         self.heartbeat_kill_threshold = KillConditions.WEBSOCKET_TIMEOUT_SECONDS    # From config (75s)
         
+        # EXCHANGE AVAILABILITY TRACKING
+        self.is_exchange_available = True
+        self._consecutive_failures = 0
+        self._last_failure_time: float = 0
+        self._failure_log_count = 0  # For log throttling
+        self._last_availability_change: float = 0
+        
+        # EXPONENTIAL BACKOFF for reconnects
+        self._reconnect_delay = 5.0  # Start at 5s
+        self._min_reconnect_delay = 5.0
+        self._max_reconnect_delay = 120.0  # Max 2 minutes
+        
+        # DUPLICATE TICK PROTECTION - Prevent infinite loops
+        # Changed: deduplicate on (timestamp, price) not just timestamp
+        # This ensures we don't lose price changes when timestamp is same
+        self._last_seen_ts: Dict[str, int] = {}  # symbol -> last timestamp
+        self._last_seen_price: Dict[str, float] = {}  # symbol -> last price
+        self._duplicate_count: int = 0
+        
         # Data buffers (ring buffers para eficiencia)
         self.tick_buffer = deque(maxlen=1000)  # Raw ticks
         self.trade_buffer = deque(maxlen=10000)  # Para CVD
@@ -59,7 +78,7 @@ class KrakenFuturesWebSocket:
         logger.info(f"KrakenFuturesWebSocket initialized for {symbols}")
     
     async def connect(self):
-        """Conectar y mantener conexión activa"""
+        """Conectar y mantener conexión activa con backoff exponencial"""
         logger.info("Connecting to Kraken Futures WebSocket...")
         
         while not self._shutdown:
@@ -72,7 +91,19 @@ class KrakenFuturesWebSocket:
                     self.ws = ws
                     self.is_connected = True
                     self.last_tick = time.time()
-                    logger.info("✅ Connected to Kraken Futures")
+                    
+                    # Reset backoff on successful connection
+                    self._reconnect_delay = self._min_reconnect_delay
+                    self._consecutive_failures = 0
+                    
+                    # Only log if we were previously down
+                    if not self.is_exchange_available:
+                        logger.info("✅ Exchange recovered - Kraken Futures back online")
+                        self.is_exchange_available = True
+                        self._last_availability_change = time.time()
+                        self._failure_log_count = 0
+                    else:
+                        logger.info("✅ Connected to Kraken Futures")
                     
                     # Subscribe
                     await self._subscribe()
@@ -85,14 +116,14 @@ class KrakenFuturesWebSocket:
                 self._shutdown = True
                 self.is_connected = False
                 break
-            except websockets.exceptions.ConnectionClosed:
-                logger.warning("WebSocket connection closed")
+            except websockets.exceptions.ConnectionClosed as e:
                 self.is_connected = False
+                self._handle_connection_failure(str(e))
                 if self._shutdown:
                     break
             except Exception as e:
-                logger.error(f"WebSocket error: {e}")
                 self.is_connected = False
+                self._handle_connection_failure(str(e))
                 if self._shutdown:
                     break
             
@@ -100,11 +131,39 @@ class KrakenFuturesWebSocket:
             if self._shutdown:
                 break
             
-            # Wait before reconnecting
-            logger.info("Waiting 5s before reconnect...")
-            await asyncio.sleep(5)
+            # Exponential backoff with log throttling
+            if self._failure_log_count < 3 or self._failure_log_count % 10 == 0:
+                logger.info(f"Waiting {self._reconnect_delay:.0f}s before reconnect... (attempt {self._consecutive_failures})")
+            await asyncio.sleep(self._reconnect_delay)
+            
+            # Increase backoff for next failure
+            self._reconnect_delay = min(self._reconnect_delay * 1.5, self._max_reconnect_delay)
         
         logger.info("WebSocket connect() loop exited")
+    
+    def _handle_connection_failure(self, error_msg: str):
+        """Handle connection failure with tracking and log throttling"""
+        self._consecutive_failures += 1
+        self._last_failure_time = time.time()
+        self._failure_log_count += 1
+        
+        # Detect exchange outage patterns
+        is_outage = any(x in error_msg.lower() for x in [
+            '1013', 'unavailable', '503', 'service unavailable', 'try again later'
+        ])
+        
+        if is_outage:
+            if self.is_exchange_available:
+                logger.warning("⚠️ KRAKEN EXCHANGE OUTAGE DETECTED - Trading engine unavailable")
+                self.is_exchange_available = False
+                self._last_availability_change = time.time()
+            elif self._failure_log_count <= 3 or self._failure_log_count % 20 == 0:
+                # Throttle repeated outage logs
+                logger.warning(f"⚠️ Exchange still down ({self._consecutive_failures} failures, {time.time() - self._last_availability_change:.0f}s)")
+        else:
+            # Regular connection issue - log first few, then throttle
+            if self._failure_log_count <= 3:
+                logger.warning(f"WebSocket connection failed: {error_msg[:100]}")
     
     async def _subscribe(self):
         """Subscribe a channels de Kraken Futures (API v1)"""
@@ -258,6 +317,22 @@ class KrakenFuturesWebSocket:
                 
                 # Ensure integer MS for consistency
                 ts = int(ts)
+                
+                # DUPLICATE TICK PROTECTION - Skip only if BOTH timestamp AND price are same
+                # This prevents losing price updates when timestamp doesn't change
+                last_ts = self._last_seen_ts.get(symbol, 0)
+                last_price = self._last_seen_price.get(symbol, 0.0)
+                
+                if ts <= last_ts and abs(price - last_price) < 0.01:
+                    # True duplicate - same time AND same price
+                    self._duplicate_count += 1
+                    if self._duplicate_count % 1000 == 0:
+                        logger.debug(f"Skipped {self._duplicate_count} true duplicates (ts={ts}, price={price})")
+                    continue
+                
+                # Update tracking - price changed even if timestamp didn't
+                self._last_seen_ts[symbol] = ts
+                self._last_seen_price[symbol] = price
                 
                 trade_obj = {
                     'timestamp': ts, 
@@ -457,6 +532,17 @@ class KrakenFuturesWebSocket:
     def is_heartbeat_healthy(self) -> bool:
         silence = time.time() - self.last_tick
         return silence < self.heartbeat_kill_threshold
+    
+    def get_availability_status(self) -> dict:
+        """Get exchange availability status for trading decisions"""
+        return {
+            'is_available': self.is_exchange_available,
+            'is_connected': self.is_connected,
+            'consecutive_failures': self._consecutive_failures,
+            'seconds_since_failure': time.time() - self._last_failure_time if self._last_failure_time else 0,
+            'seconds_since_change': time.time() - self._last_availability_change if self._last_availability_change else 0,
+            'reconnect_delay': self._reconnect_delay
+        }
     
     async def disconnect(self):
         logger.info("WebSocket disconnect() called")

@@ -382,3 +382,84 @@ class EdgeRegimeClassifier:
             return True
         
         return False
+    
+    def get_dynamic_rr(self, atr_ratio: float = None) -> Tuple[float, str]:
+        """
+        CAPA 2: Get dynamic Risk/Reward ratio based on current market regime.
+        
+        RR is determined by OBSERVABLE REGIME, not by signal quality.
+        This prevents overoptimization and keeps RR decisions data-driven.
+        
+        Args:
+            atr_ratio: Current ATR / median ATR (for volatility adjustment)
+        
+        Returns:
+            Tuple of (rr_target, reason)
+        
+        Logic:
+            REGIME_A (Trend): RR 1.2-1.5 (let winners run)
+            REGIME_B (Compression): RR 0.9-1.0 (fakeout risk, take profits early)
+            REGIME_C (News): RR 0.8 (reduced, just survive)
+            REGIME_D (Chop): RR 0.8-0.9 (reduced targets)
+            Vol extrema: RR reduced + trailing recommended
+        """
+        base_rr = 1.0
+        reason = "default"
+        
+        # Regime-based RR
+        if self.current_regime == MarketRegime.REGIME_A:
+            # Trend - let winners run
+            base_rr = 1.3
+            reason = "REGIME_A: trend continuation"
+        elif self.current_regime == MarketRegime.REGIME_B:
+            # Compression - fakeout risk
+            base_rr = 0.95
+            reason = "REGIME_B: compression/fakeouts"
+        elif self.current_regime == MarketRegime.REGIME_C:
+            # News-driven - reduced
+            base_rr = 0.8
+            reason = "REGIME_C: news/unstable"
+        elif self.current_regime == MarketRegime.REGIME_D:
+            # Chop - reduced
+            base_rr = 0.85
+            reason = "REGIME_D: low participation"
+        
+        # Volatility adjustment (optional layer)
+        if atr_ratio is not None:
+            if atr_ratio > 1.5:
+                # Extreme volatility - reduce RR and recommend trailing
+                base_rr = min(base_rr, 0.9)
+                reason += " + high vol (trailing recommended)"
+            elif atr_ratio < 0.5:
+                # Very low volatility - slightly wider RR
+                base_rr = min(base_rr * 1.1, 1.5)
+                reason += " + low vol"
+        
+        return (round(base_rr, 2), reason)
+    
+    def get_be_conditions(self) -> dict:
+        """
+        CAPA 2: Get Break-Even conditions based on regime.
+        
+        Returns dict with BE parameters that vary by regime.
+        """
+        # Default conservative BE
+        be_config = {
+            'min_r_for_be': 0.6,  # Minimum +0.6R before considering BE
+            'momentum_required': True,  # Require momentum still in direction
+            'volume_check': True,  # Check volume hasn't collapsed
+            'enabled': True
+        }
+        
+        if self.current_regime == MarketRegime.REGIME_A:
+            # Trending - give more room, BE at 0.8R
+            be_config['min_r_for_be'] = 0.8
+            be_config['momentum_required'] = False  # Trust trend
+        elif self.current_regime == MarketRegime.REGIME_B:
+            # Compression - tighter BE at 0.5R
+            be_config['min_r_for_be'] = 0.5
+        elif self.current_regime in [MarketRegime.REGIME_C, MarketRegime.REGIME_D]:
+            # Unfavorable - aggressive BE at 0.4R
+            be_config['min_r_for_be'] = 0.4
+        
+        return be_config

@@ -19,12 +19,20 @@ from engine.config import (
 from engine.core_utils import (
     ensure_utc, PositionSizer, get_position_sizer
 )
+from engine.state_types import PositionState
 
 logger = logging.getLogger(__name__)
 
 
+# REGIME CONSTANTS
+REGIME_NORMAL = "NORMAL"    # Cortar basura, rascar wins, proteger DD
+REGIME_RUNNER = "RUNNER"    # Dejar correr, solo time exit
+RUNNER_PROMOTION_MFE = 1.5  # MFE >= 1.5R promociona a RUNNER (muy selectivo)
+RUNNER_TIME_EXIT_CANDLES = 90  # N velas fijas para time exit (90min)
+
+
 class Position:
-    """Represents an open position"""
+    """Represents an open position with execution integrity invariants"""
     
     def __init__(self, symbol: str, direction: str, entry_price: float, 
                  size: float, stop_loss: float, atr_1m: float,
@@ -35,6 +43,25 @@ class Position:
         self.size = size
         self.stop_loss = stop_loss
         self.initial_stop_loss = stop_loss
+        
+        # ===== EXECUTION INTEGRITY INVARIANTS (CAPA 1) =====
+        self.system_side = direction.upper()  # What system intended: 'LONG' or 'SHORT'
+        self.exchange_side: Optional[str] = None  # What exchange confirmed: 'LONG' or 'SHORT'
+        self.expected_qty = size  # What we ordered
+        self.exchange_qty: Optional[float] = None  # What exchange confirmed
+        self.reduce_only_validated = False  # True once SL/TP confirmed as reduce-only
+        self.integrity_validated = False  # True once all invariants pass
+        self.integrity_errors: list = []  # List of integrity issues
+        self.position_state = PositionState.PENDING  # Explicit position state tracking
+        
+        # ===== EXCHANGE SL TRACKING (CRITICAL FIX) =====
+        # If True: SL order is on exchange → trust exchange to execute, DON'T close locally
+        # If False: No SL on exchange → must use emergency market close when price hits SL
+        self.exchange_sl_active = False  # Set True when set_position_stops() succeeds
+        self.exchange_sl_order_id: Optional[str] = None  # Track the SL order ID
+        
+        # REGIME SYSTEM: Trade starts as NORMAL, promoted to RUNNER if MFE >= 0.8R
+        self.regime = REGIME_NORMAL
         
         # Take profit management
         self.tp1_price = self._calculate_tp1(entry_price, stop_loss, direction)
@@ -123,6 +150,87 @@ class Position:
         else:
             return entry - (risk * RiskManagement.TP1_RISK_MULTIPLE)
     
+    def validate_integrity(self, exchange_side: str, exchange_qty: float, 
+                          qty_tolerance: float = 0.02) -> bool:
+        """
+        CAPA 1: Validate position integrity against exchange data.
+        
+        Args:
+            exchange_side: Side reported by exchange ('long' or 'short')
+            exchange_qty: Quantity reported by exchange
+            qty_tolerance: Allowed difference (default 2%)
+        
+        Returns:
+            True if all invariants pass, False if any fails.
+        """
+        self.integrity_errors = []
+        self.exchange_side = exchange_side.upper() if exchange_side else None
+        self.exchange_qty = exchange_qty
+        
+        # Check 1: Side consistency
+        if self.exchange_side and self.system_side != self.exchange_side:
+            error = f"SIDE MISMATCH: system={self.system_side} vs exchange={self.exchange_side}"
+            self.integrity_errors.append(error)
+            logger.error(f"🚨 INTEGRITY: {error}")
+            self.position_state = PositionState.INCONSISTENT
+        
+        # Check 2: Quantity consistency (within tolerance)
+        is_partial = False
+        # 🔥 AUDIT FIX: Add check for expected_qty > 0 to prevent division by zero
+        if exchange_qty and self.expected_qty and self.expected_qty > 0:
+            qty_diff = abs(exchange_qty - self.expected_qty) / self.expected_qty
+            if qty_diff > qty_tolerance:
+                error = f"QTY MISMATCH: expected={self.expected_qty:.8f} vs exchange={exchange_qty:.8f} (diff={qty_diff*100:.2f}%)"
+                self.integrity_errors.append(error)
+                logger.error(f"🚨 INTEGRITY: {error}")
+                # Adjust internal size to match exchange reality
+                logger.warning(f"⚠️ Adjusting position size from {self.size} to {exchange_qty}")
+                self.size = exchange_qty
+                is_partial = True
+        
+        # Check 3: SL/TP would reduce position (validated later)
+        # This is set after SL/TP are successfully placed
+        
+        self.integrity_validated = len(self.integrity_errors) == 0
+        
+        # Update position state based on validation result
+        if self.integrity_validated:
+            self.position_state = PositionState.OPEN
+            logger.info(f"✅ INTEGRITY: All invariants passed | side={self.system_side} qty={self.size:.8f}")
+        elif is_partial and self.position_state != PositionState.INCONSISTENT:
+            self.position_state = PositionState.PARTIAL
+            logger.warning(f"⚠️ INTEGRITY: Partial fill detected, adjusting tracking")
+        else:
+            logger.critical(f"❌ INTEGRITY: {len(self.integrity_errors)} errors - SL/TP placement blocked")
+        
+        return self.integrity_validated
+    
+    def mark_reduce_only_validated(self):
+        """Mark that SL/TP have been confirmed as reduce-only orders."""
+        self.reduce_only_validated = True
+        logger.info("✅ INTEGRITY: SL/TP confirmed as reduce-only")
+    
+    def mark_exchange_sl_active(self, order_id: str = None):
+        """
+        Mark that SL is ACTIVE on the exchange.
+        
+        When True: Trust exchange to execute SL, DON'T close locally.
+        Called after set_position_stops() succeeds.
+        """
+        self.exchange_sl_active = True
+        self.exchange_sl_order_id = order_id
+        logger.info(f"✅ EXCHANGE SL ACTIVE: Trust exchange to execute SL (order: {order_id[:8] if order_id else 'N/A'})")
+    
+    def mark_exchange_sl_inactive(self, reason: str = "SL order failed"):
+        """
+        Mark that SL is NOT on the exchange.
+        
+        When False: Must use emergency market close when price hits SL.
+        """
+        self.exchange_sl_active = False
+        self.exchange_sl_order_id = None
+        logger.warning(f"⚠️ EXCHANGE SL INACTIVE: {reason} - will use emergency close")
+    
     def update_tp2(self, tp2_price: float):
         """Set TP2 target"""
         self.tp2_price = tp2_price
@@ -149,17 +257,21 @@ class Position:
         """
         STEPPED TRAILING - Wide steps, let winners breathe!
         
-        BTC intraday needs ROOM. Don't cut winners.
+        REGIME-AWARE:
+        - NORMAL: Aplica trailing stepped (cut losses, capture small wins)
+        - RUNNER: NO trailing fino - solo SL ampliado ya fijado
         
-        Steps (based on MFE reached, not current price):
-        - MFE >= 0.4R → stop = entry - 0.15R (slight protection)
-        - MFE >= 0.7R → stop = entry (breakeven)
+        Steps for NORMAL regime (based on MFE reached, not current price):
+        - MFE >= 0.8R → stop = entry (breakeven) - FASE 1: activation threshold
         - MFE >= 1.0R → stop = +0.4R  
         - MFE >= 1.5R → stop = +0.9R
         - MFE >= 2.2R → stop = +1.6R
         
         NO ATR dynamic trailing. Just discrete levels.
         """
+        # RUNNER regime: NO trailing fino, dejar correr
+        if self.regime == REGIME_RUNNER:
+            return  # SL ya fue fijado en promoción a RUNNER
         if market_time is None:
             market_time = self.open_time
         
@@ -184,7 +296,7 @@ class Position:
             else:
                 new_stop = self.entry_price - (risk * 1.6)
                 self.trailing_stop = min(self.trailing_stop, new_stop)
-            logger.debug(f"📈 TRAILING STEP 5: MFE {mfe_r:.2f}R >= 2.2R → Lock +1.6R")
+            logger.debug(f"📈 TRAILING STEP 4: MFE {mfe_r:.2f}R >= 2.2R → Lock +1.6R")
         
         elif mfe_r >= 1.5:
             # Lock in +0.9R
@@ -194,7 +306,7 @@ class Position:
             else:
                 new_stop = self.entry_price - (risk * 0.9)
                 self.trailing_stop = min(self.trailing_stop, new_stop)
-            logger.debug(f"📈 TRAILING STEP 4: MFE {mfe_r:.2f}R >= 1.5R → Lock +0.9R")
+            logger.debug(f"📈 TRAILING STEP 3: MFE {mfe_r:.2f}R >= 1.5R → Lock +0.9R")
         
         elif mfe_r >= 1.0:
             # Lock in +0.4R
@@ -204,43 +316,101 @@ class Position:
             else:
                 new_stop = self.entry_price - (risk * 0.4)
                 self.trailing_stop = min(self.trailing_stop, new_stop)
-            logger.debug(f"📈 TRAILING STEP 3: MFE {mfe_r:.2f}R >= 1.0R → Lock +0.4R")
+            logger.debug(f"📈 TRAILING STEP 2: MFE {mfe_r:.2f}R >= 1.0R → Lock +0.4R")
         
-        elif mfe_r >= 0.7:
-            # Lock in breakeven
+        elif mfe_r >= 0.8:
+            # FASE 1: Trailing only activates at 0.8R MFE (lock in breakeven)
             if self.direction == 'LONG':
                 self.trailing_stop = max(self.trailing_stop, self.entry_price)
             else:
                 self.trailing_stop = min(self.trailing_stop, self.entry_price)
-            logger.debug(f"📈 TRAILING STEP 2: MFE {mfe_r:.2f}R >= 0.7R → Lock BE")
-        
-        elif mfe_r >= 0.4:
-            # Early protection: Move stop to -0.15R (reduce loss if trade reverses)
-            if self.direction == 'LONG':
-                new_stop = self.entry_price - (risk * 0.15)
-                self.trailing_stop = max(self.trailing_stop, new_stop)
-            else:
-                new_stop = self.entry_price + (risk * 0.15)
-                self.trailing_stop = min(self.trailing_stop, new_stop)
-            logger.debug(f"📈 TRAILING STEP 1: MFE {mfe_r:.2f}R >= 0.4R → Lock -0.15R")
+            logger.debug(f"📈 TRAILING STEP 1: MFE {mfe_r:.2f}R >= 0.8R → Lock BE (FASE 1 threshold)")
     
     def increment_candle_count(self):
         """Increment candle count for mediocre trade detection"""
         self.candle_count += 1
     
-    def check_mediocre_trade_exit(self, n_candles: int = 6) -> bool:
+    def check_regime_promotion(self) -> bool:
         """
-        KILL SWITCH: Exit stagnant trades early
+        PASO 3 - PROMOCIÓN A RUNNER
         
-        Condition: After N candles:
-          - MFE < 0.15R AND MAE < 0.15R
+        Si MFE >= 1.2R → regime = RUNNER
+        Sin indicadores nuevos. Sin excepciones.
         
-        This eliminates:
-        - Lateral trades that eat commissions
-        - False positives that never move
+        Al promocionar: El SL del RUNNER es el MEJOR entre:
+        - El trailing stop actual (ya movido por stepped trailing)
+        - BE (breakeven)
+        
+        NO bajamos el SL si el trailing ya lo subió.
+        
+        Returns: True if just promoted to RUNNER
+        """
+        if self.regime == REGIME_RUNNER:
+            return False  # Ya es RUNNER
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        if mfe_r >= RUNNER_PROMOTION_MFE:
+            self.regime = REGIME_RUNNER
+            
+            # RUNNER SL = el MEJOR entre trailing actual y BE
+            # NO reducir el SL si trailing ya lo subió
+            if self.direction == 'LONG':
+                # Para LONG, mayor = mejor
+                runner_stop = max(self.trailing_stop, self.entry_price)
+                self.stop_loss = runner_stop
+                self.trailing_stop = runner_stop
+            else:
+                # Para SHORT, menor = mejor
+                runner_stop = min(self.trailing_stop, self.entry_price)
+                self.stop_loss = runner_stop
+                self.trailing_stop = runner_stop
+            
+            logger.info(f"🏃 REGIME PROMOTED TO RUNNER: MFE={mfe_r:.2f}R >= {RUNNER_PROMOTION_MFE}R | SL locked at: {self.stop_loss:.2f}")
+            return True
+        
+        return False
+    
+    def check_runner_time_exit(self) -> bool:
+        """
+        PASO 6 - TIME_BASED_EXIT para RUNNERS
+        
+        Condición: regime == RUNNER AND candle_count >= N
+        N = constante fija (45 velas = 45 min en 1m chart)
+        MISMO N para longs, shorts, todos activos.
+        
+        Returns: True if should exit via time
+        """
+        if self.regime != REGIME_RUNNER:
+            return False
+        
+        if self.candle_count >= RUNNER_TIME_EXIT_CANDLES:
+            logger.info(f"⏱️ RUNNER TIME EXIT: {self.candle_count} candles >= {RUNNER_TIME_EXIT_CANDLES} | Regime=RUNNER")
+            return True
+        
+        return False
+    
+    def check_mediocre_trade_exit(self, n_candles: int = 6, mfe_threshold: float = 0.3,
+                                     adx: float = None, atr_ratio: float = None) -> bool:
+        """
+        KILL SWITCH: Exit stagnant trades early (TIME_INVALIDATION)
+        
+        HYBRID LOGIC (Jan 9, 2026):
+        Close ONLY if ALL conditions are met:
+        1. candles >= n_candles (6)
+        2. MFE < threshold_R (0.3R) - trade hasn't proven direction
+        3. ADX < 20 - market is NOT trending (optional, defaults to True if not provided)
+        4. ATR ratio < 0.8 - volatility is compressed (optional, defaults to True if not provided)
+        
+        This avoids:
+        - Killing slow but directional trades in trending markets
+        - Staying stuck in dead ranges with no volatility
         
         Args:
             n_candles: Number of candles before checking (default 6)
+            mfe_threshold: Minimum MFE in R required (default 0.3R)
+            adx: Current ADX value (if None, condition is considered met)
+            atr_ratio: Current ATR / Average ATR (if None, condition is considered met)
         
         Returns: True if trade should be killed
         """
@@ -248,14 +418,30 @@ class Position:
             return False
         
         mfe_r = self.calculate_mfe_r()
-        mae_r = self.calculate_mae_r()
         
-        # Trade is mediocre if it hasn't moved either direction
-        if mfe_r < 0.15 and mae_r < 0.15:
-            logger.warning(f"☠️ MEDIOCRE KILL: {self.candle_count} candles, MFE={mfe_r:.2f}R, MAE={mae_r:.2f}R - both < 0.15R")
-            return True
+        # Condition 1: MFE too low (didn't prove direction)
+        if mfe_r >= mfe_threshold:
+            return False  # Trade is proving itself, don't kill
         
-        return False
+        # Condition 2: ADX check (skip if market is trending)
+        ADX_THRESHOLD = 20
+        if adx is not None and adx >= ADX_THRESHOLD:
+            # Market is trending - give trade more time
+            logger.debug(f"📊 TIME_INVALIDATION skipped: ADX={adx:.1f} >= {ADX_THRESHOLD} (trending market)")
+            return False
+        
+        # Condition 3: Volatility check (skip if volatility is expanding)
+        ATR_RATIO_THRESHOLD = 0.8  # Below 80% of average = compressed
+        if atr_ratio is not None and atr_ratio >= ATR_RATIO_THRESHOLD:
+            # Volatility is normal/expanding - trade might move soon
+            logger.debug(f"📊 TIME_INVALIDATION skipped: ATR ratio={atr_ratio:.2f} >= {ATR_RATIO_THRESHOLD} (volatility OK)")
+            return False
+        
+        # ALL conditions met: market is dead/lateral, kill the trade
+        adx_str = f"ADX={adx:.1f}" if adx else "ADX=N/A"
+        atr_str = f"ATR_ratio={atr_ratio:.2f}" if atr_ratio else "ATR=N/A"
+        logger.warning(f"☠️ TIME_INVALIDATION: {self.candle_count} velas, MFE={mfe_r:.2f}R < {mfe_threshold}R | {adx_str} | {atr_str}")
+        return True
     
     def check_add_to_winner(self, current_price: float) -> dict:
         """
@@ -358,12 +544,13 @@ class Position:
     def check_stop_hit(self, current_price: float, current_low: float = None, 
                        atr_1m: float = None, market_time: datetime = None) -> bool:
         """
-        2-PHASE DYNAMIC STOP with sweep detection
+        Check if stop loss was hit and MANUAL CLOSE is needed.
         
-        PHASE 1 (Exploration): While MFE < 0.25R
-        SIMPLE STOP LOSS CHECK - No complex phases!
-        
-        Just check if price hit the stop. The trailing_stop handles the rest.
+        CRITICAL FIX (Jan 12, 2026):
+        - If exchange_sl_active = True: Return False ALWAYS
+          (trust exchange to execute SL, don't close locally)
+        - If exchange_sl_active = False: Check price and return True if hit
+          (must use emergency market close)
         
         Args:
             current_price: Current price
@@ -371,8 +558,22 @@ class Position:
             atr_1m: ATR (optional, for sweep detection)
             market_time: Current market time
         
-        Returns: True if SL hit (and it's not a sweep)
+        Returns: True if SL hit AND we need to close manually (no exchange SL)
         """
+        # 🔥 CRITICAL: If exchange has the SL, DON'T trigger local close
+        # The exchange will execute the SL and we'll detect position_size=0
+        if self.exchange_sl_active:
+            # Check if price hit SL for LOGGING only (not action)
+            if self.direction == 'LONG':
+                sl_touched = current_price <= self.stop_loss
+            else:
+                sl_touched = current_price >= self.stop_loss
+            
+            if sl_touched:
+                logger.debug(f"📊 SL price touched @ {current_price:.2f} - WAITING for exchange to execute (SL active)")
+            return False  # NEVER trigger local close when exchange has SL
+        
+        # No exchange SL - we must manage locally
         # Check if current price hits stop
         if self.direction == 'LONG':
             sl_hit = current_price <= self.stop_loss
@@ -381,6 +582,8 @@ class Position:
         
         if not sl_hit:
             return False
+        
+        logger.warning(f"🚨 SL HIT @ {current_price:.2f} - NO exchange SL active, will use emergency close")
         
         # GRACE PERIOD: First 10 minutes, only exit on EXTREME moves
         if market_time is not None:
@@ -433,8 +636,9 @@ class Position:
         update_trailing_stop() based on MFE levels.
         
         If trailing_stop has been moved from initial stop, check it.
+        FASE 1: Trailing only activates at MFE >= 0.8R
         """
-        # Check if trailing has moved (means MFE reached at least 0.4R)
+        # Check if trailing has moved (means MFE reached at least 0.8R per FASE 1)
         initial_stop = self.initial_stop_loss
         trailing_moved = abs(self.trailing_stop - initial_stop) > 0.01  # Small tolerance
         
@@ -644,6 +848,19 @@ class RiskEngine:
                     used = float(used_balances.get(currency, 0.0))
                     
                     self.capital = total
+                    
+                    # =====================================================================
+                    # 🔒 FIX (Jan 13, 2026): SYNC EQUITY FROM EXCHANGE IN LIVE MODE
+                    # Initial equity must be set from real exchange balance, not default 10k
+                    # This ensures DD calculations and PnL tracking use real values
+                    # =====================================================================
+                    if self.initial_equity == 10000.0 or self.equity == 10000.0:
+                        # First time update - sync all equity values to real balance
+                        logger.info(f"💰 LIVE: Syncing equity from exchange (was default 10k)")
+                        self.initial_equity = total
+                        self.equity = total
+                        self.max_equity = total
+                    
                     logger.info(f"💰 Capital actualizado: ${self.capital:.2f} {currency} (Libre: ${free:.2f}, En uso: ${used:.2f})")
                     return True
             
@@ -706,31 +923,79 @@ class RiskEngine:
         return base_size
     
     def calculate_stop_loss(self, entry_price: float, direction: str, 
-                           support_resistance: float, atr_1m: float) -> float:
+                           support_resistance: float, atr_1m: float,
+                           atr_ratio: float = None,
+                           regime_atr_mult: float = None) -> float:
         """
         Calculate technical stop loss with ATR buffer
         support_resistance: HL for LONG, LH for SHORT
         
         EDGE FIX: Use minimum 1.2 ATR distance to avoid noise stops
         The SL is the FURTHER of: structure level OR ATR minimum
+        
+        CAPA 2: SL is CAPPED at max_atr_multiple to avoid false RR
+        - SL cannot exceed 4.0 ATR from entry (prevents fake high RR trades)
+        
+        REGIME-AWARE SL (Jan 12, 2026):
+        - RANGE: tighter SL (1.5 ATR) - quick scalps to value
+        - TREND: wider SL (2.5 ATR) - let winners run
+        - Volatility adjustment still applies ON TOP of regime base
+        
+        DYNAMIC SL (Jan 9, 2026) - NOW RELATIVE TO REGIME:
+        - If ATR ratio > 1.2 (high volatility): +0.5 ATR to avoid barridas
+        - If ATR ratio < 0.8 (low volatility): -0.5 ATR to protect capital
         """
         buffer = RiskManagement.STOP_LOSS_ATR_BUFFER * atr_1m
         
-        # Minimum SL distance = 2.5 ATR (survive 3-4 candles of noise in BTC)
-        min_sl_distance = 2.5 * atr_1m
+        # 🔥 BASE ATR multiplier from regime (or default 2.5)
+        base_atr_multiplier = regime_atr_mult if regime_atr_mult is not None else 2.5
+        
+        # Volatility adjustment ON TOP of regime base
+        if atr_ratio is not None:
+            if atr_ratio > 1.2:
+                # High volatility - add room to avoid stops
+                atr_multiplier = base_atr_multiplier + 0.5
+                logger.debug(f"📈 High volatility (ATR ratio {atr_ratio:.2f}) → SL @ {atr_multiplier:.1f} ATR")
+            elif atr_ratio < 0.8:
+                # Low volatility - tighter stops ok
+                atr_multiplier = max(1.0, base_atr_multiplier - 0.5)  # Never below 1.0
+                logger.debug(f"📉 Low volatility (ATR ratio {atr_ratio:.2f}) → SL @ {atr_multiplier:.1f} ATR")
+            else:
+                atr_multiplier = base_atr_multiplier
+        else:
+            atr_multiplier = base_atr_multiplier
+        
+        # CAPA 2: Maximum SL distance cap (prevents fake high RR)
+        max_atr_multiple = 4.0  # Never exceed 4 ATR from entry
+        max_sl_distance = max_atr_multiple * atr_1m
+        
+        # Minimum SL distance = dynamic ATR (survive noise in BTC)
+        min_sl_distance = atr_multiplier * atr_1m
         
         if direction == 'LONG':
             structure_stop = support_resistance - buffer
             # SL must be at least min_sl_distance below entry
             atr_stop = entry_price - min_sl_distance
             stop = min(structure_stop, atr_stop)  # Use the LOWER (further) one
+            
+            # CAPA 2: Apply max cap
+            max_stop = entry_price - max_sl_distance
+            if stop < max_stop:
+                logger.warning(f"⚠️ SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple} ATR)")
+                stop = max_stop
         else:  # SHORT
             structure_stop = support_resistance + buffer
             # SL must be at least min_sl_distance above entry  
             atr_stop = entry_price + min_sl_distance
             stop = max(structure_stop, atr_stop)  # Use the HIGHER (further) one
+            
+            # CAPA 2: Apply max cap
+            max_stop = entry_price + max_sl_distance
+            if stop > max_stop:
+                logger.warning(f"⚠️ SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple} ATR)")
+                stop = max_stop
         
-        logger.info(f"Stop loss calculated: {stop:.2f} (Structure: {support_resistance:.2f}±{buffer:.2f}, ATR min: {min_sl_distance:.2f})")
+        logger.info(f"Stop loss calculated: {stop:.2f} (Structure: {support_resistance:.2f}±{buffer:.2f}, ATR min: {min_sl_distance:.2f} [{atr_multiplier}x])")
         return stop
     
     async def open_position(self, symbol: str, direction: str, entry_price: float,
@@ -759,18 +1024,28 @@ class RiskEngine:
                              tp2_target: Optional[float] = None,
                              ema20_5m: Optional[float] = None,
                              has_bos_against: bool = False,
-                             market_time: datetime = None) -> Optional[dict]:
+                             market_time: datetime = None,
+                             adx: Optional[float] = None,
+                             atr_ratio: Optional[float] = None) -> Optional[dict]:
         """
-        Manage open position - check stops, TPs, exits
+        Manage open position with REGIME-BASED exit logic
+        
+        RÉGIMEN NORMAL (default):
+        - STOP_LOSS: exactamente el actual
+        - TRAILING_STOP: stepped, solo para régimen NORMAL
+        - TIME_EXIT: DESACTIVADO
+        - Objetivo: Cortar basura, rascar pequeños wins, proteger DD
+        
+        RÉGIMEN RUNNER (promoción cuando MFE >= 0.8R):
+        - STOP_LOSS: ampliado a BE o -0.3R
+        - TRAILING: DESACTIVADO (dejar correr)
+        - TIME_BASED_EXIT: único exit (N velas = 45)
+        - Objetivo: AQUÍ ESTÁ EL DINERO - dejar correr
         
         Args:
-            market_time: Current market time (REQUIRED - used for trailing stop phases and time-based exits)
+            market_time: Current market time (REQUIRED)
         
         Returns: exit_action dict if position should be closed, None otherwise
-        
-        SMART BE Parameters:
-        - ema20_5m: EMA20 del 5m para detectar pérdida de estructura
-        - has_bos_against: Flag si hay BOS en contra de la posición
         """
         if not self.position:
             return None
@@ -778,62 +1053,84 @@ class RiskEngine:
         async with self._lock:
             pos = self.position
             pos.update_unrealized_pnl(current_price)
+            
+            # ================================================================
+            # PASO 3: Check promoción a RUNNER (antes de cualquier exit)
+            # ================================================================
+            pos.check_regime_promotion()
+            
+            # Update trailing stop (solo aplica en régimen NORMAL)
             pos.update_trailing_stop(current_price, atr_1m, market_time)
             
             # Set TP2 if provided and not yet set
             if tp2_target and not pos.tp2_price:
                 pos.update_tp2(tp2_target)
             
-            # ⚠️ BOS INVALIDATION: Tighten SL BEFORE TP1 (protective exit)
-            if has_bos_against and not pos.tp1_hit and not pos.sl_tightened:
-                logger.critical("🚨 BOS INVALIDATION: Tesis LONG invalidada - tightening SL")
-                pos.tighten_stop_loss(tighten_pct=0.5)  # Move SL 50% closer
-            
-            # SMART BE: Check si debemos mover SL a BE por rotura de estructura (AFTER TP1)
-            if ema20_5m is not None and pos.tp1_hit and not pos.be_moved:
-                should_move, reason = pos.check_structure_break(current_price, ema20_5m, has_bos_against)
-                if should_move:
-                    pos.move_stop_to_breakeven(reason)
-            
-            # 1. Check stop loss (with grace period for first 10 min)
-            sl_check = pos.check_stop_hit(current_price, market_time=market_time)
-            # Log SL check periodically for diagnosis (every 1000 ticks to avoid spam)
-            if not hasattr(self, '_sl_check_count'):
-                self._sl_check_count = 0
-            self._sl_check_count += 1
-            if self._sl_check_count % 1000 == 0 or sl_check:
-                logger.info(f"[MANAGE] #{self._sl_check_count} Price: {current_price:.2f} | SL: {pos.stop_loss:.2f} | Dir: {pos.direction} | SL_Hit: {sl_check}")
-            if sl_check:
-                return await self._close_position(current_price, 'STOP_LOSS')
-            
-            # 2. Check TP1
-            if pos.check_tp1_hit(current_price):
-                return await self._handle_tp1(current_price)
-            
-            # 3. Check trailing stop (after TP1)
-            if pos.check_trailing_stop_hit(current_price):
-                return await self._close_position(current_price, 'TRAILING_STOP')
-            
             # ================================================================
-            # SIMPLIFIED EXIT LOGIC - ONLY 3 EXIT TYPES
-            # 1. STOP_LOSS (no tocar)
-            # 2. TRAILING_STOP (por fases, después de MFE >= 0.6R)
-            # 3. TIME_BASED_EXIT (solo para runners con MFE >= 1.2R)
+            # PASO 4: RÉGIMEN NORMAL - Gestión conservadora
+            # Aplica: STOP_LOSS + TRAILING_STOP
+            # NO aplica: TIME_EXIT
             # ================================================================
             
-            time_in_trade = pos.get_time_in_trade_minutes(market_time)
-            
-            # TIME_BASED_EXIT: Only for GOOD trades that need to be harvested
-            # Condition: MFE >= 1.2R AND trade still open after 90min
-            if time_in_trade >= RiskManagement.MAX_TRADE_DURATION_MINUTES:
-                mfe_r = pos.calculate_mfe_r()
+            if pos.regime == REGIME_NORMAL:
+                # 0. Check mediocre trade exit (kill stagnant trades early)
+                # HYBRID LOGIC (Jan 9, 2026): ADX + ATR ratio to avoid killing slow trends
+                if pos.check_mediocre_trade_exit(n_candles=6, adx=adx, atr_ratio=atr_ratio):
+                    return await self._close_position(current_price, 'TIME_INVALIDATION')
                 
-                # Only exit via TIME if trade showed strong momentum (MFE >= 1.2R)
-                # This captures clean intraday BTC trends
-                if mfe_r >= 1.2:
-                    logger.info(f"⏱️ TIME_BASED_EXIT: {time_in_trade:.0f}min, MFE={mfe_r:.2f}R >= 1.2R - harvesting runner")
+                # 0.5. ADD TO WINNER: Scale into proven winners (MFE >= 0.6R, no -0.2R touch)
+                add_action = pos.check_add_to_winner(current_price)
+                if add_action:
+                    # Return add action to signal_engine for execution
+                    return add_action
+                
+                # 1. Check stop loss (with grace period for first 10 min)
+                sl_check = pos.check_stop_hit(current_price, market_time=market_time)
+                if sl_check:
+                    return await self._close_position(current_price, 'STOP_LOSS')
+                
+                # 2. Check TP1 (partial close, promotes toward RUNNER)
+                if pos.check_tp1_hit(current_price):
+                    return await self._handle_tp1(current_price)
+                
+                # 2.5. Check TP2 (after TP1 hit, close remaining runner)
+                if pos.check_tp2_hit(current_price):
+                    logger.info(f"🎯🎯 TP2 HIT @ {current_price:.2f} - Closing remaining runner")
+                    return await self._close_position(current_price, 'TP2')
+                
+                # 3. Check trailing stop (only for NORMAL regime)
+                if pos.check_trailing_stop_hit(current_price):
+                    return await self._close_position(current_price, 'TRAILING_STOP')
+                
+                # NO TIME_EXIT para régimen NORMAL - let trailing handle it
+                return None
+            
+            # ================================================================
+            # PASO 5: RÉGIMEN RUNNER - Dejar correr
+            # Aplica: STOP_LOSS ampliado + TIME_BASED_EXIT
+            # NO aplica: Trailing fino, cierres por debilidad
+            # ================================================================
+            
+            if pos.regime == REGIME_RUNNER:
+                # 1. Check stop loss (ampliado - ya se movió en promoción)
+                sl_check = pos.check_stop_hit(current_price, market_time=market_time)
+                if sl_check:
+                    return await self._close_position(current_price, 'STOP_LOSS')
+                
+                # 1.5. Check TP2 (runner's profit target)
+                if pos.check_tp2_hit(current_price):
+                    logger.info(f"🎯🎯 TP2 HIT @ {current_price:.2f} - Runner hit target!")
+                    return await self._close_position(current_price, 'TP2')
+                
+                # 2. TIME_BASED_EXIT: La única salida programada para RUNNERS
+                # Condición: candle_count >= N (45 velas fijas)
+                if pos.check_runner_time_exit():
+                    mfe_r = pos.calculate_mfe_r()
+                    logger.info(f"🏃 RUNNER TIME EXIT: {pos.candle_count} candles, MFE={mfe_r:.2f}R")
                     return await self._close_position(current_price, 'TIME_BASED_EXIT')
-                # Otherwise just let it run - trailing will handle it
+                
+                # No más exits - dejar correr
+                return None
             
             return None
     
@@ -983,10 +1280,16 @@ class RiskEngine:
             'total_pnl': round(self.total_pnl, 2)
         }
     
-    async def update_from_exchange_position(self, position_data: dict):
+    async def update_from_exchange_position(self, position_data: dict, atr: float = None):
         """
         Recover internal state from an existing on-chain position
         position_data: dict from CCXT fetch_position
+        atr: optional ATR value for proper SL calculation
+        
+        CCXT unified position structure:
+        - 'side': 'long' or 'short' (most reliable for direction)
+        - 'contracts': can be signed (+ long, - short) or unsigned depending on exchange
+        - 'info': raw exchange response
         """
         async with self._lock:
             try:
@@ -997,14 +1300,39 @@ class RiskEngine:
                     self.position = None
                     return
                 
-                direction = 'LONG' if contracts > 0 else 'SHORT'
+                # CCXT unified 'side' field is most reliable
+                side = position_data.get('side', '').lower()
+                
+                if side == 'long':
+                    direction = 'LONG'
+                elif side == 'short':
+                    direction = 'SHORT'
+                else:
+                    # Fallback to sign of contracts (less reliable for some exchanges)
+                    direction = 'LONG' if contracts > 0 else 'SHORT'
+                    logger.warning(f"Position 'side' not available, inferring from contracts sign: {direction}")
+                
                 entry_price = float(position_data.get('entryPrice', 0))
                 size = abs(contracts)
                 
-                # Approximate ATR/Stop since we don't have history
-                # This is a fallback recovery mode
-                estimated_atr = entry_price * 0.01
-                estimated_stop = entry_price * 0.99 if direction == 'LONG' else entry_price * 1.01
+                # Log full position data for debugging
+                logger.info(f"📊 Exchange position data: side={side}, contracts={contracts}, entryPrice={entry_price}")
+                
+                # Calculate SL based on ATR if provided, otherwise fallback to 1%
+                if atr and atr > 0:
+                    # Use 2.5x ATR like normal trades
+                    sl_distance = 2.5 * atr
+                    estimated_atr = atr
+                else:
+                    # Fallback: 1% of entry price
+                    sl_distance = entry_price * 0.01
+                    estimated_atr = entry_price * 0.01
+                    logger.warning(f"⚠️ ATR not available for recovered position, using 1% fallback SL")
+                
+                if direction == 'LONG':
+                    estimated_stop = entry_price - sl_distance
+                else:
+                    estimated_stop = entry_price + sl_distance
                 
                 self.position = Position(
                     symbol=symbol,
@@ -1015,7 +1343,7 @@ class RiskEngine:
                     atr_1m=estimated_atr
                 )
                 
-                logger.warning(f"RECOVERED POSITION from exchange: {direction} {size} @ {entry_price}")
+                logger.warning(f"RECOVERED POSITION from exchange: {direction} {size} @ {entry_price} | SL: {estimated_stop:.2f}")
                 
             except Exception as e:
                 logger.error(f"Error updating from exchange position: {e}")

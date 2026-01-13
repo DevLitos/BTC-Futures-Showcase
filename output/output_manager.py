@@ -78,6 +78,8 @@ class OutputManager:
     def _format_telegram_message(self, rec: dict) -> str:
         status = rec.get('status', 'N/A')
         pnl = rec.get('pnl')
+        account_value = rec.get('account_value')
+        score = rec.get('score')
 
         lines = [
             "📈 <b>Señal Detectada</b>",
@@ -86,11 +88,18 @@ class OutputManager:
             f"Estado: <b>{status}</b>",
             f"Precio: <b>{rec['entry_price']:.2f}</b>",
             f"Stop Loss: <b>{rec.get('stop_loss_price', 0):.2f}</b>",
-            f"⏰ Timestamp: <b>{rec.get('signal_timestamp', 'N/A')}</b>"
         ]
-
+        
+        if score is not None:
+            lines.append(f"📊 Score: <b>{score}/9</b>")
+        
         if pnl is not None:
             lines.append(f"💰 PnL: <b>{pnl:.2f}</b>")
+        
+        if account_value is not None:
+            lines.append(f"💼 Cuenta: <b>${account_value:.2f}</b>")
+        
+        lines.append(f"⏰ Timestamp: <b>{rec.get('signal_timestamp', 'N/A')}</b>")
 
         return "\n".join(lines)
 
@@ -113,12 +122,70 @@ class OutputManager:
             logger.error(f"Error enviando notificación de salida: {e}")
 
     def _format_exit_message(self, data: dict) -> str:
+        account_value = data.get('account_value')
+        r_realized = data.get('r_realized')
+        
         lines = [
             "🚪 <b>Cierre de Posición</b>",
             f"Símbolo: <b>{data['symbol']}</b>",
             f"Razón: <b>{data.get('reason', 'N/A')}</b>",
             f"PnL: <b>{data.get('pnl', 0):.2f}</b>",
-            f"Precio Salida: <b>{data.get('exit_price', 0):.2f}</b>",
-            f"⏰ Timestamp: <b>{data.get('timestamp', 'N/A')}</b>"
+        ]
+        
+        if r_realized is not None:
+            emoji = "✅" if r_realized > 0 else "❌" if r_realized < 0 else "➖"
+            lines.append(f"{emoji} R Realizado: <b>{r_realized:.2f}R</b>")
+        
+        lines.append(f"Precio Salida: <b>{data.get('exit_price', 0):.2f}</b>")
+        
+        if account_value is not None:
+            lines.append(f"💼 Cuenta Actual: <b>${account_value:.2f}</b>")
+        
+        lines.append(f"⏰ Timestamp: <b>{data.get('timestamp', 'N/A')}</b>")
+        return "\n".join(lines)
+
+    async def send_critical_alert(self, alert_data):
+        """
+        Send critical alert (errors, kill switch, etc.)
+        Used for: 3 consecutive errors, daily loss limit, heartbeat death
+        
+        Args:
+            alert_data: Either a string message or a dict with 'reason' key
+        """
+        # Handle both string and dict
+        if isinstance(alert_data, str):
+            reason = alert_data
+            alert_data = {'reason': reason}
+        else:
+            reason = alert_data.get('reason', 'UNKNOWN')
+        
+        logger.critical(f"🚨 CRITICAL ALERT: {reason}")
+        if not self.bot:
+            logger.warning("Telegram disabled: cannot send critical alert")
+            return
+
+        message = self._format_critical_alert(alert_data)
+
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=message,
+                parse_mode=ParseMode.HTML
+            )
+            logger.info("Critical alert sent to Telegram.")
+        except Exception as e:
+            logger.error(f"Error sending critical alert: {e}")
+
+    def _format_critical_alert(self, data: dict) -> str:
+        lines = [
+            "🚨🚨🚨 <b>CRITICAL ALERT</b> 🚨🚨🚨",
+            "",
+            f"<b>Reason:</b> {data.get('reason', 'UNKNOWN')}",
+            f"<b>Details:</b> {data.get('details', 'N/A')}",
+            f"<b>Action:</b> {data.get('action', 'BOT STOPPED')}",
+            "",
+            f"⏰ <b>Time:</b> {data.get('timestamp', 'N/A')}",
+            "",
+            "⚠️ <i>Manual intervention may be required</i>"
         ]
         return "\n".join(lines)

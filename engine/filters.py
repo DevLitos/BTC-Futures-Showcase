@@ -13,6 +13,7 @@ from engine.config import (
     KillConditions, HTFFilters, MTFFilters,
     get_session_name
 )
+from engine.state_machine import BotState
 from engine.indicators import (
     calculate_ema, calculate_adx, calculate_atr,
     calculate_relative_volume, calculate_orderbook_imbalance,
@@ -103,8 +104,10 @@ class KillConditionsFilter:
         # 1. CRÍTICA: Daily drawdown >= 3% → OBSERVATION pero NO apagar
         # SKIP in backtest - drawdown accumulates unrealistically without daily resets
         if not self.backtest_mode:
-            capital = self.capital
-            dd_pct = abs(self.state_machine.daily_drawdown / max(capital, 1.0)) * 100
+            # 🔥 FIX: Use daily_pnl (absolute) not the old daily_drawdown attribute
+            daily_pnl = getattr(self.state_machine, 'daily_pnl', 0.0)
+            capital = self.capital if self.capital > 0 else 1.0
+            dd_pct = abs(min(0, daily_pnl) / capital) * 100  # Only count losses
             if dd_pct >= KillConditions.MAX_DAILY_DRAWDOWN_PCT:
                 logger.warning(f"⚠️ Daily drawdown {dd_pct:.2f}% >= {KillConditions.MAX_DAILY_DRAWDOWN_PCT}% - entering observation")
                 self.state_machine.enter_observation_mode(f"Daily drawdown {dd_pct:.2f}%")
@@ -114,7 +117,9 @@ class KillConditionsFilter:
         # SKIP in backtest - prevents testing losing strategies
         if not self.backtest_mode:
             if self.state_machine.consecutive_losses >= KillConditions.MAX_CONSECUTIVE_LOSSES:
-                logger.warning(f"⚠️ Consecutive losses {self.state_machine.consecutive_losses} >= {KillConditions.MAX_CONSECUTIVE_LOSSES} - entering observation")
+                # Only log once when first entering observation (not on every tick)
+                if self.state_machine.state != BotState.OBSERVATION:
+                    logger.warning(f"⚠️ Consecutive losses {self.state_machine.consecutive_losses} >= {KillConditions.MAX_CONSECUTIVE_LOSSES} - entering observation")
                 self.state_machine.enter_observation_mode(f"Consecutive losses: {self.state_machine.consecutive_losses}")
                 return False, ""  # No apagar, solo observation
         
@@ -378,21 +383,23 @@ class HTFFilter:
         # =========================================================
         
         # Check ADX strength (only in live mode)
+        # ADX defines REGIME, not timing
         if adx <= HTFFilters.MIN_ADX:
-            logger.info(f"⛔ HTF rejected: ADX {adx:.2f} <= {HTFFilters.MIN_ADX}")
+            logger.info(f"⛔ HTF rejected: ADX {adx:.2f} <= {HTFFilters.MIN_ADX} (no trend regime)")
             return False, None, f"ADX {adx:.2f} <= {HTFFilters.MIN_ADX}"
         
-        # IMPROVED: Smart slope filtering
-        if HTFFilters.SMART_SLOPE_FILTER:
-            if adx > HTFFilters.WEAK_ADX_THRESHOLD:
-                if slope < -0.5:
-                    return False, None, f"Strong trend collapsing: ADX={adx:.1f}, slope={slope:.3f}"
-            else:
-                if slope < HTFFilters.STRONG_SLOPE_DECLINE:
-                    return False, None, f"Weak trend dying: ADX={adx:.1f} < {HTFFilters.WEAK_ADX_THRESHOLD}, slope={slope:.3f}"
-        else:
-            if slope <= HTFFilters.MIN_ADX_SLOPE:
-                return False, None, f"ADX slope {slope:.2f} not positive"
+        # =========================================================
+        # ADX SLOPE - INFORMATION ONLY, NEVER BLOCKS
+        # 
+        # ADX slope negativo ≠ tendencia colapsando
+        # ADX mide fuerza PASADA, no reversión
+        # Cae durante pullbacks normales
+        # 
+        # Colapso real = estructura (price < EMA50), no indicador
+        # =========================================================
+        # slope is logged and returned for tagging, but NEVER blocks entry
+        if slope < -0.5:
+            logger.info(f"📊 HTF: ADX slope negative ({slope:.3f}) - INFO only, not blocking")
         
         # Check ATR
         if atr <= atr_ma * HTFFilters.MIN_ATR_VS_MA:
@@ -733,6 +740,7 @@ class LTFTriggerFilter:
     
     def __init__(self, backtest_mode: bool = False):
         self.backtest_mode = backtest_mode
+        self._last_ltf_info = {}  # Store LTF details for trade tags
     
     def check(self, df_1m: pd.DataFrame, bias: str, orderbook: dict = None,
               regime: str = None, regime_confidence: float = 0.0) -> Tuple[bool, str]:
@@ -806,42 +814,51 @@ class LTFTriggerFilter:
         
         # ===== DECISION LOGIC =====
         
-        # Require at least 2 of 3 confirmations for quality entries
+        # SCORE > GATES: LTF never blocks, only contributes to score
+        # Each confirmation adds to the LTF score (for use in entry threshold)
         confirmations = sum([bos_confirmed, ema_reclaim, slope_positive])
-        trigger_fires = confirmations >= 2
         
-        if not trigger_fires:
-            return False, f"Weak LTF trigger ({confirmations}/3): BOS={bos_confirmed} | EMAReclaim={ema_reclaim} | Slope={slope_positive}"
+        # Store LTF details in filter_info for tags (accessible via last_ltf_info)
+        self._last_ltf_info = {
+            'bos_confirmed': bos_confirmed,
+            'ema_reclaim': ema_reclaim,
+            'slope_positive': slope_positive,
+            'confirmations': confirmations,
+            'ema_9': ema_9,
+            'ema_20': ema_20,
+            'ema_slope': ema_slope,
+            'current_price': current_price
+        }
         
-        # ===== SECONDARY: VOLUME VALIDATION (REGIME-AWARE) =====
-        # In backtest mode, skip volume validation (Kraken data often has V=0)
+        # INFO ONLY - Log confirmations but NEVER block
+        logger.info(f"📊 LTF confirmations: {confirmations}/3 | BOS={bos_confirmed} | EMAReclaim={ema_reclaim} | Slope={slope_positive}")
+        
+        # ===== SECONDARY: VOLUME (INFO ONLY - NEVER BLOCKS) =====
+        # SCORE > GATES: Volume is tag + score contributor, NOT a gate
+        # Low volume on pullbacks is NORMAL and often precedes expansion
         rel_vol = 1.0  # Default for backtest
-        confidence = "BACKTEST"
         
         if self.backtest_mode:
-            logger.debug(f"[BACKTEST] Skipping volume validation")
+            logger.debug(f"[BACKTEST] Skipping volume calculation")
         else:
             rel_vol = calculate_relative_volume(volumes, 20)[-1]
-            confidence = "HIGH" if rel_vol > 1.0 else "MEDIUM" if rel_vol > 0.7 else "LOW"
-            
-            # Determinar umbral de bloqueo basado en régimen
-            # REGIME_A (expansion_trend_continuation): El edge DEPENDE de volumen
-            # Otros regímenes: Volumen bajo puede ser normal
-            
-            if regime == 'expansion_trend_continuation' and regime_confidence >= 0.6:
-                # En régimen de expansión, el volumen es crítico
-                volume_threshold = self.VOLUME_BLOCK_THRESHOLD_EXPANSION
-                if rel_vol < volume_threshold:
-                    logger.warning(f"⛔ Volume block (REGIME_A): RelVol {rel_vol:.2f} < {volume_threshold} threshold")
-                    return False, f"Volume too low for expansion regime ({rel_vol:.2f} < {volume_threshold})"
-            else:
-                # En otros regímenes (o sin clasificación), solo bloquear volumen muerto
-                volume_threshold = self.VOLUME_BLOCK_THRESHOLD_DEFAULT
-                if rel_vol < volume_threshold:
-                    logger.warning(f"⛔ Volume block (dead trade): RelVol {rel_vol:.2f} < {volume_threshold}")
-                    return False, f"Volume critically low - dead trade ({rel_vol:.2f} < {volume_threshold})"
         
-        logger.debug(f"LTF: {bias} | BOS={bos_confirmed} EMA={ema_reclaim} Slope={slope_positive} | Vol={confidence} ({rel_vol:.2f})")
+        # Classify volume for tags (never block)
+        if rel_vol >= 1.0:
+            volume_bucket = 'high'
+        elif rel_vol >= 0.5:
+            volume_bucket = 'normal'
+        elif rel_vol >= 0.25:
+            volume_bucket = 'low'
+        else:
+            volume_bucket = 'very_low'
+        
+        # Store volume info in LTF details for tags
+        self._last_ltf_info['rel_vol'] = rel_vol
+        self._last_ltf_info['volume_bucket'] = volume_bucket
+        
+        logger.info(f"📊 LTF volume: {rel_vol:.2f} ({volume_bucket}) - INFO only, not blocking")
+        logger.debug(f"LTF: {bias} | BOS={bos_confirmed} EMA={ema_reclaim} Slope={slope_positive} | Vol={volume_bucket} ({rel_vol:.2f})")
         
         # ===== TERTIARY: ORDERBOOK (INFORMATION ONLY) =====
         
@@ -860,3 +877,7 @@ class LTFTriggerFilter:
                     logger.info(f"  → Orderbook: NEUTRAL {imbalance:.1f}%")
         
         return True, f"LTF trigger on price structure (BOS={bos_confirmed})"
+    
+    def get_last_ltf_info(self) -> dict:
+        """Return LTF confirmation details for trade tags"""
+        return self._last_ltf_info.copy() if self._last_ltf_info else {}

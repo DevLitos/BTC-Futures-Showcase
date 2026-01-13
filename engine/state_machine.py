@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 class BotState(Enum):
     """Trading bot states"""
     IDLE = "IDLE"                   # Waiting for setup
-    WAIT_FILL = "WAIT_FILL"        # Order placed, waiting for fill
+    WAIT_FILL = "WAIT_FILL"        # Order placed, waiting for fill (DEPRECATED - use HARD_LOCK)
+    HARD_LOCK = "HARD_LOCK"        # Transition state - NO SUBSYSTEM CAN ACT
     MANAGE = "MANAGE"               # Position open, managing exit
     OBSERVATION = "OBSERVATION"     # Observing only, no trading
     OFF = "OFF"                     # Bot is off (kill conditions met)
@@ -62,7 +63,19 @@ class StateMachine:
         # Risk tracking
         self.consecutive_losses = 0
         self.daily_trades = 0
-        self.daily_drawdown = 0.0  # Track daily drawdown in absolute terms
+        
+        # =====================================================================
+        # 🔥 DAILY DRAWDOWN PROTECTION - SURVIVAL, NOT EDGE
+        # Track equity at start of day, update after each close
+        # If DD >= threshold → HALT (no recover, no retry)
+        # =====================================================================
+        self.daily_equity_start: float = 0.0  # Set at start of day / first trade
+        self.daily_pnl: float = 0.0  # Cumulative PnL today
+        self.daily_drawdown_pct: float = 0.0  # Current DD as percentage
+        self.daily_drawdown_limit_pct: float = 0.03  # 3% max daily DD (configurable)
+        self.is_daily_halt: bool = False  # Once True, stays True until manual reset
+        self.daily_halt_reason: str = ""  # Why we halted
+        self._last_dd_check_date: Optional[datetime] = None  # Track date for reset
         
         # Performance tracking
         self.profit_factor = 0.0
@@ -161,19 +174,52 @@ class StateMachine:
         self.daily_trades += 1
         logger.info(f"Trade opened: {trade_id} at {self.trade_open_time.strftime('%H:%M:%S')}")
 
-    def record_trade_close(self, pnl: float, is_win: bool):
-        """Record when a trade is closed"""
+    def record_trade_close(self, pnl: float, is_win: bool, exit_reason: str = "UNKNOWN"):
+        """
+        Record when a trade is closed.
+        
+        CRITICAL FIX (Jan 12, 2026):
+        Consecutive losses are ONLY counted for REAL LOSSES:
+        - SL hit (stop-loss triggered)
+        - Market adverse exit (manual close at loss)
+        - R < 0 with confirmed position
+        
+        Administrative events DO NOT count as losses:
+        - FUNDING_EXIT (funding rate issue)
+        - TIME_EXIT (stagnation timeout)
+        - CANCELLED (order never filled)
+        - RECONCILE_CLOSE (exchange sync)
+        
+        This prevents the bot from penalizing itself for non-trade events.
+        """
         if self.current_trade_id:
             duration = (self._get_time() - self.trade_open_time).total_seconds() / 60
-            logger.info(f"Trade closed: {self.current_trade_id} | Duration: {duration:.1f}min | PnL: ${pnl:.2f}")
+            logger.info(f"Trade closed: {self.current_trade_id} | Reason: {exit_reason} | Duration: {duration:.1f}min | PnL: ${pnl:.2f}")
         
-        # Update statistics (drawdown now handled by risk_engine)
+        # Determine if this is a REAL trade loss (not administrative)
+        REAL_LOSS_REASONS = {'SL_HIT', 'STOP_LOSS', 'MARKET_CLOSE', 'MANUAL_CLOSE'}
+        is_real_trade = exit_reason.upper() in REAL_LOSS_REASONS or exit_reason.upper().startswith('SL')
+        
+        # Administrative exits that should NOT count as losses
+        ADMIN_REASONS = {'FUNDING_EXIT', 'TIME_EXIT', 'TIME_BASED_EXIT', 'CANCELLED', 
+                         'RECONCILE_CLOSE', 'TIMEOUT', 'POST_ONLY_REJECT', 'SYNC_ERROR'}
+        is_admin_event = exit_reason.upper() in ADMIN_REASONS
+        
+        # Update statistics
         if is_win:
             self.consecutive_losses = 0
             self.total_wins += 1
-        else:
+            logger.debug(f"WIN recorded - consecutive losses reset to 0")
+        elif is_real_trade and not is_admin_event and pnl < 0:
+            # Only count as loss if it's a real trade with actual loss
             self.consecutive_losses += 1
             self.total_losses += 1
+            logger.info(f"📉 REAL LOSS recorded ({exit_reason}) - consecutive losses: {self.consecutive_losses}")
+        else:
+            # Administrative event - don't count as loss
+            logger.info(f"⚪ Administrative close ({exit_reason}) - NOT counted as loss (consecutive: {self.consecutive_losses})")
+            # Don't increment consecutive_losses
+            # Don't reset either - maintain current streak
         
         # Reset trade tracking
         self.current_trade_id = None
@@ -253,17 +299,37 @@ class StateMachine:
     
     def get_size_multiplier(self) -> float:
         """
-        NEW (Jan 4, 2026): Get position size multiplier.
+        Get position size multiplier based on operational state.
         
-        Returns 1.0 normally, or reduced multiplier if in penalty mode.
+        ANTI-REVENGE TRADING (Jan 9, 2026):
+        - 2 consecutive losses → reduce to 0.5x
+        - 3+ consecutive losses → reduce to 0.25x
+        
+        OBSERVATION mode still applies its own reduction.
+        
+        Returns: multiplier (0.0 to 1.0)
         """
+        multiplier = 1.0
+        
+        # ANTI-REVENGE: Reduce sizing after consecutive losses
+        if self.consecutive_losses >= 3:
+            multiplier = 0.25
+            logger.info(f"📉 ANTI-REVENGE: {self.consecutive_losses} consecutive losses → 0.25x sizing")
+        elif self.consecutive_losses >= 2:
+            multiplier = 0.5
+            logger.info(f"📉 ANTI-REVENGE: {self.consecutive_losses} consecutive losses → 0.5x sizing")
+        
+        # OBSERVATION mode overrides if more restrictive
         if self.state == BotState.OBSERVATION:
             if self.setups_skipped >= self.observation_setups_to_skip:
                 # Done skipping, trade at reduced size
-                return self.observation_size_multiplier
-            # Still skipping setups - shouldn't reach here
-            return 0.0
-        return 1.0
+                obs_mult = self.observation_size_multiplier
+                multiplier = min(multiplier, obs_mult)
+            else:
+                # Still skipping setups - shouldn't reach here
+                return 0.0
+        
+        return multiplier
     
     def try_exit_observation_mode(self) -> bool:
         """
@@ -331,6 +397,74 @@ class StateMachine:
         if self.state == BotState.OBSERVATION:
             self.transition_to(BotState.IDLE, "Daily reset from observation")
 
+    # =========================================================================
+    # 🔥 DAILY DRAWDOWN PROTECTION METHODS
+    # =========================================================================
+    
+    def initialize_daily_equity(self, equity: float):
+        """
+        Set starting equity for the day. Call this at bot startup and after midnight reset.
+        """
+        current_date = self._get_time().date()
+        
+        # Check if we need to reset for new day
+        if self._last_dd_check_date is not None and self._last_dd_check_date != current_date:
+            logger.info(f"🌅 New trading day detected - resetting daily drawdown")
+            self.daily_pnl = 0.0
+            self.daily_drawdown_pct = 0.0
+            self.is_daily_halt = False
+            self.daily_halt_reason = ""
+        
+        self.daily_equity_start = equity
+        self._last_dd_check_date = current_date
+        logger.info(f"📊 Daily equity initialized: ${equity:.2f} | DD limit: {self.daily_drawdown_limit_pct*100:.1f}%")
+    
+    def update_daily_pnl(self, trade_pnl: float) -> bool:
+        """
+        Update daily PnL after each trade close.
+        Returns True if we should HALT (DD exceeded).
+        """
+        if self.is_daily_halt:
+            return True  # Already halted
+        
+        self.daily_pnl += trade_pnl
+        
+        # Calculate current drawdown percentage
+        if self.daily_equity_start > 0:
+            self.daily_drawdown_pct = min(0, self.daily_pnl) / self.daily_equity_start
+        else:
+            self.daily_drawdown_pct = 0.0
+        
+        # Check if we hit the limit
+        if abs(self.daily_drawdown_pct) >= self.daily_drawdown_limit_pct:
+            self.is_daily_halt = True
+            self.daily_halt_reason = f"Daily DD {abs(self.daily_drawdown_pct)*100:.1f}% >= limit {self.daily_drawdown_limit_pct*100:.1f}%"
+            logger.critical(f"🛑 DAILY HALT: {self.daily_halt_reason}")
+            logger.critical(f"🛑 Daily PnL: ${self.daily_pnl:.2f} | Starting equity: ${self.daily_equity_start:.2f}")
+            return True
+        
+        logger.info(f"📉 Daily PnL: ${self.daily_pnl:.2f} | DD: {abs(self.daily_drawdown_pct)*100:.2f}%")
+        return False
+    
+    def check_daily_halt(self) -> tuple[bool, str]:
+        """
+        Check if daily halt is active.
+        Returns: (is_halted, reason)
+        """
+        if self.is_daily_halt:
+            return True, self.daily_halt_reason
+        return False, ""
+    
+    def force_daily_reset(self, new_equity: float):
+        """Manual reset - only call this at start of new day or manual intervention."""
+        self.daily_pnl = 0.0
+        self.daily_drawdown_pct = 0.0
+        self.is_daily_halt = False
+        self.daily_halt_reason = ""
+        self.daily_equity_start = new_equity
+        self._last_dd_check_date = self._get_time().date()
+        logger.info(f"🔄 Daily drawdown manually reset. New equity: ${new_equity:.2f}")
+
     def get_status(self, drawdown_pct: float = 0.0) -> dict:
         """
         Get current state machine status.
@@ -354,5 +488,10 @@ class StateMachine:
             'profit_factor': round(self.profit_factor, 2),
             'expectancy': round(self.expectancy, 2),
             'total_wins': self.total_wins,
-            'total_losses': self.total_losses
+            'total_losses': self.total_losses,
+            # 🔥 Daily drawdown info
+            'daily_pnl': round(self.daily_pnl, 2),
+            'daily_drawdown_pct': round(abs(self.daily_drawdown_pct) * 100, 2),
+            'is_daily_halt': self.is_daily_halt,
+            'daily_halt_reason': self.daily_halt_reason
         }

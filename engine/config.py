@@ -4,6 +4,216 @@ All strategy parameters and thresholds
 """
 
 # ============================================================================
+# OPERATING MODE - Controls all system behavior
+# ============================================================================
+class OperatingMode:
+    """
+    DISCOVERY: Collect data, minimal filters, fixed low risk
+    PRODUCTION: Full filters, dynamic sizing, strict gates
+    
+    NEVER mix logic with loose ifs - everything depends on MODE
+    """
+    MODE = "DISCOVERY"  # "DISCOVERY" or "PRODUCTION"
+    
+    # Mode-specific thresholds
+    DISCOVERY_SCORE_THRESHOLD = 5   # More permissive
+    PRODUCTION_SCORE_THRESHOLD = 7  # Stricter
+    
+    # Risk per trade by mode
+    DISCOVERY_RISK_PCT = 0.25       # Fixed low risk in discovery
+    PRODUCTION_RISK_PCT = 1.0       # Dynamic in production
+    
+    # RR minimum by mode - CRITICAL HARD FLOOR to filter bad setups
+    # With fees + slippage + funding, RR < 0.9 is negative expectancy
+    DISCOVERY_MIN_RR = 0.9          # HARD FLOOR - no trades below this
+    PRODUCTION_MIN_RR = 1.2         # Require good RR or no trade
+    
+    # ABSOLUTE MINIMUM - never trade below this regardless of mode
+    RR_HARD_FLOOR = 0.8             # Mathematical minimum - below this = guaranteed loss
+    
+    # =========================================================================
+    # RR PENALTY IN SCORING - Penalize low RR setups BEFORE score evaluation
+    # This ensures RR < 1.0 trades are mathematically harder to pass
+    # =========================================================================
+    RR_PENALTY_THRESHOLD = 1.0      # Below this RR, apply score penalty
+    RR_PENALTY_POINTS = 2           # Subtract 2 points from score if RR < 1.0
+    RR_EXCELLENT_THRESHOLD = 1.5    # Above this RR, add bonus
+    RR_EXCELLENT_BONUS = 1          # Add 1 point if RR >= 1.5
+    
+    # =========================================================================
+    # CONSECUTIVE LOSSES SIZING - Reduce size after losses
+    # Progressive reduction: 1 loss = 80%, 2 losses = 60%, 3 losses = 50%
+    # =========================================================================
+    LOSS_SIZING_MULTIPLIERS = {
+        0: 1.0,    # No losses - full size
+        1: 0.80,   # 1 loss - 80% size
+        2: 0.60,   # 2 losses - 60% size
+        3: 0.50,   # 3+ losses - 50% size (anti-tilt)
+    }
+    
+    # =========================================================================
+    # CAPA 4: MINIMUM ACTIVITY PER SESSION - Prevent "no trades" failures
+    # If trades/session is below minimum, progressively relax filters
+    # =========================================================================
+    MIN_TRADES_PER_SESSION = 1        # Minimum trades expected per 4h session
+    MIN_TRADES_PER_DAY = 3            # Minimum trades expected per day
+    
+    # Filter relaxation when activity is too low
+    LOW_ACTIVITY_SCORE_REDUCTION = 1  # Reduce threshold by 1 if low activity
+    
+    # =========================================================================
+    # SESSION QUALITY SIZING - Adjust size by session quality
+    # Best sessions = full size, dead hours = reduced
+    # =========================================================================
+    SESSION_SIZE_MULTIPLIERS = {
+        'LONDON_NY_OVERLAP': 1.0,   # Best liquidity
+        'LONDON': 0.90,             # Good
+        'NY': 0.90,                 # Good
+        'ASIA': 0.75,               # Lower quality
+        'DEAD_HOURS': 0.50,         # High risk
+        'WEEKEND': 0.50,            # Low liquidity
+        'OTHER': 0.75,              # Default reduced
+    }
+    
+    @classmethod
+    def get_min_rr(cls) -> float:
+        return cls.DISCOVERY_MIN_RR if cls.is_discovery() else cls.PRODUCTION_MIN_RR
+    
+    @classmethod
+    def get_loss_sizing_multiplier(cls, consecutive_losses: int) -> float:
+        """Get sizing multiplier based on consecutive losses."""
+        if consecutive_losses >= 3:
+            return cls.LOSS_SIZING_MULTIPLIERS[3]
+        return cls.LOSS_SIZING_MULTIPLIERS.get(consecutive_losses, 1.0)
+    
+    @classmethod
+    def get_session_multiplier(cls, session_name: str) -> float:
+        """Get sizing multiplier based on session."""
+        return cls.SESSION_SIZE_MULTIPLIERS.get(session_name.upper(), 0.75)
+    
+    # SMART COOLDOWN - Based on exit reason and PnL size
+    # TIME_INVALIDATION = market was dead, not our fault → short cooldown
+    # SL_HIT = stop hit, need caution → medium cooldown  
+    # EMERGENCY = system issue → longer cooldown
+    COOLDOWN_TIME_INVALIDATION = 3   # 3 min - market was dead, not error
+    COOLDOWN_SL_SMALL_LOSS = 8       # 8 min - small loss (< 0.5R)
+    COOLDOWN_SL_NORMAL = 15          # 15 min - normal SL hit
+    COOLDOWN_SL_LARGE_LOSS = 25      # 25 min - large loss (> 1R)
+    COOLDOWN_EMERGENCY = 30          # 30 min - emergency close
+    COOLDOWN_DEFAULT = 15            # 15 min - unknown reason
+    
+    # If signal still aligned with HTF after loss, reduce cooldown
+    COOLDOWN_ALIGNED_REDUCTION = 0.5  # 50% reduction if still aligned
+    
+    @classmethod
+    def get_smart_cooldown(cls, exit_reason: str, pnl_r: float) -> int:
+        """Calculate cooldown based on exit reason and loss size"""
+        if exit_reason == 'TIME_INVALIDATION':
+            return cls.COOLDOWN_TIME_INVALIDATION
+        elif 'EMERGENCY' in exit_reason:
+            return cls.COOLDOWN_EMERGENCY
+        elif 'SL' in exit_reason or 'STOP' in exit_reason:
+            # Size-based cooldown for stop losses
+            if abs(pnl_r) < 0.5:
+                return cls.COOLDOWN_SL_SMALL_LOSS
+            elif abs(pnl_r) < 1.0:
+                return cls.COOLDOWN_SL_NORMAL
+            else:
+                return cls.COOLDOWN_SL_LARGE_LOSS
+        else:
+            return cls.COOLDOWN_DEFAULT
+    
+    # Logging level
+    DISCOVERY_LOGGING = "DEBUG"     # Maximum logging
+    PRODUCTION_LOGGING = "INFO"     # Normal logging
+    
+    @classmethod
+    def is_discovery(cls) -> bool:
+        return cls.MODE == "DISCOVERY"
+    
+    @classmethod
+    def get_score_threshold(cls) -> int:
+        return cls.DISCOVERY_SCORE_THRESHOLD if cls.is_discovery() else cls.PRODUCTION_SCORE_THRESHOLD
+    
+    @classmethod
+    def get_risk_pct(cls) -> float:
+        return cls.DISCOVERY_RISK_PCT if cls.is_discovery() else cls.PRODUCTION_RISK_PCT
+
+
+# ============================================================================
+# STATISTICAL DISCIPLINE - DO NOT MODIFY DURING DISCOVERY
+# ============================================================================
+class StatisticalDiscipline:
+    """
+    Rules to prevent premature optimization and system tampering.
+    Your future self WILL try to break these. Don't let them.
+    
+    These are not suggestions. They are constraints.
+    """
+    
+    # EVALUATION HORIZON
+    # Evaluate by TRADE COUNT, not by time.
+    # 200 trades = 1 evaluation cycle
+    EVALUATION_HORIZON_TRADES = 200
+    
+    # MINIMUM SAMPLE SIZE
+    # Do not draw ANY conclusions before this
+    MIN_SAMPLE_SIZE = 100
+    
+    # SIGNAL DEATH CRITERIA
+    # If expectancy < 0 after N trades, signal is dead
+    SIGNAL_DEATH_TRADES = 500
+    SIGNAL_DEATH_EXPECTANCY = 0.0  # Must be > 0 to survive
+    
+    # SCORE DISTRIBUTION SANITY
+    # If > 35% of trades have score >= 7, something is wrong
+    # (or market is exceptionally trending - verify manually)
+    MAX_HIGH_SCORE_RATIO = 0.35
+    HIGH_SCORE_THRESHOLD = 7
+    
+    # SCORE INTERPRETATION
+    # 5 = mediocre but valid event (not "neutral")
+    # 6-7 = core edge
+    # 8-9 = tail event (rare, don't expect these often)
+    SCORE_5_MEANING = "mediocre_valid"
+    SCORE_6_7_MEANING = "core_edge"
+    SCORE_8_9_MEANING = "tail_rare"
+    
+    # =========================================================================
+    # EXPLICIT PROHIBITIONS
+    # =========================================================================
+    
+    # ❌ DO NOT optimize score weights before SIGNAL_DEATH_TRADES
+    # ❌ DO NOT add new synergy bonuses (max = 1)
+    # ❌ DO NOT change DISCOVERY_RISK_PCT until 500+ trades
+    # ❌ DO NOT switch to PRODUCTION until drawdowns are known
+    # ❌ DO NOT interpret "mediocre" score (5) as "bad"
+    # ❌ DO NOT discard session data that contradicts expectations
+    #    (edge may be WORSE in London+NY, BETTER in "ugly" zones)
+    
+    # When tempted to break these rules, re-read this:
+    # "If a trade hurts, it's fulfilling its function."
+    # "Renaissance would accept the data. So should you."
+    
+    @classmethod
+    def can_evaluate(cls, trade_count: int) -> bool:
+        """Check if we have enough trades to evaluate."""
+        return trade_count >= cls.MIN_SAMPLE_SIZE
+    
+    @classmethod
+    def should_kill_signal(cls, trade_count: int, expectancy: float) -> bool:
+        """Check if a signal should be killed based on data."""
+        if trade_count < cls.SIGNAL_DEATH_TRADES:
+            return False  # Not enough data
+        return expectancy < cls.SIGNAL_DEATH_EXPECTANCY
+    
+    @classmethod
+    def is_score_distribution_suspect(cls, high_score_ratio: float) -> bool:
+        """Check if too many trades are scoring high (suspicious)."""
+        return high_score_ratio > cls.MAX_HIGH_SCORE_RATIO
+
+
+# ============================================================================
 # TIMEFRAME CONFIGURATION
 # ============================================================================
 class Timeframes:
@@ -69,18 +279,19 @@ class KillConditions:
 # HTF FILTERS (1H)
 # ============================================================================
 class HTFFilters:
-    # RETUNED (Jan 4, 2026): Relaxed to allow intraday frequency
-    # Previous MIN_ADX=15 was still blocking weak-but-valid trends
-    MIN_ADX = 12                    # Was 15 - allow weak bias (intraday doesn't need strong HTF)
-    MIN_ADX_SLOPE = -0.8            # Was -0.5 - allow deeper pullbacks
-    MIN_ATR_VS_MA = 0.4             # Was 0.5 - allow low vol compression
+    # RETUNED (Jan 9, 2026): ADX slope NO LONGER BLOCKS
+    # ADX solo define régimen, no timing
+    # Slope negativo en pullback es NORMAL, no patológico
+    MIN_ADX = 12                    # Minimum ADX for trend regime
+    MIN_ADX_SLOPE = -999            # DEPRECATED: slope never blocks
+    MIN_ATR_VS_MA = 0.4             # Allow low vol compression
     
-    # IMPROVED: Smart slope filtering
-    # Block ONLY when ADX is weak AND declining (true trend death)
-    # High ADX + negative slope = consolidation within trend = OK for intraday
-    SMART_SLOPE_FILTER = True       # Use smart slope logic
-    WEAK_ADX_THRESHOLD = 20         # Was 25 - more lenient
-    STRONG_SLOPE_DECLINE = -0.15    # Was -0.10 - allow more slope decline
+    # DEPRECATED: Slope filtering removed
+    # ADX slope is now INFO/TAG only, never a veto
+    # Colapso real = estructura (price < EMA50), no indicador
+    SMART_SLOPE_FILTER = False      # DISABLED - slope is info only
+    WEAK_ADX_THRESHOLD = 20         # Not used (kept for reference)
+    STRONG_SLOPE_DECLINE = -0.15    # Not used (kept for reference)
     
     # Counter-trend trading in defensive mode
     ALLOW_COUNTERTREND_DEFENSIVE = True  # Allow counter-trend with reduced size
@@ -178,6 +389,16 @@ class DynamicRiskConfig:
     
     # Emergency risk cap (never risk more than this regardless of tier)
     MAX_RISK_PCT = 1.5    # 1.5% absolute maximum
+    
+    # =========================================================================
+    # MICRO ACCOUNT SIZING (for accounts < $500)
+    # Uses NOTIONAL-based sizing instead of risk-based
+    # This ensures minimum tradeable sizes on exchanges
+    # =========================================================================
+    MICRO_ACCOUNT_THRESHOLD = 500.0   # Below this, use notional-based sizing
+    BASE_NOTIONAL_USD = 7.5           # Target notional per trade ($7.5)
+    MIN_NOTIONAL_USD = 5.0            # Never trade below this notional
+    MIN_BTC_SIZE = 0.0001             # Kraken Futures minimum (absolute floor)
 
 
 # ============================================================================
@@ -201,10 +422,9 @@ class RiskManagement:
     # Stop loss
     STOP_LOSS_ATR_BUFFER = 0.3      # Buffer of 0.3x ATR(1m) above SL level
     
-    # Take profits - Based on empirical MFE analysis
-    # Data shows: avg MFE = 0.52R, so TP1 at 0.6R targets upper MFE range
-    # This captures wins while letting more trades hit target
-    TP1_RISK_MULTIPLE = 0.6         # TP at 0.6R (slightly above avg MFE)
+    # Take profits - Minimum 1R to ensure positive expectancy after fees
+    # With fees ~0.04% + slippage + funding, RR < 1 is negative EV
+    TP1_RISK_MULTIPLE = 1.0         # TP at 1.0R (minimum for positive expectancy)
     TP1_CLOSE_PCT = 60              # Close 60% at TP1, leave 40% runner
     
     # Exit management (FIXED - no inventos)
@@ -259,7 +479,28 @@ class OrderExecution:
     # Use market order when price velocity is high
     USE_MARKET_ON_MOMENTUM = True   # Enable market orders in momentum
     MOMENTUM_VELOCITY_MULTIPLIER = 2.0  # Market if velocity > 2x ATR (fast move)
+    MOMENTUM_MAX_VELOCITY = 3.5  # SKIP entry if velocity > 3.5x ATR AND ADX < 25 (chasing in dead market)
+    MOMENTUM_MAX_VELOCITY_ADX_THRESHOLD = 25  # ADX below this = dead market, don't chase
     MARKET_ORDER_TIMEOUT_SECONDS = 0.5  # Wait only 500ms for market fills (must be instant)
+    
+    # =========================================================================
+    # ANTI-CHASING GATE - Block entries after impulsive candles
+    # If last N candles are > threshold ATR, we're chasing, not anticipating
+    # RELAXED (Jan 12, 2026): Was too aggressive, blocking valid entries
+    # =========================================================================
+    ANTI_CHASING_ENABLED = True
+    ANTI_CHASING_ATR_THRESHOLD = 1.5  # Candle range > 1.5x ATR = impulsive (was 1.2)
+    ANTI_CHASING_LOOKBACK = 2          # Check last 2 candles (was 3)
+    
+    # =========================================================================
+    # FUNDING DIRECTION SIZING - Reduce size when funding against position
+    # LONG with positive funding = paying funding = reduce size
+    # SHORT with negative funding = paying funding = reduce size
+    # =========================================================================
+    FUNDING_SIZING_ENABLED = True
+    FUNDING_AGAINST_MULTIPLIER = 0.75  # 75% size when paying funding
+    FUNDING_FAVORABLE_MULTIPLIER = 1.1  # 110% size when receiving funding
+    FUNDING_NEUTRAL_THRESHOLD = 0.01   # ±0.01% = neutral
 
 
 # ============================================================================
@@ -314,11 +555,68 @@ class DataConfig:
 # FIX #6: FUNDING RATE CONTROL
 # ============================================================================
 class FundingRateControl:
-    # FIX (Jan 3, 2026): DISABLED temporarily for diagnosis - was blocking too many signals
-    ENABLED = False  # TODO: Re-enable after confirming bot generates trades
-    MAX_FUNDING_RATE_PCT = 0.03      # Do not trade LONG if > 0.03% (3 bps)
-    FORCE_EXIT_FUNDING_PCT = 0.05    # Force exit if funding reaches 0.05%
+    # AUDITORÍA (Jan 9, 2026): RE-ENABLED with relaxed thresholds
+    # Critical for live trading - protects from funding spikes
+    # FIX (Jan 12, 2026): Raised thresholds - Kraken normal funding is ~0.10%
+    ENABLED = True
+    MAX_FUNDING_RATE_PCT = 0.12      # Entry threshold - block new LONGs above this
+    FORCE_EXIT_FUNDING_PCT = 0.20    # Force exit only at extreme funding (was 0.08 - too aggressive)
     CHECK_INTERVAL_MINUTES = 60      # Check funding rate every hour
+    
+    # =========================================================================
+    # FUNDING BUCKETS for sizing decisions
+    # =========================================================================
+    FUNDING_BUCKETS = {
+        'extreme_positive': 0.05,   # >= 0.05% = extremely bullish (bearish for longs)
+        'high_positive': 0.03,      # >= 0.03% = high positive
+        'normal': 0.01,             # ±0.01% = normal range
+        'high_negative': -0.03,     # <= -0.03% = high negative  
+        'extreme_negative': -0.05,  # <= -0.05% = extremely bearish
+    }
+    
+    @classmethod
+    def get_funding_bucket(cls, funding_rate: float) -> str:
+        """Classify funding rate into a bucket."""
+        if funding_rate >= cls.FUNDING_BUCKETS['extreme_positive']:
+            return 'extreme_positive'
+        elif funding_rate >= cls.FUNDING_BUCKETS['high_positive']:
+            return 'high_positive'
+        elif funding_rate <= cls.FUNDING_BUCKETS['extreme_negative']:
+            return 'extreme_negative'
+        elif funding_rate <= cls.FUNDING_BUCKETS['high_negative']:
+            return 'high_negative'
+        else:
+            return 'normal'
+    
+    @classmethod
+    def get_funding_sizing_factor(cls, funding_rate: float, bias: str) -> float:
+        """
+        Get sizing factor based on funding rate and position direction.
+        
+        LONG + positive funding = paying = reduce size
+        LONG + negative funding = receiving = can increase
+        SHORT + negative funding = paying = reduce size  
+        SHORT + positive funding = receiving = can increase
+        """
+        bucket = cls.get_funding_bucket(funding_rate)
+        
+        # Determine if funding is favorable or against
+        if bias == 'LONG':
+            if funding_rate > 0.01:  # Paying funding
+                if bucket in ['extreme_positive', 'high_positive']:
+                    return 0.70  # Significant reduction
+                return 0.85  # Moderate reduction
+            elif funding_rate < -0.01:  # Receiving funding
+                return 1.10  # Slight boost
+        else:  # SHORT
+            if funding_rate < -0.01:  # Paying funding
+                if bucket in ['extreme_negative', 'high_negative']:
+                    return 0.70
+                return 0.85
+            elif funding_rate > 0.01:  # Receiving funding
+                return 1.10
+        
+        return 1.0  # Neutral
 
 
 # ============================================================================
@@ -344,10 +642,12 @@ class SweepFilter:
 # FIX #9: SESSION QUALITY FILTER
 # ============================================================================
 class SessionQuality:
-    # FIX (Jan 3, 2026): DISABLED temporarily for diagnosis - was blocking 50%+ of signals
-    ENABLED = False  # TODO: Re-enable after confirming bot generates trades
-    # FIX (Jan 3, 2026): ENABLED weekend trading for diagnosis
-    WEEKEND_TRADING = True            # Allow weekend trading (reduced risk)
+    # AUDITORÍA (Jan 9, 2026): PERMANENTLY DISABLED for 24/7 BTC trading
+    # BTC trades 24/7 with institutional activity around the clock
+    # Session-based filtering is designed for equity markets, NOT crypto
+    ENABLED = False  # Crypto markets don't follow traditional session patterns
+    # Allow weekend trading - BTC is 24/7
+    WEEKEND_TRADING = True
     
     MIN_ADX_BY_SESSION = {
         'london': 20,                 # 8am-4pm UTC
@@ -458,15 +758,48 @@ def get_risk_for_session(hour: int, minute: int) -> float:
     return RiskManagement.RISK_ASIA_WEEKEND_PCT / 100.0
 
 
-def get_session_name(hour: int, minute: int) -> str:
-    """Get the name of the current trading session"""
-    if hour == 9 and 30 <= minute <= 45:
+def get_session_name(hour: int, minute: int, day_of_week: int = None) -> str:
+    """
+    Get the name of the current trading session.
+    
+    Args:
+        hour: Hour in UTC (0-23)
+        minute: Minute (0-59)
+        day_of_week: Day of week (0=Monday, 6=Sunday). If None, won't check weekend.
+    
+    Returns: Session name matching SESSION_SIZE_MULTIPLIERS keys
+    """
+    # Check weekend first (if day_of_week provided)
+    if day_of_week is not None:
+        # Weekend: Friday 21:00 UTC to Sunday 21:00 UTC (approx CME close)
+        if day_of_week == 4 and hour >= 21:  # Friday evening
+            return "WEEKEND"
+        elif day_of_week in (5, 6):  # Saturday or Sunday
+            return "WEEKEND"
+    
+    # NY volatile open window
+    if hour == 14 and 30 <= minute <= 45:  # 9:30-9:45 EST = 14:30-14:45 UTC
         return "NY_OPEN_VOLATILE"
-    elif 3 <= hour < 11:
+    
+    # London/NY overlap: 13:30-16:00 UTC (8:30 AM - 11:00 AM EST)
+    # This is the best liquidity window
+    if 13 <= hour < 16 or (hour == 13 and minute >= 30):
+        return "LONDON_NY_OVERLAP"
+    
+    # London session: 8:00-16:00 UTC
+    if 8 <= hour < 16:
         return "LONDON"
-    elif 9 <= hour < 16:
+    
+    # NY session: 13:30-21:00 UTC (8:30 AM - 4:00 PM EST)
+    if (hour == 13 and minute >= 30) or (14 <= hour < 21):
         return "NY"
-    elif 18 <= hour or hour < 3:
+    
+    # Asia session: 23:00-8:00 UTC
+    if hour >= 23 or hour < 8:
         return "ASIA"
-    else:
-        return "OTHER"
+    
+    # Dead hours: 21:00-23:00 UTC (after NY close, before Asia)
+    if 21 <= hour < 23:
+        return "DEAD_HOURS"
+    
+    return "OTHER"

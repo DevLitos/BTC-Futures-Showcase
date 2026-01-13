@@ -14,6 +14,52 @@ from datetime import datetime, UTC
 from typing import Optional
 
 
+# ============================================================================
+# EXECUTION INTEGRITY STATES (CAPA 1)
+# ============================================================================
+
+class OrderState(Enum):
+    """
+    State of an individual order in the execution pipeline.
+    
+    OPEN: Order submitted, waiting for fill
+    FILLED: Order fully filled
+    PARTIAL: Order partially filled (qty mismatch)
+    CANCELED: Order canceled (by system or user)
+    LOST: Order disappeared from exchange (timeout without confirmation)
+    REJECTED: Order rejected by exchange
+    """
+    OPEN = "open"
+    FILLED = "filled"
+    PARTIAL = "partial"
+    CANCELED = "canceled"
+    LOST = "lost"
+    REJECTED = "rejected"
+
+
+class PositionState(Enum):
+    """
+    State of a position being managed.
+    
+    FLAT: No position (or position fully closed)
+    PENDING: Entry order placed, waiting for fill
+    OPEN: Position confirmed on exchange with matching qty
+    PARTIAL: Position size doesn't match expected (partial fill)
+    CLOSING: Exit in progress (SL/TP triggered or manual close)
+    INCONSISTENT: System/exchange mismatch detected
+    """
+    FLAT = "flat"
+    PENDING = "pending"
+    OPEN = "open"
+    PARTIAL = "partial"
+    CLOSING = "closing"
+    INCONSISTENT = "inconsistent"
+
+
+# ============================================================================
+# STRATEGY STATES
+# ============================================================================
+
 class StrategyState(Enum):
     """
     Operational states of the strategy.

@@ -234,7 +234,10 @@ def get_dynamic_risk_pct(equity: float) -> float:
     """
     PALANCA 1: Get risk percentage based on current equity.
     
-    Risk tiers (professional scaling):
+    IN DISCOVERY MODE: Returns fixed 0.25% regardless of equity.
+    IN PRODUCTION MODE: Uses dynamic tiers.
+    
+    Risk tiers (professional scaling, PRODUCTION only):
     - < 2,000€: 1.0% per trade (más agresivo para cuentas pequeñas)
     - 2k-5k€: 0.75% per trade
     - > 5k€: 0.5% per trade (conservador para cuentas grandes)
@@ -249,9 +252,15 @@ def get_dynamic_risk_pct(equity: float) -> float:
         Risk percentage as decimal (0.01 = 1%)
     """
     # Import here to avoid circular imports
-    from engine.config import DynamicRiskConfig
+    from engine.config import DynamicRiskConfig, OperatingMode
     
-    # Find the appropriate tier
+    # DISCOVERY MODE: Fixed low risk for data collection
+    if OperatingMode.is_discovery():
+        risk_pct = OperatingMode.DISCOVERY_RISK_PCT  # 0.25%
+        logger.debug(f"DISCOVERY mode: fixed risk {risk_pct}%")
+        return risk_pct / 100.0  # Convert to decimal
+    
+    # PRODUCTION MODE: Find the appropriate tier
     for max_equity, risk_pct in DynamicRiskConfig.RISK_TIERS:
         if equity < max_equity:
             # Apply floor and ceiling
@@ -541,14 +550,49 @@ class PositionSizer:
             logger.warning(f"Invalid capital ({capital}) or price ({entry_price})")
             return 0.0
         
+        # =====================================================================
+        # MICRO ACCOUNT MODE: Use PERCENTAGE-based sizing for small accounts
+        # This ensures we use a meaningful portion of capital while respecting
+        # exchange minimums and leverage settings.
+        # 
+        # FIX (Jan 13, 2026): Changed from fixed $7.5 notional to 20% of capital
+        # With $50 and 10x leverage: $50 * 20% * 10 = $100 notional
+        # =====================================================================
+        from engine.config import DynamicRiskConfig
+        
+        leverage = leverage or self.leverage
+        
+        if capital < DynamicRiskConfig.MICRO_ACCOUNT_THRESHOLD:
+            # MICRO ACCOUNT: Percentage-based sizing
+            # Use 20% of capital as base margin (conservative but meaningful)
+            MICRO_ACCOUNT_MARGIN_PCT = 0.20  # 20% of capital per trade
+            
+            base_margin = capital * MICRO_ACCOUNT_MARGIN_PCT
+            
+            # Apply leverage to get notional exposure
+            position_notional = base_margin * leverage
+            
+            # Ensure minimum notional (exchange may reject tiny orders)
+            position_notional = max(position_notional, DynamicRiskConfig.MIN_NOTIONAL_USD * leverage)
+            
+            base_size = position_notional / entry_price
+            
+            # HARD FLOOR: Never below exchange minimum
+            base_size = max(base_size, DynamicRiskConfig.MIN_BTC_SIZE)
+            
+            logger.info(f"💰 MICRO ACCOUNT sizing: capital=${capital:.2f} × {MICRO_ACCOUNT_MARGIN_PCT*100:.0f}% = ${base_margin:.2f} margin × {leverage}x lev = ${position_notional:.2f} notional → {base_size:.6f} BTC")
+            return base_size
+        
+        # =====================================================================
+        # NORMAL ACCOUNT: Risk-based sizing (original logic)
+        # =====================================================================
+        
         # PALANCA 1: Dynamic risk based on equity tier
         if risk_pct is None:
             if self.use_dynamic_risk:
                 risk_pct = get_dynamic_risk_pct(capital)
             else:
                 risk_pct = self.default_risk_pct
-        
-        leverage = leverage or self.leverage
         
         # Risk per unit (distance to stop)
         risk_per_unit = abs(entry_price - stop_loss)
@@ -567,6 +611,9 @@ class PositionSizer:
         
         # Use smaller of the two for safety
         base_size = min(risk_based_size, margin_based_size)
+        
+        # FLOOR: Never below exchange minimum even in normal mode
+        base_size = max(base_size, DynamicRiskConfig.MIN_BTC_SIZE)
         
         logger.debug(f"Base size: risk-based={risk_based_size:.6f} (risk_pct={risk_pct*100:.2f}%), "
                     f"margin-based={margin_based_size:.6f} (lev={leverage}x), final={base_size:.6f}")

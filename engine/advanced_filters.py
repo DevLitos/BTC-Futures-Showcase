@@ -37,7 +37,7 @@ async def check_funding_rate_safe(external_data_manager, symbol: str, bias: str)
         # Only check for LONG entries (SHORT benefits from high funding)
         if bias == 'LONG':
             if current_funding > FundingRateControl.MAX_FUNDING_RATE_PCT / 100:
-                return False, f"Funding too high: {current_funding:.4f}% > {FundingRateControl.MAX_FUNDING_RATE_PCT/100:.4f}%"
+                return False, f"Funding too high: {current_funding*100:.4f}% > {FundingRateControl.MAX_FUNDING_RATE_PCT:.4f}%"
         
         return True, ""
         
@@ -46,9 +46,25 @@ async def check_funding_rate_safe(external_data_manager, symbol: str, bias: str)
         return True, ""  # If we can't check, don't block entry
 
 
-async def should_exit_on_funding(external_data_manager, symbol: str, bias: str) -> Tuple[bool, str]:
+async def should_exit_on_funding(
+    external_data_manager, 
+    symbol: str, 
+    bias: str,
+    unrealized_pnl: float = 0.0,  # Pass current PnL
+    time_to_funding_min: float = None  # Minutes until next funding settlement
+) -> Tuple[bool, str]:
     """
-    FIX #6: Force exit if funding becomes extreme
+    FIX #6: Force exit if funding becomes EXTREMELY dangerous
+    
+    IMPROVED (Jan 12, 2026):
+    - Uses REAL TIME until next funding settlement (not arbitrary position age)
+    - Only exit on EXTREME funding (>0.20%)
+    - Never exit positions in profit from funding alone
+    - Only consider exiting if funding settlement is imminent (<30 min)
+    
+    Logic:
+    - If time_to_funding < 30 min AND funding extreme AND position losing → EXIT
+    - Otherwise: hold (funding is just a cost, not immediate danger)
     
     Returns: (should_exit: bool, reason: str)
     """
@@ -57,11 +73,33 @@ async def should_exit_on_funding(external_data_manager, symbol: str, bias: str) 
     
     try:
         current_funding = await external_data_manager.get_funding_rate(symbol)
+        funding_pct = current_funding * 100  # Convert to percentage for display
+        threshold_pct = FundingRateControl.FORCE_EXIT_FUNDING_PCT
         
-        if current_funding > FundingRateControl.FORCE_EXIT_FUNDING_PCT / 100:
-            return True, f"CRITICAL: Funding {current_funding:.4f}% exceeds {FundingRateControl.FORCE_EXIT_FUNDING_PCT/100:.4f}% limit"
+        # Get time to next funding if not provided
+        if time_to_funding_min is None:
+            try:
+                time_to_funding_min = external_data_manager.funding.get_time_to_next_funding_minutes()
+            except:
+                time_to_funding_min = 60.0  # Default: assume not imminent
         
-        return False, ""
+        # GATE 1: Funding must exceed threshold
+        if current_funding <= threshold_pct / 100:
+            return False, ""
+        
+        # PROTECTION 1: Never close positions in profit due to funding
+        if unrealized_pnl > 0:
+            logger.debug(f"Funding extreme ({funding_pct:.4f}%) but position in profit ({unrealized_pnl:.2f}) - holding")
+            return False, ""
+        
+        # PROTECTION 2: Only exit if funding settlement is imminent (<30 min)
+        # If settlement is far away, we might recover the loss before paying
+        if time_to_funding_min > 30.0:
+            logger.debug(f"Funding extreme ({funding_pct:.4f}%) but settlement in {time_to_funding_min:.0f}min - holding")
+            return False, ""
+        
+        # EXIT: Extreme funding + losing position + settlement imminent
+        return True, f"FUNDING EXIT: {funding_pct:.4f}% > {threshold_pct:.4f}%, PnL={unrealized_pnl:.2f}, settlement in {time_to_funding_min:.0f}min"
         
     except Exception as e:
         logger.warning(f"Failed to check exit funding: {e}")

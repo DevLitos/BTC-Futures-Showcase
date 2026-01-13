@@ -62,6 +62,66 @@ from engine.persistence import TradeLogger, PositionReconciler
 # 6. SIGNAL ENGINE
 from engine.signal_engine import SignalEngine
 
+# 7. ERROR TRACKING
+from engine.error_tracker import ErrorTracker, ErrorTrackerConfig, ErrorSeverity, init_error_tracker
+
+# 8. HEALTH SERVER for Docker
+import http.server
+import socketserver
+import threading
+import json
+
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    """Simple HTTP handler for Docker health checks"""
+    bot_status = {"healthy": False, "reason": "not_started"}
+    signal_engine_ref = None  # Reference to signal engine for health data
+    
+    def do_GET(self):
+        if self.path == "/health":
+            status = HealthHandler.bot_status.copy()
+            
+            # Add detailed health monitor data if available
+            if HealthHandler.signal_engine_ref and hasattr(HealthHandler.signal_engine_ref, 'health_monitor'):
+                health_monitor = HealthHandler.signal_engine_ref.health_monitor
+                if health_monitor:
+                    health_data = health_monitor.get_health_status()
+                    status['system_health'] = health_data
+                    should_stop, reason = health_monitor.should_stop_trading()
+                    if should_stop:
+                        status['healthy'] = False
+                        status['reason'] = reason
+            
+            if status.get("healthy"):
+                self.send_response(200)
+            else:
+                self.send_response(503)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(status).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        pass  # Suppress HTTP logging
+
+def start_health_server(port: int = 8001):
+    """Start health check HTTP server in background thread"""
+    def run_server():
+        try:
+            # 🔥 FIX: Allow address reuse to prevent "Address already in use" errors
+            class ReusableTCPServer(socketserver.TCPServer):
+                allow_reuse_address = True
+            
+            with ReusableTCPServer(("", port), HealthHandler) as httpd:
+                httpd.serve_forever()
+        except OSError as e:
+            logging.getLogger('MainApp').warning(f"Health server could not start: {e}")
+    
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    logging.getLogger('MainApp').info(f"Health server started on port {port}")
+
 # Legacy (mantener compatibilidad)
 from output.output_manager import OutputManager
 from monitoring.metrics import start_metrics_server
@@ -72,6 +132,13 @@ logging.basicConfig(
     format='%(asctime)s - %(name)-20s - %(levelname)-8s - %(message)s'
 )
 logger = logging.getLogger('MainApp')
+
+# =====================================================================
+# 🔒 FIX (Jan 13, 2026): SUPPRESS HTTPX LOGGING TO PREVENT TOKEN LEAKS
+# httpx logs full URLs including API tokens which is a security risk
+# =====================================================================
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 # Load environment variables before using them
 load_env_file()
@@ -186,6 +253,16 @@ class TradingSystemOrchestrator:
         
         # 5.5 OUTPUT MANAGER
         self.output_manager = OutputManager()
+        
+        # 5.6 ERROR TRACKER - 3 consecutive errors = stop + Telegram
+        self.error_tracker = init_error_tracker(
+            telegram_callback=self.output_manager.send_critical_alert,
+            config=ErrorTrackerConfig(
+                max_consecutive_errors=3,
+                error_window_seconds=300,
+                notify_on_stop=True
+            )
+        )
 
         # 6. SIGNAL ENGINE
         self.signal_engine = SignalEngine(market_data=self.market_data,
@@ -193,6 +270,9 @@ class TradingSystemOrchestrator:
                                          external_data=self.external_data,
                                          trade_logger=self.trade_logger,
                                          output_manager=self.output_manager)
+        
+        # Register signal engine with health handler for detailed health endpoint
+        HealthHandler.signal_engine_ref = self.signal_engine
         
         self.tasks = []
         self.demo_mode = DEMO_MODE
@@ -205,11 +285,34 @@ class TradingSystemOrchestrator:
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
         logger.info(f"Received signal {signum} - initiating graceful shutdown...")
-        asyncio.create_task(self.shutdown())
+        self.is_running = False  # Set flag FIRST - this stops the main loop
+        
+        # 🔥 FIX: On second signal, force exit immediately
+        if hasattr(self, '_shutdown_requested') and self._shutdown_requested:
+            logger.critical("🛑 FORCE EXIT - Second signal received")
+            import os
+            os._exit(1)
+        
+        self._shutdown_requested = True
+        
+        # Schedule shutdown task
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(self.shutdown()))
+        except RuntimeError:
+            # No running loop - just exit
+            logger.info("No event loop running - forcing exit")
+            import os
+            os._exit(0)
     
     async def _load_historical_data(self):
         """Load historical candles to bootstrap the system"""
         logger.info("\n📊 Loading historical data...")
+        
+        # 🔥 AUDIT FIX: Verify execution engine is initialized
+        if not self.execution or not self.execution.exchange:
+            logger.error("Cannot load historical data: execution engine not initialized")
+            return
         
         try:
             # Load 1h candles (need 200+ for EMA 200)
@@ -233,7 +336,8 @@ class TradingSystemOrchestrator:
             else:
                 logger.warning("Failed to load 1m historical data")
             
-            logger.info("✓ Historical data loaded successfully")
+            logger.info("✅ Historical data loaded successfully (REST warmup)")
+            logger.info("🔄 Warmup complete – switching to WS only for live data")
             
         except Exception as e:
             logger.error(f"Error loading historical data: {e}", exc_info=True)
@@ -245,6 +349,10 @@ class TradingSystemOrchestrator:
         logger.info("=" * 70)
         logger.info("🚀 BTC PERPETUAL TRADING SYSTEM - INITIALIZATION (CORRECT ORDER)")
         logger.info("=" * 70)
+        
+        # Start health server for Docker healthchecks
+        start_health_server(port=8001)
+        HealthHandler.bot_status = {"healthy": False, "reason": "initializing"}
         
         if self.demo_mode:
             logger.warning("🔧 DEMO MODE - Running without API keys")
@@ -296,6 +404,26 @@ class TradingSystemOrchestrator:
             await self.trade_logger.start()
             logger.info("✓ Persistence logger started (backpressure queues active)")
             
+            # 6.5. RECONCILIATION AT STARTUP - Critical for crash recovery
+            logger.info("[6.5/7] Checking exchange position vs local state...")
+            try:
+                exchange_pos = await self.execution.get_position(CCXT_SYMBOL)
+                exchange_size = exchange_pos.get('contracts', 0) if exchange_pos else 0
+                local_pos = self.signal_engine.risk_engine.position
+                local_size = local_pos.size if local_pos else 0
+                
+                if exchange_size != 0 and local_size == 0:
+                    logger.warning(f"⚠️ RECONCILE NEEDED: Exchange has position ({exchange_size}) but local is empty")
+                    logger.warning("   → Manual intervention required: close position on exchange or restart with position sync")
+                elif exchange_size == 0 and local_size != 0:
+                    logger.warning(f"⚠️ RECONCILE NEEDED: Local has position ({local_size}) but exchange is empty")
+                    logger.warning("   → Clearing local position state")
+                    self.signal_engine.risk_engine.position = None
+                else:
+                    logger.info(f"✓ Position reconciliation OK (exchange={exchange_size}, local={local_size})")
+            except Exception as e:
+                logger.warning(f"Could not reconcile positions at startup: {e}")
+            
             # 7. Signal Engine (fetch balance + set leverage)
             logger.info("[7/7] Initializing signal engine (balance + leverage)...")
             leverage = int(os.getenv('LEVERAGE', '10'))  # Default 10x
@@ -311,7 +439,11 @@ class TradingSystemOrchestrator:
             logger.info("\n✅ All components initialized successfully")
             logger.info("=" * 70)
             
+            # Mark as healthy for Docker
+            HealthHandler.bot_status = {"healthy": True, "reason": "initialized"}
+            
         except Exception as e:
+            HealthHandler.bot_status = {"healthy": False, "reason": f"init_error: {str(e)[:100]}"}
             if self.demo_mode:
                 logger.warning(f"Initialization warning (DEMO MODE): {e}")
                 # Continue in demo mode
@@ -398,6 +530,14 @@ class TradingSystemOrchestrator:
         if not hasattr(self, '_ws_last_candle_time'):
             self._ws_last_candle_time = datetime.now()
         self._ws_last_candle_time = datetime.now()
+        
+        # 🔥 CRITICAL FIX: Increment candle count for open positions
+        # This is required for TIME_EXIT and RUNNER time exit to work in LIVE
+        # Previously only called in backtest - BUG since Jan 2026
+        if (hasattr(self, 'signal_engine') and 
+            self.signal_engine.risk_engine.position is not None):
+            self.signal_engine.risk_engine.position.increment_candle_count()
+        
         logger.debug(f"1m candle closed: {candle['close']:.2f}")
     
     async def _on_candle_5m(self, candle: dict):
@@ -522,11 +662,41 @@ class TradingSystemOrchestrator:
                 if self.signal_engine:
                     status = self.signal_engine.get_status()
                     logger.info(f"Signal Engine: {status.get('state', 'unknown')}")
+                    
+                    # Log health monitor summary
+                    if status.get('health'):
+                        health = status['health']
+                        logger.info(f"Health: trades_today={health.get('trades_today', 0)}, "
+                                   f"fill_rate={health.get('fill_rate', 1.0):.0%}, "
+                                   f"integrity_errors={health.get('integrity_errors', 0)}, "
+                                   f"avg_latency={health.get('avg_latency_ms', 0):.0f}ms")
+                    if status.get('health_alert'):
+                        logger.warning(f"⚠️ Health Alert: {status['health_alert']}")
                 
                 # External data
                 if self.external_data:
                     ext_status = self.external_data.get_status()
                     can_trade, reason = self.external_data.can_trade()
+                    
+                    # Check exchange availability (WebSocket + REST)
+                    exchange_available = True
+                    exchange_issues = []
+                    
+                    if hasattr(self.market_data, 'get_availability_status'):
+                        ws_status = self.market_data.get_availability_status()
+                        if not ws_status.get('is_available', True):
+                            exchange_available = False
+                            exchange_issues.append("WS down")
+                    
+                    if hasattr(self.execution, 'is_exchange_available'):
+                        if not self.execution.is_exchange_available:
+                            exchange_available = False
+                            exchange_issues.append("REST down")
+                    
+                    if not exchange_available:
+                        can_trade = False
+                        reason = f"Exchange unavailable ({', '.join(exchange_issues)})"
+                    
                     logger.info(f"Can Trade: {can_trade} ({reason})")
                     logger.info(f"Funding: {ext_status['funding']['current_rate']*100:.4f}%")
                 

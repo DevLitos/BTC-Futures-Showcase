@@ -630,6 +630,39 @@ def print_results(results: dict):
     for reason, data in sorted(exit_reasons.items(), key=lambda x: x[1]['count'], reverse=True):
         avg_r_reason = sum(data['r']) / len(data['r']) if data['r'] else 0
         print(f"  {reason:20s}: {data['count']:3d} trades | PnL: ${data['pnl']:7.2f} | Avg R: {avg_r_reason:.2f}")
+    
+    # REGIME BREAKDOWN
+    regime_normal = [t for t in trades if t['data'].get('regime') == 'NORMAL']
+    regime_runner = [t for t in trades if t['data'].get('regime') == 'RUNNER']
+    
+    runner_pct = len(regime_runner) / len(trades) * 100 if trades else 0
+    runner_r = [t['data'].get('r', 0) for t in regime_runner if 'r' in t['data']]
+    normal_r = [t['data'].get('r', 0) for t in regime_normal if 'r' in t['data']]
+    
+    avg_runner_r = sum(runner_r) / len(runner_r) if runner_r else 0
+    avg_normal_r = sum(normal_r) / len(normal_r) if normal_r else 0
+    
+    print("-"*70)
+    print("🏃 REGIME BREAKDOWN:")
+    print(f"  NORMAL trades:     {len(regime_normal):3d} ({100-runner_pct:.1f}%) | Avg R: {avg_normal_r:.2f}")
+    print(f"  RUNNER trades:     {len(regime_runner):3d} ({runner_pct:.1f}%) | Avg R: {avg_runner_r:.2f}")
+    
+    # Target validation
+    print("-"*70)
+    print("🎯 TARGET VALIDATION:")
+    target_runner_r = 1.8
+    target_expectancy = 0.45
+    target_runner_pct_min = 20
+    target_runner_pct_max = 30
+    
+    runner_r_ok = "✅" if avg_runner_r >= target_runner_r else "❌"
+    exp_ok = "✅" if expectancy >= target_expectancy else "❌"
+    runner_pct_ok = "✅" if target_runner_pct_min <= runner_pct <= target_runner_pct_max else "⚠️"
+    
+    print(f"  {runner_r_ok} Avg R RUNNER: {avg_runner_r:.2f}R (target >= {target_runner_r}R)")
+    print(f"  {exp_ok} Expectancy:   {expectancy:.3f}R (target >= {target_expectancy}R)")
+    print(f"  {runner_pct_ok} % RUNNER:     {runner_pct:.1f}% (target {target_runner_pct_min}-{target_runner_pct_max}%)")
+    
     print("="*70)
     
     if trades:

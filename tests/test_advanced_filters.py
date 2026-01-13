@@ -52,9 +52,46 @@ def test_should_exit_on_funding_triggers(monkeypatch, fake_external_data):
 
     fake_external_data.funding_rate = 0.001  # 0.1%
 
-    should_exit, reason = run_async(af.should_exit_on_funding(fake_external_data, "BTC/USDT:USDT", "LONG"))
+    # Must pass negative PnL and imminent funding (<30min) to trigger exit
+    should_exit, reason = run_async(af.should_exit_on_funding(
+        fake_external_data, "BTC/USDT:USDT", "LONG",
+        unrealized_pnl=-10.0,  # Position losing
+        time_to_funding_min=15.0  # Funding imminent (<30min)
+    ))
     assert should_exit is True
-    assert "CRITICAL" in reason
+    assert "FUNDING EXIT" in reason
+
+
+def test_should_exit_on_funding_protects_profit(monkeypatch, fake_external_data):
+    """Test that positions in profit are NOT closed by funding"""
+    monkeypatch.setattr(af.FundingRateControl, "ENABLED", True, raising=False)
+    monkeypatch.setattr(af.FundingRateControl, "FORCE_EXIT_FUNDING_PCT", 0.05, raising=False)
+
+    fake_external_data.funding_rate = 0.001  # 0.1% (extreme)
+
+    # Position in profit should NOT exit
+    should_exit, reason = run_async(af.should_exit_on_funding(
+        fake_external_data, "BTC/USDT:USDT", "LONG",
+        unrealized_pnl=5.0,  # Position winning
+        time_to_funding_min=15.0  # Imminent but profitable
+    ))
+    assert should_exit is False
+
+
+def test_should_exit_on_funding_protects_distant_funding(monkeypatch, fake_external_data):
+    """Test that positions are NOT closed if funding settlement is far away"""
+    monkeypatch.setattr(af.FundingRateControl, "ENABLED", True, raising=False)
+    monkeypatch.setattr(af.FundingRateControl, "FORCE_EXIT_FUNDING_PCT", 0.05, raising=False)
+
+    fake_external_data.funding_rate = 0.001  # 0.1% (extreme)
+
+    # Losing position but funding far away (>30min) should NOT exit
+    should_exit, reason = run_async(af.should_exit_on_funding(
+        fake_external_data, "BTC/USDT:USDT", "LONG",
+        unrealized_pnl=-10.0,  # Position losing
+        time_to_funding_min=120.0  # Funding 2 hours away
+    ))
+    assert should_exit is False
 
 
 def test_check_session_quality_blocks_weekend(monkeypatch):
