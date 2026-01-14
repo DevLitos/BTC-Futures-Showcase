@@ -1,47 +1,106 @@
 """
-Main Entry Point for BTC Perpetual Trading System - ORDEN CORRECTO
+Main Entry Point for BTC Perpetual Trading System - PRODUCTION GRADE
+
+PRODUCTION FEATURES (Jan 14, 2026):
+- Centralized settings with pydantic-settings validation
+- Structured logging with secret redaction
+- Kill switch for hot trading pause
+- Health endpoints (/healthz, /readyz, /health)
+- Audit logging for critical events
+- Prometheus metrics for observability
 
 Prioridades de inicialización:
-1. DATOS DE MERCADO (WebSocket Kraken)
-2. BUFFER MULTI-TIMEFRAME sincronizado
-3. EJECUCIÓN REAL (REST + CCXT)
-4. DATOS EXTERNOS (Funding, Macro)
-5. PERSISTENCIA (Parquet/PostgreSQL)
-6. SIGNAL ENGINE (usa todo lo anterior)
+1. SETTINGS & LOGGING (validated configuration)
+2. DATOS DE MERCADO (WebSocket Kraken)
+3. BUFFER MULTI-TIMEFRAME sincronizado
+4. EJECUCIÓN REAL (REST + CCXT)
+5. DATOS EXTERNOS (Funding, Macro)
+6. PERSISTENCIA (Parquet/PostgreSQL)
+7. SIGNAL ENGINE (usa todo lo anterior)
 """
 
 import asyncio
 import logging
 import os
 import signal
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 
-# Load environment variables from ~/.trad2_env
+# =====================================================================
+# 🔒 PHASE 1: Load env file FIRST (before any imports that might use env vars)
+# =====================================================================
 def load_env_file():
-    """Load environment variables from ~/.trad2_env"""
-    env_file = Path.home() / '.trad2_env'
-    if env_file.exists():
-        with open(env_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    # Handle 'export ' prefix if present
-                    if line.startswith('export '):
-                        line = line[7:].strip()
-                    
-                    if '=' in line:
-                        key, value = line.split('=', 1)
-                        # Remove quotes if present
-                        value = value.strip()
-                        if (value.startswith('"') and value.endswith('"')) or \
-                           (value.startswith("'") and value.endswith("'")):
-                            value = value[1:-1]
+    """Load environment variables from ~/.trad2_env or .env"""
+    # Try ~/.trad2_env first, then .env
+    env_files = [Path.home() / '.trad2_env', Path('.env')]
+    
+    for env_file in env_files:
+        if env_file.exists():
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        # Handle 'export ' prefix if present
+                        if line.startswith('export '):
+                            line = line[7:].strip()
+                        
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            # Remove quotes if present
+                            value = value.strip()
+                            if (value.startswith('"') and value.endswith('"')) or \
+                               (value.startswith("'") and value.endswith("'")):
+                                value = value[1:-1]
                             
-                        os.environ[key.strip()] = value
-        logger.info(f"Environment variables loaded from {env_file}")
-    else:
-        logger.warning(f"Environment file {env_file} not found")
+                            # Don't override existing env vars
+                            if key.strip() not in os.environ:
+                                os.environ[key.strip()] = value
+            # Only load first found file
+            break
+
+# Load env vars before any other imports
+load_env_file()
+
+# =====================================================================
+# 🔒 PHASE 2: Initialize production-grade settings and logging
+# =====================================================================
+from core.settings import get_settings, TradingMode, validate_startup, redact_secrets
+from core.logging_config import configure_logging, get_audit_logger, set_session_id
+from core.kill_switch import init_kill_switch, get_kill_switch
+from core.health import init_health_status, get_health_status, start_health_server
+
+# Get validated settings (will fail fast if invalid)
+try:
+    settings = get_settings()
+except Exception as e:
+    # Minimal logging for startup failure
+    logging.basicConfig(level=logging.ERROR)
+    logging.error(f"❌ FATAL: Configuration validation failed: {e}")
+    raise SystemExit(1)
+
+# Configure structured logging with secret redaction
+configure_logging(settings)
+logger = logging.getLogger('MainApp')
+
+# Initialize kill switch
+init_kill_switch(settings.kill_switch_file)
+
+# Initialize health status
+health_status = init_health_status(
+    version=settings.app_version,
+    git_commit=settings.git_commit,
+    run_id=settings.run_id
+)
+
+# Extract commonly used settings
+WS_SYMBOL = settings.ws_symbol
+CCXT_SYMBOL = settings.ccxt_symbol
+EXCHANGE = settings.exchange.value
+DEMO_MODE = settings.demo_mode
+
+# =====================================================================
+# 🔒 PHASE 3: Import other modules (after logging is configured)
+# =====================================================================
 
 # 1. DATOS DE MERCADO
 from ingest.kraken_websocket import KrakenFuturesWebSocket
@@ -65,83 +124,32 @@ from engine.signal_engine import SignalEngine
 # 7. ERROR TRACKING
 from engine.error_tracker import ErrorTracker, ErrorTrackerConfig, ErrorSeverity, init_error_tracker
 
-# 8. HEALTH SERVER for Docker
-import http.server
-import socketserver
-import threading
-import json
+# 8. NEW ARCHITECTURE - Runtime Mode & Position Store
+from core import RuntimeMode, init_runtime, get_runtime_config
+from accounting import get_position_store
+from core.events import get_event_bus, EventType
 
-class HealthHandler(http.server.BaseHTTPRequestHandler):
-    """Simple HTTP handler for Docker health checks"""
-    bot_status = {"healthy": False, "reason": "not_started"}
-    signal_engine_ref = None  # Reference to signal engine for health data
-    
-    def do_GET(self):
-        if self.path == "/health":
-            status = HealthHandler.bot_status.copy()
-            
-            # Add detailed health monitor data if available
-            if HealthHandler.signal_engine_ref and hasattr(HealthHandler.signal_engine_ref, 'health_monitor'):
-                health_monitor = HealthHandler.signal_engine_ref.health_monitor
-                if health_monitor:
-                    health_data = health_monitor.get_health_status()
-                    status['system_health'] = health_data
-                    should_stop, reason = health_monitor.should_stop_trading()
-                    if should_stop:
-                        status['healthy'] = False
-                        status['reason'] = reason
-            
-            if status.get("healthy"):
-                self.send_response(200)
-            else:
-                self.send_response(503)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(status).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        pass  # Suppress HTTP logging
-
-def start_health_server(port: int = 8001):
-    """Start health check HTTP server in background thread"""
-    def run_server():
-        try:
-            # 🔥 FIX: Allow address reuse to prevent "Address already in use" errors
-            class ReusableTCPServer(socketserver.TCPServer):
-                allow_reuse_address = True
-            
-            with ReusableTCPServer(("", port), HealthHandler) as httpd:
-                httpd.serve_forever()
-        except OSError as e:
-            logging.getLogger('MainApp').warning(f"Health server could not start: {e}")
-    
-    thread = threading.Thread(target=run_server, daemon=True)
-    thread.start()
-    logging.getLogger('MainApp').info(f"Health server started on port {port}")
+# 9. METRICS
+from monitoring.metrics import (
+    start_metrics_server,
+    BUILD_INFO,
+    ORDERS_PLACED_TOTAL, ORDERS_FAILED_TOTAL,
+    WS_RECONNECTS_TOTAL, WS_MESSAGES_TOTAL,
+    HEALTH_WS_CONNECTED, HEALTH_EXCHANGE_REACHABLE, HEALTH_TIME_DRIFT_MS,
+    KILL_SWITCH_ACTIVE
+)
 
 # Legacy (mantener compatibilidad)
 from output.output_manager import OutputManager
-from monitoring.metrics import start_metrics_server
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)-20s - %(levelname)-8s - %(message)s'
-)
-logger = logging.getLogger('MainApp')
-
-# =====================================================================
-# 🔒 FIX (Jan 13, 2026): SUPPRESS HTTPX LOGGING TO PREVENT TOKEN LEAKS
-# httpx logs full URLs including API tokens which is a security risk
-# =====================================================================
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('httpcore').setLevel(logging.WARNING)
-
-# Load environment variables before using them
-load_env_file()
+# Set build info metric
+BUILD_INFO.info({
+    'version': settings.app_version,
+    'git_commit': settings.git_commit,
+    'run_id': settings.run_id,
+    'exchange': EXCHANGE
+})
+# NOTE: load_env_file() already called at line 62 - removed duplicate call here
 
 # Configuration from environment
 KRAKEN_API_KEY = os.getenv('KRAKEN_API_KEY', '')
@@ -200,6 +208,9 @@ class TradingSystemOrchestrator:
     """
     
     def __init__(self):
+        # Store settings reference
+        self.settings = settings
+        
         # 1. DATOS DE MERCADO (WebSocket solo para Kraken Futures por ahora)
         if EXCHANGE == 'krakenfutures':
             self.kraken_ws = KrakenFuturesWebSocket([WS_SYMBOL])
@@ -216,39 +227,16 @@ class TradingSystemOrchestrator:
         # 2. BUFFER SINCRONIZADO
         self.market_data = SynchronizedMultiTimeframeBuffer(CCXT_SYMBOL)
         
-        # 3. EJECUCIÓN
-        if EXCHANGE == 'krakenfutures':
-            credentials = {
-                'enableRateLimit': True,
-            }
-            if KRAKEN_FUTURES_API_KEY and KRAKEN_FUTURES_SECRET and not DEMO_MODE:
-                credentials['apiKey'] = KRAKEN_FUTURES_API_KEY
-                credentials['secret'] = KRAKEN_FUTURES_SECRET
-        elif EXCHANGE == 'kraken':
-            credentials = {
-                'enableRateLimit': True,
-            }
-            if KRAKEN_API_KEY and KRAKEN_SECRET and not DEMO_MODE:
-                credentials['apiKey'] = KRAKEN_API_KEY
-                credentials['secret'] = KRAKEN_SECRET
-        elif EXCHANGE == 'binance':
-            credentials = {
-                'enableRateLimit': True,
-                'options': {'defaultType': 'future'}
-            }
-            if BINANCE_API_KEY and BINANCE_SECRET and not DEMO_MODE:
-                credentials['apiKey'] = BINANCE_API_KEY
-                credentials['secret'] = BINANCE_SECRET
-        else:
-            credentials = {'enableRateLimit': True}
-            
+        # 3. EJECUCIÓN - Use credentials from settings
+        credentials = settings.get_credentials_dict()
         self.execution = RESTExecutionEngine(EXCHANGE, credentials)
         
         # 4. DATOS EXTERNOS
         self.external_data = ExternalDataManager(CCXT_SYMBOL, EXCHANGE)
         
         # 5. PERSISTENCIA
-        self.trade_logger = TradeLogger(PERSISTENCE, DB_URL)
+        self.trade_logger = TradeLogger(settings.persistence_backend, 
+                                        settings.database_url.get_secret_value() if settings.database_url else None)
         self.reconciler = PositionReconciler(self.execution)
         
         # 5.5 OUTPUT MANAGER
@@ -271,8 +259,8 @@ class TradingSystemOrchestrator:
                                          trade_logger=self.trade_logger,
                                          output_manager=self.output_manager)
         
-        # Register signal engine with health handler for detailed health endpoint
-        HealthHandler.signal_engine_ref = self.signal_engine
+        # 7. HEALTH STATUS - Update with signal engine reference
+        self.health_status = health_status
         
         self.tasks = []
         self.demo_mode = DEMO_MODE
@@ -315,10 +303,12 @@ class TradingSystemOrchestrator:
             return
         
         try:
-            # Load 1h candles (need 200+ for EMA 200)
-            candles_1h = await self.execution.fetch_ohlcv(CCXT_SYMBOL, '1h', limit=250)
+            # Load 1h candles (need 480+ for LocationFilter 20-day range)
+            # 500 bars = ~21 days of hourly data
+            candles_1h = await self.execution.fetch_ohlcv(CCXT_SYMBOL, '1h', limit=500)
             if candles_1h:
                 self.market_data.load_historical_candles(candles_1h, '1h')
+                logger.info(f"✓ Loaded {len(candles_1h)} 1h candles (LocationFilter needs 480)")
             else:
                 logger.warning("Failed to load 1h historical data")
             
@@ -341,21 +331,254 @@ class TradingSystemOrchestrator:
             
         except Exception as e:
             logger.error(f"Error loading historical data: {e}", exc_info=True)
-    
+
+    async def _startup_recovery_check(self):
+        """
+        FIX #2 (Jan 13, 2026): Complete startup recovery after crash.
+        
+        Checks:
+        1. Open positions on exchange → create local tracking or close
+        2. Pending orders → cancel stale orders
+        3. Sync PnL state for the day
+        4. Notify user of recovery actions
+        """
+        from datetime import datetime, UTC
+        from engine.risk_engine import Position
+        
+        logger.info("🔄 STARTUP RECOVERY: Checking for orphan positions/orders...")
+        
+        recovery_actions = []
+        
+        # Step 1: Check for open positions
+        try:
+            exchange_pos = await self.execution.get_position(CCXT_SYMBOL)
+            
+            if exchange_pos:
+                size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                side = exchange_pos.get('side', '').lower()
+                entry_price = float(exchange_pos.get('entryPrice', 0) or exchange_pos.get('info', {}).get('avgEntryPrice', 0) or 0)
+                
+                if size > 0.00001:
+                    logger.warning(f"⚠️ EXISTING POSITION DETECTED: {side} {size:.6f} @ {entry_price:.2f}")
+                    recovery_actions.append(f"Found existing {side} position: {size:.6f}")
+                    
+                    # =========================================================================
+                    # DECISION: ADOPT position (don't close!)
+                    # Closing on restart is WRONG - we lose money for no reason
+                    # The position is legitimate, just restart the tracking
+                    # =========================================================================
+                    CLOSE_ORPHAN_POSITIONS = False  # NEVER close legitimate positions!
+                    
+                    if CLOSE_ORPHAN_POSITIONS:
+                        logger.warning("🔄 CLOSING ORPHAN POSITION (safety first)...")
+                        try:
+                            close_side = 'sell' if side == 'long' else 'buy'
+                            await self.execution.close_position_market(
+                                symbol=CCXT_SYMBOL,
+                                side=close_side,
+                                amount=size,
+                                reason="ORPHAN_CLEANUP"
+                            )
+                            logger.info(f"✅ Orphan position closed: {size:.6f} {side}")
+                            recovery_actions.append(f"Closed orphan position: {size:.6f} {side}")
+                            
+                            # Send notification
+                            if self.output_manager:
+                                await self.output_manager.send_critical_alert(
+                                    f"🔄 STARTUP RECOVERY: Closed orphan {side} position of {size:.6f} BTC"
+                                )
+                        except Exception as e:
+                            logger.critical(f"🔴 FAILED TO CLOSE ORPHAN POSITION: {e}")
+                            recovery_actions.append(f"FAILED to close orphan: {e}")
+                            raise RuntimeError(f"Cannot recover: orphan position close failed: {e}")
+                    else:
+                        # Adopt the position into risk engine
+                        logger.info("🔄 ADOPTING EXISTING POSITION into risk engine...")
+                        # Create Position object for tracking
+                        direction = 'LONG' if side == 'long' else 'SHORT'
+                        
+                        # Check for existing SL/TP orders on exchange
+                        existing_sl = None
+                        existing_tp = None
+                        try:
+                            open_orders = await self.execution.get_open_orders(CCXT_SYMBOL)
+                            for order in open_orders:
+                                order_type = str(order.get('type', '')).lower()
+                                reduce_only = order.get('reduceOnly', order.get('info', {}).get('reduceOnly', False))
+                                
+                                if order_type in ('stop-loss', 'stop') or (reduce_only and order.get('side') != side):
+                                    existing_sl = float(order.get('price', 0) or order.get('triggerPrice', 0) or order.get('stopPrice', 0) or 0)
+                                    logger.info(f"   Found existing SL order: {existing_sl:.2f}")
+                                elif order_type in ('take-profit', 'limit') and reduce_only:
+                                    existing_tp = float(order.get('price', 0) or 0)
+                                    logger.info(f"   Found existing TP order: {existing_tp:.2f}")
+                        except Exception as e:
+                            logger.warning(f"   Could not check for existing SL/TP: {e}")
+                        
+                        # Use existing SL or conservative estimate
+                        if existing_sl and existing_sl > 0:
+                            sl_to_use = existing_sl
+                            sl_active = True
+                        else:
+                            # Conservative SL estimate (1% away)
+                            sl_to_use = entry_price * 0.99 if direction == 'LONG' else entry_price * 1.01
+                            sl_active = False
+                            logger.warning(f"   ⚠️ No SL found - using estimate: {sl_to_use:.2f}")
+                        
+                        self.signal_engine.risk_engine.position = Position(
+                            symbol=CCXT_SYMBOL,
+                            direction=direction,
+                            entry_price=entry_price,
+                            size=size,
+                            stop_loss=sl_to_use,
+                            atr_1m=100.0,  # Conservative estimate
+                            market_time=datetime.now(UTC)
+                        )
+                        
+                        # Mark SL status
+                        if sl_active:
+                            self.signal_engine.risk_engine.position.exchange_sl_active = True
+                            logger.info(f"   ✅ Exchange SL is ACTIVE at {sl_to_use:.2f}")
+                        else:
+                            self.signal_engine.risk_engine.position.exchange_sl_active = False
+                            logger.warning(f"   ⚠️ No exchange SL - will need to set one!")
+                        
+                        # Track TP if exists
+                        if existing_tp and existing_tp > 0:
+                            self.signal_engine.risk_engine.position.take_profit = existing_tp
+                            logger.info(f"   ✅ TP tracked at {existing_tp:.2f}")
+                        
+                        # Transition signal engine to MANAGE state
+                        from engine.state_machine import BotState
+                        if hasattr(self.signal_engine, 'state_machine'):
+                            self.signal_engine.state_machine.transition_to(BotState.MANAGE, "Adopted existing position")
+                            self.signal_engine._stops_set = sl_active  # Track if SL needs to be set
+                        
+                        logger.info(f"✅ Position adopted: {direction} {size:.6f} @ {entry_price:.2f}")
+                        recovery_actions.append(f"Adopted existing position: {direction} {size:.6f}")
+                else:
+                    logger.info("✓ No open position on exchange")
+            else:
+                logger.info("✓ No open position on exchange")
+                
+                # Clear any stale local state
+                if self.signal_engine.risk_engine.position is not None:
+                    logger.warning("   → Clearing stale local position state")
+                    self.signal_engine.risk_engine.position = None
+                    recovery_actions.append("Cleared stale local position state")
+                    
+        except Exception as e:
+            logger.error(f"Error checking positions: {e}")
+            raise
+        
+        # Step 2: Cancel stale pending orders (BUT NOT SL/TP if position exists!)
+        try:
+            open_orders = await self.execution.get_open_orders(CCXT_SYMBOL)
+            has_position = self.signal_engine.risk_engine.position is not None
+            
+            if open_orders and len(open_orders) > 0:
+                stale_count = 0
+                protective_count = 0
+                
+                for order in open_orders:
+                    order_id = order.get('id', 'unknown')
+                    order_type = str(order.get('type', 'unknown')).lower()
+                    order_side = order.get('side', 'unknown')
+                    order_amount = order.get('amount', 0)
+                    reduce_only = order.get('reduceOnly', order.get('info', {}).get('reduceOnly', False))
+                    
+                    # Check if this is a protective order (SL/TP)
+                    is_protective = order_type in ('stop-loss', 'stop', 'take-profit', 'trailing-stop') or reduce_only
+                    
+                    if has_position and is_protective:
+                        # DON'T cancel protective orders if we have a position!
+                        logger.info(f"   ✅ Keeping protective order: {order_id} ({order_type})")
+                        protective_count += 1
+                    else:
+                        # Cancel non-protective or orphan orders
+                        logger.warning(f"   Cancelling stale order: {order_id} ({order_type} {order_side} {order_amount})")
+                        try:
+                            await self.execution.cancel_order(order_id, CCXT_SYMBOL)
+                            recovery_actions.append(f"Cancelled stale order {order_id}")
+                            stale_count += 1
+                        except Exception as e:
+                            logger.error(f"   Failed to cancel order {order_id}: {e}")
+                
+                if stale_count > 0:
+                    logger.info(f"✅ Cancelled {stale_count} stale orders")
+                    recovery_actions.append(f"Found {stale_count} stale orders")
+                if protective_count > 0:
+                    logger.info(f"✅ Kept {protective_count} protective orders (SL/TP)")
+            else:
+                logger.info("✓ No pending orders on exchange")
+                
+        except Exception as e:
+            logger.error(f"Error checking orders: {e}")
+        
+        # Step 3: Sync position store (source of truth)
+        try:
+            position_store = get_position_store()
+            sync_result = await position_store.sync_from_exchange(self.execution.exchange)
+            
+            if sync_result.get('discrepancies'):
+                for d in sync_result['discrepancies']:
+                    logger.warning(f"⚠️ Position discrepancy: {d}")
+                    recovery_actions.append(f"Discrepancy: {d}")
+            
+            logger.info(f"✓ Position store synced: {sync_result.get('positions_synced', 0)} positions")
+        except Exception as e:
+            logger.error(f"Position store sync failed: {e}")
+        
+        # Step 4: Log recovery summary
+        if recovery_actions:
+            logger.info("=" * 50)
+            logger.info("🔄 STARTUP RECOVERY SUMMARY:")
+            for action in recovery_actions:
+                logger.info(f"   • {action}")
+            logger.info("=" * 50)
+            
+            # Only send critical alert if something BAD happened (closed position, errors)
+            # Adopting an existing position is NORMAL, not an emergency
+            has_critical_action = any(
+                'FAILED' in a or 'Closed' in a or 'error' in a.lower() 
+                for a in recovery_actions
+            )
+            
+            if has_critical_action and self.output_manager:
+                summary = "\\n".join([f"• {a}" for a in recovery_actions])
+                await self.output_manager.send_critical_alert(
+                    f"🔄 STARTUP RECOVERY COMPLETED:\\n{summary}"
+                )
+            else:
+                # Normal recovery (adopted position) - just log, no telegram spam
+                logger.info("✓ Recovery actions were routine - no critical alert needed")
+        else:
+            logger.info("✓ No recovery actions needed - clean startup")
+
     async def initialize(self):
         """
         Inicializar en el orden correcto
         """
         logger.info("=" * 70)
-        logger.info("🚀 BTC PERPETUAL TRADING SYSTEM - INITIALIZATION (CORRECT ORDER)")
+        logger.info("🚀 BTC PERPETUAL TRADING SYSTEM - INITIALIZATION (PRODUCTION GRADE)")
         logger.info("=" * 70)
         
-        # Start health server for Docker healthchecks
-        start_health_server(port=8001)
-        HealthHandler.bot_status = {"healthy": False, "reason": "initializing"}
+        # Start health server for Docker healthchecks (uses new health module)
+        start_health_server(self.health_status, port=settings.health_port)
+        
+        # Start Prometheus metrics server
+        start_metrics_server(port=settings.metrics_port)
         
         if self.demo_mode:
             logger.warning("🔧 DEMO MODE - Running without API keys")
+        
+        # Log kill switch status
+        kill_switch = get_kill_switch()
+        if kill_switch.is_active:
+            logger.warning(f"⚠️ KILL SWITCH ACTIVE: {kill_switch.reason}")
+            KILL_SWITCH_ACTIVE.set(1)
+        else:
+            KILL_SWITCH_ACTIVE.set(0)
         
         try:
             # 1. WebSocket (solo Kraken por ahora)
@@ -372,6 +595,11 @@ class TradingSystemOrchestrator:
                 
                 self.tasks.append(asyncio.create_task(self.kraken_ws.connect(), name="KrakenWS"))
                 await asyncio.sleep(2)  # Esperar a conectar
+                
+                # Update health status
+                if self.kraken_ws.is_connected:
+                    self.health_status.set_ws_connected(True)
+                    HEALTH_WS_CONNECTED.labels(exchange=EXCHANGE).set(1)
             else:
                 logger.info("\n[1/7] WebSocket disabled - using REST polling only")
             
@@ -384,6 +612,8 @@ class TradingSystemOrchestrator:
             # 4. Execution engine (REST)
             logger.info("[4/7] Initializing REST execution engine...")
             await self.execution.initialize()
+            self.health_status.set_exchange_reachable(True)
+            HEALTH_EXCHANGE_REACHABLE.labels(exchange=EXCHANGE).set(1)
             
             # 4.5. Load historical data to bootstrap
             if not self.demo_mode:
@@ -404,25 +634,16 @@ class TradingSystemOrchestrator:
             await self.trade_logger.start()
             logger.info("✓ Persistence logger started (backpressure queues active)")
             
-            # 6.5. RECONCILIATION AT STARTUP - Critical for crash recovery
-            logger.info("[6.5/7] Checking exchange position vs local state...")
+            # 6.5. POSITION RECOVERY AT STARTUP - Critical for crash recovery
+            logger.info("[6.5/7] 🔄 STARTUP RECOVERY: Checking exchange state...")
             try:
-                exchange_pos = await self.execution.get_position(CCXT_SYMBOL)
-                exchange_size = exchange_pos.get('contracts', 0) if exchange_pos else 0
-                local_pos = self.signal_engine.risk_engine.position
-                local_size = local_pos.size if local_pos else 0
-                
-                if exchange_size != 0 and local_size == 0:
-                    logger.warning(f"⚠️ RECONCILE NEEDED: Exchange has position ({exchange_size}) but local is empty")
-                    logger.warning("   → Manual intervention required: close position on exchange or restart with position sync")
-                elif exchange_size == 0 and local_size != 0:
-                    logger.warning(f"⚠️ RECONCILE NEEDED: Local has position ({local_size}) but exchange is empty")
-                    logger.warning("   → Clearing local position state")
-                    self.signal_engine.risk_engine.position = None
-                else:
-                    logger.info(f"✓ Position reconciliation OK (exchange={exchange_size}, local={local_size})")
+                await self._startup_recovery_check()
             except Exception as e:
-                logger.warning(f"Could not reconcile positions at startup: {e}")
+                logger.error(f"Startup recovery failed: {e}")
+                runtime_config = get_runtime_config()
+                if runtime_config.mode == RuntimeMode.LIVE:
+                    logger.critical("🚨 CRITICAL: Cannot recover state in LIVE mode - stopping")
+                    raise RuntimeError(f"Startup recovery required in LIVE mode: {e}")
             
             # 7. Signal Engine (fetch balance + set leverage)
             logger.info("[7/7] Initializing signal engine (balance + leverage)...")
@@ -439,11 +660,12 @@ class TradingSystemOrchestrator:
             logger.info("\n✅ All components initialized successfully")
             logger.info("=" * 70)
             
-            # Mark as healthy for Docker
-            HealthHandler.bot_status = {"healthy": True, "reason": "initialized"}
+            # Mark as healthy for Docker (using new health module)
+            self.health_status.set_healthy(True, "initialized")
             
         except Exception as e:
-            HealthHandler.bot_status = {"healthy": False, "reason": f"init_error: {str(e)[:100]}"}
+            self.health_status.set_healthy(False, f"init_error: {str(e)[:100]}")
+            HEALTH_EXCHANGE_REACHABLE.labels(exchange=EXCHANGE).set(0)
             if self.demo_mode:
                 logger.warning(f"Initialization warning (DEMO MODE): {e}")
                 # Continue in demo mode
@@ -471,8 +693,10 @@ class TradingSystemOrchestrator:
             # Start monitoring
             self.tasks.append(asyncio.create_task(self._monitoring_loop(), name="Monitor"))
             
-            # Start metrics
-            start_metrics_server()
+            # Metrics server already started in initialize()
+            
+            # Start kill switch monitor task
+            self.tasks.append(asyncio.create_task(self._kill_switch_monitor(), name="KillSwitchMonitor"))
             
             logger.info("=" * 70)
             logger.info("✅ SYSTEM READY")
@@ -558,6 +782,50 @@ class TradingSystemOrchestrator:
         self._ws_last_candle_time = datetime.now()
         self.ws_healthy = True
         logger.info(f"1h candle closed: O={candle['open']:.2f} C={candle['close']:.2f}")
+    
+    # ===== KILL SWITCH MONITOR =====
+    
+    async def _kill_switch_monitor(self):
+        """
+        Background task to monitor kill switch state.
+        Checks every 5 seconds for env var or file flag changes.
+        """
+        kill_switch = get_kill_switch()
+        audit_logger = get_audit_logger()
+        
+        while self.is_running:
+            try:
+                await asyncio.sleep(5)
+                
+                # Check for changes (is_active checks file flag and env var internally)
+                was_active = getattr(self, '_kill_switch_was_active', False)
+                is_now_active = kill_switch.is_active
+                
+                # Update metrics
+                KILL_SWITCH_ACTIVE.set(1 if is_now_active else 0)
+                
+                # If just activated, log and notify
+                if is_now_active and not was_active:
+                    logger.warning(f"⚠️ KILL SWITCH ACTIVATED: {kill_switch.reason}")
+                    audit_logger.kill_switch_activated(reason=kill_switch.reason)
+                    
+                    # Pause signal engine if it has a pause method
+                    if hasattr(self.signal_engine, 'pause'):
+                        self.signal_engine.pause()
+                
+                # Track state for next iteration
+                self._kill_switch_was_active = is_now_active
+                    
+                if not is_now_active and was_active:
+                    logger.info("✅ KILL SWITCH DEACTIVATED - resuming trading")
+                    
+                    # Resume signal engine if it has a resume method
+                    if hasattr(self.signal_engine, 'resume'):
+                        self.signal_engine.resume()
+                        
+            except Exception as e:
+                logger.error(f"Error in kill switch monitor: {e}")
+                await asyncio.sleep(30)  # Back off on error
     
     # ===== FALLBACK REST POLLING (si WebSocket falla) =====
     
@@ -705,6 +973,23 @@ class TradingSystemOrchestrator:
                     recon = await self.reconciler.get_status()
                     logger.info(f"Last Reconcile: {recon['last_reconcile']}")
                 
+                # Position Store sync (NEW - source of truth)
+                try:
+                    runtime_config = get_runtime_config()
+                    if runtime_config.mode == RuntimeMode.LIVE:
+                        position_store = get_position_store()
+                        sync_result = await position_store.sync_from_exchange(self.execution.exchange)
+                        
+                        if sync_result.get('discrepancies'):
+                            for d in sync_result['discrepancies']:
+                                logger.warning(f"⚠️ Position mismatch detected: {d}")
+                        else:
+                            pos = position_store.get_position(CCXT_SYMBOL)
+                            pos_str = f"{pos.side} {pos.size:.6f}" if pos and not pos.is_flat else "FLAT"
+                            logger.info(f"Position (exchange truth): {pos_str}")
+                except Exception as e:
+                    logger.error(f"Position sync error in monitoring: {e}")
+                
                 logger.info("=" * 70)
                 
             except Exception as e:
@@ -722,6 +1007,9 @@ class TradingSystemOrchestrator:
         logger.info("=" * 70)
         
         self.is_running = False
+        
+        # Mark as shutting down
+        self.health_status.set_healthy(False, "shutting_down")
         
         try:
             # 1. Stop signal engine (cierra posiciones)
@@ -754,8 +1042,8 @@ class TradingSystemOrchestrator:
                 try:
                     stats = self.trade_logger.get_stats()
                     logger.info(f"Trade logger stats: trades={stats['trades_logged']}, events={stats['events_logged']}, dropped={stats['trades_dropped']+stats['events_dropped']}")
-                except Exception:
-                    pass
+                except (KeyError, AttributeError) as e:
+                    logger.debug(f"Could not get trade logger stats: {e}")
                 await self.trade_logger.stop()
                 logger.info("✓ Trade logger stopped and flushed")
             
@@ -794,6 +1082,77 @@ class TradingSystemOrchestrator:
 
 async def main():
     """Main entry"""
+    
+    # =========================================================================
+    # 🔒 PRODUCTION: Configure logging FIRST with structured output
+    # =========================================================================
+    configure_logging(settings)
+    
+    # Set a unique session ID for this run (use run_id from settings)
+    set_session_id(settings.run_id)
+    
+    audit_logger = get_audit_logger()
+    audit_logger.system_start(mode=settings.trading_mode.value, exchange=settings.exchange.value)
+    
+    # Validate startup (fail fast on misconfig)
+    try:
+        validation_result = await validate_startup(settings)
+        if validation_result["valid"]:
+            logger.info("✅ Startup validation passed")
+        else:
+            for error in validation_result.get("errors", []):
+                logger.critical(f"❌ Startup validation error: {error}")
+            return
+        for warning in validation_result.get("warnings", []):
+            logger.warning(f"⚠️ Startup validation warning: {warning}")
+    except Exception as e:
+        logger.critical(f"❌ Startup validation FAILED: {e}")
+        return
+    
+    # Log build info and settings (redacted)
+    logger.info("=" * 70)
+    logger.info("🚀 BTC PERPETUAL TRADING SYSTEM v2.1.0 (PRODUCTION)")
+    logger.info("=" * 70)
+    logger.info(f"Settings: {redact_secrets(str(settings.model_dump()))}")
+    
+    # =========================================================================
+    # 🔒 CRITICAL: Initialize RuntimeMode FIRST before anything else
+    # This sets strict guardrails that PREVENT catastrophic errors
+    # =========================================================================
+    trading_mode = os.getenv('TRADING_MODE', 'PAPER').upper()
+    
+    if trading_mode == 'LIVE':
+        runtime_mode = RuntimeMode.LIVE
+    elif trading_mode == 'PAPER':
+        runtime_mode = RuntimeMode.PAPER
+        # ⚠️ CRITICAL WARNING: PAPER mode STILL EXECUTES REAL ORDERS on Kraken!
+        # The only difference is equity tracking is simulated.
+        # For TRUE paper trading (no real orders), use a testnet exchange
+        # or implement a SimulatedExecutionEngine.
+        logger.warning("⚠️  PAPER MODE WARNING: Real orders WILL be placed on Kraken!")
+        logger.warning("   This is NOT a simulation - you WILL move real money!")
+        logger.warning("   To disable real execution, implement SimulatedExecutionEngine")
+    else:
+        runtime_mode = RuntimeMode.BACKTEST
+    
+    # Initialize runtime config with strict validation
+    runtime_config = init_runtime(runtime_mode)
+    
+    logger.info("=" * 70)
+    logger.info(f"🔐 RUNTIME MODE: {runtime_config.mode.value}")
+    logger.info(f"   Equity source: {runtime_config.equity_source}")
+    logger.info(f"   Instant fill: {runtime_config.instant_fill}")
+    logger.info(f"   Reduce-only required: {runtime_config.reduce_only_required}")
+    
+    if runtime_config.mode == RuntimeMode.LIVE:
+        logger.warning("⚠️  LIVE MODE - REAL MONEY AT RISK!")
+        logger.warning("   All positions will be synced from exchange")
+        logger.warning("   SL/TP orders MUST be reduce_only")
+    logger.info("=" * 70)
+    
+    # Initialize position store (singleton - used throughout)
+    position_store = get_position_store()
+    
     orchestrator = TradingSystemOrchestrator()
     
     try:
@@ -801,10 +1160,13 @@ async def main():
         await orchestrator.start()
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+        audit_logger.log("SYSTEM_SHUTDOWN", reason="user_interrupt")
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
+        audit_logger.log("SYSTEM_CRASH", error=str(e), severity="CRITICAL")
     finally:
         await orchestrator.shutdown()
+        audit_logger.log("SYSTEM_STOPPED")
 
 
 if __name__ == "__main__":

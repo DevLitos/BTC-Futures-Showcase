@@ -21,7 +21,7 @@ from engine.filters import (
     # MTFStructureFilter removed (FIX #1: Enable earlier entries)
 )
 from engine.risk_engine import RiskEngine
-from engine.execution import round_size_to_exchange  # 🔒 FIX: Centralized size rounding
+from engine.execution import round_size_to_exchange, KRAKEN_BTC_MIN_SIZE  # 🔒 FIX: Centralized size rounding + min size
 from engine.indicators import (
     calculate_ema, calculate_atr, calculate_adx, calculate_rsi, calculate_bollinger_bands
 )
@@ -49,6 +49,11 @@ from engine.important_levels import (
     ImportantLevelsProvider, get_important_levels_provider,
     initialize_important_levels, LevelContext, LevelType
 )
+from engine.location_filter import LocationFilter, get_location_filter, LocationContext
+
+# NEW ARCHITECTURE: Position Store as Single Source of Truth
+from core import RuntimeMode, get_runtime_config
+from accounting import get_position_store, TrackedPosition
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +80,22 @@ SIGNALS_GENERATED = Counter(
 # Configuration
 ENTRY_TIMEOUT_MINUTES = 3  # 3 candles at 1m = 3 minutes
 POSITION_CHECK_INTERVAL = 5  # Check position every 5 seconds
+
+
+def _create_safe_task(coro, name: str = "anonymous"):
+    """
+    Create an async task with error handling.
+    Prevents fire-and-forget tasks from silently losing errors.
+    """
+    async def wrapped():
+        try:
+            return await coro
+        except asyncio.CancelledError:
+            pass  # Normal shutdown, don't log as error
+        except Exception as e:
+            logger.error(f"Async task '{name}' failed: {e}")
+    
+    return asyncio.create_task(wrapped(), name=name)
 
 
 
@@ -115,6 +136,17 @@ class SignalEngine:
         self._enforcement_mode = enforcement_mode
         self._is_backtest = enforcement_mode == 'backtest'
         
+        # =====================================================================
+        # NEW ARCHITECTURE: Position Store Integration
+        # In LIVE mode, position_store is the SINGLE SOURCE OF TRUTH
+        # =====================================================================
+        self._position_store = get_position_store()
+        try:
+            self._runtime_config = get_runtime_config()
+        except RuntimeError:
+            # Runtime not initialized yet (backtest mode)
+            self._runtime_config = None
+        
         # Core components
         self.state_machine = StateMachine(backtest_mode=self._is_backtest)
         self.risk_engine = RiskEngine(capital=0.0)  # Will be updated from exchange
@@ -138,6 +170,10 @@ class SignalEngine:
         self.htf_filter = HTFFilter(backtest_mode=self._is_backtest)
         # self.mtf_filter = MTFStructureFilter()  # REMOVED (FIX #1: Enable earlier entries)
         self.ltf_filter = LTFTriggerFilter(backtest_mode=self._is_backtest)
+        
+        # Location filter - macro context veto (prevents buying tops in RANGE)
+        self.location_filter = get_location_filter()
+        self._location_context: LocationContext = None
         
         # Regime classifier for volume-aware filtering
         self.regime_classifier = EdgeRegimeClassifier()
@@ -333,6 +369,12 @@ class SignalEngine:
         
         self._last_exchange_state_check = now
         
+        # 🔒 FIX (Jan 14, 2026): Skip enforcement during HARD_LOCK (exit in progress)
+        # The reconciler handles state during exits - don't interfere
+        if self.reconciler and self.reconciler.is_hard_locked:
+            logger.debug("Skipping exchange state enforcement: HARD_LOCK active")
+            return
+        
         try:
             # 🔥 GET EXCHANGE TRUTH
             exchange_position = await self.execution.get_position(self.symbol)
@@ -354,6 +396,9 @@ class SignalEngine:
             # ===== ENFORCE STATE BASED ON EXCHANGE =====
             if exchange_size > MIN_POSITION_SIZE:
                 # EXCHANGE HAS POSITION → WE MUST BE IN MANAGE (or WAIT_FILL transitioning)
+                # Reset "no position" counter since we have one
+                self._consecutive_no_position_checks = 0
+                
                 if current_state == BotState.IDLE:
                     logger.critical(f"🔄 STATE OVERRIDE: IDLE but exchange has {exchange_size:.6f} → forcing MANAGE")
                     
@@ -372,9 +417,37 @@ class SignalEngine:
                     local_pos.size = exchange_size
                     
             else:
-                # EXCHANGE HAS NO POSITION → WE MUST BE IN IDLE (unless actively waiting for fill)
+                # EXCHANGE HAS NO POSITION
+                # 🔒 FIX: Require 3 consecutive "no position" checks before forcing IDLE
+                # This prevents race conditions after partial closes
+                if not hasattr(self, '_consecutive_no_position_checks'):
+                    self._consecutive_no_position_checks = 0
+                
+                self._consecutive_no_position_checks += 1
+                
                 if current_state == BotState.MANAGE:
-                    logger.critical(f"🔄 STATE OVERRIDE: MANAGE but exchange has no position → forcing IDLE")
+                    if self._consecutive_no_position_checks < 3:
+                        # Wait for more confirmations before forcing IDLE
+                        logger.warning(f"⚠️ Exchange shows no position ({self._consecutive_no_position_checks}/3) - waiting for confirmation")
+                        return
+                    
+                    # 🔒 FIX (Jan 14, 2026): Force sync position_store before final decision
+                    # This ensures phantom positions are cleared
+                    try:
+                        if self.execution and hasattr(self.execution, 'exchange'):
+                            await self._position_store.sync_from_exchange(self.execution.exchange)
+                        
+                        # NOW check if position_store still has a position (shouldn't after sync)
+                        ps_pos = self._position_store.get_position(self.symbol)
+                        if ps_pos and not ps_pos.is_flat and ps_pos.size > MIN_POSITION_SIZE:
+                            # This is weird - sync should have cleared it. Log but proceed anyway
+                            logger.error(f"🚨 position_store still has {ps_pos.side} {ps_pos.size:.6f} after sync - forcing clear")
+                            ps_pos.size = 0
+                            ps_pos.side = 'FLAT'
+                    except Exception as ps_e:
+                        logger.debug(f"Position store sync failed: {ps_e}")
+                    
+                    logger.critical(f"🔄 STATE OVERRIDE: MANAGE but exchange has no position (confirmed 3x) → forcing IDLE")
                     
                     # Clear local position
                     if self.risk_engine.has_open_position():
@@ -383,6 +456,7 @@ class SignalEngine:
                     
                     self._reset_trade_state("Exchange has no position - enforced")
                     self.state_machine.transition_to(BotState.IDLE, "No exchange position - enforced")
+                    self._consecutive_no_position_checks = 0
                 
                 # If in WAIT_FILL too long with no position, also reset
                 elif current_state == BotState.WAIT_FILL:
@@ -392,10 +466,54 @@ class SignalEngine:
                             logger.warning(f"🔄 WAIT_FILL timeout with no exchange position → forcing IDLE")
                             self._reset_trade_state("WAIT_FILL timeout - no position")
                             self.state_machine.transition_to(BotState.IDLE, "WAIT_FILL timeout - enforced")
+                            self._consecutive_no_position_checks = 0
                     
         except Exception as e:
             # On error, don't crash - just log and continue
-            logger.error(f"Error in exchange state enforcement: {e}")
+            # 🔒 FIX: Include stack trace for debugging
+            logger.error(f"Error in exchange state enforcement: {e}", exc_info=True)
+    
+    def _on_reconciler_state_change(self, public_state, snapshot):
+        """
+        Callback when ExchangeReconciler detects a state change.
+        
+        🔥 FIX (Jan 14, 2026): React immediately to position closes detected by reconciler.
+        This handles TP/SL fills on exchange that the bot didn't initiate.
+        """
+        from engine.exchange_reconciler import ReconcilerState
+        
+        # If reconciler says IDLE and we're in MANAGE, the position was closed externally
+        if public_state == ReconcilerState.IDLE and self.state_machine.state == BotState.MANAGE:
+            logger.critical("📤 RECONCILER DETECTED: Position closed on exchange (TP/SL hit)")
+            
+            # Record trade close with estimated PnL
+            if self.risk_engine.has_open_position():
+                position = self.risk_engine.position
+                # Try to get last known price for PnL estimate
+                candles = self.market_data.get_candles('1m')
+                current_price = candles[-1]['close'] if candles else position.entry_price
+                pnl_estimate = position.calculate_pnl(current_price) if hasattr(position, 'calculate_pnl') else 0
+                
+                # Log trade close
+                self.state_machine.record_trade_close(pnl_estimate, pnl_estimate > 0, exit_reason='EXCHANGE_TP_SL')
+                self.state_machine.update_daily_pnl(pnl_estimate)
+                
+                logger.info(f"✅ Trade closed by exchange TP/SL - Estimated PnL: ${pnl_estimate:.2f}")
+            
+            # Clear local state
+            self.risk_engine.position = None
+            self._reset_trade_state("Exchange TP/SL hit - reconciler detected")
+            self.state_machine.transition_to(BotState.IDLE, "Exchange TP/SL filled")
+            self._consecutive_no_position_checks = 0
+            
+            # Also clear position_store
+            try:
+                ps_pos = self._position_store.get_position(self.symbol)
+                if ps_pos:
+                    ps_pos.size = 0
+                    ps_pos.side = 'FLAT'
+            except Exception:
+                pass
     
     def _reset_trade_state(self, reason: str = "State reset"):
         """Limpia COMPLETAMENTE el estado de trading - CRITICAL para prevenir órdenes múltiples"""
@@ -532,6 +650,9 @@ class SignalEngine:
         # =====================================================================
         self.reconciler.set_symbol(symbol)
         
+        # 🔥 FIX (Jan 14, 2026): Register as listener to react to position closes
+        self.reconciler.register_listener(self._on_reconciler_state_change)
+        
         # 1. Set leverage on exchange
         leverage_set = await self.execution.set_leverage(leverage, symbol)
         if leverage_set:
@@ -624,6 +745,7 @@ class SignalEngine:
     async def _main_loop(self):
         """Main trading loop - process ticks every second"""
         last_reconcile_time = datetime.now(UTC)
+        last_position_sync_time = datetime.now(UTC)
         
         while self.is_running:
             # ═══════════════════════════════════════════════════════════════
@@ -637,6 +759,17 @@ class SignalEngine:
                 continue
             
             try:
+                # ═══════════════════════════════════════════════════════════════
+                # 🔒 NEW: Position Store Sync (LIVE mode - every 30s)
+                # This ensures we always have accurate position state from exchange
+                # FIX #4 (Jan 13, 2026): Enhanced with auto-correction
+                # ═══════════════════════════════════════════════════════════════
+                if self._runtime_config and self._runtime_config.mode == RuntimeMode.LIVE:
+                    time_since_sync = (datetime.now(UTC) - last_position_sync_time).total_seconds()
+                    if time_since_sync > 30:
+                        await self._periodic_reconciliation()
+                        last_position_sync_time = datetime.now(UTC)
+                
                 # Periodic order reconciliation (every 60s)
                 time_since_reconcile = (datetime.now(UTC) - last_reconcile_time).total_seconds()
                 if time_since_reconcile > 60:
@@ -884,34 +1017,38 @@ class SignalEngine:
         
         time_since_sync = (market_time - self._last_exchange_sync).total_seconds()
         if time_since_sync > 30:  # Sync cada 30s
-            # 🔥 AUDIT FIX: Use proper async lock instead of flag
-            async with self._sync_lock:
-                try:
-                    self._syncing_position = True
-                    
-                    exchange_has_position = await self.execution.has_open_position(self.symbol)
-                    if exchange_has_position:
-                        logger.critical("🔄 IDLE but exchange has position - syncing state...")
-                        
-                        # Get ATR for proper SL calculation
-                        candles_5m = self.market_data.get_candles('5m')
-                        atr_5m = self._calculate_atr_5m(pd.DataFrame(candles_5m)) if candles_5m else None
-                        
-                        # Intentar recuperar y sincronizar posición
-                        exchange_position = await self.execution.get_position(self.symbol)
-                        if exchange_position:
-                            await self.risk_engine.update_from_exchange_position(exchange_position, atr=atr_5m)
-                        
-                        self._syncing_position = False
-                        self.state_machine.transition_to(BotState.MANAGE, "Synced with exchange position")
-                        return
-                        
-                    self._last_exchange_sync = market_time
-                    
-                except Exception as e:
-                    logger.error(f"Error during exchange sync in IDLE: {e}")
-                finally:
-                    self._syncing_position = False
+            # 🔥 AUDIT FIX: Use proper async lock with timeout to prevent deadlock
+            try:
+                async with asyncio.timeout(10):  # 10 second timeout on lock
+                    async with self._sync_lock:
+                        try:
+                            self._syncing_position = True
+                            
+                            exchange_has_position = await self.execution.has_open_position(self.symbol)
+                            if exchange_has_position:
+                                logger.critical("🔄 IDLE but exchange has position - syncing state...")
+                                
+                                # Get ATR for proper SL calculation
+                                candles_5m = self.market_data.get_candles('5m')
+                                atr_5m = self._calculate_atr_5m(pd.DataFrame(candles_5m)) if candles_5m else None
+                                
+                                # Intentar recuperar y sincronizar posición
+                                exchange_position = await self.execution.get_position(self.symbol)
+                                if exchange_position:
+                                    await self.risk_engine.update_from_exchange_position(exchange_position, atr=atr_5m)
+                                
+                                # 🔒 FIX: Don't set flag here - let finally handle it
+                                self.state_machine.transition_to(BotState.MANAGE, "Synced with exchange position")
+                                return
+                                
+                            self._last_exchange_sync = market_time
+                            
+                        except Exception as e:
+                            logger.error(f"Error during exchange sync in IDLE: {e}")
+                        finally:
+                            self._syncing_position = False
+            except asyncio.TimeoutError:
+                logger.warning("Exchange sync lock acquisition timeout - will retry next cycle")
         
         # ===== CHECK IF IN WAIT_LTF STATE =====
         if self.setup_state == "WAIT_LTF":
@@ -1106,6 +1243,68 @@ class SignalEngine:
         if self._last_htf_state != f'passed_{bias}':
             logger.info(f"✅ HTF filter passed - Bias: {bias_label}")
             self._last_htf_state = f'passed_{bias}'
+        
+        # ===== BLOQUE 1.5: LOCATION FILTER (MACRO VETO) =====
+        # Check if location in market structure allows this trade direction
+        # This is a HARD VETO that prevents buying tops in RANGE regime
+        
+        closes_1h = df_1h['close'].values
+        highs_1h = df_1h['high'].values
+        lows_1h = df_1h['low'].values
+        volumes_1h = df_1h['volume'].values if 'volume' in df_1h.columns else np.ones(len(closes_1h))
+        
+        # Get ATR and ADX for location context
+        atr_1h_vals = calculate_atr(highs_1h, lows_1h, closes_1h, 14)
+        atr_1h = atr_1h_vals[-1] if len(atr_1h_vals) > 0 else current_price * 0.01
+        
+        adx_1h_vals, _ = calculate_adx(highs_1h, lows_1h, closes_1h, 14)
+        adx_1h = adx_1h_vals[-1] if len(adx_1h_vals) > 0 else 20.0
+        
+        # Get current regime for location filter
+        regime_for_location = self.regime_classifier.current_regime.value if self.regime_classifier.current_regime else "RANGE"
+        
+        # Calculate location context (cached by 1h bar close)
+        location_cache_key = _ts_to_int(df_1h.iloc[-1].get('timestamp', 0))
+        location_allowed, location_reason, self._location_context = self.location_filter.check(
+            closes_1h=closes_1h,
+            highs_1h=highs_1h,
+            lows_1h=lows_1h,
+            volumes_1h=volumes_1h,
+            current_price=current_price,
+            atr_1h=atr_1h,
+            adx_1h=adx_1h,
+            bias=bias,
+            regime=regime_for_location,
+            cache_key=location_cache_key
+        )
+        
+        # Store location context in trade tags
+        if self._location_context:
+            self._current_trade_tags['location_pct_60d'] = self._location_context.percentile_60d
+            self._current_trade_tags['location_headroom_atr'] = (
+                self._location_context.headroom_to_high_atr if bias == 'LONG' 
+                else self._location_context.headroom_to_low_atr
+            )
+            self._current_trade_tags['location_in_extreme'] = (
+                self._location_context.in_extreme_high or self._location_context.in_extreme_low
+            )
+            self._current_trade_tags['location_is_breakout'] = (
+                self._location_context.is_breakout_up or self._location_context.is_breakout_down
+            )
+        
+        if not location_allowed:
+            # Log location veto (once per bias change)
+            if not hasattr(self, '_last_location_state') or self._last_location_state != f'vetoed_{bias}':
+                logger.warning(f"📍 LOCATION VETO: {location_reason}")
+                if self._location_context:
+                    logger.info(self.location_filter.get_location_summary(self._location_context))
+                self._last_location_state = f'vetoed_{bias}'
+            return
+        else:
+            self._last_location_state = f'allowed_{bias}'
+            # Log location context on first pass or regime change
+            if self._location_context and self._idle_eval_count % 60 == 0:
+                logger.debug(self.location_filter.get_location_summary(self._location_context))
         
         # ===== BLOQUE 2: SKIPPED - MTF FILTER REMOVED =====
         # OPTIMIZATION FIX #1 (Jan 3, 2026):
@@ -1778,28 +1977,38 @@ class SignalEngine:
         
         # Re-check if score still passes threshold after RR adjustment
         if score < self._entry_threshold:
-            logger.warning(f"⛔ Score {score} < threshold {self._entry_threshold} AFTER RR adjustment - SKIP ENTRY")
+            logger.warning(f"⛔ Score {score:.1f} < threshold {self._entry_threshold} AFTER RR adjustment - SKIP ENTRY")
             self._current_trade_tags['skip_reason'] = 'score_below_threshold_after_rr_adjustment'
             return
         
-        # ===== RR HARD FLOOR CHECK - NEVER TRADE BELOW THIS =====
-        # With fees (~0.04%), slippage, and funding, RR < 0.8 is negative expectancy
-        rr_hard_floor = getattr(OperatingMode, 'RR_HARD_FLOOR', 0.8)
-        if tp_multiplier < rr_hard_floor:
-            logger.warning(f"🚫 RR BELOW HARD FLOOR: {tp_multiplier}R < {rr_hard_floor}R → REJECTED (mathematically unprofitable)")
-            self._current_trade_tags['skip_reason'] = 'rr_below_hard_floor'
+        # ===== RR HARD FLOOR CHECK - REGIME AWARE (Jan 14, 2026) =====
+        # Different regimes have different mathematical minimums:
+        # - RANGE: High winrate mean-reversion can work with 0.5R+
+        # - TREND: Need 0.9R+ because momentum premium
+        # Use regime_config.min_rr as PRIMARY floor
+        current_regime_config = self.regime_detector.get_config(self._current_regime)
+        regime_min_rr = current_regime_config.min_rr
+        
+        # Absolute floor (applies to ALL regimes)
+        absolute_floor = getattr(OperatingMode, 'RR_HARD_FLOOR', 0.4)
+        
+        # Use the higher of: regime-specific floor or absolute floor
+        effective_floor = max(regime_min_rr, absolute_floor)
+        
+        self._current_trade_tags['rr_regime_floor'] = regime_min_rr
+        self._current_trade_tags['rr_effective_floor'] = effective_floor
+        
+        if tp_multiplier < effective_floor:
+            logger.warning(f"🚫 RR BELOW FLOOR: {tp_multiplier:.2f}R < {effective_floor:.2f}R ({self._current_regime.value}) → REJECTED")
+            self._current_trade_tags['skip_reason'] = 'rr_below_floor'
             return
         
-        # ===== RR MINIMUM CHECK (by mode) =====
-        min_rr = OperatingMode.get_min_rr()
+        # Log acceptance for transparency
+        if tp_multiplier < 1.0:
+            logger.info(f"✅ RR {tp_multiplier:.2f}R ACCEPTED for {self._current_regime.value} (floor={effective_floor:.2f}R)")
+        
+        # Tag the configured values for analysis
         self._current_trade_tags['rr_configured'] = tp_multiplier
-        self._current_trade_tags['rr_min_required'] = min_rr
-        
-        if tp_multiplier < min_rr:
-            # Both DISCOVERY and PRODUCTION reject trades below their min RR
-            logger.warning(f"🚫 RR TOO LOW: {tp_multiplier}R < {min_rr}R → SKIP ENTRY")
-            self._current_trade_tags['skip_reason'] = 'rr_too_low'
-            return
         
         # 🔥 REFRESH CAPITAL BEFORE POSITION SIZING
         # This ensures we use ACTUAL free margin, not stale capital value
@@ -1823,7 +2032,7 @@ class SignalEngine:
         
         # ==================================================================
         # CENTRALIZED POSITION SIZING (Using PositionSizer + Score + Funding)
-        # Enhanced with: Loss streak, Session quality, Funding direction
+        # Enhanced with: Loss streak, Session quality, Day of week, Funding direction
         # ==================================================================
         
         # Get state multiplier from operational state machine
@@ -1831,6 +2040,9 @@ class SignalEngine:
         
         # Get black swan defensive multiplier
         black_swan_multiplier = self.black_swan_filter.get_size_multiplier(market_time)
+        
+        # Initialize funding_sizing_factor (will be updated in TIER 2 section if not backtest)
+        funding_sizing_factor = 1.0
         
         # SCORE-BASED SIZING: score=5→0.8x, score=6→1.0x, score>=7→1.2x
         # This replaces the old momentum-based sizing
@@ -1859,33 +2071,23 @@ class SignalEngine:
         combined_defensive *= session_multiplier
         
         # =========================================================================
-        # FUNDING DIRECTION SIZING (Jan 9, 2026) - Reduce when paying funding
+        # DAY OF WEEK SIZING (Jan 13, 2026) - Reduce on Friday/Weekend
         # =========================================================================
-        funding_sizing_factor = 1.0
-        funding_rate = 0.0
+        day_multiplier = OperatingMode.get_day_multiplier(market_time.weekday())
+        if day_multiplier < 1.0:
+            day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+            logger.info(f"📊 Day sizing: {day_names[market_time.weekday()]} → {day_multiplier:.0%}")
+        self._current_trade_tags['day_of_week'] = market_time.weekday()
+        self._current_trade_tags['day_size_factor'] = day_multiplier
+        combined_defensive *= day_multiplier
         
-        if not self._is_backtest:
-            try:
-                # Get current funding rate
-                funding_info = self.external_data.funding.get_funding_info()
-                funding_rate = funding_info.get('rate', 0.0) if funding_info else 0.0
-                
-                # Apply funding direction sizing
-                from engine.config import FundingRateControl
-                funding_sizing_factor = FundingRateControl.get_funding_sizing_factor(funding_rate, bias)
-                
-                # Store funding info in tags
-                self._current_trade_tags['funding_rate'] = funding_rate
-                self._current_trade_tags['funding_bucket'] = FundingRateControl.get_funding_bucket(funding_rate)
-                self._current_trade_tags['funding_direction'] = 'positive' if funding_rate > 0 else 'negative'
-                self._current_trade_tags['funding_sizing_factor'] = funding_sizing_factor
-                
-                if funding_sizing_factor != 1.0:
-                    logger.info(f"💰 Funding direction sizing: {funding_rate:.4%} ({bias}) → {funding_sizing_factor:.0%}")
-            except Exception as e:
-                logger.warning(f"Could not get funding rate for sizing: {e}")
-        
-        combined_defensive *= funding_sizing_factor
+        # =========================================================================
+        # FUNDING SIZING - Moved to TIER 2 section (lines ~1980) to avoid duplication
+        # The funding_sizing_factor is retrieved from external_data.funding.get_funding_info()
+        # which provides comprehensive funding data including directional scoring
+        # =========================================================================
+        # NOTE: funding_sizing_factor will be set later in the TIER 2 section
+        # and applied via combined_defensive there
         
         # Calculate position size using centralized sizer
         position_size, size_breakdown = self._position_sizer.calculate_position_size(
@@ -1910,7 +2112,7 @@ class SignalEngine:
             logger.info(f"📊 Size pre-rounded for local tracking: {intended_size:.8f} → {position_size:.8f}")
         
         # Log sizing breakdown with ALL factors
-        logger.info(f"📊 Position sizing: base={size_breakdown['base']:.6f} × state={size_breakdown['state']:.2f} × edge={size_breakdown['edge']:.2f} × score={score_size_multiplier:.1f}x × losses={loss_streak_multiplier:.2f}x × session={session_multiplier:.2f}x × funding={funding_sizing_factor:.2f}x = {position_size:.6f}")
+        logger.info(f"📊 Position sizing: base={size_breakdown['base']:.6f} × state={size_breakdown['state']:.2f} × edge={size_breakdown['edge']:.2f} × score={score_size_multiplier:.1f}x × losses={loss_streak_multiplier:.2f}x × session={session_multiplier:.2f}x × day={day_multiplier:.2f}x = {position_size:.6f}")
         
         if size_breakdown.get('blocked_by'):
             logger.warning(f"⛔ Sizing blocked by: {size_breakdown['blocked_by']}")
@@ -1948,6 +2150,7 @@ class SignalEngine:
             self._current_trade_tags['funding_sizing_factor'] = funding_info['sizing_factor']
             
             # Log funding status (INFO for normal, WARNING for elevated+)
+            # Bucket names from external_data: 'normal', 'elevated', 'high', 'critical', 'extreme'
             if funding_info['bucket'] in ['high', 'critical', 'extreme']:
                 logger.warning(f"⚠️ Funding {funding_info['bucket'].upper()}: {funding_info['rate_pct']:.4f}% | sizing ×{funding_info['sizing_factor']:.2f}")
             elif funding_info['bucket'] == 'elevated':
@@ -1980,6 +2183,9 @@ class SignalEngine:
                     volatility_bps = ((high - low) / close * 10000.0) if close > 0 else 0.0
                 except Exception as e:
                     logger.debug(f"Session metrics calc failed: {e}")
+            
+            # 🔒 FIX: Store ADX 1h in tags for consistency with HTF filter
+            self._current_trade_tags['adx_1h'] = float(adx_1h)
             
             session_ok, session_reason = check_session_quality(adx_1h, volatility_bps)
             self._current_trade_tags['session_quality'] = 'good' if session_ok else 'poor'
@@ -2152,7 +2358,7 @@ class SignalEngine:
                             'account_value': self.risk_engine.capital,
                             'score': score
                         }
-                        asyncio.create_task(self.output_manager.send_recommendation(rec))
+                        _create_safe_task(self.output_manager.send_recommendation(rec), "send_recommendation")
                     except Exception as e:
                         logger.error(f"Failed to send Telegram notification: {e}")
                 
@@ -2224,13 +2430,14 @@ class SignalEngine:
                     SIGNALS_GENERATED.labels(symbol=self.symbol, direction=bias).inc()
                     logger.info(f"🎯 Position opened: {bias} {fill_size} @ {fill_price:.2f}")
                 else:
-                    # LIVE MODE: Always go through WAIT_FILL to verify position on exchange
+                    # NON-BACKTEST MODE: Always go through WAIT_FILL to verify position on exchange
                     # Even if exchange API returns 'filled', we must verify:
                     # - Position actually exists
                     # - Actual fill price (may differ from order price)
                     # - Actual fill size (may be partial or rounded)
                     if is_instant_fill and not self._is_backtest:
-                        logger.info(f"⏳ Order returned filled status, but LIVE mode requires verification via WAIT_FILL")
+                        mode_name = self._runtime_config.mode.value if self._runtime_config else "UNKNOWN"
+                        logger.info(f"⏳ Order returned filled status, but {mode_name} mode (instant_fill=False) requires verification via WAIT_FILL")
                     
                     self.state_machine.start_entry_timer()
                     self.state_machine.transition_to(BotState.WAIT_FILL, "Order placed")
@@ -2318,7 +2525,7 @@ class SignalEngine:
                     atr = entry_data.get('atr_1m', 100)  # Default ATR if not available
                     
                     # Get current price
-                    current_price = self.market_data.get_last_price()
+                    current_price = self.market_data.last_price
                     
                     if current_price and entry_price and atr:
                         # Calculate how far price has moved away from limit
@@ -2401,32 +2608,84 @@ class SignalEngine:
             if elapsed > ENTRY_TIMEOUT_MINUTES * 60:
                 logger.warning(f"Entry timeout after {elapsed:.0f}s - attempting cancel")
                 
-                # Intentar cancelar en exchange
-                cancel_success = False
+                # ================================================================
+                # FIX #3 (Jan 13, 2026): Enhanced timeout cleanup with late fill detection
+                # ================================================================
+                
+                # Step 1: Check if order was ALREADY filled before we cancel
+                pre_cancel_filled = False
                 try:
-                    cancel_success = await self.execution.cancel_order(
-                        self.pending_order_id,
-                        self.symbol
+                    fill_status = await self.execution.poll_fill_status(
+                        self.pending_order_id, self.symbol
                     )
-                    # 📊 CAPA 5: Record cancel in health monitor
-                    if self.health_monitor:
-                        self.health_monitor.record_order_canceled(reason="timeout")
+                    if fill_status.get('filled'):
+                        logger.warning("⚠️ Order appears FILLED during timeout check - processing fill instead")
+                        pre_cancel_filled = True
+                        # Don't return - let the normal fill flow handle it below
                 except Exception as e:
-                    logger.error(f"Error cancelling order: {e}")
+                    logger.debug(f"Pre-cancel fill check error: {e}")
                 
-                # CRITICAL: Limpiar open_orders incluso si la cancelación falla
-                # (la orden puede ya estar filled o cancelada)
-                if self.pending_order_id in self.execution.open_orders:
-                    self.execution.open_orders.pop(self.pending_order_id, None)
-                    logger.debug(f"Cleaned order {self.pending_order_id} from local tracking")
-                
-                # Reconciliar con exchange para estar seguros
-                await self._reconcile_orders()
-                
-                # Limpieza completa del estado
-                self._reset_trade_state("Order timeout")
-                self.state_machine.transition_to(BotState.IDLE, "Entry timeout")
-                return
+                if not pre_cancel_filled:
+                    # Step 2: Cancel the order
+                    cancel_success = False
+                    try:
+                        cancel_success = await self.execution.cancel_order(
+                            self.pending_order_id,
+                            self.symbol
+                        )
+                        # 📊 CAPA 5: Record cancel in health monitor
+                        if self.health_monitor:
+                            self.health_monitor.record_order_canceled(reason="timeout")
+                    except Exception as e:
+                        logger.error(f"Error cancelling order: {e}")
+                    
+                    # Step 3: Wait briefly and check for LATE FILL (race condition)
+                    await asyncio.sleep(0.5)
+                    
+                    try:
+                        exchange_has_position = await self.execution.has_open_position(self.symbol)
+                        if exchange_has_position:
+                            logger.critical("🚨 LATE FILL DETECTED: Order filled after timeout!")
+                            logger.critical("🔄 Closing orphan position created by late fill...")
+                            
+                            # Get position details
+                            exchange_pos = await self.execution.get_position(self.symbol)
+                            if exchange_pos:
+                                size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                                side = exchange_pos.get('side', '').lower()
+                                
+                                if size >= KRAKEN_BTC_MIN_SIZE:
+                                    close_side = 'sell' if side == 'long' else 'buy'
+                                    await self.execution.close_position_market(
+                                        symbol=self.symbol,
+                                        side=close_side,
+                                        amount=size,
+                                        reason="LATE_FILL"
+                                    )
+                                    logger.info(f"✅ Late fill position closed: {size:.6f} {side}")
+                                    
+                                    # Notify
+                                    if self.output_manager:
+                                        await self.output_manager.send_critical_alert(
+                                            f"🚨 LATE FILL: Closed orphan {side} {size:.6f} (order filled after timeout)"
+                                        )
+                                elif size > 0:
+                                    logger.warning(f"⚠️ Late fill size {size:.6f} < min - considered closed")
+                    except Exception as e:
+                        logger.error(f"Error checking late fill: {e}")
+                    
+                    # Step 4: Clean up local state
+                    if self.pending_order_id in self.execution.open_orders:
+                        self.execution.open_orders.pop(self.pending_order_id, None)
+                        logger.debug(f"Cleaned order {self.pending_order_id} from local tracking")
+                    
+                    # Step 5: Reconcile to ensure clean state
+                    await self._reconcile_orders()
+                    
+                    # Step 6: Complete cleanup
+                    self._reset_trade_state("Order timeout (enhanced)")
+                    self.state_machine.transition_to(BotState.IDLE, "Entry timeout")
+                    return
         
         # Check if order was filled
         try:
@@ -2799,10 +3058,25 @@ class SignalEngine:
                 logger.critical(f"🚨 FORCED EXIT (Funding): {funding_exit_reason}")
                 # 🔐 FIX #2: Hard-lock during exit to prevent state corruption
                 self.reconciler.notify_exit_started("FUNDING_EXIT")
+                
+                # 🔒 FIX (Jan 14, 2026): Get real size from exchange
+                close_size = position.size
+                try:
+                    exchange_pos = await self.execution.get_position(self.symbol)
+                    if exchange_pos:
+                        close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                except Exception:
+                    pass
+                
+                if close_size < KRAKEN_BTC_MIN_SIZE:
+                    logger.warning(f"⚠️ FUNDING_EXIT skipped: size {close_size:.6f} < min")
+                    return
+                
                 await self.execution.close_position_market(
                     symbol=self.symbol,
                     side='sell' if position.direction == 'LONG' else 'buy',
-                    amount=position.size
+                    amount=close_size,
+                    reason="FUNDING_EXIT"
                 )
                 pnl_funding = position.unrealized_pnl
                 self.state_machine.record_trade_close(pnl_funding, pnl_funding > 0, exit_reason='FUNDING_EXIT')
@@ -2831,7 +3105,7 @@ class SignalEngine:
                     except Exception as e:
                         logger.debug(f"Could not refresh capital for funding exit notification: {e}")
                     
-                    asyncio.create_task(self.output_manager.send_exit_notification({
+                    _create_safe_task(self.output_manager.send_exit_notification({
                         'symbol': self.symbol,
                         'reason': 'FUNDING_EXIT',
                         'pnl': position.unrealized_pnl,
@@ -2839,7 +3113,7 @@ class SignalEngine:
                         'exit_price': current_price,
                         'timestamp': market_time.isoformat(),
                         'account_value': self.risk_engine.capital
-                    }))
+                    }), "funding_exit_notification")
                 
                 self.risk_engine.position = None
                 self._reset_trade_state(f"Trade closed: FUNDING_EXIT")
@@ -2855,10 +3129,25 @@ class SignalEngine:
                 logger.critical(f"🚨 FORCED EXIT (Time): {time_exit_reason}")
                 # 🔐 FIX #2: Hard-lock during exit to prevent state corruption
                 self.reconciler.notify_exit_started("TIME_EXIT")
+                
+                # 🔒 FIX (Jan 14, 2026): Get real size from exchange
+                close_size = position.size
+                try:
+                    exchange_pos = await self.execution.get_position(self.symbol)
+                    if exchange_pos:
+                        close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                except Exception:
+                    pass
+                
+                if close_size < KRAKEN_BTC_MIN_SIZE:
+                    logger.warning(f"⚠️ TIME_EXIT skipped: size {close_size:.6f} < min")
+                    return
+                
                 await self.execution.close_position_market(
                     symbol=self.symbol,
                     side='sell' if position.direction == 'LONG' else 'buy',
-                    amount=position.size
+                    amount=close_size,
+                    reason="TIME_EXIT"
                 )
                 pnl_time = position.unrealized_pnl
                 self.state_machine.record_trade_close(pnl_time, pnl_time > 0, exit_reason='TIME_EXIT')
@@ -2887,7 +3176,7 @@ class SignalEngine:
                     except Exception as e:
                         logger.debug(f"Could not refresh capital for time exit notification: {e}")
                     
-                    asyncio.create_task(self.output_manager.send_exit_notification({
+                    _create_safe_task(self.output_manager.send_exit_notification({
                         'symbol': self.symbol,
                         'reason': f'TIME_EXIT ({time_exit_reason})',
                         'pnl': position.unrealized_pnl,
@@ -2895,7 +3184,7 @@ class SignalEngine:
                         'exit_price': current_price,
                         'timestamp': market_time.isoformat(),
                         'account_value': self.risk_engine.capital
-                    }))
+                    }), "time_exit_notification")
                 
                 self.risk_engine.position = None
                 self._reset_trade_state(f"Trade closed: TIME_BASED_EXIT")
@@ -2950,6 +3239,44 @@ class SignalEngine:
         # Check for BOS against position
         has_bos_against = self._check_bos_against_position(position.direction, candles_5m)
         
+        # =====================================================================
+        # SMART EXITS INDICATORS (Jan 13, 2026)
+        # Calculate RSI, BB width for advanced exit management
+        # =====================================================================
+        rsi_1m = None
+        bb_width = None
+        bb_avg = None
+        vpoc_price = None
+        
+        try:
+            # Calculate RSI for momentum exit
+            if len(closes) >= 14:
+                rsi_values = calculate_rsi(closes, 14)
+                rsi_1m = float(rsi_values[-1]) if len(rsi_values) > 0 else None
+            
+            # Calculate Bollinger Bands for volatility squeeze
+            if len(closes) >= 20:
+                bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(closes, period=20, std_dev=2)
+                if len(bb_upper) > 0 and len(bb_lower) > 0:
+                    bb_width = float(bb_upper[-1] - bb_lower[-1])
+                    # Calculate average BB width from last 20 values
+                    if len(bb_upper) >= 20:
+                        bb_widths = bb_upper[-20:] - bb_lower[-20:]
+                        bb_avg = float(np.mean(bb_widths))
+                    else:
+                        bb_avg = bb_width
+            
+            # Get VPOC if available from advanced filters
+            try:
+                from engine.advanced_filters import calculate_vpoc
+                if len(candles_1m) >= 50:
+                    vpoc_price = calculate_vpoc(candles_1m[-100:] if len(candles_1m) >= 100 else candles_1m)
+            except Exception:
+                vpoc_price = None
+                
+        except Exception as e:
+            logger.debug(f"Could not calculate smart exit indicators: {e}")
+        
         # 🔥 FIX #3: Block logical exits when exchange is unavailable
         # Only emergency close with confirmed position is allowed
         if not self.reconciler.is_exchange_available():
@@ -2968,7 +3295,8 @@ class SignalEngine:
                     exchange_size = abs(float(exchange_pos.get('contracts', 0) or 0))
                     if exchange_size > 0 and abs(exchange_size - position.size) > 0.00001:
                         logger.info(f"🔄 Pre-manage size sync: local={position.size:.6f} → exchange={exchange_size:.6f}")
-                        position.size = exchange_size
+                        # 🔒 FIX: Use thread-safe sync method
+                        await self.risk_engine.sync_position_size(exchange_size, "pre-manage")
             except Exception as e:
                 logger.warning(f"Could not sync size before manage: {e}")
         
@@ -2983,7 +3311,11 @@ class SignalEngine:
             has_bos_against=has_bos_against,
             market_time=market_time,
             adx=current_adx,           # For hybrid TIME_INVALIDATION
-            atr_ratio=atr_ratio        # For volatility check
+            atr_ratio=atr_ratio,       # For volatility check
+            rsi_1m=rsi_1m,             # For momentum exit
+            vpoc=vpoc_price,           # For VPOC resistance exit
+            bb_width=bb_width,         # For volatility squeeze
+            bb_avg=bb_avg              # For volatility squeeze comparison
         )
         
         if exit_action:
@@ -2993,13 +3325,20 @@ class SignalEngine:
             try:
                 if action == 'PARTIAL_CLOSE':
                     close_size = float(exit_action.get('size', 0) or 0)
+                    
+                    # 🔒 FIX (Jan 14, 2026): Validate minimum order size before executing
+                    if close_size < KRAKEN_BTC_MIN_SIZE:
+                        logger.warning(f"⚠️ PARTIAL_CLOSE blocked: size {close_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}")
+                        return
+                    
                     if close_size > 0:
-                        # 🔐 FIX #2: Hard-lock during exit to prevent state corruption
-                        self.reconciler.notify_exit_started("PARTIAL_CLOSE")
+                        # 🔐 FIX #2: Hard-lock during PARTIAL close (uses timeout, not position=0)
+                        self.reconciler.notify_partial_close("SMART_PARTIAL_CLOSE")
                         await self.execution.close_position_market(
                             symbol=self.symbol,
                             side='sell' if position.direction == 'LONG' else 'buy',
-                            amount=close_size
+                            amount=close_size,
+                            reason="PARTIAL"
                         )
                         
                         # 🔥 CRITICAL: Sync local size with exchange after partial close
@@ -3133,7 +3472,8 @@ class SignalEngine:
                         await self.execution.close_position_market(
                             symbol=self.symbol,
                             side='sell' if position.direction == 'LONG' else 'buy',
-                            amount=close_size
+                            amount=close_size,
+                            reason="FULL_CLOSE"
                         )
                     
                     # Check if TP2 was reached
@@ -3160,7 +3500,8 @@ class SignalEngine:
                                     await self.execution.close_position_market(
                                         symbol=self.symbol,
                                         side='sell' if position.direction == 'LONG' else 'buy',
-                                        amount=remaining
+                                        amount=remaining,
+                                        reason="RESIDUAL"
                                     )
                                     logger.info(f"✅ Emergency closed remaining {remaining:.6f}")
                                 else:
@@ -3184,7 +3525,7 @@ class SignalEngine:
                 logger.warning(f"Could not refresh capital for notification: {e}")
             
             if self.output_manager:
-                asyncio.create_task(self.output_manager.send_exit_notification({
+                _create_safe_task(self.output_manager.send_exit_notification({
                     'symbol': self.symbol,
                     'reason': exit_action.get('reason', 'FULL_CLOSE'),
                     'pnl': pnl,
@@ -3192,7 +3533,7 @@ class SignalEngine:
                     'exit_price': current_price,
                     'timestamp': market_time.isoformat(),
                     'account_value': self.risk_engine.capital
-                }))
+                }), "full_close_notification")
             
             is_win = pnl > 0
             exit_reason = exit_action.get('reason', 'unknown')
@@ -3201,8 +3542,9 @@ class SignalEngine:
             
             # 🔥 DAILY DRAWDOWN: Update after each trade close
             if self.state_machine.update_daily_pnl(pnl):
-                # Daily halt triggered - will be checked on next can_trade()
-                logger.critical("🛑 Daily drawdown limit reached - trading halted for today")
+                # Daily halt triggered - close any remaining position and cancel orders
+                logger.critical("🛑 Daily drawdown limit reached - EMERGENCY CLOSE + trading halted for today")
+                await self._emergency_daily_halt_close()
             
             # DISCOVERY: Update score distribution metrics
             if hasattr(self, '_entry_score') and self._entry_score > 0:
@@ -3613,6 +3955,10 @@ class SignalEngine:
         if move <= 0:
             return 0.0
         
+        # 🔒 FIX: Prevent division by zero
+        if atr_1m <= 0:
+            return 0.0
+        
         return move / atr_1m
     
     def _check_not_post_impulse(self, df_1m: pd.DataFrame, atr_1m: float) -> tuple[bool, str]:
@@ -3804,22 +4150,44 @@ class SignalEngine:
         
         return total, breakdown, False
     
-    def _apply_rr_score_adjustment(self, score: int, rr: float) -> tuple[int, str]:
+    def _apply_rr_score_adjustment(self, score: int, rr: float) -> tuple[float, str]:
         """
-        Apply RR-based score adjustment.
+        Apply RR-based score adjustment with PROPORTIONAL penalty.
         
-        RR < 1.0 → Subtract penalty points (makes passing harder)
+        RR < 1.0 → Proportional penalty based on distance from ideal
         RR >= 1.5 → Add bonus point (rewards high RR)
+        
+        RANGE regime gets lighter penalty (high winrate compensates)
+        TREND regime gets full penalty (need RR for math)
         
         Returns: (adjusted_score, adjustment_reason)
         """
-        adjustment = 0
+        adjustment = 0.0
         reason = ""
         
-        # RR below threshold → penalty
+        # Get regime-specific multiplier for penalty
+        regime_multiplier = 1.0  # Default (TREND)
+        if hasattr(self, '_current_regime'):
+            from core.types import MarketRegime
+            if self._current_regime in (MarketRegime.RANGE,):
+                regime_multiplier = getattr(OperatingMode, 'RR_PENALTY_RANGE_MULTIPLIER', 0.5)
+        
+        # RR below threshold → PROPORTIONAL penalty (not fixed)
         if rr < OperatingMode.RR_PENALTY_THRESHOLD:
-            adjustment = -OperatingMode.RR_PENALTY_POINTS
-            reason = f"RR penalty: {rr:.2f}R < {OperatingMode.RR_PENALTY_THRESHOLD}R → -{OperatingMode.RR_PENALTY_POINTS}"
+            # Scale penalty: RR=0.5 → full penalty, RR=1.0 → 0 penalty
+            # penalty = max_penalty * (1 - rr) / 0.5 (clamped)
+            rr_gap = OperatingMode.RR_PENALTY_THRESHOLD - rr
+            max_penalty = getattr(OperatingMode, 'RR_PENALTY_MAX_POINTS', 2)
+            
+            # Proportional: RR=0.5 gets full penalty, RR=0.9 gets 20% penalty
+            penalty_ratio = min(1.0, rr_gap / 0.5)  # Normalize to 0-1
+            base_penalty = max_penalty * penalty_ratio
+            
+            # Apply regime multiplier (RANGE = 50% penalty)
+            adjustment = -base_penalty * regime_multiplier
+            
+            regime_note = f" (RANGE: {regime_multiplier:.0%} penalty)" if regime_multiplier < 1.0 else ""
+            reason = f"RR penalty: {rr:.2f}R < {OperatingMode.RR_PENALTY_THRESHOLD}R → {adjustment:.1f}{regime_note}"
             logger.warning(f"📉 {reason}")
         # RR excellent → bonus
         elif rr >= OperatingMode.RR_EXCELLENT_THRESHOLD:
@@ -3976,7 +4344,9 @@ class SignalEngine:
             adx_slope = adx[-1] - adx[-5]
         
         # Store in trade tags for analysis
-        self._current_trade_tags['adx'] = float(adx_val)
+        # NOTE: This is ADX from 5m timeframe (LTF momentum)
+        self._current_trade_tags['adx_5m'] = float(adx_val)
+        self._current_trade_tags['adx'] = float(adx_val)  # Keep for backwards compat
         self._current_trade_tags['adx_slope'] = float(adx_slope)
         
         # Store ADX array for regime detection (last 10 values)
@@ -4529,17 +4899,33 @@ class SignalEngine:
                 if candles_1m and len(candles_1m) > 0:
                     current_price = candles_1m[-1]['close']
                 
+                # 🔒 FIX (Jan 14, 2026): Get real size from exchange for emergency close
+                close_size = position.size
+                try:
+                    exchange_pos = await self.execution.get_position(self.symbol)
+                    if exchange_pos:
+                        close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                except Exception:
+                    pass
+                
+                if close_size < KRAKEN_BTC_MIN_SIZE:
+                    logger.warning(f"⚠️ Emergency close skipped: size {close_size:.6f} < min - position effectively closed")
+                    self.risk_engine.position = None
+                    self._reset_trade_state("Position too small to close")
+                    return
+                
                 # Calculate PnL
                 if position.direction == 'LONG':
-                    pnl = (current_price - position.entry_price) * position.size
+                    pnl = (current_price - position.entry_price) * close_size
                 else:
-                    pnl = (position.entry_price - current_price) * position.size
+                    pnl = (position.entry_price - current_price) * close_size
                 
                 # Market close via REST
                 close_result = await self.execution.close_position_market(
                     symbol=self.symbol,
                     side='sell' if position.direction == 'LONG' else 'buy',
-                    amount=position.size
+                    amount=close_size,
+                    reason="EMERGENCY"
                 )
                 
                 # ═══════════════════════════════════════════════════════════════
@@ -4601,16 +4987,86 @@ class SignalEngine:
                 logger.error(f"Error verifying position after emergency close exception: {verify_err}")
             # Limpia de todas formas
             self._reset_trade_state("Emergency close error")
+
+    async def _emergency_daily_halt_close(self):
+        """
+        Emergency close triggered by daily drawdown limit.
+        
+        FIX #1 (Jan 13, 2026): When daily loss limit is hit:
+        1. Cancel ALL pending orders
+        2. Close ANY open position at market
+        3. Set system to halt state
+        4. Log clearly for audit
+        """
+        logger.critical("🛑🛑🛑 DAILY HALT CLOSE - Closing all positions and cancelling orders 🛑🛑🛑")
+        
+        try:
+            # Step 1: Cancel ALL pending orders
+            try:
+                await self.execution.cancel_all_open_orders(self.symbol)
+                logger.info("✅ All pending orders cancelled for daily halt")
+            except Exception as e:
+                logger.error(f"Error cancelling orders during daily halt: {e}")
+            
+            # Step 2: Close any open position
+            try:
+                exchange_pos = await self.execution.get_position(self.symbol)
+                if exchange_pos:
+                    size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                    side = exchange_pos.get('side', '').lower()
+                    
+                    if size >= KRAKEN_BTC_MIN_SIZE:
+                        close_side = 'sell' if side == 'long' else 'buy'
+                        logger.critical(f"🛑 Closing {side} position of {size:.6f} at market")
+                        
+                        await self.execution.close_position_market(
+                            symbol=self.symbol,
+                            side=close_side,
+                            amount=size,
+                            reason="DAILY_HALT"
+                        )
+                        logger.critical(f"✅ Daily halt position closed: {size:.6f} {side}")
+                    elif size > 0:
+                        logger.warning(f"⚠️ Daily halt: Position {size:.6f} < min - considered closed")
+                else:
+                    logger.info("No open position to close for daily halt")
+            except Exception as e:
+                logger.critical(f"🔴 CRITICAL: Failed to close position during daily halt: {e}")
+            
+            # Step 3: Reset local state
+            self._reset_trade_state("Daily halt emergency close")
+            
+            # Step 4: Clear risk engine position
+            if self.risk_engine.position:
+                self.risk_engine.position = None
+            
+            logger.critical("🛑 Daily halt close completed - trading halted until next day")
+            
+        except Exception as e:
+            logger.critical(f"🔴🔴🔴 CRITICAL ERROR in daily halt close: {e}")
     
     # NOTE: _open_position_from_order REMOVED - duplicated and unused
     # Position opening logic is in _handle_wait_fill_state after fill confirmation
     
     def get_status(self) -> dict:
         """Get engine status"""
+        # Get position from PositionStore (source of truth in LIVE mode)
+        position_store_pos = None
+        if self._runtime_config and self._runtime_config.mode == RuntimeMode.LIVE:
+            ps_pos = self._position_store.get_position(self.symbol) if self.symbol else None
+            if ps_pos and not ps_pos.is_flat:
+                position_store_pos = {
+                    'side': ps_pos.side,
+                    'size': ps_pos.size,
+                    'entry_price': ps_pos.entry_price,
+                    'source': 'exchange'
+                }
+        
         status = {
             'state': str(self.state_machine.state),
             'current_bias': self.current_bias,
             'has_position': self.risk_engine.has_open_position(),
+            'position_store': position_store_pos,  # NEW: Source of truth
             'pending_order': self.pending_order_id is not None,
             'daily_trades': self.state_machine.daily_trades,
             'edge_state': self.edge_enforcement.state_machine.current_state.value if self.edge_enforcement else 'N/A',
@@ -4806,3 +5262,134 @@ class SignalEngine:
             
         except Exception as e:
             logger.error(f"Error recording trade for edge enforcement: {e}")
+
+    async def _periodic_reconciliation(self):
+        """
+        FIX #4 (Jan 13, 2026): Periodic reconciliation with exchange.
+        
+        Runs every 30s to ensure local state matches exchange reality.
+        Handles:
+        1. Position size drift (partial liquidations, etc.)
+        2. Orphan positions (position exists but no local tracking)
+        3. Ghost positions (local tracking but no exchange position)
+        4. Stale orders
+        """
+        try:
+            logger.debug("🔄 Periodic reconciliation starting...")
+            
+            # Step 1: Sync position store
+            sync_result = await self._position_store.sync_from_exchange(self.execution.exchange)
+            
+            # Step 2: Check for discrepancies and handle them
+            if sync_result.get('discrepancies'):
+                for d in sync_result['discrepancies']:
+                    disc_type = d.get('type', 'unknown')
+                    
+                    if disc_type == 'size_mismatch':
+                        # Exchange has different size than we think
+                        local_size = d.get('local_size', 0)
+                        exchange_size = d.get('exchange_size', 0)
+                        
+                        logger.warning(f"⚠️ SIZE MISMATCH: local={local_size:.6f} vs exchange={exchange_size:.6f}")
+                        
+                        # Update local position to match exchange
+                        if self.risk_engine.position:
+                            old_size = self.risk_engine.position.size
+                            self.risk_engine.position.size = exchange_size
+                            logger.info(f"🔄 Auto-corrected position size: {old_size:.6f} → {exchange_size:.6f}")
+                    
+                    elif disc_type == 'orphan_position':
+                        # Exchange has position, we don't track it
+                        logger.critical(f"🚨 ORPHAN POSITION DETECTED: {d}")
+                        
+                        # In production, we might want to adopt or close it
+                        # For now, just log critically
+                        if self.output_manager:
+                            await self.output_manager.send_critical_alert(
+                                f"🚨 ORPHAN POSITION: {d.get('exchange_side')} {d.get('exchange_size')} @ {d.get('exchange_entry')}"
+                            )
+                    
+                    elif disc_type == 'ghost_position':
+                        # We think we have position, exchange doesn't
+                        logger.warning(f"⚠️ GHOST POSITION: Local thinks we have position but exchange has none")
+                        
+                        # Clear local state
+                        if self.risk_engine.position:
+                            logger.warning("🔄 Clearing ghost position from local state")
+                            self.risk_engine.position = None
+                            self._reset_trade_state("Ghost position cleared")
+                            self.state_machine.transition_to(BotState.IDLE, "Ghost position - synced with exchange")
+                    
+                    else:
+                        logger.warning(f"⚠️ Unknown discrepancy: {d}")
+            
+            # Step 3: Verify local risk engine matches position store
+            pos_store_pos = self._position_store.get_position(self.symbol) if self.symbol else None
+            local_pos = self.risk_engine.position
+            
+            if pos_store_pos and not pos_store_pos.is_flat:
+                # Exchange has position
+                if not local_pos:
+                    # We should have local tracking but don't
+                    logger.warning("⚠️ Position store has position but risk engine doesn't")
+                    # The startup recovery or next candle will handle this
+                else:
+                    # Verify size matches
+                    if abs(pos_store_pos.size - local_pos.size) > 0.00001:
+                        logger.warning(f"🔄 Size correction: local={local_pos.size:.6f} → store={pos_store_pos.size:.6f}")
+                        local_pos.size = pos_store_pos.size
+            else:
+                # Exchange has no position
+                if local_pos:
+                    logger.warning("⚠️ Risk engine has position but exchange doesn't - clearing")
+                    self.risk_engine.position = None
+                    if self.state_machine.state == BotState.MANAGE:
+                        self._reset_trade_state("Periodic reconciliation - no exchange position")
+                        self.state_machine.transition_to(BotState.IDLE, "No exchange position")
+            
+            # Step 4: Check for stale orders (orders older than 5 minutes)
+            # CRITICAL: Do NOT cancel SL/TP protective orders!
+            try:
+                open_orders = await self.execution.get_open_orders(self.symbol)
+                if open_orders:
+                    for order in open_orders:
+                        # CRITICAL FIX: Skip protective orders (SL/TP) - these should remain indefinitely
+                        order_type = str(order.get('type', '')).lower()
+                        reduce_only = order.get('reduceOnly', order.get('info', {}).get('reduceOnly', False))
+                        
+                        # Skip stop-loss, take-profit, and any reduceOnly orders (protective orders)
+                        if order_type in ('stop-loss', 'stop', 'take-profit', 'trailing-stop'):
+                            logger.debug(f"Skipping protective order: {order.get('id')} type={order_type}")
+                            continue
+                        if reduce_only:
+                            logger.debug(f"Skipping reduceOnly order: {order.get('id')} (likely SL/TP)")
+                            continue
+                        
+                        order_time_str = order.get('datetime') or order.get('timestamp')
+                        if order_time_str:
+                            try:
+                                if isinstance(order_time_str, (int, float)):
+                                    order_time = datetime.fromtimestamp(order_time_str / 1000, tz=UTC)
+                                else:
+                                    order_time = datetime.fromisoformat(str(order_time_str).replace('Z', '+00:00'))
+                                
+                                age_seconds = (datetime.now(UTC) - order_time).total_seconds()
+                                
+                                if age_seconds > 300:  # 5 minutes
+                                    order_id = order.get('id', 'unknown')
+                                    logger.warning(f"⚠️ STALE ORDER: {order_id} is {age_seconds/60:.1f} min old (type={order_type}) - cancelling")
+                                    try:
+                                        await self.execution.cancel_order(order_id, self.symbol)
+                                        logger.info(f"✅ Stale order {order_id} cancelled")
+                                    except Exception as e:
+                                        logger.error(f"Failed to cancel stale order {order_id}: {e}")
+                            except Exception as e:
+                                logger.debug(f"Could not parse order time: {e}")
+            except Exception as e:
+                logger.debug(f"Error checking stale orders: {e}")
+            
+            logger.debug("✅ Periodic reconciliation complete")
+            
+        except Exception as e:
+            logger.error(f"Periodic reconciliation error: {e}")
+

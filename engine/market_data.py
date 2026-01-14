@@ -36,7 +36,7 @@ class SynchronizedMultiTimeframeBuffer:
     JAMÁS recalcules indicadores con velas incompletas
     """
     
-    def __init__(self, symbol: str = 'BTC/USD', max_candles: int = 250, backtest_mode: bool = False):
+    def __init__(self, symbol: str = 'BTC/USD', max_candles: int = 500, backtest_mode: bool = False):
         self.symbol = symbol
         self.max_candles = max_candles
         self.backtest_mode = backtest_mode

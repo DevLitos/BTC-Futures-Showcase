@@ -32,6 +32,9 @@ class FundingRateMonitor:
         # Track last funding bucket to avoid log spam
         self._last_logged_bucket = None
         
+        # 🔒 FIX (Jan 13, 2026): Reusable HTTP session to prevent resource leaks
+        self._session: Optional[aiohttp.ClientSession] = None
+        
         # Check if exchange is supported
         SUPPORTED_EXCHANGES = ['kraken', 'binance', 'krakenfutures']
         if exchange not in SUPPORTED_EXCHANGES:
@@ -40,6 +43,19 @@ class FundingRateMonitor:
         
         logger.info(f"FundingRateMonitor initialized for {symbol}")
     
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create reusable HTTP session."""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=30)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+    
+    async def _close_session(self):
+        """Close HTTP session if open."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+    
     async def start(self):
         """Start polling funding rate"""
         if not self.enabled:
@@ -47,17 +63,23 @@ class FundingRateMonitor:
             return
             
         self.is_running = True
-        while self.is_running:
-            try:
-                await self.poll_funding_rate()
-                await asyncio.sleep(self.check_interval)
-            except Exception as e:
-                logger.error(f"Error polling funding: {e}")
-                await asyncio.sleep(60)  # Retry en 1 min
+        try:
+            while self.is_running:
+                try:
+                    await self.poll_funding_rate()
+                    await asyncio.sleep(self.check_interval)
+                except Exception as e:
+                    logger.error(f"Error polling funding: {e}")
+                    await asyncio.sleep(60)  # Retry en 1 min
+        finally:
+            # 🔒 Always close session when stopping
+            await self._close_session()
     
     async def stop(self):
         """Stop funding monitor"""
         logger.info("Stopping funding rate monitor...")
+        self.is_running = False
+        await self._close_session()
         self.is_running = False
     
     async def poll_funding_rate(self) -> float:
@@ -94,38 +116,39 @@ class FundingRateMonitor:
             clean_symbol = self.symbol.replace('/', '').upper().replace('USDT', 'USD')
             symbol_kraken = symbol_map.get(self.symbol, symbol_map.get(clean_symbol, 'PF_XBTUSD'))
             
-            async with aiohttp.ClientSession() as session:
-                url = f"https://futures.kraken.com/derivatives/api/v3/tickers"
-                
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        tickers = data.get('tickers', [])
-                        
-                        # Find the matching ticker
-                        for ticker in tickers:
-                            if ticker.get('symbol') == symbol_kraken:
-                                raw_rate = float(ticker.get('fundingRate', 0))
-                                
-                                # KRAKEN FUNDING RATE FIX:
-                                # Kraken returns funding rate as annualized rate (e.g., 0.88 = 88% annual)
-                                # Convert to 8-hour rate for comparison with other exchanges
-                                # Annual → 8h: divide by (365 * 3) = 1095 funding periods per year
-                                # Or check if rate is already in correct format (very small number)
-                                if abs(raw_rate) > 0.01:  # Likely annualized format
-                                    # Convert annual to 8h rate: rate / 1095
-                                    rate = raw_rate / 1095.0
-                                    logger.debug(f"Kraken funding rate converted: {raw_rate:.4f} annual → {rate:.6f} (8h)")
-                                else:
-                                    rate = raw_rate
-                                
-                                self.current_rate = rate
-                                self.last_check = datetime.now()
-                                
-                                logger.info(f"Funding rate ({symbol_kraken}): {rate*100:.4f}% (8h)")
-                                return rate
-                        
-                        logger.warning(f"Symbol {symbol_kraken} not found in Kraken tickers")
+            # 🔒 FIX: Use reusable session instead of creating new one each time
+            session = await self._get_session()
+            url = f"https://futures.kraken.com/derivatives/api/v3/tickers"
+            
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    tickers = data.get('tickers', [])
+                    
+                    # Find the matching ticker
+                    for ticker in tickers:
+                        if ticker.get('symbol') == symbol_kraken:
+                            raw_rate = float(ticker.get('fundingRate', 0))
+                            
+                            # KRAKEN FUNDING RATE FIX:
+                            # Kraken returns funding rate as annualized rate (e.g., 0.88 = 88% annual)
+                            # Convert to 8-hour rate for comparison with other exchanges
+                            # Annual → 8h: divide by (365 * 3) = 1095 funding periods per year
+                            # Or check if rate is already in correct format (very small number)
+                            if abs(raw_rate) > 0.01:  # Likely annualized format
+                                # Convert annual to 8h rate: rate / 1095
+                                rate = raw_rate / 1095.0
+                                logger.debug(f"Kraken funding rate converted: {raw_rate:.4f} annual → {rate:.6f} (8h)")
+                            else:
+                                rate = raw_rate
+                            
+                            self.current_rate = rate
+                            self.last_check = datetime.now()
+                            
+                            logger.info(f"Funding rate ({symbol_kraken}): {rate*100:.4f}% (8h)")
+                            return rate
+                    
+                    logger.warning(f"Symbol {symbol_kraken} not found in Kraken tickers")
         
         except Exception as e:
             logger.error(f"Error getting Kraken funding: {e}")
@@ -135,21 +158,22 @@ class FundingRateMonitor:
     async def _get_binance_funding(self) -> float:
         """Binance funding rate"""
         try:
-            async with aiohttp.ClientSession() as session:
-                symbol_binance = self.symbol.replace('/', '').upper()
-                url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol_binance}USDT&limit=1"
-                
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
+            # 🔒 FIX: Use reusable session instead of creating new one each time
+            session = await self._get_session()
+            symbol_binance = self.symbol.replace('/', '').upper()
+            url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol_binance}USDT&limit=1"
+            
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    
+                    if data:
+                        rate = float(data[0]['fundingRate'])
+                        self.current_rate = rate
+                        self.last_check = datetime.now()
                         
-                        if data:
-                            rate = float(data[0]['fundingRate'])
-                            self.current_rate = rate
-                            self.last_check = datetime.now()
-                            
-                            logger.info(f"Funding rate: {rate*100:.4f}%")
-                            return rate
+                        logger.info(f"Funding rate: {rate*100:.4f}%")
+                        return rate
         
         except Exception as e:
             logger.error(f"Error getting Binance funding: {e}")

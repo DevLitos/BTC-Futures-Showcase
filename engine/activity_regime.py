@@ -300,6 +300,8 @@ class ActivityRegimeAnalyzer:
         
         # Consistency: direction agreement
         changes = np.diff(recent)
+        if len(changes) == 0:
+            return float(strength), 0.5  # Return neutral consistency if no changes
         if price_change >= 0:
             consistent = np.sum(changes >= 0) / len(changes)
         else:

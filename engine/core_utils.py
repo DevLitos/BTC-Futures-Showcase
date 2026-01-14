@@ -57,6 +57,59 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 
 # =============================================================================
+# ERROR MESSAGE SANITIZATION
+# =============================================================================
+
+# Patterns that might contain sensitive data
+_SENSITIVE_PATTERNS = [
+    'api_key', 'apikey', 'api-key',
+    'secret', 'password', 'token',
+    'authorization', 'auth',
+]
+
+
+def sanitize_error(error: Union[Exception, str], max_length: int = 200) -> str:
+    """
+    Sanitize error message to prevent logging sensitive data.
+    
+    - Truncates very long messages that might contain full responses
+    - Masks URLs that might contain API keys or tokens
+    - Removes query parameters from URLs
+    
+    Args:
+        error: Exception or error string
+        max_length: Maximum length of returned message
+        
+    Returns:
+        Sanitized error message safe for logging
+    """
+    import re
+    
+    msg = str(error)
+    
+    # Remove URL query parameters (often contain tokens)
+    msg = re.sub(r'\?[^\s]*', '?[PARAMS_REMOVED]', msg)
+    
+    # Mask anything that looks like an API key (long alphanumeric strings)
+    msg = re.sub(r'[A-Za-z0-9+/=]{32,}', '[MASKED]', msg)
+    
+    # Check for sensitive keywords and mask adjacent values
+    for pattern in _SENSITIVE_PATTERNS:
+        msg = re.sub(
+            rf'({pattern})[=:\s]+["\']?([^"\'\s,}}]+)',
+            r'\1=[MASKED]',
+            msg,
+            flags=re.IGNORECASE
+        )
+    
+    # Truncate if too long
+    if len(msg) > max_length:
+        msg = msg[:max_length] + '...[TRUNCATED]'
+    
+    return msg
+
+
+# =============================================================================
 # TIMESTAMP STANDARDIZATION
 # =============================================================================
 
@@ -564,8 +617,8 @@ class PositionSizer:
         
         if capital < DynamicRiskConfig.MICRO_ACCOUNT_THRESHOLD:
             # MICRO ACCOUNT: Percentage-based sizing
-            # Use 20% of capital as base margin (conservative but meaningful)
-            MICRO_ACCOUNT_MARGIN_PCT = 0.20  # 20% of capital per trade
+            # Use 55% of capital as base margin to achieve ~$200 notional after multipliers
+            MICRO_ACCOUNT_MARGIN_PCT = 0.55  # 55% of capital per trade
             
             base_margin = capital * MICRO_ACCOUNT_MARGIN_PCT
             

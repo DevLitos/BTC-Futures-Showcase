@@ -195,7 +195,8 @@ class RegimeDetector:
         try:
             slope = np.polyfit(x, y, 1)[0]
             return slope
-        except:
+        except (np.linalg.LinAlgError, ValueError, TypeError) as e:
+            logger.debug(f"Slope calculation failed: {e}")
             return 0.0
     
     def _is_chaos(self, spread_pct: float, range_expansion: float, volume_spike: bool) -> bool:

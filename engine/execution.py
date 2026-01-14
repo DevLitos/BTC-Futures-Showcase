@@ -8,16 +8,99 @@ REGLA DE ORO: WebSocket = datos, REST = ejecución
 import asyncio
 import logging
 import math
-from typing import Optional, Dict, Tuple
+import random
+from typing import Optional, Dict, Tuple, Callable, TypeVar, Any
+from functools import wraps
 import ccxt.async_support as ccxt
 from datetime import datetime, UTC
 
+from core.settings import generate_client_order_id
+
 logger = logging.getLogger(__name__)
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    """Safely convert value to float, handling None and invalid types."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid numeric value for conversion: {value!r}")
+        return default
+
 
 # Timeouts para operaciones de exchange (segundos)
 EXCHANGE_TIMEOUT_SHORT = 10.0   # Para consultas simples
 EXCHANGE_TIMEOUT_MEDIUM = 30.0  # Para órdenes
 EXCHANGE_TIMEOUT_LONG = 60.0    # Para operaciones complejas
+
+# Retry configuration
+MAX_RETRIES = 3
+BASE_DELAY = 1.0  # Base delay in seconds
+MAX_DELAY = 30.0  # Maximum delay in seconds
+
+T = TypeVar('T')
+
+
+def with_retry(
+    max_retries: int = MAX_RETRIES,
+    base_delay: float = BASE_DELAY,
+    max_delay: float = MAX_DELAY,
+    retryable_exceptions: tuple = (
+        asyncio.TimeoutError,
+        ccxt.NetworkError,
+        ccxt.ExchangeNotAvailable,
+        ccxt.RequestTimeout,
+        ccxt.DDoSProtection,
+    )
+):
+    """
+    Decorator for async functions with exponential backoff retry.
+    
+    Uses exponential backoff with jitter to avoid thundering herd.
+    Only retries on transient errors, not on business logic errors.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay in seconds
+        max_delay: Maximum delay cap
+        retryable_exceptions: Tuple of exceptions to retry on
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        async def wrapper(*args, **kwargs) -> T:
+            last_exception = None
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except retryable_exceptions as e:
+                    last_exception = e
+                    
+                    if attempt == max_retries:
+                        logger.error(
+                            f"🔄 {func.__name__} failed after {max_retries + 1} attempts: {e}"
+                        )
+                        raise
+                    
+                    # Exponential backoff with jitter
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    jitter = delay * 0.1 * random.random()
+                    actual_delay = delay + jitter
+                    
+                    logger.warning(
+                        f"🔄 {func.__name__} attempt {attempt + 1}/{max_retries + 1} failed: {e}. "
+                        f"Retrying in {actual_delay:.1f}s..."
+                    )
+                    await asyncio.sleep(actual_delay)
+            
+            # Should not reach here, but just in case
+            if last_exception:
+                raise last_exception
+                
+        return wrapper
+    return decorator
 
 # =========================================================================
 # SIZE PRECISION CONSTANTS (Kraken Futures BTC/USD:USD)
@@ -91,8 +174,9 @@ class RESTExecutionEngine:
         
         logger.info(f"RESTExecutionEngine initialized for {exchange}")
     
+    @with_retry(max_retries=3, base_delay=2.0)
     async def initialize(self):
-        """Inicializar conexión a exchange"""
+        """Inicializar conexión a exchange con retry automático"""
         try:
             ExchangeClass = getattr(ccxt, self.exchange_name)
             
@@ -114,13 +198,15 @@ class RESTExecutionEngine:
     
     async def place_limit_order(self, symbol: str, side: str, amount: float, 
                                price: float, stop_loss: float = None, 
-                               take_profit: float = None) -> Optional[Dict]:
+                               take_profit: float = None,
+                               client_order_id: str = None) -> Optional[Dict]:
         """
         Colocar orden limit post-only con SL/TP ATOMICOS
         
         Args:
             stop_loss: Precio de stop loss (se envía en la misma orden)
             take_profit: Precio de take profit (se envía en la misma orden)
+            client_order_id: Idempotent client-generated order ID for retry safety
         
         Returns: order object o None si falla
         
@@ -134,22 +220,34 @@ class RESTExecutionEngine:
         # 🔥 PRE-ROUND SIZE to exchange precision to prevent desync
         original_amount = amount
         amount = round_size_to_exchange(amount)
-        if amount == 0:
-            logger.error(f"⛔ Cannot place order: size {original_amount:.8f} rounds to 0")
+        if amount == 0 or amount < KRAKEN_BTC_MIN_SIZE:
+            logger.error(f"⛔ Cannot place limit order: size {original_amount:.8f} → {amount:.8f} (min: {KRAKEN_BTC_MIN_SIZE})")
             return None
         if amount != original_amount:
             logger.info(f"📊 Size pre-rounded: {original_amount:.8f} → {amount:.8f}")
         
+        # Generate idempotent client order ID if not provided
+        if client_order_id is None:
+            client_order_id = generate_client_order_id(
+                symbol=symbol,
+                side=side,
+                timestamp=datetime.now(UTC),
+                strategy_id="limit"
+            )
+        
         try:
             # Build params for Kraken Futures
-            params = {'timeInForce': 'GTC'}
+            params = {
+                'timeInForce': 'GTC',
+                'clientOrderId': client_order_id
+            }
             
             # ⚠️ IMPORTANT: Kraken Futures NO acepta stopLoss/takeProfit en órdenes LIMIT
             # Solo las acepta en órdenes MARKET
             # Por tanto: Colocamos la orden de entrada SIN SL/TP
             # Los SL/TP se colocarán DESPUÉS cuando la posición esté abierta
             
-            logger.info(f"Placing {side.upper()} order: {amount} {symbol} @ {price}")
+            logger.info(f"Placing {side.upper()} order: {amount} {symbol} @ {price} (clientId={client_order_id})")
             
             order = await asyncio.wait_for(
                 self.exchange.create_order(
@@ -164,6 +262,7 @@ class RESTExecutionEngine:
             )
             
             order['created_at'] = datetime.now(UTC).isoformat()
+            order['clientOrderId'] = client_order_id
             self.open_orders[order['id']] = order
             
             # Store SL/TP for later placement (when position opens)
@@ -339,85 +438,124 @@ class RESTExecutionEngine:
         result = {'filled': False, 'amount': 0.0, 'average_price': 0.0}
         not_found_count = 0
         max_not_found = 3  # After 3 consecutive not-found, check position before assuming rejected
+        consecutive_errors = 0
+        max_consecutive_errors = 5  # Bail out after 5 consecutive errors
         
         while True:
-            elapsed = (datetime.now(UTC) - start_time).total_seconds()
+            try:
+                elapsed = (datetime.now(UTC) - start_time).total_seconds()
+                
+                if elapsed > timeout_seconds:
+                    logger.warning(f"Order {order_id} timeout after {elapsed}s")
+                    return result
+                
+                order = await self.get_order_status(order_id, symbol)
             
-            if elapsed > timeout_seconds:
-                logger.warning(f"Order {order_id} timeout after {elapsed}s")
-                return result
-            
-            order = await self.get_order_status(order_id, symbol)
-            
-            if not order:
-                not_found_count += 1
-                if not_found_count >= max_not_found:
-                    # Before assuming rejection, check if position exists (instant fill case)
-                    # Retry position check a few times since exchange may be slow to update
-                    for pos_attempt in range(3):
+                if not order:
+                    not_found_count += 1
+                    if not_found_count >= max_not_found:
+                        # Before assuming rejection, check multiple sources:
+                        # 1. Check if position exists (instant fill case)
+                        # 2. Check recent trades (fills)
+                        
+                        # Method 1: Position check
+                        for pos_attempt in range(3):
+                            try:
+                                if pos_attempt > 0:
+                                    await asyncio.sleep(0.5)
+                                position = await self.get_position(symbol)
+                                if position and abs(position.get('contracts', 0)) > 0:
+                                    contracts = abs(position.get('contracts', 0))
+                                    entry_price = position.get('entryPrice', 0)
+                                    logger.info(f"✅ Order {order_id} INSTANT FILL detected via position (attempt {pos_attempt+1}): {contracts} @ {entry_price}")
+                                    result = {
+                                        'filled': True,
+                                        'amount': contracts,
+                                        'average_price': entry_price,
+                                        'instant_fill': True
+                                    }
+                                    return result
+                            except Exception as e:
+                                logger.debug(f"Position check attempt {pos_attempt+1} failed: {e}")
+                        
+                        # Method 2: Check recent trades for this order
                         try:
-                            if pos_attempt > 0:
-                                await asyncio.sleep(0.5)  # Small delay between retries
-                            position = await self.get_position(symbol)
-                            if position and abs(position.get('contracts', 0)) > 0:
-                                # Position exists! Order was filled instantly
-                                contracts = abs(position.get('contracts', 0))
-                                entry_price = position.get('entryPrice', 0)
-                                logger.info(f"✅ Order {order_id} INSTANT FILL detected via position (attempt {pos_attempt+1}): {contracts} @ {entry_price}")
-                                result = {
-                                    'filled': True,
-                                    'amount': contracts,
-                                    'average_price': entry_price,
-                                    'instant_fill': True
-                                }
-                                return result
+                            trades = await asyncio.wait_for(
+                                self.exchange.fetch_my_trades(symbol, limit=20),
+                                timeout=EXCHANGE_TIMEOUT_SHORT
+                            )
+                            for trade in trades:
+                                if trade.get('order') == order_id:
+                                    filled_amount = trade.get('amount', 0)
+                                    avg_price = trade.get('price', 0)
+                                    logger.info(f"✅ Order {order_id} FILL detected via trades: {filled_amount} @ {avg_price}")
+                                    result = {
+                                        'filled': True,
+                                        'amount': filled_amount,
+                                        'average_price': avg_price,
+                                        'via_trades': True
+                                    }
+                                    return result
                         except Exception as e:
-                            logger.debug(f"Position check attempt {pos_attempt+1} failed: {e}")
-                    
-                    # No position found after retries - order was truly rejected
-                    logger.warning(f"🚫 Order {order_id} not found after {not_found_count} attempts and no position - REJECTED by exchange")
-                    result['rejected'] = True
-                    return result
-                await asyncio.sleep(poll_interval)
-                continue
-            
-            # Reset counter if we found order
-            not_found_count = 0
-            
-            status = order.get('status')
-            filled = order.get('filled', 0)
-            amount_requested = order.get('amount', 0)
-            
-            if status == 'closed' or filled >= amount_requested:
-                result = {
-                    'filled': True, 
-                    'amount': filled, 
-                    'average_price': order.get('average', 0)
-                }
-                logger.info(f"✅ Order FILLED: {order_id} ({filled} @ {result['average_price']:.2f})")
-                return result
-            
-            elif status == 'canceled':
-                # PARTIAL FILL HANDLING: Return what was filled
-                if filled > 0:
+                            logger.debug(f"Trades check failed: {e}")
+                        
+                        # No position or trades found - order was truly rejected
+                        logger.warning(f"🚫 Order {order_id} not found after {not_found_count} attempts and no position/trades - REJECTED by exchange")
+                        result['rejected'] = True
+                        return result
+                    await asyncio.sleep(poll_interval)
+                    continue
+                
+                # Reset counter if we found order
+                not_found_count = 0
+                
+                status = order.get('status')
+                filled = order.get('filled', 0)
+                amount_requested = order.get('amount', 0)
+                
+                if status == 'closed' or filled >= amount_requested:
                     result = {
-                        'filled': True,  # Partial is still a fill
-                        'amount': filled,
-                        'average_price': order.get('average', 0),
-                        'partial': True
+                        'filled': True, 
+                        'amount': filled, 
+                        'average_price': order.get('average', 0)
                     }
-                    logger.warning(f"⚠️ Order PARTIAL FILL: {order_id} ({filled}/{amount_requested} @ {result['average_price']:.2f})")
+                    logger.info(f"✅ Order FILLED: {order_id} ({filled} @ {result['average_price']:.2f})")
                     return result
-                logger.warning(f"Order CANCELLED: {order_id}")
-                return result
+                
+                elif status == 'canceled':
+                    # PARTIAL FILL HANDLING: Return what was filled
+                    if filled > 0:
+                        result = {
+                            'filled': True,  # Partial is still a fill
+                            'amount': filled,
+                            'average_price': order.get('average', 0),
+                            'partial': True
+                        }
+                        logger.warning(f"⚠️ Order PARTIAL FILL: {order_id} ({filled}/{amount_requested} @ {result['average_price']:.2f})")
+                        return result
+                    logger.warning(f"Order CANCELLED: {order_id}")
+                    return result
+                
+                elif status == 'rejected':
+                    logger.error(f"Order REJECTED: {order_id}")
+                    return result
+                
+                # Still pending - reset error counter on successful iteration
+                consecutive_errors = 0
+                logger.debug(f"Order {order_id} pending ({filled}/{amount_requested})")
+                await asyncio.sleep(poll_interval)
             
-            elif status == 'rejected':
-                logger.error(f"Order REJECTED: {order_id}")
-                return result
-            
-            # Still pending
-            logger.debug(f"Order {order_id} pending ({filled}/{amount_requested})")
-            await asyncio.sleep(poll_interval)
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"Error in poll_fill_status loop (attempt {consecutive_errors}/{max_consecutive_errors}): {e}")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(f"🚫 Bailing out of poll_fill_status after {consecutive_errors} consecutive errors for order {order_id}")
+                    result['error'] = str(e)
+                    return result
+                
+                # Wait before retrying
+                await asyncio.sleep(poll_interval)
     
     async def get_position(self, symbol: str) -> Optional[Dict]:
         """Consultar posición actual con timeout"""
@@ -470,11 +608,11 @@ class RESTExecutionEngine:
             # Verificar si la posición tiene contratos abiertos
             # CRITICAL: Solo confiar en contracts, notional es 0.0 en Kraken
             for pos in positions:
-                # Manejar None values de forma segura
+                # Manejar None values y tipos inválidos de forma segura
                 contracts_raw = pos.get('contracts')
                 
-                # Convertir a float solo si no es None
-                contracts = abs(float(contracts_raw)) if contracts_raw is not None else 0.0
+                # Convertir usando safe_float para evitar crashes por API responses inesperadas
+                contracts = abs(safe_float(contracts_raw, 0.0))
                 
                 # THRESHOLD: Solo considerar posición real si contracts >= 0.0001
                 # Esto evita detectar órdenes pendientes o residuos
@@ -546,6 +684,11 @@ class RESTExecutionEngine:
                 position_side = 'long' if contracts > 0 else 'short'
                 logger.warning(f"Position 'side' not available ({raw_side}), using contracts sign: {position_side}")
             position_size = abs(contracts)
+            
+            # 🔒 FIX (Jan 14, 2026): Validate position size before setting SL/TP
+            if position_size < KRAKEN_BTC_MIN_SIZE:
+                logger.error(f"Cannot set stops: position size {position_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}")
+                return False
             
             logger.info(f"📍 Setting stops: SL={stop_loss:.2f}, TP={take_profit:.2f}")
             logger.info(f"   Position: {position_side.upper()} {position_size:.8f} {symbol}")
@@ -829,14 +972,15 @@ class RESTExecutionEngine:
             logger.error(f"Error verifying stops on exchange: {e}")
             return {'has_sl': False, 'has_tp': False, 'orders': []}
     
-    async def close_position_market(self, symbol: str = None, side: str = None, amount: float = None) -> Optional[Dict]:
+    async def close_position_market(self, symbol: str = None, side: str = None, amount: float = None, reason: str = "EMERGENCY") -> Optional[Dict]:
         """
-        Cerrar posición a mercado (EMERGENCIA) con timeout y retry
+        Cerrar posición a mercado con timeout y retry
         
         Args:
             symbol: Trading pair (uses self.current_symbol if not provided)
             side: 'buy' (close short) o 'sell' (close long)
             amount: Position size to close (fetches from exchange if not provided)
+            reason: Context for logging - 'PARTIAL', 'FULL_CLOSE', 'EMERGENCY', 'SL_HIT', etc.
         
         Returns: Order dict or None if failed after retries
         """
@@ -845,7 +989,13 @@ class RESTExecutionEngine:
         
         # Use stored symbol if not provided
         if symbol is None:
-            symbol = getattr(self, 'current_symbol', 'BTC/USD:USD')
+            if hasattr(self, 'current_symbol') and self.current_symbol:
+                symbol = self.current_symbol
+            else:
+                logger.error("Emergency close called without symbol and no current_symbol set")
+                # Use default as last resort but log it clearly
+                symbol = 'BTC/USD:USD'
+                logger.warning(f"Using fallback symbol: {symbol}")
         
         MAX_RETRIES = 3
         RETRY_DELAY = 2.0
@@ -865,6 +1015,17 @@ class RESTExecutionEngine:
                     logger.warning("Position amount is 0, nothing to close")
                     return None
                 
+                # 🔒 FIX (Jan 14, 2026): Validate minimum order size
+                if close_amount < KRAKEN_BTC_MIN_SIZE:
+                    logger.warning(f"⚠️ Close amount {close_amount:.6f} < min {KRAKEN_BTC_MIN_SIZE}, cannot execute")
+                    return None
+                
+                # Round to exchange precision
+                close_amount = round_size_to_exchange(close_amount)
+                if close_amount < KRAKEN_BTC_MIN_SIZE:
+                    logger.warning(f"⚠️ Rounded close amount {close_amount:.6f} < min, cannot execute")
+                    return None
+                
                 # Determine side from position if not provided
                 if side is None:
                     # Use CCXT unified 'side' field (more reliable than contracts sign)
@@ -879,7 +1040,7 @@ class RESTExecutionEngine:
                         side = 'sell' if position_contracts > 0 else 'buy'
                         logger.warning(f"Position 'side' not available, using contracts sign: {side}")
                 
-                logger.critical(f"EMERGENCY MARKET CLOSE (attempt {attempt + 1}/{MAX_RETRIES}): {close_amount} {symbol} side={side}")
+                logger.critical(f"📤 {reason} MARKET CLOSE (attempt {attempt + 1}/{MAX_RETRIES}): {close_amount} {symbol} side={side}")
                 
                 # =====================================================================
                 # 🔒 FIX (Jan 13, 2026): ALWAYS USE reduceOnly=True FOR CLOSE ORDERS
@@ -969,7 +1130,7 @@ class RESTExecutionEngine:
             # Fallback: return first non-zero asset from free
             for asset, amount in free.items():
                 if amount and amount > 0:
-                    capital = float(amount)
+                    capital = safe_float(amount, 0.0)
                     logger.warning(f"No USDT/USD/EUR in free, using {asset}: {capital:.6f}")
                     return capital
             
@@ -980,7 +1141,7 @@ class RESTExecutionEngine:
                 if 'accounts' in info:
                     for acc in info.get('accounts', []):
                         if acc.get('currency', '').upper() in ['USD', 'USDT'] or acc.get('type') == 'cash':
-                            avail = float(acc.get('available', 0))
+                            avail = safe_float(acc.get('available', 0), 0.0)
                             if avail > 0:
                                 logger.info(f"💰 Kraken Futures Balance (info): ${avail:.2f}")
                                 return avail
@@ -1262,7 +1423,8 @@ class RESTExecutionEngine:
     
     async def place_market_order(self, symbol: str, side: str, amount: float,
                                   stop_loss: float = None, 
-                                  take_profit: float = None) -> Optional[Dict]:
+                                  take_profit: float = None,
+                                  client_order_id: str = None) -> Optional[Dict]:
         """
         Place market order with optional SL/TP.
         
@@ -1274,6 +1436,7 @@ class RESTExecutionEngine:
             amount: Position size
             stop_loss: SL price (placed after fill)
             take_profit: TP price (placed after fill)
+            client_order_id: Idempotent client-generated order ID for retry safety
             
         Returns:
             Order result dict
@@ -1285,26 +1448,37 @@ class RESTExecutionEngine:
         # 🔥 PRE-ROUND SIZE to exchange precision to prevent desync
         original_amount = amount
         amount = round_size_to_exchange(amount)
-        if amount == 0:
-            logger.error(f"⛔ Cannot place order: size {original_amount:.8f} rounds to 0")
+        if amount == 0 or amount < KRAKEN_BTC_MIN_SIZE:
+            logger.error(f"⛔ Cannot place market order: size {original_amount:.8f} → {amount:.8f} (min: {KRAKEN_BTC_MIN_SIZE})")
             return None
         if amount != original_amount:
             logger.info(f"📊 Size pre-rounded: {original_amount:.8f} → {amount:.8f}")
         
+        # Generate idempotent client order ID if not provided
+        if client_order_id is None:
+            client_order_id = generate_client_order_id(
+                symbol=symbol,
+                side=side,
+                timestamp=datetime.now(UTC),
+                strategy_id="market"
+            )
+        
         try:
-            logger.info(f"🚀 MARKET ORDER: {side.upper()} {amount} {symbol}")
+            logger.info(f"🚀 MARKET ORDER: {side.upper()} {amount} {symbol} (clientId={client_order_id})")
             
             order = await asyncio.wait_for(
                 self.exchange.create_order(
                     symbol=symbol,
                     type='market',
                     side=side.lower(),
-                    amount=amount
+                    amount=amount,
+                    params={'clientOrderId': client_order_id}
                 ),
                 timeout=EXCHANGE_TIMEOUT_MEDIUM
             )
             
             order['created_at'] = datetime.now(UTC).isoformat()
+            order['clientOrderId'] = client_order_id
             self.open_orders[order['id']] = order
             
             logger.info(f"✅ Market order executed: {order['id']}")

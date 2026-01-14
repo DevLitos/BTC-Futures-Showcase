@@ -14,6 +14,7 @@ from enum import Enum
 from typing import Optional
 from datetime import datetime, timedelta, UTC
 import logging
+import threading
 
 # Use centralized time provider for consistent timestamps
 from .time_provider import get_time_provider, TimeProvider
@@ -34,13 +35,19 @@ class BotState(Enum):
 
 class StateMachine:
     """
-    Manages the trading bot state and transitions
+    Manages the trading bot state and transitions.
+    
+    Thread-safe: Uses a lock to protect state transitions from race conditions
+    in concurrent async operations.
     """
 
     def __init__(self, backtest_mode: bool = False):
         self.state = BotState.IDLE
         self.previous_state = None
         self.backtest_mode = backtest_mode
+        
+        # Thread-safe lock for state transitions
+        self._state_lock = threading.Lock()
         
         # Use centralized TimeProvider for consistent timestamps
         time_mode = TimeProvider.MODE_BACKTEST if backtest_mode else TimeProvider.MODE_LIVE
@@ -109,17 +116,23 @@ class StateMachine:
         return self._time_provider.now()
 
     def transition_to(self, new_state: BotState, reason: str = ""):
-        """Transition to a new state"""
-        if new_state == self.state:
-            return
-            
-        self.previous_state = self.state
-        self.state = new_state
+        """
+        Transition to a new state (thread-safe).
         
-        log_msg = f"State transition: {self.previous_state.value} → {self.state.value}"
-        if reason:
-            log_msg += f" | Reason: {reason}"
-        logger.info(log_msg)
+        Uses a lock to prevent race conditions when multiple async
+        operations try to change state simultaneously.
+        """
+        with self._state_lock:
+            if new_state == self.state:
+                return
+                
+            self.previous_state = self.state
+            self.state = new_state
+            
+            log_msg = f"State transition: {self.previous_state.value} → {self.state.value}"
+            if reason:
+                log_msg += f" | Reason: {reason}"
+            logger.info(log_msg)
 
     def can_trade(self) -> tuple[bool, str]:
         """

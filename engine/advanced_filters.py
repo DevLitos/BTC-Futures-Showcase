@@ -80,7 +80,8 @@ async def should_exit_on_funding(
         if time_to_funding_min is None:
             try:
                 time_to_funding_min = external_data_manager.funding.get_time_to_next_funding_minutes()
-            except:
+            except (AttributeError, TypeError, ValueError) as e:
+                logger.debug(f"Could not get funding time: {e}")
                 time_to_funding_min = 60.0  # Default: assume not imminent
         
         # GATE 1: Funding must exceed threshold

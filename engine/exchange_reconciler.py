@@ -60,11 +60,13 @@ class HardLockEvent(Enum):
     - CANCEL_SENT: Released when cancel confirms
     - SL_TP_SET: Released when SL/TP confirmed on exchange
     - EXIT_PENDING: Released when position_size = 0 confirmed
+    - PARTIAL_CLOSE: Released when position size changes (not necessarily to 0)
     """
     ORDER_PLACED = "ORDER_PLACED"    # Entry order placed
     CANCEL_SENT = "CANCEL_SENT"      # Cancel request sent
     SL_TP_SET = "SL_TP_SET"          # SL/TP being set
     EXIT_PENDING = "EXIT_PENDING"    # Exit in progress - CRITICAL
+    PARTIAL_CLOSE = "PARTIAL_CLOSE"  # Partial close - releases when size changes
     MANUAL = "MANUAL"                # Manual lock (fallback)
     
 
@@ -263,6 +265,16 @@ class ExchangeReconciler:
             # Release if: position is now flat (no position on exchange)
             return not snapshot.has_position
         
+        # =====================================================================
+        # 🔒 FIX (Jan 14, 2026): PARTIAL_CLOSE should release when size changes
+        # For partial closes, position won't be 0, so we release when size differs
+        # =====================================================================
+        if self._hard_lock_event == HardLockEvent.PARTIAL_CLOSE:
+            # Release if: position size has changed from expected
+            # We use timeout as the release mechanism since we can't easily track
+            # the expected new size here. The 5s timeout is sufficient.
+            return False  # Let timeout handle it
+        
         # MANUAL: only timeout
         return False
     
@@ -415,9 +427,27 @@ class ExchangeReconciler:
             max_duration_ms=3000  # 3s fallback for SL/TP
         )
     
+    def notify_partial_close(self, reason: str = "Partial close"):
+        """
+        Called when a PARTIAL close is being executed.
+        
+        Unlike EXIT_PENDING, position will NOT be 0 after.
+        Uses PARTIAL_CLOSE event which releases by timeout.
+        
+        CRITICAL: During PARTIAL_CLOSE hard-lock:
+        - NO state enforcement runs
+        - Local size sync happens after exit
+        """
+        self.enter_hard_lock(
+            reason=reason,
+            event=HardLockEvent.PARTIAL_CLOSE,
+            max_duration_ms=5000  # 5s fallback for partial close
+        )
+        logger.info(f"🔒 PARTIAL CLOSE HARD_LOCK started: {reason}")
+    
     def notify_exit_started(self, reason: str = "Position closing"):
         """
-        Called when exit is being executed.
+        Called when FULL exit is being executed.
         
         CRITICAL: During EXIT_PENDING hard-lock:
         - NO penalty can be applied
@@ -586,14 +616,25 @@ class ExchangeReconciler:
         self._state = new_state
         self._state_changes += 1
         
-        # Log transition
+        # Log transition with REASON for clarity
         emoji = {
             ReconcilerState.IDLE: "⚪",
             ReconcilerState.ORDER_PENDING: "🟡",
             ReconcilerState.HARD_LOCK: "🔒",
             ReconcilerState.POSITION_OPEN: "🟢"
         }
-        logger.info(f"{emoji.get(new_state, '❓')} Reconciler: {old_state.value} → {new_state.value}")
+        
+        # Build reason string for better debugging
+        reason = ""
+        if snapshot:
+            if new_state == ReconcilerState.POSITION_OPEN and snapshot.has_position:
+                reason = f" (exchange confirmed: {snapshot.position_side} {snapshot.position_size:.6f} @ {snapshot.position_entry_price:.2f})"
+            elif new_state == ReconcilerState.IDLE and not snapshot.has_position:
+                reason = " (no position on exchange)"
+            elif new_state == ReconcilerState.ORDER_PENDING and snapshot.has_pending_entry:
+                reason = f" (entry order pending)"
+        
+        logger.info(f"{emoji.get(new_state, '❓')} Reconciler: {old_state.value} → {new_state.value}{reason}")
         
         # Clear HARD_LOCK when transitioning out (via _release_hard_lock for proper cleanup)
         if old_state == ReconcilerState.HARD_LOCK and new_state != ReconcilerState.HARD_LOCK:

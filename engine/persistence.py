@@ -15,6 +15,13 @@ from datetime import datetime, UTC
 import json
 import os
 
+# Import for parquet error handling
+try:
+    from pyarrow.lib import ArrowInvalid
+except ImportError:
+    # Fallback if pyarrow not installed
+    ArrowInvalid = Exception
+
 logger = logging.getLogger(__name__)
 
 # Constantes de backpressure
@@ -269,7 +276,8 @@ class TradeLogger:
                 try:
                     existing_df = pd.read_parquet(filename)
                     df = pd.concat([existing_df, new_df], ignore_index=True)
-                except Exception:
+                except (OSError, ValueError, ArrowInvalid) as e:
+                    logger.warning(f"Could not read existing metrics file, starting fresh: {e}")
                     df = new_df
             else:
                 df = new_df

@@ -14,12 +14,13 @@ from monitoring.metrics import ORDERS_RECOMMENDED
 
 from engine.config import (
     RiskManagement, OrderExecution,
-    get_risk_for_session, SweepFilter, TimeBasedExits
+    get_risk_for_session, SweepFilter, TimeBasedExits, SmartExits
 )
 from engine.core_utils import (
     ensure_utc, PositionSizer, get_position_sizer
 )
 from engine.state_types import PositionState
+from engine.execution import KRAKEN_BTC_MIN_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,24 @@ class Position:
     def __init__(self, symbol: str, direction: str, entry_price: float, 
                  size: float, stop_loss: float, atr_1m: float,
                  market_time: datetime = None):
+        # ===== INPUT VALIDATION =====
+        if not symbol:
+            raise ValueError("symbol cannot be empty")
+        if direction.upper() not in ('LONG', 'SHORT'):
+            raise ValueError(f"direction must be LONG or SHORT, got: {direction}")
+        if entry_price <= 0:
+            raise ValueError(f"entry_price must be positive, got: {entry_price}")
+        if size <= 0:
+            raise ValueError(f"size must be positive, got: {size}")
+        if stop_loss <= 0:
+            raise ValueError(f"stop_loss must be positive, got: {stop_loss}")
+        
+        # Validate SL direction matches trade direction
+        if direction.upper() == 'LONG' and stop_loss >= entry_price:
+            logger.warning(f"⚠️ LONG position SL ({stop_loss}) >= entry ({entry_price}) - invalid but continuing")
+        if direction.upper() == 'SHORT' and stop_loss <= entry_price:
+            logger.warning(f"⚠️ SHORT position SL ({stop_loss}) <= entry ({entry_price}) - invalid but continuing")
+        
         self.symbol = symbol
         self.direction = direction  # 'LONG' or 'SHORT'
         self.entry_price = entry_price
@@ -97,6 +116,24 @@ class Position:
         
         # Candle counter for mediocre trade detection
         self.candle_count = 0
+        
+        # =====================================================================
+        # SMART EXITS TRACKING (Jan 13, 2026)
+        # =====================================================================
+        # Scaled partial exits tracking
+        self.partial_exits_done = []  # List of (mfe_r_level, pct_exited) tuples
+        self.remaining_size_pct = 1.0  # 100% initially
+        
+        # Time profit lock
+        self.profit_locked = False
+        self.locked_r = 0.0
+        
+        # Last RSI value (updated externally)
+        self.last_rsi = 50.0
+        
+        # Bollinger Band width tracking
+        self.last_bb_width = 0.0
+        self.avg_bb_width = 0.0
         
         logger.info(f"Position opened: {direction} {size} {symbol} @ {entry_price:.2f} | SL: {stop_loss:.2f} | TP1: {self.tp1_price:.2f}")
     
@@ -474,6 +511,12 @@ class Position:
         # Check conditions
         if mfe_r >= 0.6 and not self.touched_minus_02r:
             add_size = self.initial_size * 0.5
+            
+            # 🔒 FIX (Jan 14, 2026): Validate minimum order size
+            if add_size < KRAKEN_BTC_MIN_SIZE:
+                logger.info(f"🔄 ADD TO WINNER blocked: add_size {add_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}")
+                return None
+            
             self.added_to_winner = True
             logger.info(f"💪 ADD TO WINNER: MFE {mfe_r:.2f}R >= 0.6R, no -0.2R touch → Adding {add_size:.6f}")
             return {
@@ -783,6 +826,361 @@ class Position:
         
         return False, ""
 
+    # =========================================================================
+    # SMART EXITS - 5 Advanced Exit Strategies (Jan 13, 2026)
+    # =========================================================================
+    
+    def check_scaled_partial_exit(self) -> Optional[Dict]:
+        """
+        SMART EXIT #1: Scaled partial profit taking.
+        
+        Exit progressively at multiple R levels instead of binary TP1/TP2.
+        This locks in profits while letting a portion run.
+        
+        Returns:
+            Dict with exit details if should take partial, None otherwise
+            {'action': 'PARTIAL_EXIT', 'exit_pct': 0.33, 'mfe_r': 0.8, 'reason': str}
+        """
+        if not SmartExits.SCALED_PARTIALS_ENABLED:
+            return None
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        # Check each scale-out level
+        for level_r, exit_pct in SmartExits.SCALE_OUT_LEVELS:
+            # Skip if we already exited at this level
+            already_done = any(done_r == level_r for done_r, _ in self.partial_exits_done)
+            if already_done:
+                continue
+            
+            # Check if MFE reached this level
+            if mfe_r >= level_r:
+                # Check if we have enough position left
+                if self.remaining_size_pct <= SmartExits.MIN_RUNNER_PCT:
+                    logger.debug(f"📊 SCALED PARTIAL: Skip level {level_r}R - only {self.remaining_size_pct:.0%} remaining (min runner)")
+                    continue
+                
+                # Calculate actual exit percentage (adjusted for remaining)
+                actual_exit_pct = min(exit_pct, self.remaining_size_pct - SmartExits.MIN_RUNNER_PCT)
+                
+                if actual_exit_pct > 0.01:  # At least 1%
+                    # Record this partial exit
+                    self.partial_exits_done.append((level_r, actual_exit_pct))
+                    self.remaining_size_pct -= actual_exit_pct
+                    
+                    logger.info(f"💰 SCALED PARTIAL: Exit {actual_exit_pct:.0%} @ MFE {mfe_r:.2f}R (level: {level_r}R) | Remaining: {self.remaining_size_pct:.0%}")
+                    
+                    return {
+                        'action': 'PARTIAL_EXIT',
+                        'exit_pct': actual_exit_pct,
+                        'mfe_r': mfe_r,
+                        'level_r': level_r,
+                        'remaining_pct': self.remaining_size_pct,
+                        'reason': f'Scaled partial at {level_r}R'
+                    }
+        
+        return None
+    
+    def check_momentum_exit(self, rsi_1m: float, volume_ratio: float = 1.0) -> Optional[Dict]:
+        """
+        SMART EXIT #2: Exit when momentum dies BEFORE price reverses.
+        
+        Detects loss of momentum via RSI divergence from price.
+        Only applies when trade is already in profit.
+        
+        Args:
+            rsi_1m: Current RSI (1-minute)
+            volume_ratio: Current volume / average volume
+        
+        Returns:
+            Dict with exit details if momentum dying, None otherwise
+        """
+        if not SmartExits.MOMENTUM_EXIT_ENABLED:
+            return None
+        
+        # Update last RSI
+        self.last_rsi = rsi_1m
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        # Only apply if we have minimum profit
+        if mfe_r < SmartExits.MOMENTUM_EXIT_MIN_MFE_R:
+            return None
+        
+        # Check momentum death based on direction
+        momentum_dead = False
+        reason = ""
+        
+        if self.direction == 'LONG':
+            if rsi_1m < SmartExits.RSI_LONG_EXIT_THRESHOLD:
+                momentum_dead = True
+                reason = f"RSI {rsi_1m:.1f} < {SmartExits.RSI_LONG_EXIT_THRESHOLD} (LONG momentum dying)"
+        else:
+            if rsi_1m > SmartExits.RSI_SHORT_EXIT_THRESHOLD:
+                momentum_dead = True
+                reason = f"RSI {rsi_1m:.1f} > {SmartExits.RSI_SHORT_EXIT_THRESHOLD} (SHORT momentum dying)"
+        
+        # Optional: Check volume confirmation
+        if momentum_dead and SmartExits.REQUIRE_VOLUME_DECLINE:
+            if volume_ratio >= SmartExits.VOLUME_DECLINE_THRESHOLD:
+                # Volume not declining, don't exit yet
+                logger.debug(f"📊 MOMENTUM EXIT skipped: Volume ratio {volume_ratio:.2f} >= {SmartExits.VOLUME_DECLINE_THRESHOLD}")
+                return None
+            reason += f" + Volume declining ({volume_ratio:.0%})"
+        
+        if momentum_dead:
+            logger.warning(f"📉 MOMENTUM EXIT: {reason} | MFE: {mfe_r:.2f}R")
+            return {
+                'action': 'MOMENTUM_EXIT',
+                'rsi': rsi_1m,
+                'mfe_r': mfe_r,
+                'volume_ratio': volume_ratio,
+                'reason': reason
+            }
+        
+        return None
+    
+    def check_vpoc_exit(self, current_price: float, vpoc_price: float) -> Optional[Dict]:
+        """
+        SMART EXIT #3: Exit when approaching strong resistance/support (VPOC).
+        
+        Volume Profile POC (Point of Control) represents strongest resistance.
+        Exit before getting trapped.
+        
+        Args:
+            current_price: Current market price
+            vpoc_price: Volume Profile Point of Control price
+        
+        Returns:
+            Dict with exit details if near VPOC, None otherwise
+        """
+        if not SmartExits.VPOC_EXIT_ENABLED:
+            return None
+        
+        if vpoc_price is None or vpoc_price <= 0:
+            return None
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        # Only apply if we have minimum profit
+        if mfe_r < SmartExits.VPOC_EXIT_MIN_MFE_R:
+            return None
+        
+        # Calculate distance to VPOC
+        distance_pct = abs(current_price - vpoc_price) / current_price
+        
+        # Check if within proximity threshold
+        if distance_pct > SmartExits.VPOC_PROXIMITY_PCT:
+            return None  # Not close enough
+        
+        # Check direction - are we approaching VPOC as resistance?
+        approaching_resistance = False
+        reason = ""
+        
+        if self.direction == 'LONG' and current_price < vpoc_price:
+            # LONG approaching VPOC from below = resistance
+            approaching_resistance = True
+            reason = f"LONG approaching VPOC resistance @ {vpoc_price:.2f}"
+        elif self.direction == 'SHORT' and current_price > vpoc_price:
+            # SHORT approaching VPOC from above = support
+            approaching_resistance = True
+            reason = f"SHORT approaching VPOC support @ {vpoc_price:.2f}"
+        
+        if approaching_resistance:
+            logger.warning(f"🎯 VPOC EXIT: {reason} | Distance: {distance_pct:.2%} | MFE: {mfe_r:.2f}R")
+            return {
+                'action': 'VPOC_EXIT',
+                'current_price': current_price,
+                'vpoc_price': vpoc_price,
+                'distance_pct': distance_pct,
+                'mfe_r': mfe_r,
+                'reason': reason
+            }
+        
+        return None
+    
+    def check_time_profit_lock(self) -> Optional[Dict]:
+        """
+        SMART EXIT #4: Lock profits after time threshold.
+        
+        If trade has been running for N candles with profit, move stop
+        to lock in minimum R gain.
+        
+        Returns:
+            Dict with lock details if triggered, None otherwise
+        """
+        if not SmartExits.TIME_PROFIT_LOCK_ENABLED:
+            return None
+        
+        if self.profit_locked:
+            return None  # Already locked
+        
+        # Check candle count
+        if self.candle_count < SmartExits.TIME_LOCK_CANDLES:
+            return None
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        # Only lock if above minimum MFE
+        if mfe_r < SmartExits.TIME_LOCK_MIN_MFE_R:
+            return None
+        
+        # Calculate lock price (entry + lock_R * risk)
+        initial_risk = abs(self.entry_price - self.initial_stop_loss)
+        lock_r = SmartExits.TIME_LOCK_FLOOR_R
+        
+        if self.direction == 'LONG':
+            lock_price = self.entry_price + (initial_risk * lock_r)
+            # Only lock if current stop is below lock price
+            if self.trailing_stop < lock_price:
+                self.trailing_stop = lock_price
+                self.stop_loss = lock_price
+                self.profit_locked = True
+                self.locked_r = lock_r
+        else:
+            lock_price = self.entry_price - (initial_risk * lock_r)
+            # Only lock if current stop is above lock price
+            if self.trailing_stop > lock_price:
+                self.trailing_stop = lock_price
+                self.stop_loss = lock_price
+                self.profit_locked = True
+                self.locked_r = lock_r
+        
+        if self.profit_locked:
+            logger.info(f"🔒 TIME PROFIT LOCK: {self.candle_count} candles, MFE {mfe_r:.2f}R → Locked +{lock_r}R @ {lock_price:.2f}")
+            return {
+                'action': 'TIME_PROFIT_LOCK',
+                'candles': self.candle_count,
+                'mfe_r': mfe_r,
+                'locked_r': lock_r,
+                'lock_price': lock_price,
+                'reason': f'Time lock after {self.candle_count} candles'
+            }
+        
+        return None
+    
+    def check_volatility_squeeze_exit(self, bb_width: float, bb_avg_width: float) -> Optional[Dict]:
+        """
+        SMART EXIT #5: Exit during volatility squeeze.
+        
+        When Bollinger Bands compress (squeeze), market is indecisive.
+        Take small profits before squeeze resolves (could go either way).
+        
+        Args:
+            bb_width: Current Bollinger Band width (upper - lower)
+            bb_avg_width: Average BB width (for comparison)
+        
+        Returns:
+            Dict with exit details if in squeeze, None otherwise
+        """
+        if not SmartExits.VOLATILITY_SQUEEZE_EXIT_ENABLED:
+            return None
+        
+        # Update tracking
+        self.last_bb_width = bb_width
+        self.avg_bb_width = bb_avg_width
+        
+        if bb_avg_width <= 0:
+            return None
+        
+        # Calculate squeeze ratio
+        squeeze_ratio = bb_width / bb_avg_width
+        
+        # Check if in squeeze
+        if squeeze_ratio >= SmartExits.BB_SQUEEZE_RATIO:
+            return None  # Not a squeeze
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        # Only exit if in the "uncertain profit" zone
+        if mfe_r < SmartExits.SQUEEZE_EXIT_MIN_MFE_R:
+            return None  # Not enough profit, hold
+        
+        if mfe_r > SmartExits.SQUEEZE_EXIT_MAX_MFE_R:
+            return None  # Good profit, let it run
+        
+        reason = f"Volatility squeeze (BB width {squeeze_ratio:.0%} of avg) with small profit {mfe_r:.2f}R"
+        logger.warning(f"📦 SQUEEZE EXIT: {reason}")
+        
+        return {
+            'action': 'VOLATILITY_SQUEEZE_EXIT',
+            'bb_width': bb_width,
+            'bb_avg_width': bb_avg_width,
+            'squeeze_ratio': squeeze_ratio,
+            'mfe_r': mfe_r,
+            'reason': reason
+        }
+    
+    def update_smart_exit_indicators(self, rsi: float = None, bb_width: float = None, 
+                                      bb_avg: float = None, volume_ratio: float = None):
+        """
+        Update indicators used by smart exits.
+        Call this on each candle to keep values fresh.
+        
+        Args:
+            rsi: Current RSI value
+            bb_width: Current Bollinger Band width
+            bb_avg: Average BB width
+            volume_ratio: Current volume / average volume
+        """
+        if rsi is not None:
+            self.last_rsi = rsi
+        if bb_width is not None:
+            self.last_bb_width = bb_width
+        if bb_avg is not None:
+            self.avg_bb_width = bb_avg
+    
+    def check_all_smart_exits(self, current_price: float, rsi: float = None, 
+                               vpoc: float = None, bb_width: float = None,
+                               bb_avg: float = None, volume_ratio: float = 1.0) -> Optional[Dict]:
+        """
+        Master method: Check all smart exit conditions in priority order.
+        
+        Returns first triggered exit or None.
+        
+        Args:
+            current_price: Current market price
+            rsi: Current RSI (1m)
+            vpoc: VPOC price level
+            bb_width: Current BB width
+            bb_avg: Average BB width
+            volume_ratio: Volume ratio (current/avg)
+        
+        Returns:
+            Dict with highest priority exit trigger, or None
+        """
+        # Update indicators
+        self.update_smart_exit_indicators(rsi, bb_width, bb_avg, volume_ratio)
+        
+        # Priority 1: Time-based profit lock (moves stop, doesn't exit)
+        lock_result = self.check_time_profit_lock()
+        # Note: This modifies stop, doesn't trigger full exit
+        
+        # Priority 2: Scaled partial exits
+        partial_result = self.check_scaled_partial_exit()
+        if partial_result:
+            return partial_result
+        
+        # Priority 3: Momentum exit
+        if rsi is not None:
+            momentum_result = self.check_momentum_exit(rsi, volume_ratio)
+            if momentum_result:
+                return momentum_result
+        
+        # Priority 4: VPOC exit
+        if vpoc is not None and vpoc > 0:
+            vpoc_result = self.check_vpoc_exit(current_price, vpoc)
+            if vpoc_result:
+                return vpoc_result
+        
+        # Priority 5: Volatility squeeze exit
+        if bb_width is not None and bb_avg is not None:
+            squeeze_result = self.check_volatility_squeeze_exit(bb_width, bb_avg)
+            if squeeze_result:
+                return squeeze_result
+        
+        return None
+
 
 class RiskEngine:
     """
@@ -823,6 +1221,30 @@ class RiskEngine:
             market_time=market_time
         )
         return self.position
+    
+    async def sync_position_size(self, new_size: float, reason: str = "exchange sync") -> bool:
+        """
+        🔒 Thread-safe update of position size.
+        
+        This method should be used instead of direct assignment to position.size
+        to prevent race conditions between multiple coroutines.
+        
+        Args:
+            new_size: New position size from exchange
+            reason: Reason for the sync (for logging)
+            
+        Returns:
+            True if sync was successful, False if no position exists
+        """
+        async with self._lock:
+            if self.position is None:
+                return False
+            
+            old_size = self.position.size
+            if abs(old_size - new_size) > 0.00001:  # Only log if actually changed
+                self.position.size = new_size
+                logger.info(f"🔄 Position size sync ({reason}): {old_size:.6f} → {new_size:.6f}")
+            return True
     
     async def update_capital_from_balance(self, balance_dict: Dict) -> bool:
         """Update capital from exchange balance"""
@@ -1026,7 +1448,11 @@ class RiskEngine:
                              has_bos_against: bool = False,
                              market_time: datetime = None,
                              adx: Optional[float] = None,
-                             atr_ratio: Optional[float] = None) -> Optional[dict]:
+                             atr_ratio: Optional[float] = None,
+                             rsi_1m: Optional[float] = None,
+                             vpoc: Optional[float] = None,
+                             bb_width: Optional[float] = None,
+                             bb_avg: Optional[float] = None) -> Optional[dict]:
         """
         Manage open position with REGIME-BASED exit logic
         
@@ -1073,6 +1499,55 @@ class RiskEngine:
             # ================================================================
             
             if pos.regime == REGIME_NORMAL:
+                # ============================================================
+                # SMART EXITS (Jan 13, 2026) - Advanced profit/exit management
+                # Check BEFORE normal exits to capture more profit
+                # ============================================================
+                volume_ratio = volume / avg_volume if avg_volume > 0 else 1.0
+                
+                smart_exit = pos.check_all_smart_exits(
+                    current_price=current_price,
+                    rsi=rsi_1m,
+                    vpoc=vpoc,
+                    bb_width=bb_width,
+                    bb_avg=bb_avg,
+                    volume_ratio=volume_ratio
+                )
+                
+                if smart_exit:
+                    action_type = smart_exit.get('action', '')
+                    
+                    # Handle partial exits (scaled profit taking)
+                    if action_type == 'PARTIAL_EXIT':
+                        exit_pct = smart_exit.get('exit_pct', 0)
+                        if exit_pct > 0:
+                            close_size = pos.size * exit_pct
+                            remaining_size = pos.size - close_size
+                            
+                            # 🔒 FIX (Jan 14, 2026): Validate minimum order sizes
+                            if close_size < KRAKEN_BTC_MIN_SIZE:
+                                logger.info(f"🔄 SMART PARTIAL skipped: close_size {close_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}")
+                                # Don't return, let normal exit logic continue below
+                            elif remaining_size > 0 and remaining_size < KRAKEN_BTC_MIN_SIZE:
+                                # Remaining too small - close ALL instead
+                                logger.info(f"🔄 SMART PARTIAL: Remaining {remaining_size:.6f} < min, closing FULL")
+                                return await self._close_position(current_price, 'SCALED_PARTIAL_FULL')
+                            else:
+                                reason = smart_exit.get('reason', 'SCALED_PARTIAL')
+                                logger.info(f"💰 SMART PARTIAL: Closing {exit_pct:.0%} ({close_size:.6f}) - {reason}")
+                                return {
+                                    'action': 'PARTIAL_CLOSE',
+                                    'size': close_size,
+                                    'reason': reason,
+                                    'mfe_r': smart_exit.get('mfe_r', 0)
+                                }
+                    
+                    # Handle full exit triggers (momentum, VPOC, squeeze)
+                    elif action_type in ('MOMENTUM_EXIT', 'VPOC_EXIT', 'VOLATILITY_SQUEEZE_EXIT'):
+                        reason = smart_exit.get('reason', action_type)
+                        logger.info(f"🚀 SMART EXIT: {action_type} - {reason}")
+                        return await self._close_position(current_price, action_type)
+                
                 # 0. Check mediocre trade exit (kill stagnant trades early)
                 # HYBRID LOGIC (Jan 9, 2026): ADX + ATR ratio to avoid killing slow trends
                 if pos.check_mediocre_trade_exit(n_candles=6, adx=adx, atr_ratio=atr_ratio):
@@ -1141,6 +1616,18 @@ class RiskEngine:
         # Calculate partial close
         close_size = pos.size * (RiskManagement.TP1_CLOSE_PCT / 100.0)
         remaining_size = pos.size - close_size
+        
+        # 🔒 FIX (Jan 14, 2026): Validate minimum order sizes
+        # If partial close would leave remaining below minimum, close ALL
+        if remaining_size < KRAKEN_BTC_MIN_SIZE:
+            logger.info(f"🔄 TP1: Remaining {remaining_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}, closing FULL position")
+            return await self._close_position(current_price, 'TP1_FULL')
+        
+        # If close_size below minimum, skip partial and let TP2 handle full close
+        if close_size < KRAKEN_BTC_MIN_SIZE:
+            logger.info(f"🔄 TP1: Close size {close_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}, skipping partial")
+            pos.tp1_hit = True  # Mark as hit but don't close
+            return None
         
         # Calculate PnL for closed portion
         if pos.direction == 'LONG':
@@ -1291,12 +1778,16 @@ class RiskEngine:
         - 'contracts': can be signed (+ long, - short) or unsigned depending on exchange
         - 'info': raw exchange response
         """
+        # Minimum position size to consider valid (prevents float precision issues)
+        MIN_POSITION_SIZE = 0.00001
+        
         async with self._lock:
             try:
                 symbol = position_data.get('symbol', 'UNKNOWN')
                 contracts = float(position_data.get('contracts', 0))
                 
-                if contracts == 0:
+                # 🔒 FIX: Use tolerance-based comparison instead of exact == 0
+                if abs(contracts) < MIN_POSITION_SIZE:
                     self.position = None
                     return
                 

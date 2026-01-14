@@ -1,14 +1,45 @@
 # ============================================================
-# DayTrader 2.1 - Production Dockerfile
+# DayTrader 2.1 - Production Multi-Stage Dockerfile
 # BTC Perpetual Futures Trading Bot
 # ============================================================
 
-FROM python:3.12-slim
+# ---------------------
+# BUILDER STAGE
+# ---------------------
+FROM python:3.12-slim AS builder
+
+# Build environment
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /build
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY pyproject.toml requeriments.txt ./
+RUN pip install --upgrade pip && \
+    pip wheel --no-cache-dir --wheel-dir /wheels -r requeriments.txt
+
+# ---------------------
+# PRODUCTION STAGE
+# ---------------------
+FROM python:3.12-slim AS production
 
 # Metadata
 LABEL maintainer="DayTrader Team"
-LABEL version="2.1"
-LABEL description="BTC Perpetual Futures Trading Bot"
+LABEL version="2.1.0"
+LABEL description="BTC Perpetual Futures Trading Bot - Production"
+
+# Build args for versioning
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
+ENV BUILD_TIME=${BUILD_TIME}
 
 # Environment
 ENV PYTHONUNBUFFERED=1
@@ -17,28 +48,25 @@ ENV TZ=UTC
 ENV PIP_NO_CACHE_DIR=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Create non-root user for security
+# Security: Create non-root user
 RUN groupadd -r trader && useradd -r -g trader trader
 
-# Install system dependencies
+# Install runtime dependencies only
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    wget \
     netcat-openbsd \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for better caching
-COPY pyproject.toml ./
-COPY requeriments.txt ./
-
-# Install Python dependencies
-RUN pip install --upgrade pip && \
-    pip install -r requeriments.txt
+# Install pre-built wheels from builder
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 
 # Copy application code
+COPY core/ ./core/
 COPY engine/ ./engine/
 COPY ingest/ ./ingest/
 COPY output/ ./output/
@@ -48,47 +76,23 @@ COPY main.py ./
 COPY run_backtest_kraken.py ./
 COPY prometheus.yml ./
 
-# Create necessary directories
+# Create necessary directories with proper permissions
 RUN mkdir -p /app/logs /app/storage /app/output && \
+    touch /app/KILL_SWITCH && rm /app/KILL_SWITCH && \
     chown -R trader:trader /app
 
-# Health check endpoint script
-RUN echo '#!/usr/bin/env python3\n\
-import http.server\n\
-import socketserver\n\
-import threading\n\
-import json\n\
-from datetime import datetime\n\
-\n\
-class HealthHandler(http.server.BaseHTTPRequestHandler):\n\
-    def do_GET(self):\n\
-        if self.path == "/health":\n\
-            self.send_response(200)\n\
-            self.send_header("Content-type", "application/json")\n\
-            self.end_headers()\n\
-            response = {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}\n\
-            self.wfile.write(json.dumps(response).encode())\n\
-        else:\n\
-            self.send_response(404)\n\
-            self.end_headers()\n\
-    def log_message(self, format, *args):\n\
-        pass  # Suppress logging\n\
-\n\
-def start_health_server(port=8000):\n\
-    with socketserver.TCPServer(("", port), HealthHandler) as httpd:\n\
-        httpd.serve_forever()\n\
-\n\
-if __name__ == "__main__":\n\
-    start_health_server()\n\
-' > /app/health_server.py
+# Health check (uses our new health module endpoints)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8001/healthz || exit 1
 
 # Switch to non-root user
 USER trader
 
 # Expose ports
 # 8000: Prometheus metrics
-# 8001: Health check endpoint
+# 8001: Health check endpoint (liveness/readiness)
 EXPOSE 8000 8001
 
-# Default command
-CMD ["python", "main.py"]
+# Default entrypoint - use exec form for proper signal handling
+ENTRYPOINT ["python", "-u"]
+CMD ["main.py"]

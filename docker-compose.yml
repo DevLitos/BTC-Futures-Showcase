@@ -8,6 +8,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
     container_name: daytrader-bot
     restart: always
     env_file:
@@ -15,15 +18,25 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - TZ=UTC
+      # Production settings (can be overridden in .env)
+      - TRADING_MODE=${TRADING_MODE:-PAPER}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_JSON=${LOG_JSON:-true}
+      - METRICS_PORT=8000
+      - HEALTH_PORT=8001
     volumes:
       - ./logs:/app/logs
       - ./storage:/app/storage
-      - ./config:/app/config
+      - ./config:/app/config:ro
+      # Kill switch file mount (create empty file to pause trading)
+      - ./KILL_SWITCH:/app/KILL_SWITCH:ro
     depends_on:
-      - kafka
-      - prometheus
+      kafka:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -35,6 +48,15 @@ services:
         max-file: "5"
     networks:
       - trading-network
+    # Limit resources
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
 
   # ============================================================
   # SCHEDULED RESTART - Daily restart at 00:00 UTC

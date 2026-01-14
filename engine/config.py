@@ -28,15 +28,26 @@ class OperatingMode:
     DISCOVERY_MIN_RR = 0.9          # HARD FLOOR - no trades below this
     PRODUCTION_MIN_RR = 1.2         # Require good RR or no trade
     
-    # ABSOLUTE MINIMUM - never trade below this regardless of mode
-    RR_HARD_FLOOR = 0.8             # Mathematical minimum - below this = guaranteed loss
+    # =========================================================================
+    # RR HARD FLOOR BY REGIME (Jan 14, 2026)
+    # Different regimes have different mathematical minimums:
+    # - TREND: Need 0.9R+ because we're paying for momentum premium
+    # - RANGE: Can accept 0.5R+ because high winrate mean-reversion
+    # The regime_config.min_rr is the PRIMARY floor now
+    # =========================================================================
+    RR_HARD_FLOOR = 0.4             # ABSOLUTE mathematical minimum (any regime)
+    RR_HARD_FLOOR_TREND = 0.9       # Trend regimes need higher RR
+    RR_HARD_FLOOR_RANGE = 0.5       # Range regimes can accept lower RR
     
     # =========================================================================
-    # RR PENALTY IN SCORING - Penalize low RR setups BEFORE score evaluation
-    # This ensures RR < 1.0 trades are mathematically harder to pass
+    # RR PENALTY IN SCORING - PROPORTIONAL penalty (not fixed guillotine)
+    # Penalty scales with how far below ideal RR we are
+    # RANGE regime: lighter penalty (high winrate compensates)
+    # TREND regime: heavier penalty (need RR for math to work)
     # =========================================================================
     RR_PENALTY_THRESHOLD = 1.0      # Below this RR, apply score penalty
-    RR_PENALTY_POINTS = 2           # Subtract 2 points from score if RR < 1.0
+    RR_PENALTY_MAX_POINTS = 2       # Maximum penalty at RR=0.5
+    RR_PENALTY_RANGE_MULTIPLIER = 0.5  # RANGE penalty is 50% of TREND
     RR_EXCELLENT_THRESHOLD = 1.5    # Above this RR, add bonus
     RR_EXCELLENT_BONUS = 1          # Add 1 point if RR >= 1.5
     
@@ -67,6 +78,7 @@ class OperatingMode:
     # =========================================================================
     SESSION_SIZE_MULTIPLIERS = {
         'LONDON_NY_OVERLAP': 1.0,   # Best liquidity
+        'NY_OPEN_VOLATILE': 0.70,   # First 15min of NY - volatile, reduce size
         'LONDON': 0.90,             # Good
         'NY': 0.90,                 # Good
         'ASIA': 0.75,               # Lower quality
@@ -90,6 +102,24 @@ class OperatingMode:
     def get_session_multiplier(cls, session_name: str) -> float:
         """Get sizing multiplier based on session."""
         return cls.SESSION_SIZE_MULTIPLIERS.get(session_name.upper(), 0.75)
+    
+    # =========================================================================
+    # DAY OF WEEK SIZING - Reduce on riskier days
+    # =========================================================================
+    DAY_OF_WEEK_MULTIPLIERS = {
+        0: 1.0,    # Monday - normal
+        1: 1.0,    # Tuesday - good trends
+        2: 1.0,    # Wednesday - normal
+        3: 1.0,    # Thursday - normal
+        4: 0.85,   # Friday - early close risk, reduce
+        5: 0.60,   # Saturday - weekend, low liquidity
+        6: 0.60,   # Sunday - weekend, low liquidity
+    }
+    
+    @classmethod
+    def get_day_multiplier(cls, day_of_week: int) -> float:
+        """Get sizing multiplier based on day of week (0=Monday, 6=Sunday)."""
+        return cls.DAY_OF_WEEK_MULTIPLIERS.get(day_of_week, 1.0)
     
     # SMART COOLDOWN - Based on exit reason and PnL size
     # TIME_INVALIDATION = market was dead, not our fault → short cooldown
@@ -299,6 +329,44 @@ class HTFFilters:
     # Correlation filters (for NQ/ES)
     CHECK_CORRELATION = True
     CORRELATION_TIMEFRAME = '5m'
+
+
+# ============================================================================
+# LOCATION FILTER (MACRO CONTEXT) - Jan 14, 2026
+# ============================================================================
+class LocationFilters:
+    """
+    Location-based veto system - prevents buying tops in ranging markets.
+    
+    "Location" is distinct from momentum/structure. EMA/ADX/BOS measure dynamics,
+    not absolute context: WHERE you are in the HTF map (20-60 day range).
+    
+    This "macro veto" differentiates a bot that survives from one that
+    self-liquidates by buying tops.
+    
+    Rules:
+    1. EXTREMES_VETO: In RANGE, prohibit longs in top 10% / shorts in bottom 10%
+    2. HEADROOM_VETO: If distance to structure high < k*ATR, no longs in RANGE
+    3. BREAKOUT_OVERRIDE: Allow extremes if ADX high + volume expansion
+    """
+    # Percentile thresholds for extremes veto
+    EXTREME_HIGH_PERCENTILE = 90.0   # Top 10% of 60-day range → no LONG in RANGE
+    EXTREME_LOW_PERCENTILE = 10.0    # Bottom 10% of 60-day range → no SHORT in RANGE
+    
+    # Lookback periods
+    RANGE_LOOKBACK_DAYS = 60         # Primary lookback for range calculation
+    RANGE_LOOKBACK_SHORT_DAYS = 20   # Short-term confirmation
+    
+    # Headroom thresholds (in ATR units)
+    MIN_HEADROOM_ATR = 0.5           # Minimum space to target
+    MIN_HEADROOM_ATR_STRICT = 1.0    # For weaker setups
+    
+    # Breakout override thresholds
+    BREAKOUT_ADX_MIN = 30.0          # ADX required for breakout override
+    BREAKOUT_VOLUME_EXPANSION = 1.3  # Volume > 130% of avg for breakout
+    
+    # Enable/disable the filter
+    ENABLED = True
 
 
 # ============================================================================
@@ -512,6 +580,102 @@ class PostTrade:
     # Performance thresholds
     MIN_PROFIT_FACTOR = 1.5        # Minimum acceptable profit factor
     MIN_EXPECTANCY = 0.0           # Expectancy must be positive
+
+
+# ============================================================================
+# SMART EXITS - Advanced profit taking and early exit detection
+# Implemented: Jan 13, 2026
+# ============================================================================
+class SmartExits:
+    """
+    Advanced exit management to maximize profits and minimize drawdowns.
+    
+    5 Key Improvements:
+    1. Scaled partial profit taking (not just TP1/TP2)
+    2. Momentum exit - exit before reversals
+    3. VPOC resistance exit
+    4. Time-based profit lock
+    5. Volatility squeeze exit
+    """
+    
+    # =========================================================================
+    # 1. SCALED PARTIAL EXITS - Take profits progressively
+    # =========================================================================
+    SCALED_PARTIALS_ENABLED = True
+    
+    # Exit levels: (MFE in R, % of position to exit)
+    # More aggressive profit taking to capture gains
+    SCALE_OUT_LEVELS = [
+        (0.8, 0.33),   # Exit 33% at +0.8R
+        (1.5, 0.33),   # Exit 33% at +1.5R  
+        (2.5, 0.20),   # Exit 20% at +2.5R (if reached)
+        # Remaining 14% runs with trailing stop
+    ]
+    
+    # Minimum position to keep for runner
+    MIN_RUNNER_PCT = 0.10  # Always keep at least 10% as runner
+    
+    # =========================================================================
+    # 2. MOMENTUM EXIT - Exit when momentum dies BEFORE price falls
+    # =========================================================================
+    MOMENTUM_EXIT_ENABLED = True
+    
+    # RSI thresholds for momentum death
+    RSI_LONG_EXIT_THRESHOLD = 40   # Exit LONG if RSI drops below 40
+    RSI_SHORT_EXIT_THRESHOLD = 60  # Exit SHORT if RSI rises above 60
+    
+    # Only apply if trade is already in profit
+    MOMENTUM_EXIT_MIN_MFE_R = 0.5  # Need at least 0.5R profit before momentum exit
+    
+    # Volume confirmation (optional)
+    REQUIRE_VOLUME_DECLINE = False  # If True, also check for volume drop
+    VOLUME_DECLINE_THRESHOLD = 0.7  # Volume < 70% of average = declining
+    
+    # =========================================================================
+    # 3. VPOC/RESISTANCE EXIT - Exit before hitting strong levels
+    # =========================================================================
+    VPOC_EXIT_ENABLED = True
+    
+    # Distance to VPOC/resistance to trigger exit (as % of price)
+    VPOC_PROXIMITY_PCT = 0.002  # 0.2% = within 0.2% of VPOC
+    
+    # Minimum profit required before VPOC exit
+    VPOC_EXIT_MIN_MFE_R = 0.3  # Need at least 0.3R profit
+    
+    # =========================================================================
+    # 4. TIME-BASED PROFIT LOCK - Lock profits after time threshold
+    # =========================================================================
+    TIME_PROFIT_LOCK_ENABLED = True
+    
+    # After X candles in profit, tighten stop to lock minimum R
+    TIME_LOCK_CANDLES = 10  # After 10 candles (10 min in 1m chart)
+    TIME_LOCK_MIN_MFE_R = 0.5  # Trigger only if MFE >= 0.5R
+    TIME_LOCK_FLOOR_R = 0.3   # Lock at least +0.3R profit
+    
+    # =========================================================================
+    # 5. VOLATILITY SQUEEZE EXIT - Exit in compression before resolution
+    # =========================================================================
+    VOLATILITY_SQUEEZE_EXIT_ENABLED = True
+    
+    # Bollinger Band width ratio to detect squeeze
+    BB_SQUEEZE_RATIO = 0.5  # BB width < 50% of average = squeeze
+    
+    # Take profit if in squeeze with small profit
+    SQUEEZE_EXIT_MIN_MFE_R = 0.2  # Exit if profit between 0.2R and 0.5R in squeeze
+    SQUEEZE_EXIT_MAX_MFE_R = 0.5  # Don't exit if already > 0.5R (let it run)
+    
+    # =========================================================================
+    # GLOBAL EXIT PRIORITY (order of checks)
+    # =========================================================================
+    EXIT_PRIORITY = [
+        'STOP_LOSS',       # Always first - risk management
+        'TRAILING_STOP',   # Second - locked profits
+        'TIME_PROFIT_LOCK',# Third - time-based locks
+        'MOMENTUM_EXIT',   # Fourth - momentum death
+        'VPOC_EXIT',       # Fifth - resistance proximity
+        'VOLATILITY_SQUEEZE', # Sixth - compression exit
+        'PARTIAL_SCALE',   # Seventh - partial profit taking
+    ]
 
 
 # ============================================================================

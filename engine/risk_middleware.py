@@ -431,6 +431,10 @@ class BECalculator:
             entry_price, position_size, use_maker
         )
         
+        # 🔒 FIX: Guard against division by zero
+        if position_size <= 0:
+            return entry_price  # Return entry price if no position
+        
         # Fee buffer per unit
         fee_per_unit = roundtrip_fees / position_size
         

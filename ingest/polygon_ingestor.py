@@ -10,7 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 API_KEY = os.getenv("POLYGON_API_KEY")
-WEBSOCKET_URL = f"wss://socket.polygon.io/stocks?apiKey={API_KEY}"
+# 🔒 SECURITY FIX (Jan 13, 2026): Never embed API keys in URLs at module level
+# This can leak to logs and error messages
+WEBSOCKET_URL = "wss://socket.polygon.io/stocks"
 SYBOLS = ["T.SPY", "T.QQQ"]  # Example symbols to subscribe to
 
 class PolygonIngestor(BaseIngestor):
@@ -33,7 +35,8 @@ class PolygonIngestor(BaseIngestor):
             "params": self.api_key
         }))
         auth_response = await self.connection.recv()
-        logger.info(f"Auth response: {auth_response}")
+        # 🔒 SECURITY FIX: Don't log auth response as it may contain tokens
+        logger.info(f"Auth response received (status: {'success' if 'success' in str(auth_response).lower() else 'unknown'})")
 
         #decirle al servidor qué símbolos quieres escuchar
         subscription_params = ",".join(self.symbols)
