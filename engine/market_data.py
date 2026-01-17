@@ -193,7 +193,7 @@ class SynchronizedMultiTimeframeBuffer:
         if self.last_price == 0.0 and candle.get('close'):
             self.last_price = float(candle['close'])
         
-        # LOG: Detallado para rastrear actualización de datos
+        # LOG: Only log 5m/1h at INFO, 1m at DEBUG to reduce spam
         current_counts = {
             '1m': len(self.candles['1m']),
             '5m': len(self.candles['5m']),
@@ -202,16 +202,15 @@ class SynchronizedMultiTimeframeBuffer:
         
         if timeframe == '1m':
             status = "✓" if current_counts['1m'] >= 20 else "⏳"
-            logger.info(f"{status} [1m] {current_counts['1m']}/20: O={candle['open']:.2f} H={candle['high']:.2f} "
+            # 1m at DEBUG level to reduce spam - only visible with DEBUG logging
+            logger.debug(f"{status} [1m] {current_counts['1m']}/20: O={candle['open']:.2f} H={candle['high']:.2f} "
                        f"L={candle['low']:.2f} C={candle['close']:.2f} V={candle['volume']:.0f}")
         elif timeframe == '5m':
             status = "✓" if current_counts['5m'] >= 50 else "⏳"
-            logger.info(f"{status} [5m] {current_counts['5m']}/50: O={candle['open']:.2f} H={candle['high']:.2f} "
-                       f"L={candle['low']:.2f} C={candle['close']:.2f} V={candle['volume']:.0f}")
+            logger.info(f"{status} [5m] O={candle['open']:.0f} C={candle['close']:.0f} ({current_counts['5m']}/50)")
         elif timeframe == '1h':
             status = "✓" if current_counts['1h'] >= 50 else "⏳"
-            logger.info(f"{status} [1h] {current_counts['1h']}/50: O={candle['open']:.2f} H={candle['high']:.2f} "
-                       f"L={candle['low']:.2f} C={candle['close']:.2f} V={candle['volume']:.0f}")
+            logger.info(f"{status} [1h] O={candle['open']:.0f} C={candle['close']:.0f} ({current_counts['1h']}/50)")
         
         # Recalcular indicadores SOLO si hay suficientes velas
         if timeframe == '1m':
@@ -323,7 +322,7 @@ class SynchronizedMultiTimeframeBuffer:
         vwap = calculate_vwap(df, anchor='D').iloc[-1]
         self.indicators['5m']['vwap'] = vwap
         
-        logger.info(f"5m indicators: EMA20={ema20:.2f} EMA50={ema50:.2f} ATR={atr:.2f} VWAP={vwap:.2f}")
+        logger.debug(f"5m indicators: EMA20={ema20:.2f} EMA50={ema50:.2f} ATR={atr:.2f} VWAP={vwap:.2f}")
     
     def _recalculate_1h_indicators(self):
         """Recalcular indicadores de 1h"""

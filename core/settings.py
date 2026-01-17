@@ -246,6 +246,27 @@ class Settings(BaseSettings):
     )
     
     # =========================================================================
+    # Pullback Short Engine - Feature Flags
+    # =========================================================================
+    enable_short_pullback: bool = Field(
+        default=False,
+        alias="ENABLE_SHORT_PULLBACK",
+        description="Master switch for tactical pullback shorts (correction capture)"
+    )
+    short_pullback_live_allowed: bool = Field(
+        default=False,
+        alias="SHORT_PULLBACK_LIVE_ALLOWED",
+        description="Allow pullback shorts in LIVE mode (test in paper first)"
+    )
+    short_pullback_max_daily: int = Field(
+        default=5,
+        alias="SHORT_PULLBACK_MAX_DAILY",
+        description="Maximum pullback short trades per day",
+        ge=0,
+        le=20
+    )
+    
+    # =========================================================================
     # Validators
     # =========================================================================
     

@@ -145,7 +145,11 @@ class FundingRateMonitor:
                             self.current_rate = rate
                             self.last_check = datetime.now()
                             
-                            logger.info(f"Funding rate ({symbol_kraken}): {rate*100:.4f}% (8h)")
+                            # Only log at INFO if funding rate is significant
+                            if abs(rate) > 0.001:  # > 0.1%
+                                logger.info(f"Funding rate ({symbol_kraken}): {rate*100:.4f}% (8h)")
+                            else:
+                                logger.debug(f"Funding rate ({symbol_kraken}): {rate*100:.4f}% (8h)")
                             return rate
                     
                     logger.warning(f"Symbol {symbol_kraken} not found in Kraken tickers")

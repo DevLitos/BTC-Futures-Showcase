@@ -830,8 +830,11 @@ class LTFTriggerFilter:
             'current_price': current_price
         }
         
-        # INFO ONLY - Log confirmations but NEVER block
-        logger.info(f"📊 LTF confirmations: {confirmations}/3 | BOS={bos_confirmed} | EMAReclaim={ema_reclaim} | Slope={slope_positive}")
+        # INFO ONLY - Log confirmations at DEBUG level unless incomplete
+        if confirmations < 3:
+            logger.info(f"📊 LTF confirmations: {confirmations}/3 | BOS={bos_confirmed} | EMAReclaim={ema_reclaim} | Slope={slope_positive}")
+        else:
+            logger.debug(f"LTF confirmations: {confirmations}/3 | BOS={bos_confirmed} | EMAReclaim={ema_reclaim} | Slope={slope_positive}")
         
         # ===== SECONDARY: VOLUME (INFO ONLY - NEVER BLOCKS) =====
         # SCORE > GATES: Volume is tag + score contributor, NOT a gate
@@ -857,7 +860,7 @@ class LTFTriggerFilter:
         self._last_ltf_info['rel_vol'] = rel_vol
         self._last_ltf_info['volume_bucket'] = volume_bucket
         
-        logger.info(f"📊 LTF volume: {rel_vol:.2f} ({volume_bucket}) - INFO only, not blocking")
+        logger.debug(f"LTF volume: {rel_vol:.2f} ({volume_bucket})")
         logger.debug(f"LTF: {bias} | BOS={bos_confirmed} EMA={ema_reclaim} Slope={slope_positive} | Vol={volume_bucket} ({rel_vol:.2f})")
         
         # ===== TERTIARY: ORDERBOOK (INFORMATION ONLY) =====

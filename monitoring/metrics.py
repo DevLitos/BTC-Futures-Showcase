@@ -445,3 +445,108 @@ def check_edge_health_alert(expectancy_last_20: float,
     return ratio < threshold
 
 
+# =============================================================================
+# PULLBACK SHORT ENGINE METRICS (Jan 14, 2026)
+# =============================================================================
+
+PULLBACK_SHORT_SIGNALS_TOTAL = Counter(
+    'pullback_short_signals_total',
+    'Total pullback short signals generated',
+    ['symbol']
+)
+
+PULLBACK_SHORT_ENTRIES_TOTAL = Counter(
+    'pullback_short_entries_total',
+    'Total pullback short entries executed',
+    ['symbol']
+)
+
+PULLBACK_SHORT_BLOCKS_TOTAL = Counter(
+    'pullback_short_blocks_total',
+    'Total pullback short signals blocked',
+    ['symbol', 'reason']  # reason: ext_z_low, no_trigger, breakout_cooldown, daily_limit, etc.
+)
+
+PULLBACK_SHORT_PNL_TOTAL = Gauge(
+    'pullback_short_pnl_total',
+    'Cumulative PnL from pullback shorts in USD',
+    ['symbol']
+)
+
+PULLBACK_SHORT_WINS_TOTAL = Counter(
+    'pullback_short_wins_total',
+    'Total winning pullback short trades',
+    ['symbol']
+)
+
+PULLBACK_SHORT_LOSSES_TOTAL = Counter(
+    'pullback_short_losses_total',
+    'Total losing pullback short trades',
+    ['symbol']
+)
+
+PULLBACK_SHORT_MFE_R = Histogram(
+    'pullback_short_mfe_r',
+    'Maximum Favorable Excursion for pullback shorts (in R)',
+    ['symbol'],
+    buckets=[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0]
+)
+
+PULLBACK_SHORT_MAE_R = Histogram(
+    'pullback_short_mae_r',
+    'Maximum Adverse Excursion for pullback shorts (in R)',
+    ['symbol'],
+    buckets=[0.0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5]
+)
+
+PULLBACK_SHORT_EXTENSION_Z = Histogram(
+    'pullback_short_extension_z',
+    'Extension Z-score at entry for pullback shorts',
+    ['symbol'],
+    buckets=[1.5, 1.8, 2.0, 2.3, 2.5, 3.0, 4.0, 5.0]
+)
+
+PULLBACK_SHORT_DAILY_COUNT = Gauge(
+    'pullback_short_daily_count',
+    'Number of pullback short trades today',
+    ['symbol']
+)
+
+PULLBACK_SHORT_CONSECUTIVE_LOSSES = Gauge(
+    'pullback_short_consecutive_losses',
+    'Current consecutive pullback short losses',
+    ['symbol']
+)
+
+
+def update_pullback_short_signal(symbol: str, blocked: bool = False, reason: str = ""):
+    """Update pullback short signal metrics."""
+    PULLBACK_SHORT_SIGNALS_TOTAL.labels(symbol=symbol).inc()
+    if blocked and reason:
+        PULLBACK_SHORT_BLOCKS_TOTAL.labels(symbol=symbol, reason=reason).inc()
+
+
+def update_pullback_short_entry(symbol: str, extension_z: float):
+    """Update pullback short entry metrics."""
+    PULLBACK_SHORT_ENTRIES_TOTAL.labels(symbol=symbol).inc()
+    PULLBACK_SHORT_EXTENSION_Z.labels(symbol=symbol).observe(extension_z)
+
+
+def update_pullback_short_exit(symbol: str, pnl: float, is_win: bool, mfe_r: float, mae_r: float):
+    """Update pullback short exit metrics."""
+    if is_win:
+        PULLBACK_SHORT_WINS_TOTAL.labels(symbol=symbol).inc()
+    else:
+        PULLBACK_SHORT_LOSSES_TOTAL.labels(symbol=symbol).inc()
+    
+    # Update cumulative PnL (get current and add)
+    # Note: For proper cumulative, you'd track in the engine and set here
+    PULLBACK_SHORT_MFE_R.labels(symbol=symbol).observe(mfe_r)
+    PULLBACK_SHORT_MAE_R.labels(symbol=symbol).observe(mae_r)
+
+
+def update_pullback_short_status(symbol: str, daily_count: int, consecutive_losses: int, cumulative_pnl: float):
+    """Update pullback short status gauges."""
+    PULLBACK_SHORT_DAILY_COUNT.labels(symbol=symbol).set(daily_count)
+    PULLBACK_SHORT_CONSECUTIVE_LOSSES.labels(symbol=symbol).set(consecutive_losses)
+    PULLBACK_SHORT_PNL_TOTAL.labels(symbol=symbol).set(cumulative_pnl)

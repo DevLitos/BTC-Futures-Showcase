@@ -356,3 +356,275 @@ def calculate_bollinger_bands(prices: np.ndarray, period: int = 20, std_dev: flo
         lower[i] = sma - std_dev * std
     
     return upper, middle, lower
+
+
+# ============================================================================
+# PULLBACK SHORT ENGINE - New Indicators (Jan 14, 2026)
+# ============================================================================
+
+def calculate_extension_z(
+    current_price: float,
+    ema_values: np.ndarray,
+    atr_values: np.ndarray
+) -> float:
+    """
+    Calculate Z-score of price extension from EMA in ATR units.
+    
+    extension_z = (price - EMA) / ATR
+    
+    This measures how "stretched" price is from the mean.
+    - Positive = price above EMA (bullish extension)
+    - Negative = price below EMA (bearish extension)
+    - Values > 1.8 indicate significant extension
+    
+    Args:
+        current_price: Current market price
+        ema_values: EMA values array (uses last value)
+        atr_values: ATR values array (uses last value)
+    
+    Returns:
+        Extension Z-score (can be positive or negative)
+    """
+    if len(ema_values) == 0 or len(atr_values) == 0:
+        return 0.0
+    
+    ema = ema_values[-1]
+    atr = atr_values[-1]
+    
+    if np.isnan(ema) or np.isnan(atr) or atr <= 0:
+        return 0.0
+    
+    return (current_price - ema) / atr
+
+
+def detect_swing_high(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    lookback: int = 3
+) -> Tuple[bool, float, int]:
+    """
+    Detect a confirmed swing high in price data.
+    
+    A swing high is a local maximum where:
+    - The high is greater than the N highs before it
+    - The high is greater than the N highs after it (confirmation)
+    
+    Args:
+        highs: Array of high prices
+        lows: Array of low prices  
+        closes: Array of close prices
+        lookback: Number of candles to look left and right
+    
+    Returns:
+        Tuple of (is_confirmed, swing_high_price, candle_index)
+        - is_confirmed: True if swing high detected and confirmed
+        - swing_high_price: The high price at the swing
+        - candle_index: Index of the swing high candle (from end)
+    """
+    n = len(highs)
+    
+    # Need at least lookback*2 + 1 candles for confirmation
+    if n < lookback * 2 + 1:
+        return False, 0.0, -1
+    
+    # Check each potential swing high (excluding edges)
+    for i in range(lookback, n - lookback):
+        candidate_high = highs[i]
+        
+        # Check left side (N candles before)
+        left_valid = all(highs[j] < candidate_high for j in range(i - lookback, i))
+        
+        # Check right side (N candles after)
+        right_valid = all(highs[j] < candidate_high for j in range(i + 1, i + lookback + 1))
+        
+        if left_valid and right_valid:
+            # Swing high confirmed
+            candles_from_end = n - 1 - i
+            return True, candidate_high, candles_from_end
+    
+    return False, 0.0, -1
+
+
+def detect_swing_low(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    lookback: int = 3
+) -> Tuple[bool, float, int]:
+    """
+    Detect a confirmed swing low in price data.
+    
+    A swing low is a local minimum where:
+    - The low is less than the N lows before it
+    - The low is less than the N lows after it (confirmation)
+    
+    Args:
+        highs: Array of high prices
+        lows: Array of low prices
+        closes: Array of close prices
+        lookback: Number of candles to look left and right
+    
+    Returns:
+        Tuple of (is_confirmed, swing_low_price, candle_index)
+    """
+    n = len(lows)
+    
+    if n < lookback * 2 + 1:
+        return False, 0.0, -1
+    
+    for i in range(lookback, n - lookback):
+        candidate_low = lows[i]
+        
+        left_valid = all(lows[j] > candidate_low for j in range(i - lookback, i))
+        right_valid = all(lows[j] > candidate_low for j in range(i + 1, i + lookback + 1))
+        
+        if left_valid and right_valid:
+            candles_from_end = n - 1 - i
+            return True, candidate_low, candles_from_end
+    
+    return False, 0.0, -1
+
+
+def detect_breakout_impulse(
+    opens: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    volumes: np.ndarray,
+    atr: float,
+    body_atr_ratio: float = 0.6,
+    close_near_high_ratio: float = 0.8,
+    volume_expansion_ratio: float = 1.5,
+    volume_ma_period: int = 20
+) -> Tuple[bool, dict]:
+    """
+    Detect a breakout impulse candle that would VETO a pullback short.
+    
+    A breakout impulse is characterized by:
+    1. Large body relative to ATR (momentum)
+    2. Close near the high (bullish strength)
+    3. Volume expansion (conviction)
+    
+    If detected, pullback shorts should be PROHIBITED for N candles.
+    
+    Args:
+        opens: Array of open prices
+        highs: Array of high prices
+        lows: Array of low prices
+        closes: Array of close prices
+        volumes: Array of volumes
+        atr: Current ATR value
+        body_atr_ratio: Minimum body/ATR ratio for impulse
+        close_near_high_ratio: Close must be in top X% of range
+        volume_expansion_ratio: Volume must be X times SMA
+        volume_ma_period: Period for volume SMA
+    
+    Returns:
+        Tuple of (is_breakout_impulse, details_dict)
+    """
+    if len(closes) < 1 or atr <= 0:
+        return False, {}
+    
+    # Current candle values
+    open_price = opens[-1]
+    high = highs[-1]
+    low = lows[-1]
+    close = closes[-1]
+    volume = volumes[-1] if len(volumes) > 0 else 0
+    
+    # Calculate metrics
+    body = abs(close - open_price)
+    candle_range = high - low
+    
+    if candle_range == 0:
+        return False, {}
+    
+    # 1. Body size check (impulse)
+    body_ratio = body / atr
+    is_impulse = body_ratio >= body_atr_ratio
+    
+    # 2. Close near high check (bullish strength)
+    # For bullish impulse: close should be near high
+    # distance_from_high = (high - close) / candle_range
+    close_position = (close - low) / candle_range  # 0 = at low, 1 = at high
+    is_bullish_close = close_position >= close_near_high_ratio
+    
+    # 3. Volume expansion check
+    is_volume_expansion = False
+    volume_ratio = 0.0
+    if len(volumes) >= volume_ma_period and volume > 0:
+        volume_ma = np.mean(volumes[-volume_ma_period:])
+        if volume_ma > 0:
+            volume_ratio = volume / volume_ma
+            is_volume_expansion = volume_ratio >= volume_expansion_ratio
+    
+    # All conditions must be true for breakout impulse
+    is_breakout = is_impulse and is_bullish_close and is_volume_expansion
+    
+    details = {
+        'body_ratio': body_ratio,
+        'close_position': close_position,
+        'volume_ratio': volume_ratio,
+        'is_impulse': is_impulse,
+        'is_bullish_close': is_bullish_close,
+        'is_volume_expansion': is_volume_expansion,
+        'body': body,
+        'range': candle_range,
+        'atr': atr
+    }
+    
+    return is_breakout, details
+
+
+def calculate_activity_score(
+    atr_current: float,
+    atr_avg: float,
+    volume_current: float,
+    volume_avg: float,
+    velocity: float = 0.0,
+    velocity_avg: float = 0.0
+) -> float:
+    """
+    Calculate market activity score for adaptive TP targeting.
+    
+    Score ranges from 0.0 (dead market) to 1.0 (very active market).
+    
+    Components:
+    - ATR ratio: current ATR vs average
+    - Volume ratio: current volume vs average
+    - Velocity (optional): price movement speed
+    
+    Args:
+        atr_current: Current ATR value
+        atr_avg: Average ATR value
+        volume_current: Current volume
+        volume_avg: Average volume
+        velocity: Current price velocity (optional)
+        velocity_avg: Average velocity (optional)
+    
+    Returns:
+        Activity score between 0.0 and 1.0
+    """
+    scores = []
+    
+    # ATR component (0 to 1, capped at 2x average)
+    if atr_avg > 0:
+        atr_ratio = min(atr_current / atr_avg, 2.0) / 2.0
+        scores.append(atr_ratio)
+    
+    # Volume component
+    if volume_avg > 0:
+        volume_ratio = min(volume_current / volume_avg, 2.0) / 2.0
+        scores.append(volume_ratio)
+    
+    # Velocity component (optional)
+    if velocity_avg > 0 and velocity > 0:
+        velocity_ratio = min(velocity / velocity_avg, 2.0) / 2.0
+        scores.append(velocity_ratio)
+    
+    if not scores:
+        return 0.5  # Default to moderate activity
+    
+    # Average of components
+    return sum(scores) / len(scores)

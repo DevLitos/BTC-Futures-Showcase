@@ -139,6 +139,9 @@ from monitoring.metrics import (
     KILL_SWITCH_ACTIVE
 )
 
+# 10. BTC CONTEXT FEED (Jan 15, 2026)
+from engine.btc_context_feed import get_btc_context_feed
+
 # Legacy (mantener compatibilidad)
 from output.output_manager import OutputManager
 
@@ -269,15 +272,29 @@ class TradingSystemOrchestrator:
         # Signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+        # Ignore SIGPIPE - prevents BrokenPipeError when piping to head/grep
+        try:
+            signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        except AttributeError:
+            pass  # SIGPIPE not available on Windows
     
     def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
-        logger.info(f"Received signal {signum} - initiating graceful shutdown...")
-        self.is_running = False  # Set flag FIRST - this stops the main loop
+        """Handle shutdown signals gracefully, ignoring BrokenPipeError."""
+        # Set flag FIRST - this stops the main loop
+        self.is_running = False
+        
+        # Helper to safely log (ignore BrokenPipeError when piping to head/grep)
+        def safe_log(level: str, msg: str):
+            try:
+                getattr(logger, level)(msg)
+            except (BrokenPipeError, OSError):
+                pass  # Ignore pipe errors during shutdown
+        
+        safe_log("info", f"Received signal {signum} - initiating graceful shutdown...")
         
         # 🔥 FIX: On second signal, force exit immediately
         if hasattr(self, '_shutdown_requested') and self._shutdown_requested:
-            logger.critical("🛑 FORCE EXIT - Second signal received")
+            safe_log("critical", "🛑 FORCE EXIT - Second signal received")
             import os
             os._exit(1)
         
@@ -289,9 +306,23 @@ class TradingSystemOrchestrator:
             loop.call_soon_threadsafe(lambda: asyncio.create_task(self.shutdown()))
         except RuntimeError:
             # No running loop - just exit
-            logger.info("No event loop running - forcing exit")
+            safe_log("info", "No event loop running - forcing exit")
             import os
             os._exit(0)
+    
+    async def _telegram_shutdown(self):
+        """
+        Shutdown callback for Telegram /force_stop command.
+        
+        This performs a clean shutdown WITHOUT closing positions.
+        Positions remain on exchange with their SL/TP orders.
+        """
+        logger.critical("🛑 TELEGRAM /force_stop - Initiating full shutdown (positions NOT closed)")
+        self.is_running = False
+        self._shutdown_requested = True
+        
+        # Trigger shutdown with preserve_orders=True to keep SL/TP
+        await self.shutdown(preserve_orders=True)
     
     async def _load_historical_data(self):
         """Load historical candles to bootstrap the system"""
@@ -352,6 +383,13 @@ class TradingSystemOrchestrator:
         # Step 1: Check for open positions
         try:
             exchange_pos = await self.execution.get_position(CCXT_SYMBOL)
+            
+            # CRITICAL: Check for API error (not "no position")
+            if exchange_pos and exchange_pos.get('_error'):
+                logger.warning(f"⚠️ Cannot verify positions at startup (API error): {exchange_pos.get('_error')}")
+                # Don't proceed with recovery - we don't know the true state
+                recovery_actions.append("WARNING: Could not verify position state (API unavailable)")
+                exchange_pos = None  # Treat as unknown
             
             if exchange_pos:
                 size = abs(float(exchange_pos.get('contracts', 0) or 0))
@@ -625,6 +663,15 @@ class TradingSystemOrchestrator:
             logger.info("[5/7] Initializing external data monitors...")
             self.tasks.append(asyncio.create_task(self.external_data.start(), name="ExternalData"))
             
+            # 5.1 BTC Context Feed for correlation (Jan 15, 2026)
+            logger.info("[5.1/7] Starting BTC context feed for correlation...")
+            self.btc_context_feed = get_btc_context_feed(
+                exchange=EXCHANGE,
+                symbol=CCXT_SYMBOL,
+                enabled=True
+            )
+            self.tasks.append(asyncio.create_task(self.btc_context_feed.start(), name="BTCContextFeed"))
+            
             # FALLBACK: Start REST polling for candles (safety net si WS muere)
             logger.info("[5.5/7] Starting REST candle polling fallback...")
             self.tasks.append(asyncio.create_task(self._rest_candle_polling_loop(), name="CandlePolling"))
@@ -697,6 +744,12 @@ class TradingSystemOrchestrator:
             
             # Start kill switch monitor task
             self.tasks.append(asyncio.create_task(self._kill_switch_monitor(), name="KillSwitchMonitor"))
+            
+            # Start Telegram command listener (/stop, /force_stop)
+            if self.output_manager:
+                self.output_manager.set_force_exit_callback(self.signal_engine.emergency_close_all)
+                self.output_manager.set_shutdown_callback(self._telegram_shutdown)
+                self.tasks.append(asyncio.create_task(self.output_manager.start_command_listener(), name="TelegramCommands"))
             
             logger.info("=" * 70)
             logger.info("✅ SYSTEM READY")
@@ -917,14 +970,14 @@ class TradingSystemOrchestrator:
     # ===== MONITORING =====
     
     async def _monitoring_loop(self):
-        """Monitoreo cada minuto"""
+        """Monitoreo cada 5 minutos (reducido para menos spam)"""
         while self.is_running:
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(300)  # 5 minutes instead of 1
                 
-                # Status
+                # Status (compact single line)
                 logger.info("=" * 70)
-                logger.info("📊 SYSTEM STATUS")
+                logger.info("📊 SYSTEM STATUS (5min report)")
                 
                 # Signal engine
                 if self.signal_engine:
@@ -997,13 +1050,22 @@ class TradingSystemOrchestrator:
     
     # ===== SHUTDOWN =====
     
-    async def shutdown(self):
-        """Apagado graceful"""
+    async def shutdown(self, preserve_orders: bool = False):
+        """
+        Apagado graceful.
+        
+        Args:
+            preserve_orders: If True, don't cancel SL/TP orders on exchange.
+                           Used by /force_stop to keep protective orders active.
+        """
         if not self.is_running:
             return
         
         logger.info("=" * 70)
-        logger.info("🛑 GRACEFUL SHUTDOWN")
+        if preserve_orders:
+            logger.info("🛑 GRACEFUL SHUTDOWN (preserving SL/TP orders)")
+        else:
+            logger.info("🛑 GRACEFUL SHUTDOWN")
         logger.info("=" * 70)
         
         self.is_running = False
@@ -1022,19 +1084,40 @@ class TradingSystemOrchestrator:
                 logger.info("Stopping external data monitors...")
                 await self.external_data.stop()
             
+            # 2.1 Stop BTC context feed
+            if hasattr(self, 'btc_context_feed') and self.btc_context_feed:
+                logger.info("Stopping BTC context feed...")
+                await self.btc_context_feed.stop()
+            
+            # 2.2 Stop Telegram command listener
+            if self.output_manager:
+                await self.output_manager.stop_command_listener()
+            
             # 3. Stop reconciliation
             if self.reconciler:
                 logger.info("Stopping reconciliation...")
                 await self.reconciler.stop()
             
-            # 4. Cancel all orders - CRITICAL for clean shutdown
-            if self.execution:
+            # 4. Cancel all orders - CRITICAL for clean shutdown (unless preserve_orders)
+            if self.execution and not preserve_orders:
                 logger.info("Cancelling all open orders...")
                 try:
                     cancelled = await self.execution.cancel_all_orders(CCXT_SYMBOL)
                     logger.info(f"✓ Cancelled {cancelled} open orders")
+                    
+                    # CRITICAL FIX: Verify cancellation was successful
+                    await asyncio.sleep(1.0)  # Give exchange time to process
+                    remaining = await self.execution.get_open_orders(CCXT_SYMBOL)
+                    if remaining and len(remaining) > 0:
+                        logger.critical(f"⚠️ {len(remaining)} orders still active after shutdown cancel!")
+                        for order in remaining[:5]:  # Log first 5
+                            logger.critical(f"   Orphan: {order.get('id')} {order.get('type')} {order.get('side')}")
+                        # Try one more time
+                        await self.execution.cancel_all_orders(CCXT_SYMBOL)
                 except Exception as e:
                     logger.error(f"Error cancelling orders on shutdown: {e}")
+            elif preserve_orders:
+                logger.info("⚠️ Preserving SL/TP orders on exchange (force_stop mode)")
             
             # 5. Stop and flush trade logger
             if self.trade_logger:

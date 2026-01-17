@@ -386,7 +386,8 @@ class ExchangeReconciler:
         self._hard_lock_reason = reason
         self._hard_locks_triggered += 1
         
-        logger.warning(f"🔒 HARD_LOCK[{event.value}] ({max_duration_ms}ms max): {reason}")
+        # DEBUG level - HARD_LOCK is normal operation, not a warning
+        logger.debug(f"HARD_LOCK[{event.value}] ({max_duration_ms}ms max): {reason}")
         
         # Transition to HARD_LOCK state
         self._transition_to(ReconcilerState.HARD_LOCK)
@@ -409,7 +410,7 @@ class ExchangeReconciler:
             max_duration_ms=5000  # 5s fallback for order placement
         )
         
-        logger.info(f"📋 Reconciler tracking order: {order_id}")
+        logger.info(f"📋 Reconciler tracking order: {order_id[:12]}...")
     
     def notify_cancel_sent(self, order_id: str):
         """Called when a cancel request is sent"""
@@ -634,7 +635,11 @@ class ExchangeReconciler:
             elif new_state == ReconcilerState.ORDER_PENDING and snapshot.has_pending_entry:
                 reason = f" (entry order pending)"
         
-        logger.info(f"{emoji.get(new_state, '❓')} Reconciler: {old_state.value} → {new_state.value}{reason}")
+        # Log state transitions - INFO for position changes, DEBUG for others
+        if new_state == ReconcilerState.POSITION_OPEN or (old_state == ReconcilerState.POSITION_OPEN and new_state == ReconcilerState.IDLE):
+            logger.info(f"{emoji.get(new_state, '❓')} Reconciler: {old_state.value} → {new_state.value}{reason}")
+        else:
+            logger.debug(f"Reconciler: {old_state.value} → {new_state.value}{reason}")
         
         # Clear HARD_LOCK when transitioning out (via _release_hard_lock for proper cleanup)
         if old_state == ReconcilerState.HARD_LOCK and new_state != ReconcilerState.HARD_LOCK:

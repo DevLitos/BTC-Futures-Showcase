@@ -96,6 +96,15 @@ class KrakenFuturesWebSocket:
                     self._reconnect_delay = self._min_reconnect_delay
                     self._consecutive_failures = 0
                     
+                    # CRITICAL FIX: Reset candle builders on reconnect to avoid corrupt data
+                    # Old partial candles from before disconnect could mix with new data
+                    self.candle_builders = {
+                        '1m': {'data': {}, 'last_close': {}},
+                        '5m': {'data': {}, 'last_close': {}},
+                        '1h': {'data': {}, 'last_close': {}}
+                    }
+                    logger.debug("Candle builders reset on reconnect")
+                    
                     # Only log if we were previously down
                     if not self.is_exchange_available:
                         logger.info("✅ Exchange recovered - Kraken Futures back online")

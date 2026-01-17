@@ -45,6 +45,46 @@ from core.settings import Settings, redact_secrets, SECRET_PATTERNS
 LOG_FORMAT_TEXT = "%(asctime)s - %(name)-25s - %(levelname)-8s - [%(run_id)s] %(message)s"
 LOG_FORMAT_JSON = None  # JSON formatter handles this
 
+
+# =========================================================================
+# Safe Stream Handler (ignores BrokenPipeError during shutdown)
+# =========================================================================
+
+class SafeStreamHandler(logging.StreamHandler):
+    """
+    A StreamHandler that gracefully handles BrokenPipeError.
+    
+    This occurs when piping output to commands like `head` or `grep` that
+    close the pipe before the program finishes writing. Instead of crashing
+    with ugly tracebacks, we silently ignore these errors.
+    """
+    
+    def emit(self, record: logging.LogRecord) -> None:
+        """Emit a record, ignoring BrokenPipeError."""
+        try:
+            super().emit(record)
+        except BrokenPipeError:
+            # Pipe closed (e.g., `python main.py | head`), ignore silently
+            pass
+        except OSError as e:
+            # EPIPE or similar on some systems
+            if e.errno == 32:  # EPIPE
+                pass
+            else:
+                raise
+    
+    def flush(self) -> None:
+        """Flush the stream, ignoring BrokenPipeError."""
+        try:
+            super().flush()
+        except BrokenPipeError:
+            pass
+        except OSError as e:
+            if e.errno == 32:  # EPIPE
+                pass
+            else:
+                raise
+
 AUDIT_LOG_NAME = "audit"
 AUDIT_LOG_FILE = "audit.log"
 
@@ -481,8 +521,8 @@ def configure_logging(settings: Settings) -> None:
     secret_filter = SecretRedactingFilter()
     rate_limit_filter = RateLimitingFilter()
     
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
+    # Console handler (uses SafeStreamHandler to handle pipe errors gracefully)
+    console_handler = SafeStreamHandler(sys.stdout)
     console_handler.setLevel(getattr(logging, settings.log_level))
     console_handler.addFilter(secret_filter)
     console_handler.addFilter(rate_limit_filter)

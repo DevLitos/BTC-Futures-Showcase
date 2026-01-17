@@ -251,7 +251,7 @@ class TradeLogger:
             filename = f"storage/events/events_{today}.parquet"
             
             df.to_parquet(filename, compression='snappy')
-            logger.info(f"Flushed {len(self.event_buffer)} events")
+            logger.debug(f"Flushed {len(self.event_buffer)} events")  # DEBUG to reduce spam
             
             self.event_buffer = []
         

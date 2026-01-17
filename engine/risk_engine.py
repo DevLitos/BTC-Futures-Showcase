@@ -8,19 +8,24 @@ This module integrates with the centralized sizer for consistency.
 
 import logging
 import asyncio
+import numpy as np
 from datetime import datetime, UTC
 from typing import Optional, Dict, Tuple
 from monitoring.metrics import ORDERS_RECOMMENDED
 
 from engine.config import (
     RiskManagement, OrderExecution,
-    get_risk_for_session, SweepFilter, TimeBasedExits, SmartExits
+    get_risk_for_session, SweepFilter, TimeBasedExits, SmartExits,
+    TradeType
 )
 from engine.core_utils import (
     ensure_utc, PositionSizer, get_position_sizer
 )
 from engine.state_types import PositionState
 from engine.execution import KRAKEN_BTC_MIN_SIZE
+from engine.hybrid_atr_trailing import (
+    HybridATRTrailing, TrailingRegime, TrailingState, create_hybrid_trailing
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +42,8 @@ class Position:
     
     def __init__(self, symbol: str, direction: str, entry_price: float, 
                  size: float, stop_loss: float, atr_1m: float,
-                 market_time: datetime = None):
+                 market_time: datetime = None,
+                 trade_type: TradeType = TradeType.LONG_MAIN):
         # ===== INPUT VALIDATION =====
         if not symbol:
             raise ValueError("symbol cannot be empty")
@@ -58,10 +64,21 @@ class Position:
         
         self.symbol = symbol
         self.direction = direction  # 'LONG' or 'SHORT'
+        self.trade_type = trade_type  # LONG_MAIN, SHORT_STRUCTURAL, or SHORT_PULLBACK
         self.entry_price = entry_price
         self.size = size
         self.stop_loss = stop_loss
         self.initial_stop_loss = stop_loss
+        
+        # =====================================================================
+        # SHORT_PULLBACK SPECIFIC TRACKING
+        # =====================================================================
+        self.is_pullback_short = (trade_type == TradeType.SHORT_PULLBACK)
+        self.pullback_tp1_partial_done = False  # Track if 50% closed at TP1
+        self.pullback_be_moved = False          # Track if BE moved after TP1
+        self.pullback_candle_count = 0          # Candle counter for time stop
+        self.pullback_swing_high: float = 0.0   # Store swing high for reference
+        self.pullback_confirm_level: float = 0.0  # Store confirm level
         
         # ===== EXECUTION INTEGRITY INVARIANTS (CAPA 1) =====
         self.system_side = direction.upper()  # What system intended: 'LONG' or 'SHORT'
@@ -134,6 +151,23 @@ class Position:
         # Bollinger Band width tracking
         self.last_bb_width = 0.0
         self.avg_bb_width = 0.0
+        
+        # =====================================================================
+        # HYBRID ATR TRAILING (Jan 15, 2026)
+        # =====================================================================
+        # Initialize hybrid trailing stop manager
+        self.hybrid_trailing: Optional[HybridATRTrailing] = None
+        self.use_hybrid_trailing = True  # Feature flag
+        
+        if self.use_hybrid_trailing:
+            # Detect initial regime from market context (default to TREND)
+            initial_regime = TrailingRegime.TREND
+            self.hybrid_trailing = create_hybrid_trailing(
+                entry_price=entry_price,
+                initial_stop=stop_loss,
+                direction=direction,
+                regime_str=initial_regime.value
+            )
         
         logger.info(f"Position opened: {direction} {size} {symbol} @ {entry_price:.2f} | SL: {stop_loss:.2f} | TP1: {self.tp1_price:.2f}")
     
@@ -290,32 +324,83 @@ class Position:
             if current_price > self.highest_price:
                 self.highest_price = current_price
     
-    def update_trailing_stop(self, current_price: float, atr_1m: float, market_time: datetime):
+    def update_trailing_stop(self, current_price: float, atr_1m: float, market_time: datetime,
+                             highs: np.ndarray = None, lows: np.ndarray = None,
+                             regime_hint: str = None):
         """
-        STEPPED TRAILING - Wide steps, let winners breathe!
+        HYBRID TRAILING - Combines R-stepped locks with ATR-adaptive trailing.
         
-        REGIME-AWARE:
-        - NORMAL: Aplica trailing stepped (cut losses, capture small wins)
-        - RUNNER: NO trailing fino - solo SL ampliado ya fijado
+        NEW SYSTEM (Jan 15, 2026):
+        Uses HybridATRTrailing which combines:
+        1. R-stepped locks (guaranteed protection at MFE thresholds)
+        2. ATR-adaptive trailing (dynamic based on regime)
         
-        Steps for NORMAL regime (based on MFE reached, not current price):
-        - MFE >= 0.8R → stop = entry (breakeven) - FASE 1: activation threshold
-        - MFE >= 1.0R → stop = +0.4R  
-        - MFE >= 1.5R → stop = +0.9R
-        - MFE >= 2.2R → stop = +1.6R
+        Falls back to legacy stepped trailing if hybrid is disabled.
         
-        NO ATR dynamic trailing. Just discrete levels.
+        Args:
+            current_price: Current market price
+            atr_1m: Current 1-minute ATR
+            market_time: Current market time
+            highs: Array of recent high prices (for ATR trailing)
+            lows: Array of recent low prices (for ATR trailing)
+            regime_hint: Optional regime hint ('TREND', 'RANGE', 'VOLATILITY')
         """
-        # RUNNER regime: NO trailing fino, dejar correr
+        # RUNNER regime: NO trailing, let it run
         if self.regime == REGIME_RUNNER:
-            return  # SL ya fue fijado en promoción a RUNNER
+            return  # SL was fixed at RUNNER promotion
+        
         if market_time is None:
             market_time = self.open_time
         
         market_time = ensure_utc(market_time)
         self.atr_1m = atr_1m
         
-        # Calculate MFE in R
+        # =====================================================================
+        # HYBRID TRAILING (if enabled)
+        # =====================================================================
+        if self.use_hybrid_trailing and self.hybrid_trailing is not None:
+            # Determine regime
+            if regime_hint:
+                try:
+                    regime = TrailingRegime(regime_hint.upper())
+                except ValueError:
+                    regime = TrailingRegime.TREND
+            else:
+                regime = TrailingRegime.TREND
+            
+            # Convert highs/lows to numpy arrays if needed
+            import numpy as np
+            if highs is None or lows is None or len(highs) < 3:
+                # Create synthetic arrays from MFE tracking
+                highs = np.array([self.highest_price])
+                lows = np.array([self.lowest_price])
+            
+            # Update hybrid trailing
+            state = self.hybrid_trailing.update(
+                current_price=current_price,
+                highs=highs,
+                lows=lows,
+                atr=atr_1m,
+                regime=regime
+            )
+            
+            # Sync trailing_stop with hybrid result
+            new_hybrid_stop = state.final_stop
+            
+            if self.direction == 'LONG':
+                if new_hybrid_stop > self.trailing_stop:
+                    logger.info(f"🎯 HYBRID TRAIL: {self.trailing_stop:.2f} → {new_hybrid_stop:.2f} ({state.stop_source}, tier={state.r_lock_tier})")
+                    self.trailing_stop = new_hybrid_stop
+            else:
+                if new_hybrid_stop < self.trailing_stop:
+                    logger.info(f"🎯 HYBRID TRAIL: {self.trailing_stop:.2f} → {new_hybrid_stop:.2f} ({state.stop_source}, tier={state.r_lock_tier})")
+                    self.trailing_stop = new_hybrid_stop
+            
+            return  # Hybrid trailing handled everything
+        
+        # =====================================================================
+        # LEGACY STEPPED TRAILING (fallback if hybrid disabled)
+        # =====================================================================
         risk = abs(self.entry_price - self.initial_stop_loss)
         if risk <= 0:
             return
@@ -485,7 +570,8 @@ class Position:
         DYNAMIC SIZING: Add 0.5x position when trade proves itself
         
         Condition:
-          - MFE >= 0.6R
+          - MFE >= 0.6R (historical high)
+          - Current R >= 0.5R (price still near highs, NOT falling)
           - Never touched -0.2R (clean move)
         
         This increases R on clear winners without increasing drawdown.
@@ -497,19 +583,32 @@ class Position:
         
         mfe_r = self.calculate_mfe_r()
         
-        # Track if we've been -0.2R against
+        # 🔒 FIX (Jan 16, 2026): Calculate CURRENT R, not just historical MFE
+        # This prevents adding to a position that WAS winning but is now falling
         risk = abs(self.entry_price - self.initial_stop_loss)
-        if risk > 0:
-            if self.direction == 'LONG':
-                worst_drawdown = (self.entry_price - self.lowest_price) / risk
-            else:
-                worst_drawdown = (self.highest_price - self.entry_price) / risk
-            
-            if worst_drawdown >= 0.2:
-                self.touched_minus_02r = True
+        if risk <= 0:
+            return None
         
-        # Check conditions
-        if mfe_r >= 0.6 and not self.touched_minus_02r:
+        if self.direction == 'LONG':
+            current_r = (current_price - self.entry_price) / risk
+        else:
+            current_r = (self.entry_price - current_price) / risk
+        
+        # Track if we've been -0.2R against
+        if self.direction == 'LONG':
+            worst_drawdown = (self.entry_price - self.lowest_price) / risk
+        else:
+            worst_drawdown = (self.highest_price - self.entry_price) / risk
+        
+        if worst_drawdown >= 0.2:
+            self.touched_minus_02r = True
+        
+        # Check conditions - MUST include current_r check!
+        # MFE >= 0.6R means it REACHED that level
+        # current_r >= 0.5R means it's STILL there (not fallen back)
+        MIN_CURRENT_R_FOR_ADD = 0.5
+        
+        if mfe_r >= 0.6 and current_r >= MIN_CURRENT_R_FOR_ADD and not self.touched_minus_02r:
             add_size = self.initial_size * 0.5
             
             # 🔒 FIX (Jan 14, 2026): Validate minimum order size
@@ -518,13 +617,16 @@ class Position:
                 return None
             
             self.added_to_winner = True
-            logger.info(f"💪 ADD TO WINNER: MFE {mfe_r:.2f}R >= 0.6R, no -0.2R touch → Adding {add_size:.6f}")
+            logger.info(f"💪 ADD TO WINNER: MFE {mfe_r:.2f}R, current={current_r:.2f}R >= 0.5R → Adding {add_size:.6f}")
             return {
                 'action': 'ADD_POSITION',
                 'add_size': add_size,
                 'new_total_size': self.size + add_size,
-                'reason': f'Winner add at MFE {mfe_r:.2f}R'
+                'reason': f'Winner add at MFE {mfe_r:.2f}R (current={current_r:.2f}R)'
             }
+        elif mfe_r >= 0.6 and current_r < MIN_CURRENT_R_FOR_ADD:
+            # Log why we're NOT adding (for debugging)
+            logger.debug(f"🔄 ADD TO WINNER skipped: MFE {mfe_r:.2f}R but current_r {current_r:.2f}R < {MIN_CURRENT_R_FOR_ADD}R")
         
         return None
     
@@ -755,6 +857,99 @@ class Position:
         """
         current_time = market_time if market_time else self.open_time
         return (current_time - self.open_time).total_seconds() / 60
+    
+    # =========================================================================
+    # SHORT_PULLBACK SPECIFIC METHODS
+    # =========================================================================
+    
+    def pullback_increment_candle_count(self):
+        """Increment candle counter for pullback time stop."""
+        if self.is_pullback_short:
+            self.pullback_candle_count += 1
+    
+    def pullback_check_time_stop(self, time_stop_candles: int = 6, min_mfe_r: float = 0.3) -> Tuple[bool, str]:
+        """
+        Check if pullback short should be exited due to time stop.
+        
+        TIME STOP: If after N candles MFE < min_mfe_r, exit.
+        This prevents staying stuck in losing shorts against bull market.
+        
+        Args:
+            time_stop_candles: Number of candles before checking (default 6 = 30min)
+            min_mfe_r: Minimum MFE required after time_stop_candles
+            
+        Returns:
+            Tuple of (should_exit, reason)
+        """
+        if not self.is_pullback_short:
+            return False, "Not a pullback short"
+        
+        if self.pullback_candle_count < time_stop_candles:
+            return False, f"Only {self.pullback_candle_count}/{time_stop_candles} candles"
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        if mfe_r < min_mfe_r:
+            return True, f"Time stop: MFE {mfe_r:.2f}R < {min_mfe_r}R after {self.pullback_candle_count} candles"
+        
+        return False, f"MFE {mfe_r:.2f}R >= {min_mfe_r}R"
+    
+    def pullback_check_be_after_tp1(self, atr_5m: float, be_offset_atr: float = 0.1) -> Optional[float]:
+        """
+        Check if BE (breakeven) should be moved after TP1 hit.
+        
+        BE = entry - offset (to cover fees)
+        
+        Args:
+            atr_5m: Current 5m ATR
+            be_offset_atr: Offset in ATR units (default 0.1 = covers fees)
+            
+        Returns:
+            New stop loss level if BE should be moved, None otherwise
+        """
+        if not self.is_pullback_short:
+            return None
+        
+        if not self.tp1_hit:
+            return None
+        
+        if self.pullback_be_moved:
+            return None  # Already moved
+        
+        # For SHORT: BE is above entry (we want to lock profit)
+        # BE = entry - offset (gives us some room for fees)
+        offset = be_offset_atr * atr_5m
+        be_level = self.entry_price - offset
+        
+        # Mark as moved
+        self.pullback_be_moved = True
+        
+        logger.info(f"[PULLBACK] Moving SL to BE: {self.stop_loss:.2f} → {be_level:.2f} (entry - {offset:.2f})")
+        
+        return be_level
+    
+    def pullback_get_tp1_partial_size(self, tp1_close_pct: int = 50) -> float:
+        """
+        Get the size to close at TP1 for partial exit.
+        
+        Args:
+            tp1_close_pct: Percentage to close at TP1 (default 50%)
+            
+        Returns:
+            Size to close
+        """
+        if not self.is_pullback_short:
+            return 0.0
+        
+        if self.pullback_tp1_partial_done:
+            return 0.0  # Already done
+        
+        pct = tp1_close_pct / 100.0
+        close_size = self.size * pct
+        
+        self.pullback_tp1_partial_done = True
+        
+        return close_size
     
     def should_force_exit_by_time(self, market_time: datetime = None, current_atr: float = None) -> tuple[bool, str]:
         """
@@ -1111,6 +1306,108 @@ class Position:
             'reason': reason
         }
     
+    def check_rsi_divergence_exit(
+        self,
+        current_price: float,
+        rsi_values: list,
+        price_values: list,
+        lookback: int = 10
+    ) -> Optional[Dict]:
+        """
+        RSI Divergence Exit - Exit when RSI diverges from price.
+        
+        Only applies when:
+        1. MFE >= 1R (already profitable)
+        2. Divergence is confirmed (multiple lower RSI highs for LONG)
+        
+        Args:
+            current_price: Current market price
+            rsi_values: List of recent RSI values (newest last)
+            price_values: List of recent prices (newest last)
+            lookback: Number of candles to check
+        
+        Returns:
+            Dict with divergence details if detected, None otherwise
+        """
+        from engine.config import DivergenceExitConfig
+        
+        if not DivergenceExitConfig.ENABLED:
+            return None
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        # Only apply if we have minimum profit
+        if mfe_r < DivergenceExitConfig.MIN_MFE_R:
+            return None
+        
+        if len(rsi_values) < lookback or len(price_values) < lookback:
+            return None
+        
+        # Get last N values
+        rsi_recent = rsi_values[-lookback:]
+        price_recent = price_values[-lookback:]
+        
+        # Detect divergence
+        divergence_detected = False
+        reason = ""
+        
+        if self.direction == 'LONG':
+            # Bearish divergence: Higher highs in price, lower highs in RSI
+            price_making_higher_high = max(price_recent[-3:]) >= max(price_recent[:-3])
+            rsi_making_lower_high = max(rsi_recent[-3:]) < max(rsi_recent[:-3])
+            
+            if price_making_higher_high and rsi_making_lower_high:
+                divergence_detected = True
+                reason = f"Bearish RSI divergence: price HH but RSI LH (MFE={mfe_r:.2f}R)"
+        
+        else:  # SHORT
+            # Bullish divergence: Lower lows in price, higher lows in RSI
+            price_making_lower_low = min(price_recent[-3:]) <= min(price_recent[:-3])
+            rsi_making_higher_low = min(rsi_recent[-3:]) > min(rsi_recent[:-3])
+            
+            if price_making_lower_low and rsi_making_higher_low:
+                divergence_detected = True
+                reason = f"Bullish RSI divergence: price LL but RSI HL (MFE={mfe_r:.2f}R)"
+        
+        if divergence_detected:
+            logger.warning(f"📉 DIVERGENCE EXIT: {reason}")
+            
+            return {
+                'action': 'DIVERGENCE_EXIT',
+                'mfe_r': mfe_r,
+                'reason': reason,
+                'partial_close_pct': DivergenceExitConfig.PARTIAL_CLOSE_PCT,
+                'tighten_stop_to_r': DivergenceExitConfig.TIGHTEN_STOP_TO_R
+            }
+        
+        return None
+    
+    def get_volatility_regime(self, atr_ratio: float) -> str:
+        """
+        Get current volatility regime based on ATR ratio.
+        
+        Args:
+            atr_ratio: current_atr / sma(atr, 100)
+        
+        Returns:
+            Regime name: LOW_VOL, NORMAL, HIGH_VOL, or SPIKE
+        """
+        from engine.config import VolatilityRegime
+        return VolatilityRegime.classify(atr_ratio)
+    
+    def get_tp1_percentage(self, regime: str) -> int:
+        """
+        Get TP1 close percentage based on market regime.
+        
+        Args:
+            regime: Market regime (RANGE, TREND, etc.)
+        
+        Returns:
+            Percentage to close at TP1 (e.g., 40, 50, 60)
+        """
+        from engine.config import TP1PercentageConfig
+        return TP1PercentageConfig.get_tp1_pct(regime)
+    
     def update_smart_exit_indicators(self, rsi: float = None, bb_width: float = None, 
                                       bb_avg: float = None, volume_ratio: float = None):
         """
@@ -1132,7 +1429,8 @@ class Position:
     
     def check_all_smart_exits(self, current_price: float, rsi: float = None, 
                                vpoc: float = None, bb_width: float = None,
-                               bb_avg: float = None, volume_ratio: float = 1.0) -> Optional[Dict]:
+                               bb_avg: float = None, volume_ratio: float = 1.0,
+                               rsi_values: np.ndarray = None) -> Optional[Dict]:
         """
         Master method: Check all smart exit conditions in priority order.
         
@@ -1145,6 +1443,7 @@ class Position:
             bb_width: Current BB width
             bb_avg: Average BB width
             volume_ratio: Volume ratio (current/avg)
+            rsi_values: Array of recent RSI values for divergence detection
         
         Returns:
             Dict with highest priority exit trigger, or None
@@ -1161,19 +1460,29 @@ class Position:
         if partial_result:
             return partial_result
         
-        # Priority 3: Momentum exit
+        # Priority 3: RSI Divergence exit (NEW - Jan 16, 2026)
+        # Takes partial profit when RSI shows divergence at MFE >= 1R
+        if rsi_values is not None and len(rsi_values) >= 5:
+            divergence_result = self.check_rsi_divergence_exit(
+                current_price=current_price,
+                rsi_values=rsi_values
+            )
+            if divergence_result:
+                return divergence_result
+        
+        # Priority 4: Momentum exit
         if rsi is not None:
             momentum_result = self.check_momentum_exit(rsi, volume_ratio)
             if momentum_result:
                 return momentum_result
         
-        # Priority 4: VPOC exit
+        # Priority 5: VPOC exit
         if vpoc is not None and vpoc > 0:
             vpoc_result = self.check_vpoc_exit(current_price, vpoc)
             if vpoc_result:
                 return vpoc_result
         
-        # Priority 5: Volatility squeeze exit
+        # Priority 6: Volatility squeeze exit
         if bb_width is not None and bb_avg is not None:
             squeeze_result = self.check_volatility_squeeze_exit(bb_width, bb_avg)
             if squeeze_result:
@@ -1209,7 +1518,8 @@ class RiskEngine:
     
     def create_position(self, symbol: str, direction: str, entry_price: float,
                        position_size: float, stop_loss: float, atr_1m: float,
-                       market_time: datetime = None) -> Position:
+                       market_time: datetime = None,
+                       trade_type: TradeType = TradeType.LONG_MAIN) -> Position:
         """Create a new position object for tracking"""
         self.position = Position(
             symbol=symbol,
@@ -1218,7 +1528,8 @@ class RiskEngine:
             size=position_size,
             stop_loss=stop_loss,
             atr_1m=atr_1m,
-            market_time=market_time
+            market_time=market_time,
+            trade_type=trade_type
         )
         return self.position
     
@@ -1566,7 +1877,13 @@ class RiskEngine:
                 
                 # 2. Check TP1 (partial close, promotes toward RUNNER)
                 if pos.check_tp1_hit(current_price):
-                    return await self._handle_tp1(current_price)
+                    # Determine volatility regime for dynamic TP1%
+                    from engine.config import VolatilityRegime
+                    vol_regime = None
+                    if atr_ratio is not None:
+                        vol_regime = VolatilityRegime.from_atr_ratio(atr_ratio)
+                        vol_regime = vol_regime.name  # Get string name
+                    return await self._handle_tp1(current_price, regime=vol_regime)
                 
                 # 2.5. Check TP2 (after TP1 hit, close remaining runner)
                 if pos.check_tp2_hit(current_price):
@@ -1609,12 +1926,18 @@ class RiskEngine:
             
             return None
     
-    async def _handle_tp1(self, current_price: float) -> dict:
-        """Handle TP1 hit - close 60% and move stop to BE immediately"""
+    async def _handle_tp1(self, current_price: float, regime: str = None) -> dict:
+        """Handle TP1 hit - close dynamic % and move stop to BE immediately"""
         pos = self.position
         
+        # Get dynamic TP1 percentage based on regime
+        if regime:
+            tp1_pct = pos.get_tp1_percentage(regime)
+        else:
+            tp1_pct = RiskManagement.TP1_CLOSE_PCT
+        
         # Calculate partial close
-        close_size = pos.size * (RiskManagement.TP1_CLOSE_PCT / 100.0)
+        close_size = pos.size * (tp1_pct / 100.0)
         remaining_size = pos.size - close_size
         
         # 🔒 FIX (Jan 14, 2026): Validate minimum order sizes
@@ -1649,7 +1972,7 @@ class RiskEngine:
         pos.trailing_stop = pos.entry_price
         pos.be_moved = True
         
-        logger.info(f"🎯 TP1 HIT - Closed {close_size:.4f} @ {current_price:.2f} | PnL: ${pnl:.2f} | Remaining: {remaining_size:.4f}")
+        logger.info(f"🎯 TP1 HIT - Closed {close_size:.4f} ({tp1_pct}%) @ {current_price:.2f} | PnL: ${pnl:.2f} | Remaining: {remaining_size:.4f}")
         logger.info(f"🔒 SL moved to BE: {old_sl:.2f} → {pos.entry_price:.2f}")
         
         return {
@@ -1658,8 +1981,78 @@ class RiskEngine:
             'price': current_price,
             'size': close_size,
             'pnl': pnl,
-            'remaining_size': remaining_size
+            'remaining_size': remaining_size,
+            'tp1_pct': tp1_pct,
+            'requires_validation': True  # Flag for validation
         }
+    
+    async def validate_partial_close(
+        self, 
+        execution_engine,
+        symbol: str,
+        expected_remaining: float,
+        tolerance_pct: float = 0.5
+    ) -> bool:
+        """
+        Validate position size after partial close.
+        
+        CRITICAL: After TP1 partial close, verify exchange position matches
+        our expected remaining size. Fix discrepancies.
+        
+        Args:
+            execution_engine: RESTExecutionEngine instance
+            symbol: Trading pair symbol
+            expected_remaining: Expected remaining position size
+            tolerance_pct: Tolerance for mismatch (default 0.5%)
+        
+        Returns:
+            True if position matches or was corrected, False on error
+        """
+        from engine.config import PartialCloseValidation
+        
+        if not PartialCloseValidation.ENABLED:
+            return True
+        
+        try:
+            # Wait for fill to settle
+            import asyncio
+            await asyncio.sleep(PartialCloseValidation.SYNC_DELAY_MS / 1000.0)
+            
+            # Get actual position from exchange
+            position = await execution_engine.get_position(symbol)
+            
+            if not position:
+                logger.error("❌ PARTIAL VALIDATION: No position found on exchange!")
+                return False
+            
+            actual_size = abs(position.get('contracts', 0))
+            
+            # Calculate tolerance
+            tolerance = expected_remaining * (tolerance_pct / 100.0)
+            size_diff = abs(actual_size - expected_remaining)
+            
+            if size_diff <= tolerance or size_diff <= PartialCloseValidation.SIZE_EPSILON:
+                logger.info(f"✅ PARTIAL VALIDATION: Expected {expected_remaining:.6f}, got {actual_size:.6f} (diff: {size_diff:.8f})")
+                return True
+            
+            # Mismatch detected
+            logger.warning(f"⚠️ PARTIAL MISMATCH: Expected {expected_remaining:.6f}, got {actual_size:.6f} (diff: {size_diff:.6f})")
+            
+            if PartialCloseValidation.RECALCULATE_LEVELS:
+                # Update internal position to match exchange
+                await self.sync_position_size(actual_size, "partial close correction")
+                
+                # Recalculate TP2 and trailing based on new size
+                if self.position:
+                    logger.info(f"🔄 Recalculating TP2/trailing for corrected size {actual_size:.6f}")
+                    # TP2 and trailing are price-based, not size-based, so no recalc needed
+                    # But we log for awareness
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error validating partial close: {e}")
+            return False
     
     async def _close_position(self, current_price: float, reason: str) -> dict:
         """Close entire position and update equity/drawdown"""

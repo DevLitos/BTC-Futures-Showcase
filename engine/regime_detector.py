@@ -66,7 +66,7 @@ REGIME_CONFIGS: Dict[MarketRegime, RegimeConfig] = {
         score_threshold_adj=+1,          # Higher threshold (premium only)
         size_multiplier=0.7,             # Reduced size
         min_rr=1.5,
-        sl_atr_multiplier=2.0,           # Moderate SL - careful
+        sl_atr_multiplier=2.5,           # FIX (Jan 14, 2026): Increased from 2.0 to 2.5 for volatility room
         description="Trend tired - premium setups only"
     ),
     MarketRegime.RANGE: RegimeConfig(
@@ -76,7 +76,7 @@ REGIME_CONFIGS: Dict[MarketRegime, RegimeConfig] = {
         score_threshold_adj=0,            # Normal threshold
         size_multiplier=0.9,              # Slightly reduced (range = more trades)
         min_rr=0.5,                        # Lower RR target (quick scalps)
-        sl_atr_multiplier=1.5,            # TIGHT SL in range - quick in/out
+        sl_atr_multiplier=2.0,            # FIX (Jan 14, 2026): Increased from 1.5 to 2.0 for volatility room
         description="Mean reversion - quick scalps to value"
     ),
     MarketRegime.CHAOS: RegimeConfig(

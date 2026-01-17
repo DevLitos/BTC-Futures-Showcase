@@ -15,6 +15,7 @@ import ccxt.async_support as ccxt
 from datetime import datetime, UTC
 
 from core.settings import generate_client_order_id
+from accounting import get_position_store
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,44 @@ def safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def is_valid_position_response(position: Optional[Dict]) -> bool:
+    """
+    Check if position response is valid (not an error/timeout).
+    
+    Returns True if:
+      - position is a valid dict without error markers
+    Returns False if:
+      - position is None (no position - valid state)
+      - position has _error or _timeout keys (API failure)
+    
+    Use this to distinguish "no position" from "couldn't get position".
+    """
+    if position is None:
+        return True  # None = no position = valid
+    if isinstance(position, dict):
+        if position.get('_error') or position.get('_timeout'):
+            return False  # Error response
+        return True  # Valid position data
+    return False  # Invalid type
+
+
+def is_position_error(position: Optional[Dict]) -> bool:
+    """Check if position response represents an API error (not 'no position')."""
+    if position is None:
+        return False  # None = no position = not an error
+    if isinstance(position, dict):
+        return bool(position.get('_error') or position.get('_timeout'))
+    return True  # Invalid type = treat as error
+
+
 # Timeouts para operaciones de exchange (segundos)
 EXCHANGE_TIMEOUT_SHORT = 10.0   # Para consultas simples
 EXCHANGE_TIMEOUT_MEDIUM = 30.0  # Para órdenes
 EXCHANGE_TIMEOUT_LONG = 60.0    # Para operaciones complejas
+
+# CRITICAL: Threshold for float comparison of position sizes
+# Avoids false positives from floating-point residue (e.g., 0.00000001)
+MIN_POSITION_THRESHOLD = 0.00001  # 0.001% of 1 BTC
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -670,8 +705,8 @@ class RESTExecutionEngine:
                 return False
             
             contracts = position.get('contracts', 0)
-            if abs(contracts) == 0:
-                logger.error("Cannot set stops: position size is 0")
+            if abs(contracts) < MIN_POSITION_THRESHOLD:
+                logger.error("Cannot set stops: position size is effectively 0")
                 return False
             
             # Determinar dirección - CRITICAL: Use 'side' field, not contracts sign
@@ -850,7 +885,7 @@ class RESTExecutionEngine:
         
         try:
             position = await self.get_position(symbol)
-            if not position or abs(position.get('contracts', 0)) == 0:
+            if not position or abs(position.get('contracts', 0)) < MIN_POSITION_THRESHOLD:
                 logger.error("Cannot set stops: no open position")
                 return False
             
@@ -926,6 +961,196 @@ class RESTExecutionEngine:
         
         logger.info(f"SL update: {old_sl_price:.2f} → {new_sl_price:.2f} ({change_pct:.3f}%)")
         return True
+    
+    async def update_stop_loss_on_exchange(
+        self,
+        symbol: str,
+        new_sl_price: float,
+        last_sent_sl: float,
+        atr: float,
+        spread: float,
+        initial_risk: float,
+        direction: str = 'LONG'
+    ) -> Tuple[bool, float]:
+        """
+        Update trailing stop on exchange with smart thresholds.
+        
+        Implements:
+        1. Idempotent updates (same SL = no action)
+        2. Minimum movement threshold to prevent spam
+        3. Watchdog sync on restart
+        
+        Args:
+            symbol: Trading pair
+            new_sl_price: New proposed SL price
+            last_sent_sl: Last SL sent to exchange
+            atr: Current ATR (for threshold calculation)
+            spread: Current spread (for threshold calculation)
+            initial_risk: Initial risk distance (entry - SL)
+            direction: 'LONG' or 'SHORT'
+        
+        Returns:
+            Tuple of (success: bool, new_last_sent_sl: float)
+        """
+        if not self.exchange:
+            return False, last_sent_sl
+        
+        # Import config
+        from engine.config import ExchangeSLConfig
+        
+        # =====================================================================
+        # THRESHOLD CALCULATION
+        # Use MAX of: 0.3R, 0.5*spread, 0.2*ATR
+        # =====================================================================
+        threshold_r = initial_risk * ExchangeSLConfig.MIN_MOVE_R
+        threshold_spread = spread * ExchangeSLConfig.MIN_MOVE_SPREAD_MULT
+        threshold_atr = atr * ExchangeSLConfig.MIN_MOVE_ATR_MULT
+        
+        min_threshold = max(threshold_r, threshold_spread, threshold_atr)
+        
+        # Calculate movement
+        sl_movement = abs(new_sl_price - last_sent_sl)
+        
+        # =====================================================================
+        # IDEMPOTENT CHECK: Skip if movement below threshold
+        # =====================================================================
+        if sl_movement < min_threshold:
+            logger.debug(
+                f"SL update skipped: movement {sl_movement:.2f} < threshold {min_threshold:.2f} "
+                f"(R:{threshold_r:.2f}, spread:{threshold_spread:.2f}, ATR:{threshold_atr:.2f})"
+            )
+            return True, last_sent_sl  # Success but no update needed
+        
+        # =====================================================================
+        # VALIDATE SL DIRECTION
+        # For LONG: new SL should be >= last SL (trailing up)
+        # For SHORT: new SL should be <= last SL (trailing down)
+        # =====================================================================
+        if direction.upper() == 'LONG' and new_sl_price < last_sent_sl:
+            logger.warning(f"⚠️ LONG SL going DOWN: {last_sent_sl:.2f} → {new_sl_price:.2f} - skipped")
+            return True, last_sent_sl
+        if direction.upper() == 'SHORT' and new_sl_price > last_sent_sl:
+            logger.warning(f"⚠️ SHORT SL going UP: {last_sent_sl:.2f} → {new_sl_price:.2f} - skipped")
+            return True, last_sent_sl
+        
+        # =====================================================================
+        # CANCEL EXISTING SL AND PLACE NEW ONE
+        # =====================================================================
+        try:
+            # 1. Get position info
+            position = await self.get_position(symbol)
+            if not position or abs(position.get('contracts', 0)) < MIN_POSITION_THRESHOLD:
+                logger.warning("No position found for SL update")
+                return False, last_sent_sl
+            
+            contracts = position.get('contracts', 0)
+            raw_side = position.get('side', '').lower()
+            if raw_side in ('long', 'short'):
+                position_side = raw_side
+            else:
+                position_side = 'long' if contracts > 0 else 'short'
+            position_size = abs(contracts)
+            
+            # 2. Cancel existing SL orders
+            open_orders = await self.get_open_orders(symbol)
+            for order in open_orders:
+                order_type = order.get('type', '').lower()
+                is_reduce = order.get('info', {}).get('reduceOnly', False)
+                if is_reduce and order_type in ('stop', 'stop-loss', 'stop_loss'):
+                    try:
+                        await self.cancel_order(order['id'], symbol)
+                        logger.info(f"🗑️ Cancelled old SL order: {order['id']}")
+                    except Exception as cancel_e:
+                        logger.warning(f"Failed to cancel old SL: {cancel_e}")
+            
+            # 3. Place new SL
+            sl_side = 'sell' if position_side == 'long' else 'buy'
+            
+            sl_order = await asyncio.wait_for(
+                self.exchange.create_order(
+                    symbol=symbol,
+                    type='stop-loss',
+                    side=sl_side,
+                    amount=position_size,
+                    price=new_sl_price,
+                    params={
+                        'reduceOnly': True,
+                        'postOnly': False
+                    }
+                ),
+                timeout=EXCHANGE_TIMEOUT_MEDIUM
+            )
+            
+            logger.info(
+                f"✅ SL updated on exchange: {last_sent_sl:.2f} → {new_sl_price:.2f} "
+                f"(moved {sl_movement:.2f})"
+            )
+            
+            return True, new_sl_price
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to update SL on exchange: {e}")
+            return False, last_sent_sl
+    
+    async def sync_sl_on_restart(
+        self,
+        symbol: str,
+        local_sl: float,
+        direction: str = 'LONG'
+    ) -> Tuple[float, bool]:
+        """
+        Watchdog: On restart, sync local SL with exchange SL.
+        
+        Returns the BEST (tighter) SL and whether sync was needed.
+        
+        Args:
+            symbol: Trading pair
+            local_sl: Local trailing stop value
+            direction: 'LONG' or 'SHORT'
+        
+        Returns:
+            Tuple of (best_sl: float, sync_performed: bool)
+        """
+        if not self.exchange:
+            return local_sl, False
+        
+        try:
+            # Find exchange SL order
+            open_orders = await self.get_open_orders(symbol)
+            exchange_sl = None
+            
+            for order in open_orders:
+                order_type = order.get('type', '').lower()
+                is_reduce = order.get('info', {}).get('reduceOnly', False)
+                if is_reduce and order_type in ('stop', 'stop-loss', 'stop_loss'):
+                    exchange_sl = order.get('price') or order.get('stopPrice')
+                    break
+            
+            if exchange_sl is None:
+                logger.warning("⚠️ No SL found on exchange during restart sync")
+                return local_sl, False
+            
+            # Determine best SL (FAVOR_TIGHTER_SL)
+            if direction.upper() == 'LONG':
+                # For LONG, higher SL = tighter
+                best_sl = max(local_sl, exchange_sl)
+            else:
+                # For SHORT, lower SL = tighter
+                best_sl = min(local_sl, exchange_sl)
+            
+            if best_sl != local_sl:
+                logger.info(
+                    f"🔄 SL watchdog sync: local={local_sl:.2f}, exchange={exchange_sl:.2f} "
+                    f"→ using {best_sl:.2f}"
+                )
+                return best_sl, True
+            
+            logger.debug(f"SL watchdog: local and exchange aligned at {local_sl:.2f}")
+            return local_sl, False
+            
+        except Exception as e:
+            logger.error(f"Error in SL watchdog sync: {e}")
+            return local_sl, False
     
     async def verify_stops_on_exchange(self, symbol: str) -> dict:
         """
@@ -1059,6 +1284,38 @@ class RESTExecutionEngine:
                 )
                 
                 logger.critical(f"Position closed (reduceOnly=True): {order}")
+                
+                # =====================================================================
+                # 🔥 FIX (Jan 14, 2026): IMMEDIATELY update position_store after close
+                # This prevents phantom position discrepancies in the next sync.
+                # Previously, we waited for sync_from_exchange which caused warnings.
+                # =====================================================================
+                try:
+                    if order and order.get('status') == 'closed' and order.get('filled', 0) > 0:
+                        position_store = get_position_store()
+                        fill_price = order.get('average') or order.get('price', 0)
+                        fill_size = order.get('filled', close_amount)
+                        order_id = order.get('id', '')
+                        
+                        # Get fill ID from trades if available
+                        trades = order.get('trades', [])
+                        fill_id = trades[0].get('id', '') if trades else order_id
+                        
+                        await position_store.record_fill(
+                            order_id=order_id,
+                            symbol=symbol,
+                            side=side.lower(),
+                            size=fill_size,
+                            price=fill_price,
+                            fee=0.0,  # Fee is deducted from balance, not tracked here
+                            fill_type='TAKER',
+                            fill_id=fill_id,
+                        )
+                        logger.info(f"✅ Position store updated: {side} {fill_size:.6f} @ {fill_price:.2f}")
+                except Exception as ps_error:
+                    logger.error(f"⚠️ Failed to update position_store after close: {ps_error}")
+                    # Don't fail the close operation, sync will catch it later
+                
                 return order
             
             except asyncio.TimeoutError:

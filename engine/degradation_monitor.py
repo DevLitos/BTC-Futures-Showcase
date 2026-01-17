@@ -32,6 +32,10 @@ class DegradationMonitor:
     
     Tracks leading indicators that precede visible PnL degradation.
     Maintains rolling window of recent trades for continuous analysis.
+    
+    PERFORMANCE FIX (Jan 17, 2026): Added metrics caching to avoid O(n) 
+    recalculation on every query. Metrics are recalculated only when 
+    trades are added, not on every has_active_degradation() call.
     """
     
     def __init__(self, window_size: int = 20):
@@ -55,6 +59,10 @@ class DegradationMonitor:
         # Alert configuration
         self.SIGNAL_THRESHOLD = 2  # 2+ signals trigger alert
         self.SIGNAL_RETENTION_DAYS = 30
+        
+        # 🔥 PERFORMANCE FIX: Cache metrics to avoid O(n) recalculation on every query
+        self._cached_metrics: Dict = None
+        self._metrics_dirty: bool = True  # Flag to indicate cache needs refresh
     
     def add_trade(self,
                   trade_id: int,
@@ -94,6 +102,10 @@ class DegradationMonitor:
             'timestamp': datetime.now(UTC)
         }
         self.recent_trades.append(trade)
+        
+        # 🔥 PERFORMANCE FIX: Mark cache as dirty when trades are added
+        self._metrics_dirty = True
+        
         self._analyze_window()
     
     def _analyze_window(self) -> None:
@@ -227,16 +239,25 @@ class DegradationMonitor:
         """
         Returns current metrics from rolling window.
         
+        🔥 PERFORMANCE FIX (Jan 17, 2026): Uses caching to avoid O(n) 
+        recalculation on every call. Cache is invalidated when trades are added.
+        
         Returns:
             Dict with all 4 degradation metrics
         """
+        # Return cached metrics if still valid
+        if not self._metrics_dirty and self._cached_metrics is not None:
+            return self._cached_metrics
+        
         if len(self.recent_trades) == 0:
-            return {
+            self._cached_metrics = {
                 'mfe_mae_ratio': 0.0,
                 'be_stop_pct': 0.0,
                 'non_extend_pct': 0.0,
                 'avg_duration_h': 0.0
             }
+            self._metrics_dirty = False
+            return self._cached_metrics
         
         trades = list(self.recent_trades)
         
@@ -262,12 +283,14 @@ class DegradationMonitor:
         
         # UNITS: All percentages returned as FRACTIONS (0.0-1.0) for consistency
         # This matches threshold comparisons and avoids confusion
-        return {
+        self._cached_metrics = {
             'mfe_mae_ratio': round(mfe_mae_ratio, 2),
             'be_stop_pct': round(be_stop_pct, 4),  # FRACTION (0.40 = 40%)
             'non_extend_pct': round(non_extend_pct, 4),  # FRACTION (0.60 = 60%)
             'avg_duration_h': round(avg_duration, 1)
         }
+        self._metrics_dirty = False
+        return self._cached_metrics
     
     def get_current_metrics_display(self) -> Dict:
         """
@@ -355,6 +378,9 @@ class DegradationMonitor:
         """Clears alert history (use after recovery)"""
         self.signal_history = []
         self.degradation_alerts = []
+        # Invalidate cache when resetting
+        self._metrics_dirty = True
+        self._cached_metrics = None
     
     def get_summary_report(self) -> Dict:
         """

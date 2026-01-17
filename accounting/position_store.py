@@ -266,6 +266,37 @@ class PositionStore:
         logger.info("PositionStore initialized")
     
     # =========================================================================
+    # EVENT HELPERS
+    # =========================================================================
+    
+    def _emit_event(self, event_type: EventType, data: Dict[str, Any]) -> None:
+        """
+        Helper to emit events with proper Event wrapper.
+        
+        FIX (Jan 14, 2026): EventBus.emit() takes an Event object, not (type, dict).
+        This helper creates the proper Event object.
+        """
+        from core.events import Event
+        
+        event = Event(
+            type=event_type,
+            source="position_store",
+            data=data
+        )
+        
+        # Schedule the async emit without blocking
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self._event_bus.emit(event))
+            else:
+                # Sync context - can't emit async event
+                logger.debug(f"Event {event_type.name} created (no running loop)")
+        except RuntimeError:
+            # No event loop - skip
+            logger.debug(f"Event {event_type.name} skipped (no event loop)")
+    
+    # =========================================================================
     # POSITION QUERIES
     # =========================================================================
     
@@ -374,7 +405,7 @@ class PositionStore:
         )
         
         # Emit event
-        self._event_bus.emit(EventType.ORDER_CREATED, {
+        self._emit_event(EventType.ORDER_CREATED, {
             'order': order.to_dict(),
             'symbol': symbol,
             'side': side,
@@ -397,7 +428,7 @@ class PositionStore:
         # Track by exchange order ID
         self._orders[exchange_order_id] = order
         
-        self._event_bus.emit(EventType.ORDER_PLACED, {
+        self._emit_event(EventType.ORDER_PLACED, {
             'order': order.to_dict(),
             'exchange_order_id': exchange_order_id,
         })
@@ -414,7 +445,7 @@ class PositionStore:
         order.state = OrderState.CANCELED
         order.canceled_at = datetime.now(UTC)
         
-        self._event_bus.emit(EventType.ORDER_CANCELLED, {
+        self._emit_event(EventType.ORDER_CANCELLED, {
             'order_id': order_id,
             'reason': reason,
             'symbol': order.symbol,
@@ -429,7 +460,7 @@ class PositionStore:
         """Mark order as rejected by exchange."""
         order.state = OrderState.REJECTED
         
-        self._event_bus.emit(EventType.ORDER_CANCELLED, {
+        self._emit_event(EventType.ORDER_CANCELLED, {
             'order_id': order.order_id,
             'reason': f"REJECTED: {reason}",
             'symbol': order.symbol,
@@ -510,7 +541,7 @@ class PositionStore:
                     order.filled_at = ts
                     self._order_history.append(order)
                     
-                    self._event_bus.emit(EventType.ORDER_FILLED, {
+                    self._emit_event(EventType.ORDER_FILLED, {
                         'order': order.to_dict(),
                         'fill': fill_record,
                     })
@@ -564,7 +595,7 @@ class PositionStore:
                 last_fill_id=fill_id,
             )
             
-            self._event_bus.emit(EventType.POSITION_OPENED, {
+            self._emit_event(EventType.POSITION_OPENED, {
                 'symbol': symbol,
                 'side': new_side,
                 'size': size,
@@ -590,7 +621,7 @@ class PositionStore:
             pos.last_fill_id = fill_id
             pos.updated_at = timestamp
             
-            self._event_bus.emit(EventType.POSITION_UPDATED, {
+            self._emit_event(EventType.POSITION_UPDATED, {
                 'symbol': symbol,
                 'side': pos.side,
                 'size': pos.size,
@@ -612,7 +643,7 @@ class PositionStore:
                 pos.last_fill_id = fill_id
                 pos.updated_at = timestamp
                 
-                self._event_bus.emit(EventType.POSITION_UPDATED, {
+                self._emit_event(EventType.POSITION_UPDATED, {
                     'symbol': symbol,
                     'side': pos.side,
                     'size': pos.size,
@@ -627,7 +658,7 @@ class PositionStore:
                 close_pnl = self._calculate_close_pnl(pos, size, price)
                 final_pnl = pos.realized_pnl + close_pnl - fee
                 
-                self._event_bus.emit(EventType.POSITION_CLOSED, {
+                self._emit_event(EventType.POSITION_CLOSED, {
                     'symbol': symbol,
                     'side': pos.side,
                     'size': size,
@@ -668,13 +699,13 @@ class PositionStore:
                 pos.updated_at = timestamp
                 pos.trade_id = f"trade_{uuid.uuid4().hex[:8]}"
                 
-                self._event_bus.emit(EventType.POSITION_CLOSED, {
+                self._emit_event(EventType.POSITION_CLOSED, {
                     'symbol': symbol,
                     'side': 'LONG' if new_side == 'SHORT' else 'SHORT',
                     'pnl': close_pnl,
                 })
                 
-                self._event_bus.emit(EventType.POSITION_OPENED, {
+                self._emit_event(EventType.POSITION_OPENED, {
                     'symbol': symbol,
                     'side': new_side,
                     'size': remaining_size,
@@ -828,18 +859,25 @@ class PositionStore:
                             # This is a protective order (SL/TP) - normal, don't warn
                             logger.debug(f"Protective order on exchange: {order_id} (type={order_type}, reduceOnly={reduce_only})")
                         else:
-                            # Unknown non-protective order - this is unusual
-                            logger.warning(f"Unknown order on exchange: {order_id} (type={order_type})")
+                            # Unknown non-protective order - log at DEBUG to avoid spam
+                            # (often happens with pending limit orders during WAIT_FILL)
+                            logger.debug(f"Unknown order on exchange: {order_id} (type={order_type})")
                     result['orders_synced'] += 1
                 
                 self._last_sync = datetime.now(UTC)
                 self._sync_count += 1
                 
-                logger.info(
-                    f"✅ Sync complete: {result['positions_synced']} positions, "
-                    f"{result['orders_synced']} orders, "
-                    f"{len(result['discrepancies'])} discrepancies"
-                )
+                # Only log at INFO if there are discrepancies, otherwise DEBUG
+                if result['discrepancies']:
+                    logger.info(
+                        f"✅ Sync complete: {result['positions_synced']} positions, "
+                        f"{result['orders_synced']} orders, "
+                        f"{len(result['discrepancies'])} discrepancies"
+                    )
+                else:
+                    logger.debug(
+                        f"Sync: {result['positions_synced']} pos, {result['orders_synced']} orders, OK"
+                    )
                 
             except Exception as e:
                 logger.error(f"Sync error: {e}")
@@ -858,7 +896,7 @@ class PositionStore:
             pos.funding_paid += abs(amount)
             pos.updated_at = datetime.now(UTC)
             
-            self._event_bus.emit(EventType.POSITION_UPDATED, {
+            self._emit_event(EventType.POSITION_UPDATED, {
                 'symbol': symbol,
                 'funding_paid': amount,
                 'total_funding': pos.funding_paid,
@@ -894,6 +932,106 @@ class PositionStore:
             if order not in self._order_history:
                 self._order_history.append(order)
         return len(to_remove)
+    
+    async def cleanup_zombie_orders(self, exchange, symbol: str = None, max_age_minutes: int = 5) -> Dict:
+        """
+        🔒 FIX (Jan 17, 2026): Zombie Order Reaper
+        
+        Cancels orders on exchange that:
+        1. Are NOT in our local order tracking
+        2. Are NOT protective orders (SL/TP/reduceOnly)
+        3. Are older than max_age_minutes
+        
+        This prevents orphan orders from prior sessions or crashes from filling unexpectedly.
+        
+        Args:
+            exchange: CCXT exchange instance
+            symbol: Symbol to check (None = all symbols)
+            max_age_minutes: Only cancel orders older than this
+        
+        Returns:
+            Dict with 'checked', 'cancelled', 'errors' counts
+        """
+        result = {
+            'checked': 0,
+            'cancelled': 0,
+            'errors': 0,
+            'zombie_orders': []
+        }
+        
+        if not exchange:
+            return result
+        
+        try:
+            # Fetch all open orders
+            open_orders = await exchange.fetch_open_orders(symbol) if symbol else await exchange.fetch_open_orders()
+            
+            now = datetime.now(UTC)
+            
+            for order in open_orders:
+                result['checked'] += 1
+                order_id = order.get('id')
+                
+                # Skip if we're tracking this order
+                if order_id in self._orders:
+                    continue
+                
+                # Skip protective orders (SL/TP)
+                order_type = str(order.get('type', '')).lower()
+                reduce_only = order.get('reduceOnly', order.get('info', {}).get('reduceOnly', False))
+                
+                if order_type in ('stop-loss', 'stop', 'take-profit', 'trailing-stop') or reduce_only:
+                    continue
+                
+                # Check age
+                timestamp = order.get('timestamp')
+                if timestamp:
+                    order_time = datetime.fromtimestamp(timestamp / 1000, tz=UTC)
+                    age_minutes = (now - order_time).total_seconds() / 60
+                    
+                    if age_minutes < max_age_minutes:
+                        # Too new - might be a legitimate pending order
+                        continue
+                    
+                    # This is a zombie order - cancel it!
+                    order_symbol = order.get('symbol', symbol)
+                    order_side = order.get('side', 'unknown')
+                    order_price = order.get('price', 0)
+                    
+                    logger.warning(
+                        f"🧟 ZOMBIE ORDER DETECTED: {order_id[:12]}... "
+                        f"({order_side} {order_symbol} @ {order_price}) - {age_minutes:.1f}min old"
+                    )
+                    
+                    try:
+                        cancel_result = await exchange.cancel_order(order_id, order_symbol)
+                        logger.info(f"✅ ZOMBIE ORDER CANCELLED: {order_id[:12]}...")
+                        result['cancelled'] += 1
+                        result['zombie_orders'].append({
+                            'id': order_id,
+                            'symbol': order_symbol,
+                            'side': order_side,
+                            'price': order_price,
+                            'age_minutes': age_minutes,
+                            'cancelled': True
+                        })
+                    except Exception as cancel_e:
+                        logger.error(f"❌ Failed to cancel zombie order {order_id[:12]}...: {cancel_e}")
+                        result['errors'] += 1
+                        result['zombie_orders'].append({
+                            'id': order_id,
+                            'symbol': order_symbol,
+                            'error': str(cancel_e)
+                        })
+            
+            if result['cancelled'] > 0:
+                logger.info(f"🧹 Zombie cleanup: {result['cancelled']} orders cancelled")
+            
+        except Exception as e:
+            logger.error(f"Error in zombie order cleanup: {e}")
+            result['errors'] += 1
+        
+        return result
 
 
 # =============================================================================

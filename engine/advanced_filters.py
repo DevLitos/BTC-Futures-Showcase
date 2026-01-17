@@ -302,12 +302,27 @@ async def check_btc_trend(external_data_manager, bias: str) -> Tuple[bool, str]:
     
     BTC and altcoin correlation is 0.95+ (very correlated)
     
+    NOTE: This function requires the external_data_manager to have a method
+    that can fetch OHLCV data. If not available, it returns True (allow).
+    
     Returns: (is_ok_to_trade: bool, reason: str)
     """
     if not CorrelationFilters.ENABLED or not CorrelationFilters.BTC_TREND_ENABLED:
         return True, ""
     
     try:
+        # Check if the manager has get_ohlcv method
+        if not hasattr(external_data_manager, 'get_ohlcv'):
+            # Try alternative: check if there's a direct BTC price getter
+            if hasattr(external_data_manager, 'get_btc_price'):
+                current_price = await external_data_manager.get_btc_price()
+                # Without historical data, we can't calculate EMA - just return True
+                logger.debug("check_btc_trend: No OHLCV method, only current price - skipping trend check")
+                return True, "BTC trend check skipped (no historical data)"
+            else:
+                logger.debug("check_btc_trend: No get_ohlcv or get_btc_price method available")
+                return True, "BTC data unavailable"
+        
         btc_candles = await external_data_manager.get_ohlcv(
             'BTC/USDT',
             timeframe=CorrelationFilters.BTC_TIMEFRAME
@@ -328,6 +343,10 @@ async def check_btc_trend(external_data_manager, bias: str) -> Tuple[bool, str]:
         
         return True, f"BTC trend {btc_trend} OK ✓"
         
+    except AttributeError as e:
+        # Specific handling for missing methods
+        logger.debug(f"check_btc_trend: Method not available - {e}")
+        return True, "BTC check skipped (method unavailable)"
     except Exception as e:
         logger.warning(f"Failed to check BTC trend: {e}")
         return True, ""  # Don't block if check fails

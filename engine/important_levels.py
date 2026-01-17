@@ -450,17 +450,10 @@ class ImportantLevelsProvider:
             logger.warning("No important levels computed")
             return
         
-        logger.info("=" * 60)
-        logger.info("📊 IMPORTANT ANCHOR LEVELS:")
-        logger.info("=" * 60)
-        
-        # Sort by price for better visualization
+        # Compact single-line format instead of multi-line
         sorted_levels = sorted(self._levels.values(), key=lambda x: x.price, reverse=True)
-        
-        for level in sorted_levels:
-            logger.info(f"  {level.level_type.value:6s}: ${level.price:,.2f} ({level.description})")
-        
-        logger.info("=" * 60)
+        level_strs = [f"{level.level_type.value}=${level.price:,.0f}" for level in sorted_levels[:5]]
+        logger.info(f"📊 ANCHOR LEVELS (top 5): {' | '.join(level_strs)}")
     
     def get_level(self, level_type: LevelType) -> Optional[AnchorLevel]:
         """Get a specific level by type."""
