@@ -1,0 +1,81 @@
+# ============================================================
+# Prometheus Configuration - DayTrader 2.1
+# ============================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  
+  # Attach these labels to any time series or alerts when communicating with
+  # external systems (federation, remote storage, Alertmanager).
+  external_labels:
+    monitor: 'daytrader-monitor'
+    environment: 'production'
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# Rule files
+# rule_files:
+#   - "alert_rules.yml"
+
+scrape_configs:
+  # =========================================================================
+  # Trading Bot Metrics
+  # =========================================================================
+  - job_name: 'trading-bot'
+    static_configs:
+      - targets: ['trading-bot:8000']
+        labels:
+          service: 'trading-bot'
+          component: 'core'
+    # Scrape more frequently for trading metrics
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    metrics_path: /metrics
+
+  # =========================================================================
+  # Trading Bot Health
+  # =========================================================================
+  - job_name: 'trading-bot-health'
+    static_configs:
+      - targets: ['trading-bot:8001']
+        labels:
+          service: 'trading-bot'
+          component: 'health'
+    scrape_interval: 30s
+    metrics_path: /metrics
+
+  # =========================================================================
+  # Kafka Metrics (JMX Exporter)
+  # =========================================================================
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka:9092']
+        labels:
+          service: 'kafka'
+    scrape_interval: 30s
+
+  # =========================================================================
+  # Prometheus Self-Monitoring
+  # =========================================================================
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+
+  # =========================================================================
+  # Local Development (when running outside Docker)
+  # Uncomment for local testing
+  # =========================================================================
+  # - job_name: 'trading-local'
+  #   static_configs:
+  #     - targets: ['host.docker.internal:8000']
+  #       labels:
+  #         service: 'trading-bot'
+  #         environment: 'local'

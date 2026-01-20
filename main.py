@@ -64,10 +64,10 @@ load_env_file()
 # =====================================================================
 # 🔒 PHASE 2: Initialize production-grade settings and logging
 # =====================================================================
-from core.settings import get_settings, TradingMode, validate_startup, redact_secrets
-from core.logging_config import configure_logging, get_audit_logger, set_session_id
-from core.kill_switch import init_kill_switch, get_kill_switch
-from core.health import init_health_status, get_health_status, start_health_server
+from src.core.settings import get_settings, TradingMode, validate_startup, redact_secrets
+from src.core.logging_config import configure_logging, get_audit_logger, set_session_id
+from src.core.kill_switch import init_kill_switch, get_kill_switch
+from src.core.health import init_health_status, get_health_status, start_health_server
 
 # Get validated settings (will fail fast if invalid)
 try:
@@ -103,34 +103,34 @@ DEMO_MODE = settings.demo_mode
 # =====================================================================
 
 # 1. DATOS DE MERCADO
-from ingest.kraken_websocket import KrakenFuturesWebSocket
-from ingest.order_book import OrderBookManager
+from src.ingest.kraken_websocket import KrakenFuturesWebSocket
+from src.ingest.order_book import OrderBookManager
 
 # 2. BUFFER MULTI-TIMEFRAME
-from engine.market_data import SynchronizedMultiTimeframeBuffer
+from src.engine.market_data import SynchronizedMultiTimeframeBuffer
 
 # 3. EJECUCIÓN REAL
-from engine.execution import RESTExecutionEngine
+from src.engine.execution import RESTExecutionEngine
 
 # 4. DATOS EXTERNOS
-from engine.external_data import ExternalDataManager
+from src.engine.external_data import ExternalDataManager
 
 # 5. PERSISTENCIA
-from engine.persistence import TradeLogger, PositionReconciler
+from src.engine.persistence import TradeLogger, PositionReconciler
 
 # 6. SIGNAL ENGINE
-from engine.signal_engine import SignalEngine
+from src.engine.signal_engine import SignalEngine
 
 # 7. ERROR TRACKING
-from engine.error_tracker import ErrorTracker, ErrorTrackerConfig, ErrorSeverity, init_error_tracker
+from src.engine.error_tracker import ErrorTracker, ErrorTrackerConfig, ErrorSeverity, init_error_tracker
 
 # 8. NEW ARCHITECTURE - Runtime Mode & Position Store
-from core import RuntimeMode, init_runtime, get_runtime_config
-from accounting import get_position_store
-from core.events import get_event_bus, EventType
+from src.core import RuntimeMode, init_runtime, get_runtime_config
+from src.accounting import get_position_store
+from src.core.events import get_event_bus, EventType
 
 # 9. METRICS
-from monitoring.metrics import (
+from src.monitoring.metrics import (
     start_metrics_server,
     BUILD_INFO,
     ORDERS_PLACED_TOTAL, ORDERS_FAILED_TOTAL,
@@ -140,10 +140,10 @@ from monitoring.metrics import (
 )
 
 # 10. BTC CONTEXT FEED (Jan 15, 2026)
-from engine.btc_context_feed import get_btc_context_feed
+from src.engine.btc_context_feed import get_btc_context_feed
 
 # Legacy (mantener compatibilidad)
-from output.output_manager import OutputManager
+from src.output.output_manager import OutputManager
 
 # Set build info metric
 BUILD_INFO.info({
@@ -374,7 +374,7 @@ class TradingSystemOrchestrator:
         4. Notify user of recovery actions
         """
         from datetime import datetime, UTC
-        from engine.risk_engine import Position
+        from src.engine.risk_engine import Position
         
         logger.info("🔄 STARTUP RECOVERY: Checking for orphan positions/orders...")
         
@@ -442,14 +442,45 @@ class TradingSystemOrchestrator:
                             open_orders = await self.execution.get_open_orders(CCXT_SYMBOL)
                             for order in open_orders:
                                 order_type = str(order.get('type', '')).lower()
-                                reduce_only = order.get('reduceOnly', order.get('info', {}).get('reduceOnly', False))
+                                reduce_only = order.get('reduceOnly') or order.get('info', {}).get('reduceOnly', False)
                                 
-                                if order_type in ('stop-loss', 'stop') or (reduce_only and order.get('side') != side):
-                                    existing_sl = float(order.get('price', 0) or order.get('triggerPrice', 0) or order.get('stopPrice', 0) or 0)
-                                    logger.info(f"   Found existing SL order: {existing_sl:.2f}")
-                                elif order_type in ('take-profit', 'limit') and reduce_only:
-                                    existing_tp = float(order.get('price', 0) or 0)
-                                    logger.info(f"   Found existing TP order: {existing_tp:.2f}")
+                                # Extract price from multiple possible fields
+                                order_price = float(order.get('price', 0) or order.get('triggerPrice', 0) or order.get('stopPrice', 0) or 0)
+                                
+                                # Skip orders with zero or invalid price
+                                if order_price <= 0:
+                                    continue
+                                
+                                # 🔥 IMPROVED SL/TP detection: Use order type AND price position
+                                is_stop_type = order_type in ('stop-loss', 'stop', 'stop_loss', 'stop_market')
+                                is_limit_type = order_type in ('take-profit', 'take_profit', 'limit')
+                                
+                                if reduce_only or is_stop_type:
+                                    # Determine if this is SL or TP based on price position
+                                    # SL for LONG: below entry | SL for SHORT: above entry
+                                    # TP for LONG: above entry | TP for SHORT: below entry
+                                    if direction == 'LONG':
+                                        if order_price < entry_price:
+                                            # Price below entry = SL for LONG
+                                            if is_stop_type or existing_sl is None:
+                                                existing_sl = order_price
+                                                logger.info(f"   Found existing SL order: {existing_sl:.2f} (type={order_type})")
+                                        else:
+                                            # Price above entry = TP for LONG
+                                            if is_limit_type or existing_tp is None:
+                                                existing_tp = order_price
+                                                logger.info(f"   Found existing TP order: {existing_tp:.2f} (type={order_type})")
+                                    else:  # SHORT
+                                        if order_price > entry_price:
+                                            # Price above entry = SL for SHORT
+                                            if is_stop_type or existing_sl is None:
+                                                existing_sl = order_price
+                                                logger.info(f"   Found existing SL order: {existing_sl:.2f} (type={order_type})")
+                                        else:
+                                            # Price below entry = TP for SHORT
+                                            if is_limit_type or existing_tp is None:
+                                                existing_tp = order_price
+                                                logger.info(f"   Found existing TP order: {existing_tp:.2f} (type={order_type})")
                         except Exception as e:
                             logger.warning(f"   Could not check for existing SL/TP: {e}")
                         
@@ -487,10 +518,47 @@ class TradingSystemOrchestrator:
                             logger.info(f"   ✅ TP tracked at {existing_tp:.2f}")
                         
                         # Transition signal engine to MANAGE state
-                        from engine.state_machine import BotState
+                        from src.engine.state_machine import BotState
                         if hasattr(self.signal_engine, 'state_machine'):
                             self.signal_engine.state_machine.transition_to(BotState.MANAGE, "Adopted existing position")
                             self.signal_engine._stops_set = sl_active  # Track if SL needs to be set
+                            
+                            # 🔥 CRITICAL FIX: Populate _last_entry_data for SL/TP retry logic
+                            # Calculate proper SL/TP based on position
+                            atr_estimate = entry_price * 0.01  # 1% as fallback ATR
+                            if direction == 'LONG':
+                                retry_sl = sl_to_use if sl_to_use else entry_price * 0.97  # 3% SL
+                                retry_tp = entry_price * 1.02  # 2% TP
+                            else:
+                                retry_sl = sl_to_use if sl_to_use else entry_price * 1.03  # 3% SL
+                                retry_tp = entry_price * 0.98  # 2% TP
+                            
+                            self.signal_engine._last_entry_data = {
+                                'stop_loss': retry_sl,
+                                'take_profit': retry_tp,
+                                'entry_price': entry_price,
+                                'direction': direction,
+                                'adopted': True
+                            }
+                            logger.info(f"   📋 Retry data set: SL={retry_sl:.2f}, TP={retry_tp:.2f}")
+                            
+                            # 🔥 IMMEDIATE SL/TP PLACEMENT: Don't wait for main loop if no protection!
+                            if not sl_active:
+                                logger.warning("🔒 IMMEDIATE SL/TP PLACEMENT: Position has no protection!")
+                                try:
+                                    stops_placed = await self.execution.set_position_stops(
+                                        symbol=CCXT_SYMBOL,
+                                        stop_loss=retry_sl,
+                                        take_profit=retry_tp
+                                    )
+                                    if stops_placed:
+                                        logger.info(f"   ✅ SL/TP placed immediately: SL={retry_sl:.2f}, TP={retry_tp:.2f}")
+                                        self.signal_engine._stops_set = True
+                                        self.signal_engine.risk_engine.position.exchange_sl_active = True
+                                    else:
+                                        logger.critical("   ❌ FAILED to place SL/TP - position at risk!")
+                                except Exception as sl_error:
+                                    logger.critical(f"   ❌ Error placing SL/TP: {sl_error}")
                         
                         logger.info(f"✅ Position adopted: {direction} {size:.6f} @ {entry_price:.2f}")
                         recovery_actions.append(f"Adopted existing position: {direction} {size:.6f}")

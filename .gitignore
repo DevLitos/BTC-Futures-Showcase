@@ -9,14 +9,25 @@ wheels/
 # Virtual environments
 .venv
 
-# Credentials and secrets (NEVER commit these!)
+# ============================================================
+# ⚠️ SECRETOS - NUNCA COMMITEAR
+# ============================================================
 .env
-.env.*
+.env.secrets
+.env.local
+.env.*.local
 *.env
 ~/.trad2_env
 .trad2_env
 secrets/
 credentials/
+*.pem
+*.key
+
+# Excluir todo .env.* EXCEPTO ejemplos
+!.env.example
+!.env.secrets.example
+!.env.config
 
 # IDE files
 .idea/

@@ -1,0 +1,102 @@
+# ============================================================
+# DayTrader 2.1 - Docker Ignore File
+# Excludes files from Docker build context for faster builds
+# ============================================================
+
+# Git
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov/
+.coverage
+.coverage.*
+*.cover
+.hypothesis
+.nox
+.tox
+
+# Virtual environments
+.venv
+venv
+ENV
+env
+.python-version
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.egg-info
+dist
+build
+*.egg
+wheels
+
+# Local data (will be mounted as volumes)
+logs/
+storage/
+trade_logs/
+# output/ - NO EXCLUIR, contiene código Python
+*.parquet
+*.json
+!config/*.json
+!prometheus.yml
+
+# Documentation (not needed in container)
+*.md
+!README.md
+docs/
+
+# Tests (not needed in production image)
+tests/
+test_*.py
+pytest.ini
+.pytest_cache
+
+# Development files
+Makefile
+*.sh
+!quickstart.sh
+docker-compose.override.yml
+
+# Temporary files
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Secrets (NEVER include in image)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Large files
+*.zip
+*.tar
+*.tar.gz
+*.rar
+
+# Backtest data
+backtest_data/
+historical_data/
+
+# uv lock file (not needed in container)
+uv.lock
