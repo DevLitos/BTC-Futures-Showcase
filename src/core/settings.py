@@ -217,6 +217,34 @@ class Settings(BaseSettings):
     )
     
     # =========================================================================
+    # API Configuration
+    # =========================================================================
+    api_port: int = Field(
+        default=8080,
+        alias="API_PORT",
+        ge=1024,
+        le=65535,
+        description="Port for FastAPI REST API"
+    )
+    api_key: Optional[SecretStr] = Field(
+        default=None,
+        alias="API_KEY",
+        description="API key for protected endpoints (X-API-Key header)"
+    )
+    api_cors_origins: str = Field(
+        default="*",
+        alias="API_CORS_ORIGINS",
+        description="Comma-separated list of allowed CORS origins"
+    )
+    api_rate_limit: int = Field(
+        default=60,
+        alias="API_RATE_LIMIT",
+        ge=1,
+        le=1000,
+        description="Max requests per minute per IP"
+    )
+    
+    # =========================================================================
     # Safety Limits
     # =========================================================================
     max_position_usd: float = Field(
@@ -684,12 +712,18 @@ async def validate_startup(settings: Settings) -> dict:
     # Check API connectivity (if not demo/backtest)
     if not settings.demo_mode and not settings.is_backtest_mode:
         try:
+            import asyncio
             import ccxt.async_support as ccxt
             
-            ExchangeClass = getattr(ccxt, settings.exchange.value)
-            exchange = ExchangeClass(settings.get_credentials_dict())
+            STARTUP_TIMEOUT = 30.0  # 30 seconds for startup validation
             
-            await exchange.load_markets()
+            ExchangeClass = getattr(ccxt, settings.exchange.value)
+            config = settings.get_credentials_dict()
+            config['timeout'] = 10000  # 10s internal CCXT timeout
+            exchange = ExchangeClass(config)
+            
+            # 🔥 FIX (Jan 21, 2026): Add timeout to prevent blocking
+            await asyncio.wait_for(exchange.load_markets(), timeout=STARTUP_TIMEOUT)
             
             # Verify symbol exists
             if settings.ccxt_symbol not in exchange.markets:
@@ -702,7 +736,8 @@ async def validate_startup(settings: Settings) -> dict:
             
             # Check time sync (some exchanges don't support fetch_time)
             try:
-                server_time = await exchange.fetch_time()
+                # 🔥 FIX (Jan 21, 2026): Add timeout to prevent blocking
+                server_time = await asyncio.wait_for(exchange.fetch_time(), timeout=10.0)
                 local_time = int(datetime.now(UTC).timestamp() * 1000)
                 drift_ms = abs(server_time - local_time)
                 
@@ -712,11 +747,17 @@ async def validate_startup(settings: Settings) -> dict:
                     results["warnings"].append(
                         f"Clock drift detected: {drift_ms}ms > {settings.max_time_drift_ms}ms threshold"
                     )
+            except asyncio.TimeoutError:
+                results["warnings"].append("Time sync check timed out (10s)")
             except Exception as time_error:
                 # Some exchanges (krakenfutures) don't support fetch_time
                 results["warnings"].append(f"Time sync check not available: {str(time_error)[:50]}")
             
-            await exchange.close()
+            # 🔥 FIX (Jan 21, 2026): Add timeout to prevent blocking
+            try:
+                await asyncio.wait_for(exchange.close(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass  # Ignore timeout on close
             results["checks"]["exchange_connected"] = True
             
         except Exception as e:
@@ -729,10 +770,13 @@ async def validate_startup(settings: Settings) -> dict:
             import telegram
             
             bot = telegram.Bot(token=settings.telegram_bot_token.get_secret_value())
-            # Just get bot info to verify token
-            bot_info = await bot.get_me()
-            results["checks"]["telegram_valid"] = True
-            results["checks"]["telegram_bot_name"] = bot_info.username
+            # 🔥 FIX (Jan 21, 2026): Add timeout to Telegram validation
+            try:
+                bot_info = await asyncio.wait_for(bot.get_me(), timeout=10.0)
+                results["checks"]["telegram_valid"] = True
+                results["checks"]["telegram_bot_name"] = bot_info.username
+            except asyncio.TimeoutError:
+                results["warnings"].append("Telegram validation timed out (10s)")
             
         except Exception as e:
             results["warnings"].append(f"Telegram validation failed: {str(e)}")

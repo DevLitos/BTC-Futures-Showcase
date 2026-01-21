@@ -426,10 +426,22 @@ def record_error_sync(source: str, message: str,
     import asyncio
     try:
         loop = asyncio.get_running_loop()
-        # 🔥 FIX (Jan 20, 2026): If we're in an async context, create task
-        # but return False immediately (don't return Task object!)
+        # 🔥 FIX (Jan 21, 2026): Track task properly to prevent GC and enable exception handling
+        # If we're in an async context, create task but return False immediately
         # The error will be recorded asynchronously
-        asyncio.create_task(tracker.record_error(source, message, severity, category=category))
+        task = asyncio.create_task(
+            tracker.record_error(source, message, severity, category=category),
+            name=f"error_record_{source}"
+        )
+        
+        def _on_done(t):
+            if not t.cancelled():
+                exc = t.exception()
+                if exc:
+                    # Can't use logger here as it might cause recursion
+                    print(f"[ErrorTracker] Background task failed: {exc}")
+        
+        task.add_done_callback(_on_done)
         return False  # Can't know result synchronously, assume no stop needed
     except RuntimeError:
         # No event loop running, run sync

@@ -62,7 +62,7 @@ class FrictionConfig:
 # =============================================================================
 
 @dataclass
-class TradeRecord:
+class MetricsTradeRecord:
     """
     Complete record of a single trade with all metrics.
     
@@ -329,13 +329,13 @@ class TradeMetricsCalculator:
                            avg_atr: float = None,
                            apply_friction: bool = True,
                            notes: str = "",
-                           tags: List[str] = None) -> TradeRecord:
+                           tags: List[str] = None) -> MetricsTradeRecord:
         """
         Build a complete TradeRecord with all calculated metrics.
         
         This is the main entry point for creating trade records.
         """
-        record = TradeRecord(
+        record = MetricsTradeRecord(
             trade_id=trade_id,
             symbol=symbol,
             direction=direction,
@@ -441,11 +441,11 @@ class TradeLogger:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.log_dir / filename
-        self.trades: List[TradeRecord] = []
+        self.trades: List[MetricsTradeRecord] = []
         
         logger.info(f"📊 TradeLogger initialized: {self.log_file}")
     
-    def log_trade(self, record: TradeRecord) -> None:
+    def log_trade(self, record: MetricsTradeRecord) -> None:
         """Log a completed trade."""
         self.trades.append(record)
         
@@ -466,7 +466,7 @@ class TradeLogger:
         if record.tp1_to_sl:
             logger.warning(f"   ⚠️ TP1→SL Pattern detected (hit TP1 then stopped out)")
     
-    def load_trades(self) -> List[TradeRecord]:
+    def load_trades(self) -> List[MetricsTradeRecord]:
         """Load all trades from log file."""
         trades = []
         if self.log_file.exists():
@@ -630,7 +630,7 @@ def get_metrics_calculator(friction_config: FrictionConfig = None) -> TradeMetri
     return _metrics_calculator
 
 
-def log_trade(record: TradeRecord) -> None:
+def log_trade(record: MetricsTradeRecord) -> None:
     """Convenience function to log a trade."""
     get_trade_logger().log_trade(record)
 

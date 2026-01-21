@@ -4,20 +4,20 @@
 # ============================================================
 # 
 # JUSTIFICACIÓN DE ARQUITECTURA:
+# - Bot y API como servicios separados (mejor aislamiento)
+# - Comunicación vía archivos compartidos (health_status.json, KILL_SWITCH)
 # - Kafka: OPCIONAL (profile 'full'). Solo si necesitas replay/audit trail.
-#   Para bot simple, el WebSocket directo es suficiente.
 # - Prometheus/Grafana: Recomendado para observabilidad.
-# - Sin Kafka: más simple, menos latencia, menos puntos de fallo.
 #
 # PERFILES:
-#   docker compose up                    → Solo bot + monitoring (RECOMENDADO)
+#   docker compose up                    → Bot + API + monitoring (RECOMENDADO)
 #   docker compose --profile full up     → Con Kafka (si lo necesitas)
 #
 # ============================================================
 
 services:
   # ============================================================
-  # TRADING BOT - Main Application
+  # TRADING BOT - Main Application (ejecuta estrategia)
   # ============================================================
   trading-bot:
     build:
@@ -95,6 +95,79 @@ services:
     security_opt:
       - no-new-privileges:true
     read_only: false
+    
+    networks:
+      - trading-network
+
+  # ============================================================
+  # REST API - FastAPI Application (consulta y control)
+  # ============================================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    image: daytrader:${VERSION:-latest}
+    container_name: daytrader-api
+    restart: unless-stopped
+    
+    # Override entrypoint to run uvicorn instead of main.py
+    entrypoint: ["python", "-m", "uvicorn"]
+    command: ["src.api.app:app", "--host", "0.0.0.0", "--port", "8080"]
+    
+    env_file:
+      - .env.secrets
+    
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=UTC
+      - TRADING_MODE=${TRADING_MODE:-LIVE}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - API_PORT=8080
+      - API_KEY=${API_KEY:-}
+      - API_RATE_LIMIT=${API_RATE_LIMIT:-60}
+    
+    ports:
+      # API expuesta en puerto configurable
+      - "${API_HOST_PORT:-127.0.0.1:8080}:8080"
+    
+    volumes:
+      # Compartir storage con el bot para leer health_status.json
+      - ./storage:/app/storage
+      - ./logs:/app/logs:ro
+      - ./KILL_SWITCH:/app/KILL_SWITCH
+      - /etc/localtime:/etc/localtime:ro
+    
+    depends_on:
+      trading-bot:
+        condition: service_started
+    
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+    
+    security_opt:
+      - no-new-privileges:true
     
     networks:
       - trading-network

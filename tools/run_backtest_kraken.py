@@ -20,8 +20,8 @@ import ccxt
 # Importar clases REALES del sistema
 from src.engine.signal_engine import SignalEngine
 from src.engine.market_data import SynchronizedMultiTimeframeBuffer
-from src.engine.risk_engine import RiskEngine
-from src.engine.state_machine import BotState
+from src.engine.risk.risk_engine import RiskEngine
+from src.engine.state.state_machine import BotState
 
 # Import validation framework (optional slippage simulation)
 try:

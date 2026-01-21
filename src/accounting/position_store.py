@@ -255,6 +255,9 @@ class PositionStore:
         # State change events
         self._event_bus = event_bus or get_event_bus()
         
+        # 🔥 FIX (Jan 21, 2026): Track background tasks to prevent GC and enable clean shutdown
+        self._background_tasks: set = set()
+        
         # Sync tracking
         self._last_sync: Optional[datetime] = None
         self._sync_count = 0
@@ -275,6 +278,9 @@ class PositionStore:
         
         FIX (Jan 14, 2026): EventBus.emit() takes an Event object, not (type, dict).
         This helper creates the proper Event object.
+        
+        🔥 FIX (Jan 21, 2026): Track tasks to prevent garbage collection and enable
+        proper exception handling.
         """
         from src.core.events import Event
         
@@ -288,7 +294,18 @@ class PositionStore:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                asyncio.create_task(self._event_bus.emit(event))
+                task = asyncio.create_task(self._event_bus.emit(event))
+                # Track task to prevent GC and enable clean shutdown
+                self._background_tasks.add(task)
+                
+                def _on_done(t):
+                    self._background_tasks.discard(t)
+                    if not t.cancelled():
+                        exc = t.exception()
+                        if exc:
+                            logger.error(f"Event emit task failed: {exc}")
+                
+                task.add_done_callback(_on_done)
             else:
                 # Sync context - can't emit async event
                 logger.debug(f"Event {event_type.name} created (no running loop)")
@@ -747,8 +764,15 @@ class PositionStore:
             }
             
             try:
-                # Fetch positions from exchange
-                exchange_positions = await exchange.fetch_positions()
+                # 🔥 FIX (Jan 20, 2026): Add timeout to prevent hanging
+                try:
+                    exchange_positions = await asyncio.wait_for(
+                        exchange.fetch_positions(),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("⏰ TIMEOUT fetching positions in sync_from_exchange (10s)")
+                    return result  # Return empty result instead of hanging
                 
                 for ex_pos in exchange_positions:
                     symbol = ex_pos.get('symbol')
@@ -845,8 +869,15 @@ class PositionStore:
                         local_pos.size = 0
                         local_pos.updated_at = datetime.now(UTC)
                 
-                # Fetch open orders
-                exchange_orders = await exchange.fetch_open_orders()
+                # Fetch open orders - 🔥 FIX: Add timeout
+                try:
+                    exchange_orders = await asyncio.wait_for(
+                        exchange.fetch_open_orders(),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("⏰ TIMEOUT fetching open orders in sync_from_exchange (10s)")
+                    exchange_orders = []
                 
                 for ex_order in exchange_orders:
                     order_id = ex_order.get('id')
@@ -963,8 +994,15 @@ class PositionStore:
             return result
         
         try:
-            # Fetch all open orders
-            open_orders = await exchange.fetch_open_orders(symbol) if symbol else await exchange.fetch_open_orders()
+            # Fetch all open orders - 🔥 FIX: Add timeout
+            try:
+                open_orders = await asyncio.wait_for(
+                    exchange.fetch_open_orders(symbol) if symbol else exchange.fetch_open_orders(),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.error("⏰ TIMEOUT fetching open orders in cleanup_zombie_orders (10s)")
+                return result
             
             now = datetime.now(UTC)
             

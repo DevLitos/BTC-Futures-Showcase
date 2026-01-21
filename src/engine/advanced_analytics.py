@@ -41,14 +41,14 @@ except ImportError:
 
 # Integration with Market Regime
 try:
-    from src.engine.market_regime import MarketRegime, get_regime_classifier
+    from src.engine.regime.market_regime import ManagementRegime, get_regime_classifier
     _MARKET_REGIME_AVAILABLE = True
 except ImportError:
     _MARKET_REGIME_AVAILABLE = False
 
 # Integration with Risk Middleware
 try:
-    from src.engine.risk_middleware import SetupGrade, get_risk_middleware
+    from src.engine.risk.risk_middleware import SetupGrade, get_risk_middleware
     _RISK_MIDDLEWARE_AVAILABLE = True
 except ImportError:
     _RISK_MIDDLEWARE_AVAILABLE = False

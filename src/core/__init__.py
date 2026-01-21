@@ -10,6 +10,7 @@ This module provides the fundamental building blocks for the trading system:
 - LoggingConfig: Structured logging with secret redaction (NEW)
 - KillSwitch: Hot trading pause mechanism (NEW)
 - Health: Liveness/readiness endpoints (NEW)
+- HealthBridge: Cross-process health sharing for FastAPI (NEW Jan 20, 2026)
 """
 
 from .runtime_mode import RuntimeMode, RuntimeConfig, get_runtime_config, init_runtime
@@ -43,6 +44,10 @@ from .health import (
     HealthStatus, HealthHandler,
     start_health_server, init_health_status, get_health_status
 )
+from .health_bridge import (
+    HealthBridge, HealthBridgeWriter, BridgedHealthStatus,
+    get_health_bridge
+)
 
 __all__ = [
     # Runtime
@@ -70,4 +75,7 @@ __all__ = [
     # Health (NEW)
     'HealthStatus', 'HealthHandler',
     'start_health_server', 'init_health_status', 'get_health_status',
+    # Health Bridge (NEW Jan 20, 2026)
+    'HealthBridge', 'HealthBridgeWriter', 'BridgedHealthStatus',
+    'get_health_bridge',
 ]

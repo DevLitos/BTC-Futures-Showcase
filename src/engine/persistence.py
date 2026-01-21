@@ -345,14 +345,23 @@ class PositionReconciler:
     
     async def start(self):
         """Start periodic reconciliation"""
+        logger.info("🔄 PositionReconciler started (interval=60s)")
         self.is_running = True
+        
+        # 🔥 FIX (Jan 21, 2026): Wait before first reconciliation to let system stabilize
+        # This prevents blocking the event loop during startup
+        logger.info("⏳ Reconciler: waiting 10s before first reconciliation...")
+        await asyncio.sleep(10.0)
+        
         while self.is_running:
             try:
-                await self.reconcile()
-                await asyncio.sleep(self.reconcile_interval)
+                # 🔥 FIX (Jan 21, 2026): Add timeout to prevent blocking
+                await asyncio.wait_for(self.reconcile(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("⏰ PositionReconciler.reconcile() TIMEOUT (15s)")
             except Exception as e:
                 logger.error(f"Error reconciling: {e}")
-                await asyncio.sleep(10)
+            await asyncio.sleep(self.reconcile_interval)
     
     async def stop(self):
         """Stop reconciliation loop"""
@@ -388,14 +397,21 @@ class PositionReconciler:
         
         Returns: True si OK, False si desync
         """
+        import asyncio
+        # 🔥 DEBUG: Show all active tasks
+        tasks = [t for t in asyncio.all_tasks() if not t.done()]
+        logger.info(f"📊 ACTIVE TASKS ({len(tasks)}): {[t.get_name() for t in tasks]}")
+        
         # Skip reconciliation during exits to prevent state corruption
         if self._exit_in_progress:
             logger.debug(f"Reconciliation skipped: exit in progress ({self._exit_reason})")
             return True
         
         try:
+            logger.info("🔍 Reconcile: about to call get_position...")
             # Get exchange position (source of truth)
             exchange_pos = await self.execution_engine.get_position('BTC/USD:USD')
+            logger.info(f"🔍 Reconcile: get_position returned: {exchange_pos is not None}")
             
             # Get expected position from bot state
             expected = self._get_expected_position()

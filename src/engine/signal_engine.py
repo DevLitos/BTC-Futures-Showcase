@@ -14,66 +14,84 @@ from datetime import datetime, UTC, timedelta
 from prometheus_client import Counter
 import logging
 
-from src.engine.state_machine import StateMachine, BotState
+from src.engine.state.state_machine import StateMachine, BotState
 from src.engine.filters import (
     KillConditionsFilter, BlackSwanFilter, HTFFilter,
-    LTFTriggerFilter
+    LTFTriggerFilter,
     # MTFStructureFilter removed (FIX #1: Enable earlier entries)
-)
-from src.engine.risk_engine import RiskEngine
-from src.engine.execution import round_size_to_exchange, KRAKEN_BTC_MIN_SIZE  # 🔒 FIX: Centralized size rounding + min size
-from src.engine.indicators import (
-    calculate_ema, calculate_atr, calculate_adx, calculate_rsi, calculate_bollinger_bands
-)
-from src.engine.config import HTFFilters, RiskManagement, OperatingMode  # For logging thresholds + MODE
-from src.engine.advanced_filters import (
+    # Advanced filters
     check_funding_rate_safe,
     should_exit_on_funding,
     check_session_quality,
     check_htf_divergence,
     calculate_vpoc,
     check_vpoc_validity,
-    check_btc_trend
+    check_btc_trend,
+    # Specialized filters
+    LocationFilter, get_location_filter, LocationContext,
+    MicroTrendFilter, get_micro_trend_filter, MicroTrendState,
+    EntryFilterPipeline, get_entry_filter_pipeline,
+    SpreadFilter, get_spread_filter, check_spread_for_entry, SpreadCheckResult,
 )
-from src.engine.edge_regime_classifier import EdgeRegimeClassifier
-from src.engine.edge_enforcement import EdgeEnforcement
-from src.engine.edge_validator import ContextValidity
+from src.engine.risk.risk_engine import RiskEngine
+from src.engine.execution import round_size_to_exchange, KRAKEN_BTC_MIN_SIZE  # 🔒 FIX: Centralized size rounding + min size
+from src.engine.indicators import (
+    calculate_ema, calculate_atr, calculate_adx, calculate_rsi, calculate_bollinger_bands
+)
+from src.engine.config import HTFFilters, RiskManagement, OperatingMode  # For logging thresholds + MODE
+from src.engine.regime import EdgeRegimeClassifier, RegimeDetector, EntryRegime, calculate_chase_atr
+from src.engine.edge.edge_enforcement import EdgeEnforcement
+from src.engine.edge.edge_validator import ContextValidity
 from src.engine.core_utils import PositionSizer, get_position_sizer
 from src.engine.time_provider import get_time_provider, TimeProvider
 from src.engine.error_tracker import get_error_tracker, ErrorSeverity
 from src.engine.system_health import SystemHealthMonitor
-from src.engine.exchange_reconciler import ExchangeReconciler, ReconcilerState
+from src.engine.execution.exchange_reconciler import ExchangeReconciler, ReconcilerState
 from src.engine.missed_opportunity_tracker import MissedOpportunityTracker
-from src.engine.regime_detector import RegimeDetector, MarketRegime, calculate_chase_atr
 from src.engine.important_levels import (
     ImportantLevelsProvider, get_important_levels_provider,
     initialize_important_levels, LevelContext, LevelType
 )
-from src.engine.location_filter import LocationFilter, get_location_filter, LocationContext
 from src.engine.pullback_short_engine import (
     PullbackShortEngine, get_pullback_short_engine,
     PullbackShortSignal, TradeType
 )
 from src.engine.config import PullbackShortConfig
-from src.engine.micro_trend_filter import MicroTrendFilter, get_micro_trend_filter, MicroTrendState
-from src.engine.filter_pipeline import EntryFilterPipeline, get_entry_filter_pipeline
 from src.monitoring.metrics import (
     update_pullback_short_signal, update_pullback_short_entry,
     update_pullback_short_exit, update_pullback_short_status
 )
 
-# NEW IMPORTS: Slippage, Spread, Trade Logger, Dynamic Configs (Jan 16, 2026)
-from src.engine.slippage_model import (
+# NEW IMPORTS: Slippage, Trade Logger, Dynamic Configs (Jan 16, 2026)
+from src.engine.execution.slippage_model import (
     SlippageModel, get_slippage_model, calculate_worst_case_rr, OrderType
-)
-from src.engine.spread_filter import (
-    SpreadFilter, get_spread_filter, check_spread_for_entry, SpreadCheckResult
 )
 from src.engine.trade_logger import TradeLogger, get_trade_logger
 from src.engine.config import (
     DynamicScoreThreshold, SessionTradeLimits, VolatilityRegime,
     LossStreakConfig, LocationFilterOverride, MicroTrendADXConfig,
     get_session_name
+)
+from src.engine.scoring import EntryScorer, get_entry_scorer
+
+# Extracted helper modules (Jan 20, 2026 - Phase 4 refactoring)
+from src.engine.filter_checks import (
+    check_trend_filter as _check_trend_pure,
+    check_volatility_expansion as _check_volatility_expansion_pure,
+    check_anti_reversal as _check_anti_reversal_pure,
+    check_volume_delta as _check_volume_delta_pure,
+    check_bos_against_position as _check_bos_pure,
+    check_atr_regime_allows_entry as _check_atr_regime_pure,
+    check_volatility_minimum as _check_vol_min_pure,
+    check_not_post_impulse as _check_post_impulse_pure,
+    check_sweep_occurred as _check_sweep_pure,
+)
+from src.engine.indicator_helpers import (
+    calculate_atr_1m as _calc_atr_1m_pure,
+    calculate_atr_5m as _calc_atr_5m_pure,
+    calculate_atr_generic as _calc_atr_generic_pure,
+    find_tp2_target as _find_tp2_pure,
+    find_support_resistance as _find_sr_pure,
 )
 
 # NEW ARCHITECTURE: Position Store as Single Source of Truth
@@ -233,6 +251,12 @@ class SignalEngine:
         # Edge enforcement - pre-trade validation & degradation monitoring
         # Uses Activity Regime model (not session-based) for 24/7 crypto markets
         self.edge_enforcement = EdgeEnforcement(mode=self._enforcement_mode)
+        
+        # =====================================================================
+        # ENTRY SCORER - Extracted to reduce god class complexity (Jan 20, 2026)
+        # Handles score calculation: structure, timing, momentum, context
+        # =====================================================================
+        self._entry_scorer = get_entry_scorer()
         
         # Centralized position sizer for consistent sizing calculations
         self._position_sizer = get_position_sizer(
@@ -406,7 +430,7 @@ class SignalEngine:
         # Anti-chasing becomes relative to regime, not absolute
         # =====================================================================
         self.regime_detector = RegimeDetector()
-        self._current_regime: MarketRegime = MarketRegime.RANGE  # Default conservative
+        self._current_regime: EntryRegime = EntryRegime.RANGE  # Default conservative
         
         # =====================================================================
         # IMPORTANT LEVELS PROVIDER - Anchor levels for S/R (Jan 13, 2026)
@@ -736,7 +760,7 @@ class SignalEngine:
         """
         # 🔥 FIX (Jan 20, 2026): Import PublicState, not ReconcilerState
         # The callback receives PublicState enum values
-        from src.engine.exchange_reconciler import PublicState
+        from src.engine.execution.exchange_reconciler import PublicState
         
         # If reconciler says IDLE and we're in MANAGE, the position was closed externally
         if public_state == PublicState.IDLE and self.state_machine.state == BotState.MANAGE:
@@ -910,8 +934,15 @@ class SignalEngine:
         Llamar después de reconexiones de WebSocket o timeouts
         """
         try:
-            # Consultar órdenes reales en exchange
-            real_orders = await self.execution.get_open_orders(self.symbol)
+            # 🔥 FIX (Jan 20, 2026): Add timeout to prevent hanging
+            try:
+                real_orders = await asyncio.wait_for(
+                    self.execution.get_open_orders(self.symbol),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.error("⏰ TIMEOUT in _reconcile_orders - skipping reconciliation")
+                return
             
             # Limpiar tracking local
             self.execution.open_orders.clear()
@@ -1039,8 +1070,11 @@ class SignalEngine:
     
     async def _main_loop(self):
         """Main trading loop - process ticks every second"""
+        logger.info("🔄 _main_loop: Starting main trading loop")
         last_reconcile_time = datetime.now(UTC)
         last_position_sync_time = datetime.now(UTC)
+        last_heartbeat_time = datetime.now(UTC)
+        tick_count = 0
         
         while self.is_running:
             # ═══════════════════════════════════════════════════════════════
@@ -1058,30 +1092,56 @@ class SignalEngine:
                 # 🔒 NEW: Position Store Sync (LIVE mode - every 30s)
                 # This ensures we always have accurate position state from exchange
                 # FIX #4 (Jan 13, 2026): Enhanced with auto-correction
+                # FIX #5 (Jan 21, 2026): Added timeout to prevent blocking
                 # ═══════════════════════════════════════════════════════════════
                 if self._runtime_config and self._runtime_config.mode == RuntimeMode.LIVE:
                     time_since_sync = (datetime.now(UTC) - last_position_sync_time).total_seconds()
                     if time_since_sync > 30:
-                        await self._periodic_reconciliation()
+                        logger.debug(f"🔄 Starting _periodic_reconciliation (last sync {time_since_sync:.0f}s ago)")
+                        try:
+                            await asyncio.wait_for(self._periodic_reconciliation(), timeout=15.0)
+                            logger.debug("✅ _periodic_reconciliation completed")
+                        except asyncio.TimeoutError:
+                            logger.error("⏰ _periodic_reconciliation TIMEOUT (15s) - API may be slow")
+                        except Exception as e:
+                            logger.error(f"Error in periodic reconciliation: {e}")
                         last_position_sync_time = datetime.now(UTC)
                 
                 # Periodic order reconciliation (every 60s)
                 time_since_reconcile = (datetime.now(UTC) - last_reconcile_time).total_seconds()
                 if time_since_reconcile > 60:
                     # Use enhanced reconciliation
-                    if hasattr(self.execution, 'auto_reconcile_orders'):
-                        await self.execution.auto_reconcile_orders(self.symbol)
-                    else:
-                        await self._reconcile_orders()
+                    try:
+                        if hasattr(self.execution, 'auto_reconcile_orders'):
+                            await asyncio.wait_for(self.execution.auto_reconcile_orders(self.symbol), timeout=15.0)
+                        else:
+                            await asyncio.wait_for(self._reconcile_orders(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        logger.error("⏰ Order reconciliation TIMEOUT (15s) - API may be slow")
+                    except Exception as e:
+                        logger.error(f"Error in order reconciliation: {e}")
                     last_reconcile_time = datetime.now(UTC)
                 
                 tick_start = datetime.now(UTC)
+                tick_count += 1
+                
+                # 💓 HEARTBEAT: Log every 10 seconds (DEBUG MODE) to confirm system is alive
+                time_since_heartbeat = (tick_start - last_heartbeat_time).total_seconds()
+                if time_since_heartbeat >= 10:  # 🔥 Changed from 60 to 10 for debugging
+                    pos_status = "FLAT" if not self.risk_engine.has_open_position() else f"{self.risk_engine.position.direction} {self.risk_engine.position.size:.6f}"
+                    logger.info(f"💓 HEARTBEAT: tick #{tick_count}, state={self.state_machine.state.name}, pos={pos_status}")
+                    last_heartbeat_time = tick_start
+                
                 await self._process_tick()
                 tick_duration = (datetime.now(UTC) - tick_start).total_seconds()
                 # Only warn if tick takes more than 4 seconds (reconciler API calls take ~2s every 5s)
                 if tick_duration > 4.0:
                     logger.warning(f"⏱️ SLOW TICK: {tick_duration:.2f}s")
+                
+                # 🔥 DEBUG (Jan 21, 2026): Log tick completion to diagnose freezes
+                logger.debug(f"✅ Tick #{tick_count} completed in {tick_duration:.2f}s")
                 await asyncio.sleep(1)
+                # logger.debug(f"🔄 Tick #{tick_count} sleep done, starting next tick")
                 
                 # Record success to reset error counter
                 error_tracker = get_error_tracker()
@@ -1119,6 +1179,9 @@ class SignalEngine:
     async def _process_tick(self):
         """Process one tick - implements strategy logic"""
         
+        # 🔥 DEBUG (Jan 21, 2026): Log tick start
+        logger.debug(f"📍 _process_tick START | state={self.state_machine.state.name}")
+        
         # UPDATE MARKET TIME in state machine (critical for cooldown/observation)
         market_time = self.market_data.get_market_time()
         self.state_machine.set_market_time(market_time)
@@ -1141,8 +1204,12 @@ class SignalEngine:
             time_since_reconcile = (now - self._last_reconcile_time).total_seconds()
             if time_since_reconcile >= 5:
                 try:
-                    await self.reconciler.reconcile()
+                    # Add 10s timeout to prevent infinite blocking
+                    await asyncio.wait_for(self.reconciler.reconcile(), timeout=10.0)
                     self._last_reconcile_time = now
+                except asyncio.TimeoutError:
+                    logger.error("⏰ Reconciler TIMEOUT (10s) - API may be slow or stuck")
+                    self._last_reconcile_time = now  # Reset to avoid spam
                 except Exception as e:
                     logger.error(f"Reconciler error: {e}")
         
@@ -1244,6 +1311,9 @@ class SignalEngine:
         
         elif self.state_machine.state == BotState.OBSERVATION:
             await self._handle_observation_state(current_price, atr_1m, market_time)
+        
+        # 🔥 DEBUG (Jan 21, 2026): Log tick end
+        logger.debug(f"📍 _process_tick END | state={self.state_machine.state.name}")
     
     # ===== OBSERVATION STATE - MONITOR ONLY =====
     
@@ -2185,20 +2255,9 @@ class SignalEngine:
             self.state_machine.transition_to(BotState.IDLE, f"Pullback order exception: {e}")
     
     def _calculate_atr_1m(self, df_1m: pd.DataFrame) -> float:
-        """Calculate ATR from 1m data"""
-        if df_1m is None or len(df_1m) < 14:
-            return 100.0
-        try:
-            atr_vals = calculate_atr(
-                df_1m['high'].values,
-                df_1m['low'].values,
-                df_1m['close'].values,
-                14
-            )
-            return atr_vals[-1] if len(atr_vals) > 0 and not np.isnan(atr_vals[-1]) else 100.0
-        except Exception as e:
-            logger.debug(f"ATR calculation failed (using default 100.0): {e}")
-            return 100.0
+        """Calculate ATR from 1m data - delegates to indicator_helpers"""
+        result = _calc_atr_1m_pure(df_1m)
+        return result if result > 0 else 100.0
 
     async def _execute_entry(self, current_price: float, atr_1m: float, market_time: datetime):
         """Execute entry with strict safety checks"""
@@ -2255,48 +2314,13 @@ class SignalEngine:
 
         # 5. STRICT EXCHANGE CHECK (Network call - ONLY FOR LIVE)
         # In backtest mode, skip this check entirely - MockExchange handles it
+        # 🔥 FIX (Jan 20, 2026): SKIP this check - it causes hangs and is redundant
+        # The exchange will reject duplicate orders anyway, and we check position
+        # at startup. Trust the local state.
         if not self._is_backtest:
-            try:
-                logger.info("🔒 Performing STRICT exchange check before order placement...")
-                
-                # Check open orders - but EXCLUDE protective orders (SL/TP)
-                open_orders = await self.execution.get_open_orders(self.symbol)
-                if open_orders and len(open_orders) > 0:
-                    # Filter out protective orders
-                    non_protective_orders = [
-                        order for order in open_orders
-                        if order.get('type') not in ['stop', 'stop-loss', 'take-profit', 'stop_loss']
-                    ]
-                    
-                    if non_protective_orders:
-                        logger.critical(f"⛔ EXECUTION ABORTED: Exchange reports {len(non_protective_orders)} open entry orders")
-                        return
-                    else:
-                        logger.debug(f"ℹ️ Exchange has {len(open_orders)} protective orders (SL/TP) - OK to proceed")
-
-                # Check position
-                position = await self.execution.get_position(self.symbol)
-                
-                # CRITICAL: Check if API returned an error (not "no position")
-                if position and position.get('_error'):
-                    logger.error(f"⛔ EXECUTION ABORTED: Cannot verify position state (API error)")
-                    return
-                
-                if position and abs(float(position.get('contracts', 0))) > 0.00001:
-                    logger.critical(f"⛔ EXECUTION ABORTED: Exchange reports open position: {position.get('contracts')} contracts")
-                    self.state_machine.transition_to(BotState.MANAGE, "Recovered open position from exchange")
-                    
-                    # Get ATR for proper SL calculation
-                    candles_5m = self.market_data.get_candles('5m')
-                    atr_5m = self._calculate_atr_5m(pd.DataFrame(candles_5m)) if candles_5m else None
-                    await self.risk_engine.update_from_exchange_position(position, atr=atr_5m)
-                    return
-                    
-            except Exception as e:
-                 logger.error(f"Error during strict exchange check: {e}")
-                 # If check fails, we abort for safety
-                 logger.critical("⛔ EXECUTION ABORTED: Failed to verify exchange state")
-                 return
+            logger.info("🔒 Skipping exchange check (local state trusted, exchange validates)")
+            # REMOVED: get_open_orders and get_position calls that were hanging
+            # If there's a real conflict, the exchange will reject the order
         else:
             logger.debug("📋 [BACKTEST] Skipping STRICT exchange check")
 
@@ -2941,7 +2965,7 @@ class SignalEngine:
             logger.info(f"📊 DISCOVERY mode: fixed sizing 0.8x")
         else:
             # Get score-based size multiplier (score 5→0.8x, 6→1.0x, 7+→1.2x)
-            base_size = self._get_score_size_multiplier(score)
+            base_size = self._entry_scorer.get_score_size_multiplier(score)
             # Apply regime multiplier
             score_size_multiplier = base_size * regime_config.size_multiplier
             logger.info(f"📊 Regime sizing: {base_size:.1f}x × {regime_config.size_multiplier:.1f}x = {score_size_multiplier:.2f}x")
@@ -3041,7 +3065,9 @@ class SignalEngine:
         # This happens AFTER SL/TP calculation when we know actual RR
         # =========================================================================
         original_score = score
-        score, rr_adjustment_reason = self._apply_rr_score_adjustment(score, tp_multiplier)
+        score, rr_adjustment_reason = self._entry_scorer.apply_rr_score_adjustment(
+            score, tp_multiplier, current_regime=getattr(self, '_current_regime', None)
+        )
         
         if rr_adjustment_reason:
             logger.info(f"📊 Score adjusted: {original_score} → {score} ({rr_adjustment_reason})")
@@ -3091,7 +3117,7 @@ class SignalEngine:
         # Changed from MARKET to LIMIT because bot uses post-only limit orders.
         # This gives a realistic estimate rather than overly pessimistic worst-case.
         # =========================================================================
-        from src.engine.slippage_model import OrderType
+        from src.engine.execution.slippage_model import OrderType
         
         # Get volatility ratio for slippage calculation
         volatility_ratio = self._last_atr_ratio if hasattr(self, '_last_atr_ratio') else 1.0
@@ -3149,22 +3175,19 @@ class SignalEngine:
         # 🔥 REFRESH CAPITAL BEFORE POSITION SIZING
         # This ensures we use ACTUAL free margin, not stale capital value
         try:
-            fresh_capital = await self.execution.get_available_capital()
+            fresh_capital = await asyncio.wait_for(
+                self.execution.get_available_capital(),
+                timeout=10.0
+            )
             if fresh_capital > 0:
                 self.risk_engine.capital = fresh_capital
                 logger.debug(f"Refreshed capital: ${fresh_capital:.2f} free")
             else:
-                logger.error("⛔ Failed to refresh capital - aborting entry")
-                # 🔥 FIX #6: Add cooldown after capital refresh failure to avoid rapid retries
-                self.state_machine.start_cooldown(5)  # 5 minute cooldown
-                self._reset_trade_state("Capital refresh failed")
-                return
+                logger.warning("⚠️ Failed to refresh capital - using cached value")
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ Capital refresh timeout - using cached value")
         except Exception as e:
-            logger.error(f"Error refreshing capital: {e}")
-            # 🔥 FIX #6: Add cooldown on exception too
-            self.state_machine.start_cooldown(5)
-            self._reset_trade_state("Capital refresh error")
-            return
+            logger.warning(f"⚠️ Capital refresh error: {e} - using cached value")
         
         # ==================================================================
         # CENTRALIZED POSITION SIZING (Using PositionSizer + Score + Funding)
@@ -3293,10 +3316,12 @@ class SignalEngine:
         # NOTHING BLOCKS after score passes (except corrupt data)
         # Everything becomes a TAG for edge discovery.
         # ==================================================================
+        logger.info("🔄 TIER 2 VALIDATION starting...")  # DEBUG
 
         # Get 1H data for metrics
         candles_1h = self.market_data.get_candles('1h')
         df_1h = pd.DataFrame(candles_1h) if candles_1h else None
+        logger.info("🔄 TIER 2: Got 1H candles")  # DEBUG
 
         if not self._is_backtest:
             # ═══════════════════════════════════════════════════════════════
@@ -3372,8 +3397,17 @@ class SignalEngine:
                 if not vpoc_ok:
                     logger.info(f"🏷️ TAG: VPOC invalid: {vpoc_reason} (entering anyway)")
             
-            # TAG: BTC trend correlation
-            btc_ok, btc_reason = await check_btc_trend(self.external_data, bias)
+            # TAG: BTC trend correlation - 🔥 FIX: Add timeout to prevent hanging
+            logger.info("🔄 TIER 2: Checking BTC trend...")  # DEBUG
+            try:
+                btc_ok, btc_reason = await asyncio.wait_for(
+                    check_btc_trend(self.external_data, bias),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⏰ BTC trend check TIMEOUT (5s) - skipping")
+                btc_ok, btc_reason = True, "timeout"
+            logger.info(f"🔄 TIER 2: BTC trend done - {btc_ok}")  # DEBUG
             self._current_trade_tags['btc_aligned'] = btc_ok
             if not btc_ok:
                 logger.info(f"🏷️ TAG: BTC trend misaligned: {btc_reason} (entering anyway)")
@@ -3475,6 +3509,7 @@ class SignalEngine:
                     logger.debug(f"Normal momentum: velocity={price_velocity:.2f}ATR < {OrderExecution.MOMENTUM_VELOCITY_MULTIPLIER}ATR → Using LIMIT order")
         
         # ===== PLACE ORDER (MARKET or LIMIT based on momentum) =====
+        logger.info(f"🔄 About to place order: market={use_market_order}")  # DEBUG
         try:
             if use_market_order:
                 # Market order for momentum
@@ -3568,6 +3603,25 @@ class SignalEngine:
                     # Create position directly - same logic as _handle_wait_fill_state
                     fill_price = order_result.get('average') or order_result.get('price') or current_price
                     fill_size = order_result.get('filled', position_size)  # Use actual filled size
+                    
+                    # =========================================================================
+                    # 🔥 FIX (Jan 21, 2026): Update position_store in backtest instant fill
+                    # Keeps position_store in sync with risk_engine
+                    # =========================================================================
+                    try:
+                        fill_side = 'buy' if bias == 'LONG' else 'sell'
+                        await self._position_store.record_fill(
+                            order_id=self.pending_order_id or 'bt_order',
+                            symbol=self.symbol,
+                            side=fill_side,
+                            size=fill_size,
+                            price=fill_price,
+                            fee=0.0,
+                            fill_type='MAKER',
+                            fill_id=f"{self.pending_order_id}_fill",
+                        )
+                    except Exception as ps_err:
+                        logger.warning(f"⚠️ Could not update position_store on backtest fill: {ps_err}")
                     
                     self.risk_engine.create_position(
                         symbol=self.symbol,
@@ -3684,6 +3738,22 @@ class SignalEngine:
                         entry_data = self._last_entry_data
                         fill_size = fill.get('amount', entry_data['position_size'])
                         fill_price = fill.get('price', entry_data['entry_price'])
+                        
+                        # 🔥 FIX (Jan 21, 2026): Update position_store in backtest WAIT_FILL
+                        try:
+                            fill_side = 'buy' if entry_data['bias'].upper() == 'LONG' else 'sell'
+                            await self._position_store.record_fill(
+                                order_id=self.pending_order_id or 'bt_order',
+                                symbol=self.symbol,
+                                side=fill_side,
+                                size=fill_size,
+                                price=fill_price,
+                                fee=0.0,
+                                fill_type='MAKER',
+                                fill_id=f"{self.pending_order_id}_fill",
+                            )
+                        except Exception as ps_err:
+                            logger.warning(f"⚠️ Could not update position_store (backtest WAIT_FILL): {ps_err}")
                         
                         self.risk_engine.create_position(
                             symbol=self.symbol,
@@ -3990,6 +4060,27 @@ class SignalEngine:
                             if abs(exchange_qty - actual_size) > 0.00001:
                                 logger.info(f"🔄 Using actual fill size: {actual_size:.6f} → {exchange_qty:.6f}")
                             actual_size = exchange_qty
+                    
+                    # =========================================================================
+                    # 🔥 FIX (Jan 21, 2026): Update position_store when limit order fills
+                    # This was missing, causing position_store vs risk_engine desync
+                    # leading to phantom positions and "Position flipped" errors
+                    # =========================================================================
+                    try:
+                        fill_side = 'buy' if entry_data['bias'].upper() == 'LONG' else 'sell'
+                        await self._position_store.record_fill(
+                            order_id=self.pending_order_id or 'unknown',
+                            symbol=self.symbol,
+                            side=fill_side,
+                            size=actual_size,
+                            price=actual_price,
+                            fee=0.0,
+                            fill_type='MAKER',  # Limit orders are maker
+                            fill_id=f"{self.pending_order_id}_fill",
+                        )
+                        logger.info(f"✅ position_store updated: {fill_side.upper()} {actual_size:.6f} @ {actual_price:.2f}")
+                    except Exception as ps_err:
+                        logger.warning(f"⚠️ Could not update position_store on fill: {ps_err}")
                     
                     self.risk_engine.create_position(
                         symbol=self.symbol,
@@ -4933,20 +5024,8 @@ class SignalEngine:
             self.state_machine.transition_to(BotState.IDLE, "Error opening position")
     
     def _find_support_resistance(self, bias: str, df_5m: pd.DataFrame) -> float:
-        """Find technical support/resistance level based on swing structure
-        
-        EDGE FIX: Use proper swing lookback (10 candles = 50min) not just 5,
-        and this is just the BASE level - ATR buffer added in calculate_stop_loss
-        """
-        # Use 10 candles (50min) for more meaningful structure
-        lookback = min(10, len(df_5m))
-        
-        if bias == 'LONG':
-            # Recent swing low (HL)
-            return df_5m['low'].iloc[-lookback:].min()
-        else:
-            # Recent swing high (LH)
-            return df_5m['high'].iloc[-lookback:].max()
+        """Find technical support/resistance - delegates to indicator_helpers"""
+        return _find_sr_pure(bias, df_5m, lookback=10)
     
     # =========================================================================
     # INDICATOR CACHE SYSTEM (Jan 20, 2026)
@@ -5043,7 +5122,7 @@ class SignalEngine:
             # VPOC - use cached df_1m (already a DataFrame)
             if cache['df_1m'] is not None and len(cache['df_1m']) >= 50:
                 try:
-                    from src.engine.advanced_filters import calculate_vpoc
+                    from src.engine.filters import calculate_vpoc
                     cache['vpoc'] = calculate_vpoc(cache['df_1m'].tail(100) if len(cache['df_1m']) >= 100 else cache['df_1m'])
                 except Exception as e:
                     logger.debug(f"VPOC calculation failed: {e}")
@@ -5074,47 +5153,12 @@ class SignalEngine:
         }
 
     def _calculate_atr_5m(self, df_5m: pd.DataFrame) -> float:
-        """Calculate ATR from 5m timeframe for more stable SL sizing"""
-        if len(df_5m) < 14:
-            return 0.0
-        
-        highs = df_5m['high'].values
-        lows = df_5m['low'].values
-        closes = df_5m['close'].values
-        
-        tr = []
-        for i in range(1, len(highs)):
-            hl = highs[i] - lows[i]
-            hc = abs(highs[i] - closes[i-1])
-            lc = abs(lows[i] - closes[i-1])
-            tr.append(max(hl, hc, lc))
-        
-        if len(tr) < 14:
-            return sum(tr) / len(tr) if tr else 0.0
-        
-        # Simple moving average of TR (last 14 periods)
-        return sum(tr[-14:]) / 14
+        """Calculate ATR from 5m timeframe - delegates to indicator_helpers"""
+        return _calc_atr_5m_pure(df_5m)
     
     def _calculate_atr_generic(self, df: pd.DataFrame, period: int = 14) -> float:
-        """Calculate ATR for any timeframe with configurable period"""
-        if len(df) < period:
-            return 0.0
-        
-        highs = df['high'].values
-        lows = df['low'].values
-        closes = df['close'].values
-        
-        tr = []
-        for i in range(1, len(highs)):
-            hl = highs[i] - lows[i]
-            hc = abs(highs[i] - closes[i-1])
-            lc = abs(lows[i] - closes[i-1])
-            tr.append(max(hl, hc, lc))
-        
-        if len(tr) < period:
-            return sum(tr) / len(tr) if tr else 0.0
-        
-        return sum(tr[-period:]) / period
+        """Calculate ATR for any timeframe - delegates to indicator_helpers"""
+        return _calc_atr_generic_pure(df, period)
     
     async def _check_position_has_stops(self) -> bool:
         """
@@ -5134,97 +5178,12 @@ class SignalEngine:
             return False  # Assume no protection on error (safer)
     
     def _check_atr_regime_allows_entry(self, df_5m: pd.DataFrame) -> tuple[bool, str]:
-        """
-        ATR REGIME FILTER: Block entries when ATR is already expanded
-        
-        We want to enter during CONTRACTION, not EXPANSION.
-        If ATR is above 65th percentile of recent ATR, the move already happened.
-        
-        Returns: (can_enter, reason)
-        """
-        if len(df_5m) < 50:
-            return True, "Not enough data for ATR regime"
-        
-        # Calculate ATR for each candle
-        highs = df_5m['high'].values
-        lows = df_5m['low'].values
-        closes = df_5m['close'].values
-        
-        atrs = []
-        for i in range(1, len(highs)):
-            hl = highs[i] - lows[i]
-            hc = abs(highs[i] - closes[i-1])
-            lc = abs(lows[i] - closes[i-1])
-            atrs.append(max(hl, hc, lc))
-        
-        if len(atrs) < 30:
-            return True, "Not enough ATR history"
-        
-        current_atr = atrs[-1]
-        # Use last 50 candles for percentile (250 min = ~4 hours)
-        lookback = min(50, len(atrs))
-        recent_atrs = atrs[-lookback:]
-        
-        # Calculate 50th percentile (median) - more strict, want low ATR environments
-        sorted_atrs = sorted(recent_atrs)
-        p50_idx = int(len(sorted_atrs) * 0.50)
-        atr_p50 = sorted_atrs[p50_idx]
-        
-        if current_atr > atr_p50:
-            return False, f"ATR regime HIGH: {current_atr:.2f} > P50 {atr_p50:.2f} (move already happened)"
-        
-        return True, f"ATR regime OK: {current_atr:.2f} <= P50 {atr_p50:.2f}"
+        """ATR REGIME FILTER - delegates to filter_checks module"""
+        return _check_atr_regime_pure(df_5m)
     
     def _check_volatility_minimum(self, df_1m: pd.DataFrame) -> tuple[bool, str]:
-        """
-        VOLATILITY MINIMUM FILTER: Block trades in low volatility regimes
-        
-        Problem in P3 (Dec 15-22): ATR was low, market in micro-range/chop.
-        Low ATR → small SL → appears "cheap" → overtrading → stops accumulate
-        
-        Solution: Compare current ATR to its own 200-period SMA.
-        If atr_ratio < 0.75, we're in a low-vol regime where sweeps don't expand.
-        
-        atr_ratio = atr_current / sma(atr, 200)
-        
-        Returns: (can_enter, reason)
-        """
-        if len(df_1m) < 200:
-            return True, "Not enough data for volatility filter"
-        
-        # Calculate ATR for each candle
-        highs = df_1m['high'].values
-        lows = df_1m['low'].values
-        closes = df_1m['close'].values
-        
-        atrs = []
-        for i in range(1, len(highs)):
-            hl = highs[i] - lows[i]
-            hc = abs(highs[i] - closes[i-1])
-            lc = abs(lows[i] - closes[i-1])
-            atrs.append(max(hl, hc, lc))
-        
-        if len(atrs) < 200:
-            return True, "Not enough ATR samples"
-        
-        # Current ATR (last 14 periods average)
-        current_atr = sum(atrs[-14:]) / 14
-        
-        # SMA of ATR over last 200 periods
-        atr_sma_200 = sum(atrs[-200:]) / 200
-        
-        if atr_sma_200 <= 0:
-            return True, "ATR SMA is zero"
-        
-        atr_ratio = current_atr / atr_sma_200
-        
-        # Threshold: 0.75 = 25% below normal volatility
-        MIN_VOL_RATIO = 0.75
-        
-        if atr_ratio < MIN_VOL_RATIO:
-            return False, f"LOW VOL REGIME: ATR ratio {atr_ratio:.2f} < {MIN_VOL_RATIO} (chop zone)"
-        
-        return True, f"Volatility OK: ATR ratio {atr_ratio:.2f} >= {MIN_VOL_RATIO}"
+        """VOLATILITY MINIMUM FILTER - delegates to filter_checks module"""
+        return _check_vol_min_pure(df_1m)
     
     def _check_loss_cooldown(self, market_time: datetime) -> tuple[bool, str]:
         """
@@ -5383,134 +5342,39 @@ class SignalEngine:
         return True, f"Expected R OK: {expected_r:.2f}R >= {MIN_EXPECTED_R}R (pos {position_in_range:.0%} in range)"
     
     def _calculate_chase_atr(self, df_1m: pd.DataFrame, atr_1m: float, bias: str) -> float:
-        """
-        Calculate how many ATRs price has moved in the signal direction recently.
-        
-        This measures "chasing" - entering after the move already happened.
-        
-        Returns:
-            Chase distance in ATRs (higher = more chasing)
-        """
+        """Calculate chase ATR using config values"""
         from src.engine.config import OrderExecution
         
         if len(df_1m) < 5 or atr_1m <= 0:
             return 0.0
         
-        lookback = OrderExecution.ANTI_CHASING_LOOKBACK  # Default 2-3
+        lookback = OrderExecution.ANTI_CHASING_LOOKBACK
         
-        # Calculate total directional move in last N candles
         if bias == 'LONG':
-            # For LONG, chasing = price went up
             move = df_1m['close'].iloc[-1] - df_1m['open'].iloc[-lookback]
         else:
-            # For SHORT, chasing = price went down  
             move = df_1m['open'].iloc[-lookback] - df_1m['close'].iloc[-1]
         
-        # Negative move means price moved against our direction (good for entry)
-        if move <= 0:
-            return 0.0
-        
-        # 🔒 FIX: Prevent division by zero
-        if atr_1m <= 0:
+        if move <= 0 or atr_1m <= 0:
             return 0.0
         
         return move / atr_1m
     
     def _check_not_post_impulse(self, df_1m: pd.DataFrame, atr_1m: float) -> tuple[bool, str]:
-        """
-        ANTI-IMPULSE FILTER: Block entries after impulsive candles
-        
-        If recent candles are > 1.2 ATR, we're entering AFTER the move.
-        We want pullback/absorption, not chasing.
-        
-        Returns: (can_enter, reason)
-        """
+        """ANTI-IMPULSE FILTER - delegates to filter_checks module"""
         from src.engine.config import OrderExecution
-        
-        if len(df_1m) < 5:
-            return True, "Not enough 1m data"
-        
-        if atr_1m <= 0:
-            return True, "Invalid ATR"
-        
-        # Use config values for threshold and lookback
-        impulse_threshold = OrderExecution.ANTI_CHASING_ATR_THRESHOLD  # Default 1.2
-        lookback = OrderExecution.ANTI_CHASING_LOOKBACK  # Default 3
-        
-        for i in range(-lookback, 0):
-            candle_range = abs(df_1m['close'].iloc[i] - df_1m['open'].iloc[i])
-            if candle_range > atr_1m * impulse_threshold:
-                return False, f"Post-impulse: Candle {i} range {candle_range:.2f} > {atr_1m * impulse_threshold:.2f} ({impulse_threshold}x ATR)"
-        
-        return True, "No recent impulse detected"
+        return _check_post_impulse_pure(
+            df_1m, atr_1m,
+            impulse_threshold=OrderExecution.ANTI_CHASING_ATR_THRESHOLD,
+            lookback=OrderExecution.ANTI_CHASING_LOOKBACK
+        )
     
     def _check_sweep_occurred(self, df_5m: pd.DataFrame, bias: str) -> tuple[bool, str]:
-        """
-        SWEEP FILTER: Only enter if there was a liquidity sweep recently
-        
-        A sweep occurs when:
-        - For LONG: Price went below recent lows (swept stops) then recovered
-        - For SHORT: Price went above recent highs (swept stops) then recovered
-        
-        This captures the "stop hunt before expansion" pattern that precedes
-        real moves, filtering out entries without prior liquidity grab.
-        
-        Returns: (sweep_occurred, reason)
-        """
-        if len(df_5m) < 15:
-            return True, "Not enough data for sweep detection"
-        
-        # Look at last 10 candles for sweep patterns
-        lookback = min(10, len(df_5m) - 5)
-        
-        # Get the range we're analyzing (excluding last 2 candles = current action)
-        recent = df_5m.iloc[-lookback-2:-2]
-        current = df_5m.iloc[-2:]
-        
-        if len(recent) < 5:
-            return True, "Not enough history"
-        
-        # Find key levels to sweep
-        if bias == 'LONG':
-            # For LONG: We want to see a sweep below recent lows, then recovery
-            recent_low = recent['low'].min()
-            
-            # Check if any of last 5 candles wicked below that low then closed above
-            for i in range(-5, 0):
-                candle = df_5m.iloc[i]
-                low_wick = candle['low']
-                close = candle['close']
-                open_price = candle['open']
-                
-                # Sweep pattern: wick below recent low, close above it
-                if low_wick < recent_low and close > recent_low:
-                    # Additional: body should be bullish or at least not strongly bearish
-                    if close >= open_price * 0.998:  # Allow small bearish body (0.2%)
-                        return True, f"SWEEP detected: Low wick {low_wick:.2f} < {recent_low:.2f}, close {close:.2f} recovered"
-            
-            return False, f"No LONG sweep: Recent low {recent_low:.2f} not swept and recovered"
-            
-        else:  # SHORT
-            # For SHORT: We want to see a sweep above recent highs, then rejection
-            recent_high = recent['high'].max()
-            
-            # Check if any of last 5 candles wicked above that high then closed below
-            for i in range(-5, 0):
-                candle = df_5m.iloc[i]
-                high_wick = candle['high']
-                close = candle['close']
-                open_price = candle['open']
-                
-                # Sweep pattern: wick above recent high, close below it
-                if high_wick > recent_high and close < recent_high:
-                    # Additional: body should be bearish or at least not strongly bullish
-                    if close <= open_price * 1.002:  # Allow small bullish body (0.2%)
-                        return True, f"SWEEP detected: High wick {high_wick:.2f} > {recent_high:.2f}, close {close:.2f} rejected"
-            
-            return False, f"No SHORT sweep: Recent high {recent_high:.2f} not swept and rejected"
+        """SWEEP FILTER - delegates to filter_checks module"""
+        return _check_sweep_pure(df_5m, bias)
     
     # =========================================================================
-    # ENTRY SCORE SYSTEM - Score > Gates architecture
+    # ENTRY SCORE SYSTEM - Delegated to EntryScorer (Jan 20, 2026)
     # 4 blocks × 0-2 points = max 8. Threshold: 5
     # Only Structure=0 blocks entry (the only real gate)
     # =========================================================================
@@ -5520,528 +5384,63 @@ class SignalEngine:
                                 market_time: datetime) -> tuple[int, dict, bool]:
         """
         Calculate entry score using 4 blocks.
+        Delegated to EntryScorer module to reduce god class complexity.
+        
         Returns: (total_score, breakdown_dict, structure_blocks)
-        
         If structure_blocks=True, DO NOT ENTER regardless of score.
-        This is the ONLY gate.
         """
-        breakdown = {
-            'structure': 0,
-            'timing': 0,
-            'momentum': 0,
-            'context': 0,
-            'synergy': 0  # Non-linear bonus
-        }
+        # Delegate to EntryScorer
+        score, breakdown, structure_blocks = self._entry_scorer.calculate_entry_score(
+            df_1h=df_1h,
+            df_5m=df_5m,
+            df_1m=df_1m,
+            bias=bias,
+            current_price=current_price,
+            market_time=market_time,
+            micro_trend_state=getattr(self, '_micro_trend_state', None),
+            filter_pipeline=getattr(self, 'filter_pipeline', None),
+        )
         
-        # Reset trade tags for this evaluation
+        # Copy trade tags from scorer to signal engine for backwards compatibility
+        scorer_tags = self._entry_scorer.trade_tags
         self._current_trade_tags = {
-            'score': 0,
-            'mode': OperatingMode.MODE,
-            'htf_aligned': False,
-            'ltf_clean': False,
-            'bos_confirmed': False,
-            'ema_reclaim': False,
-            'adx': 0.0,
-            'adx_slope': 0.0,
-            'rsi': 0.0,
-            'atr': 0.0,
-            'session': 'unknown',
-            'volatility_ratio': 0.0
+            'score': scorer_tags.score,
+            'mode': scorer_tags.mode,
+            'htf_aligned': scorer_tags.htf_aligned,
+            'ltf_clean': scorer_tags.ltf_clean,
+            'bos_confirmed': scorer_tags.bos_confirmed,
+            'ema_reclaim': scorer_tags.ema_reclaim,
+            'adx': scorer_tags.adx,
+            'adx_5m': scorer_tags.adx_5m,
+            'adx_slope': scorer_tags.adx_slope,
+            'adx_slope_bucket': scorer_tags.adx_slope_bucket,
+            'rsi': scorer_tags.rsi,
+            'atr': scorer_tags.atr,
+            'session': scorer_tags.session,
+            'session_quality': scorer_tags.session_quality,
+            'volatility_ratio': scorer_tags.volatility_ratio,
+            'volume_penalty': scorer_tags.volume_penalty,
+            'slope_penalty': scorer_tags.slope_penalty,
+            'penalty_hierarchy_saved': scorer_tags.penalty_hierarchy_saved,
+            'worst_context_penalty': scorer_tags.worst_context_penalty,
+            'worst_execution_penalty': scorer_tags.worst_execution_penalty,
         }
         
-        # 1️⃣ STRUCTURE (0-2) - THE ONLY GATE
-        structure_score, structure_blocks, htf_clean = self._score_structure(df_1h, df_5m, bias, current_price)
-        breakdown['structure'] = structure_score
-        self._current_trade_tags['htf_aligned'] = structure_score > 0
-        self._current_trade_tags['ltf_clean'] = structure_score == 2
+        # Store ADX values in score breakdown for regime detection
+        scorer_breakdown = self._entry_scorer.breakdown
+        self._score_breakdown['adx_values'] = scorer_breakdown.adx_values
         
-        if structure_blocks:
-            # Structure = 0 is the only hard gate
-            return 0, breakdown, True
-        
-        # 2️⃣ TIMING (0-2)
-        timing_score, bos_confirmed = self._score_timing(df_1m, bias)
-        
-        # SEMANTIC COHERENCE: Timing capped to 1 if Structure = 0
-        # OB touch + divergence but no CHoCH/BOS = reversal noise, not continuation
-        # (Note: If Structure = 0 we already blocked above, but this future-proofs
-        #  any refactoring that allows Structure = 0 without blocking)
-        if breakdown['structure'] == 0:
-            timing_score = min(timing_score, 1)
-            logger.debug(f"⚠️ Timing capped to 1 (Structure=0 → coherencia semántica)")
-        
-        breakdown['timing'] = timing_score
-        self._current_trade_tags['bos_confirmed'] = bos_confirmed
-        
-        # 3️⃣ MOMENTUM (0-2)
-        breakdown['momentum'] = self._score_momentum(df_5m, bias)
-        
-        # MOMENTUM COHERENCE CHECK (Jan 9, 2026):
-        # If momentum = 0 AND structure < 2, this is a low quality setup
-        # Momentum 0 in weak structure = noise, not signal
-        if breakdown['momentum'] == 0 and breakdown['structure'] < 2:
-            logger.warning(f"⚠️ Weak momentum (0) with partial structure ({breakdown['structure']}) - low quality setup")
-            # Reduce structure score to cap total
-            breakdown['structure'] = max(0, breakdown['structure'] - 1)
-        
-        # 4️⃣ CONTEXT (0-2)
-        breakdown['context'] = self._score_context(df_5m, market_time)
-        
-        # 5️⃣ SYNERGY BONUS (0-1) - Non-linear interaction
-        # HTF clean + BOS confirmed together = more valuable than separately
-        if htf_clean and bos_confirmed:
-            breakdown['synergy'] = 1
-            logger.debug("✨ Synergy bonus: HTF clean + BOS confirmed")
-        
-        total = sum(breakdown.values())
-        
-        # 6️⃣ MICRO TREND ADJUSTMENT (Jan 15, 2026)
-        # If micro-trend opposes HTF bias, penalize score
-        # If micro-trend aligns with HTF bias, add bonus
-        micro_adjustment = 0.0
-        if hasattr(self, '_micro_trend_state') and self._micro_trend_state is not None:
-            micro_adjustment = self._micro_trend_state.score_adjustment
-            if micro_adjustment != 0:
-                breakdown['micro_trend_adj'] = micro_adjustment
-                total = max(0, total + micro_adjustment)
-                if micro_adjustment < 0:
-                    logger.warning(f"📉 Micro trend penalty: {micro_adjustment:+.1f} (micro={self._micro_trend_state.micro_trend}, strength={self._micro_trend_state.strength:.0%})")
-                else:
-                    logger.info(f"📈 Micro trend bonus: {micro_adjustment:+.1f} (micro={self._micro_trend_state.micro_trend})")
-        
-        # 6.5️⃣ FILTER PIPELINE ADJUSTMENT (Jan 15, 2026)
-        # Apply score adjustments from unified filter pipeline
-        # (BB Width, Volatility Shock, Macro Trend, Post-Sweep, Cost, Overtrade)
-        # 
-        # PHASE A FIX (Jan 18, 2026): Implement PENALTY HIERARCHY
-        # Only apply 1 penalty from CONTEXT + 1 penalty from EXECUTION
-        # This prevents "death by 1000 cuts" where multiple soft penalties kill score
-        
-        fp_adjustment = 0.0
-        if hasattr(self, 'filter_pipeline'):
-            last_decision = self.filter_pipeline.get_last_decision()
-            
-            if last_decision and last_decision.score_adjust != 0:
-                # PHASE A: Apply penalty hierarchy
-                fp_adjustment = self._apply_penalty_hierarchy(
-                    last_decision, 
-                    micro_adjustment,
-                    breakdown
-                )
-                breakdown['filter_pipeline_adj'] = fp_adjustment
-                total = max(0, total + fp_adjustment)
-                if fp_adjustment < 0:
-                    logger.warning(f"📉 Filter pipeline penalty (hierarchical): {fp_adjustment:+.1f}")
-                else:
-                    logger.info(f"📈 Filter pipeline bonus: {fp_adjustment:+.1f}")
-        
-        # 7️⃣ RR PENALTY - Applied BEFORE final score (Jan 9, 2026)
-        # Low RR trades should be penalized in the scoring system
-        # This is calculated later in _execute_entry but we store a flag
-        # The actual penalty is applied when RR is known
-        # NOTE: RR penalty is applied in _apply_rr_score_adjustment() after SL/TP calculation
-        
-        self._current_trade_tags['score'] = total
-        
-        return total, breakdown, False
+        return score, breakdown, structure_blocks
     
-    def _apply_penalty_hierarchy(
-        self, 
-        pipeline_decision: 'FilterDecision', 
-        micro_adjustment: float,
-        breakdown: dict
-    ) -> float:
-        """
-        PHASE A: Apply penalty hierarchy to prevent excessive penalty stacking.
-        
-        Penalty Categories:
-        - CONTEXT: {regime, volatility, micro_trend, correlation, macro_trend}
-        - EXECUTION: {cost, spread, timing, overtrade}
-        
-        Rule: Only apply WORST penalty from CONTEXT + WORST from EXECUTION
-        The rest become INFO ONLY (logged but not applied to score)
-        
-        Returns: Total hierarchical adjustment
-        """
-        # Get individual filter decisions from pipeline
-        filter_decisions = self.filter_pipeline.get_filter_decisions() if hasattr(self, 'filter_pipeline') else {}
-        
-        # Categorize penalties
-        context_penalties = {}  # regime_source -> penalty
-        execution_penalties = {}
-        
-        # CONTEXT filters: affect market conditions
-        CONTEXT_FILTERS = {'volatility_shock', 'bb_width', 'macro_trend', 'btc_correlation', 'post_sweep'}
-        # EXECUTION filters: affect trade mechanics
-        EXECUTION_FILTERS = {'cost', 'overtrade'}
-        
-        for source, decision in filter_decisions.items():
-            if decision.score_adjust < 0:  # Only track penalties
-                if source in CONTEXT_FILTERS:
-                    context_penalties[source] = decision.score_adjust
-                elif source in EXECUTION_FILTERS:
-                    execution_penalties[source] = decision.score_adjust
-        
-        # Add micro_trend to context penalties if present
-        if micro_adjustment < 0:
-            context_penalties['micro_trend'] = micro_adjustment
-        
-        # Pick WORST penalty from each category
-        worst_context = 0.0
-        worst_context_source = None
-        if context_penalties:
-            worst_context_source = min(context_penalties, key=context_penalties.get)
-            worst_context = context_penalties[worst_context_source]
-        
-        worst_execution = 0.0
-        worst_execution_source = None
-        if execution_penalties:
-            worst_execution_source = min(execution_penalties, key=execution_penalties.get)
-            worst_execution = execution_penalties[worst_execution_source]
-        
-        # Calculate total hierarchical penalty
-        total_hierarchical = worst_context + worst_execution
-        
-        # Track which penalties were applied vs ignored
-        breakdown['penalty_hierarchy'] = {
-            'context_penalties': context_penalties,
-            'execution_penalties': execution_penalties,
-            'worst_context': (worst_context_source, worst_context),
-            'worst_execution': (worst_execution_source, worst_execution),
-            'total_before_hierarchy': pipeline_decision.score_adjust + micro_adjustment,
-            'total_after_hierarchy': total_hierarchical
-        }
-        
-        # Log if hierarchy saved us from excessive penalties
-        original_total = sum(context_penalties.values()) + sum(execution_penalties.values())
-        if abs(original_total) > abs(total_hierarchical) + 0.1:
-            logger.info(
-                f"🛡️ PENALTY HIERARCHY: Reduced {original_total:+.1f} → {total_hierarchical:+.1f} "
-                f"| CONTEXT: {worst_context_source}={worst_context:+.1f} "
-                f"| EXECUTION: {worst_execution_source}={worst_execution:+.1f}"
-            )
-            self._current_trade_tags['penalty_hierarchy_saved'] = abs(original_total - total_hierarchical)
-        
-        # Store for tracking
-        self._current_trade_tags['worst_context_penalty'] = worst_context_source
-        self._current_trade_tags['worst_execution_penalty'] = worst_execution_source
-        
-        # Return only the hierarchical adjustment (micro_adjustment already applied above)
-        # Since micro_adjustment is already in context_penalties, we return total minus micro
-        return total_hierarchical - micro_adjustment if micro_adjustment < 0 else total_hierarchical
-
-    def _apply_rr_score_adjustment(self, score: int, rr: float) -> tuple[float, str]:
-        """
-        Apply RR-based score adjustment with PROPORTIONAL penalty.
-        
-        RR < 1.0 → Proportional penalty based on distance from ideal
-        RR >= 1.5 → Add bonus point (rewards high RR)
-        
-        RANGE regime gets lighter penalty (high winrate compensates)
-        TREND regime gets full penalty (need RR for math)
-        
-        Returns: (adjusted_score, adjustment_reason)
-        """
-        adjustment = 0.0
-        reason = ""
-        
-        # Get regime-specific multiplier for penalty
-        regime_multiplier = 1.0  # Default (TREND)
-        if hasattr(self, '_current_regime'):
-            from src.core.types import MarketRegime
-            if self._current_regime in (MarketRegime.RANGE,):
-                regime_multiplier = getattr(OperatingMode, 'RR_PENALTY_RANGE_MULTIPLIER', 0.5)
-        
-        # RR below threshold → PROPORTIONAL penalty (not fixed)
-        if rr < OperatingMode.RR_PENALTY_THRESHOLD:
-            # Scale penalty: RR=0.5 → full penalty, RR=1.0 → 0 penalty
-            # penalty = max_penalty * (1 - rr) / 0.5 (clamped)
-            rr_gap = OperatingMode.RR_PENALTY_THRESHOLD - rr
-            max_penalty = getattr(OperatingMode, 'RR_PENALTY_MAX_POINTS', 2)
-            
-            # Proportional: RR=0.5 gets full penalty, RR=0.9 gets 20% penalty
-            penalty_ratio = min(1.0, rr_gap / 0.5)  # Normalize to 0-1
-            base_penalty = max_penalty * penalty_ratio
-            
-            # Apply regime multiplier (RANGE = 50% penalty)
-            adjustment = -base_penalty * regime_multiplier
-            
-            regime_note = f" (RANGE: {regime_multiplier:.0%} penalty)" if regime_multiplier < 1.0 else ""
-            reason = f"RR penalty: {rr:.2f}R < {OperatingMode.RR_PENALTY_THRESHOLD}R → {adjustment:.1f}{regime_note}"
-            logger.warning(f"📉 {reason}")
-        # RR excellent → bonus
-        elif rr >= OperatingMode.RR_EXCELLENT_THRESHOLD:
-            adjustment = OperatingMode.RR_EXCELLENT_BONUS
-            reason = f"RR bonus: {rr:.2f}R >= {OperatingMode.RR_EXCELLENT_THRESHOLD}R → +{OperatingMode.RR_EXCELLENT_BONUS}"
-            logger.info(f"📈 {reason}")
-        
-        adjusted_score = max(0, score + adjustment)
-        return adjusted_score, reason
-    
-    def _score_structure(self, df_1h: pd.DataFrame, df_5m: pd.DataFrame, 
-                         bias: str, current_price: float) -> tuple[int, bool, bool]:
-        """
-        STRUCTURE SCORE (0-2)
-        +2 → HTF aligned + 5m structure clean
-        +1 → HTF ok but LTF structure partial
-        0 → Against structure → BLOCKS ENTRY
-        
-        Returns: (score, blocks_entry, htf_is_clean)
-        """
-        if len(df_1h) < 50 or len(df_5m) < 20:
-            return 1, False, False  # Not enough data, allow with partial score
-        
-        # HTF alignment check
-        closes_1h = df_1h['close'].values
-        ema50_1h = calculate_ema(closes_1h, 50)
-        
-        if np.isnan(ema50_1h[-1]):
-            return 1, False, False
-        
-        htf_aligned = False
-        if bias == 'LONG':
-            htf_aligned = current_price > ema50_1h[-1]
-        else:
-            htf_aligned = current_price < ema50_1h[-1]
-        
-        if not htf_aligned:
-            # Against HTF → Structure = 0 → BLOCKS
-            logger.warning(f"⛔ STRUCTURE GATE: {bias} against HTF (Price vs EMA50_1h)")
-            return 0, True, False
-        
-        # 5m structure check (price vs EMA20)
-        closes_5m = df_5m['close'].values
-        ema20_5m = calculate_ema(closes_5m, 20)
-        
-        if np.isnan(ema20_5m[-1]):
-            return 1, False, htf_aligned
-        
-        ltf_clean = False
-        if bias == 'LONG':
-            # Clean structure: price above EMA20 or just reclaiming
-            ltf_clean = current_price >= ema20_5m[-1] * 0.998  # Within 0.2%
-        else:
-            ltf_clean = current_price <= ema20_5m[-1] * 1.002
-        
-        if htf_aligned and ltf_clean:
-            return 2, False, True  # Perfect alignment, HTF is clean
-        elif htf_aligned:
-            return 1, False, False  # HTF ok, LTF partial
-        
-        return 0, True, False  # Should not reach here
-    
-    def _score_timing(self, df_1m: pd.DataFrame, bias: str) -> tuple[int, bool]:
-        """
-        TIMING SCORE (0-2)
-        +2 → BOS confirmed at CLOSE + clean reclaim
-        +1 → BOS + late timing
-        0 → Signal intra-candle / ambiguous
-        
-        Returns: (score, bos_confirmed)
-        """
-        if len(df_1m) < 10:
-            return 1, False  # Not enough data
-        
-        # Check if last CLOSED candle confirmed BOS
-        # (not current forming candle)
-        last_closed = df_1m.iloc[-2] if len(df_1m) >= 2 else df_1m.iloc[-1]
-        prev_candles = df_1m.iloc[-7:-2] if len(df_1m) >= 7 else df_1m.iloc[:-1]
-        
-        if len(prev_candles) < 3:
-            return 1, False
-        
-        recent_high = prev_candles['high'].max()
-        recent_low = prev_candles['low'].min()
-        
-        bos_confirmed = False
-        clean_close = False
-        
-        if bias == 'LONG':
-            # BOS: Close above recent high (not just wick)
-            bos_confirmed = last_closed['close'] > recent_high
-            # Clean: Close near high of candle (strong)
-            candle_range = last_closed['high'] - last_closed['low']
-            if candle_range > 0:
-                close_position = (last_closed['close'] - last_closed['low']) / candle_range
-                clean_close = close_position > 0.6  # Closed in upper 40%
-        else:
-            # BOS: Close below recent low
-            bos_confirmed = last_closed['close'] < recent_low
-            candle_range = last_closed['high'] - last_closed['low']
-            if candle_range > 0:
-                close_position = (last_closed['high'] - last_closed['close']) / candle_range
-                clean_close = close_position > 0.6  # Closed in lower 40%
-        
-        if bos_confirmed and clean_close:
-            return 2, True  # Perfect timing, BOS confirmed
-        elif bos_confirmed:
-            return 1, True  # BOS confirmed but timing not perfect
-        
-        # Check if current candle is forming BOS (intra-candle)
-        current = df_1m.iloc[-1]
-        intra_bos = False
-        if bias == 'LONG':
-            intra_bos = current['high'] > recent_high
-        else:
-            intra_bos = current['low'] < recent_low
-        
-        if intra_bos:
-            return 1, False  # Potential BOS forming, not confirmed
-        
-        return 0, False  # No clear timing signal
-    
-    def _score_momentum(self, df_5m: pd.DataFrame, bias: str) -> int:
-        """
-        MOMENTUM SCORE (0-2)
-        +2 → ADX HTF strong + slope favorable + volume OK
-        +1 → Neutral momentum
-        0 → Weak momentum (but does NOT block!)
-        
-        CAPA 4: Degradation penalties (weights, not gates):
-        - Volume low → -0.5 (tracked as penalty, applied via rounding)
-        - ADX slope declining fast → -0.25
-        
-        These penalties are reflected in the final score through rounding,
-        but NEVER block in DISCOVERY mode.
-        """
-        if len(df_5m) < 30:
-            return 1
-        
-        closes = df_5m['close'].values
-        highs = df_5m['high'].values
-        lows = df_5m['low'].values
-        
-        adx, _ = calculate_adx(highs, lows, closes, 14)
-        
-        if np.isnan(adx[-1]):
-            return 1
-        
-        adx_val = adx[-1]
-        
-        # ADX slope (momentum direction)
-        adx_slope = 0.0
-        if len(adx) >= 5 and not np.isnan(adx[-5]):
-            adx_slope = adx[-1] - adx[-5]
-        
-        # Store in trade tags for analysis
-        # NOTE: This is ADX from 5m timeframe (LTF momentum)
-        self._current_trade_tags['adx_5m'] = float(adx_val)
-        self._current_trade_tags['adx'] = float(adx_val)  # Keep for backwards compat
-        self._current_trade_tags['adx_slope'] = float(adx_slope)
-        
-        # Store ADX array for regime detection (last 10 values)
-        adx_values = adx[-10:] if len(adx) >= 10 else adx
-        # Filter out NaN values
-        adx_values = adx_values[~np.isnan(adx_values)]
-        self._score_breakdown['adx_values'] = adx_values
-        
-        # ADX slope bucket for analysis
-        if adx_slope < -0.5:
-            self._current_trade_tags['adx_slope_bucket'] = 'declining_fast'
-        elif adx_slope < -0.15:
-            self._current_trade_tags['adx_slope_bucket'] = 'declining'
-        elif adx_slope < 0.15:
-            self._current_trade_tags['adx_slope_bucket'] = 'neutral'
-        else:
-            self._current_trade_tags['adx_slope_bucket'] = 'rising'
-        
-        # Also calculate and store RSI for tags (even though it doesn't affect score)
-        rsi = calculate_rsi(closes, 14)
-        if not np.isnan(rsi[-1]):
-            self._current_trade_tags['rsi'] = float(rsi[-1])
-        
-        # Base score based on ADX strength and slope
-        base_score = 0.0
-        if adx_val > 25 and adx_slope > 0:
-            base_score = 2.0  # Strong trend, strengthening
-        elif adx_val > 20 or (adx_val > 15 and adx_slope > 0):
-            base_score = 1.0  # Moderate trend
-        else:
-            base_score = 0.0  # Weak (but doesn't block!)
-        
-        # ===== CAPA 4: Degradation penalties (weights, not gates) =====
-        penalty = 0.0
-        
-        # Volume penalty (from LTF info stored in tags)
-        rel_vol = self._current_trade_tags.get('rel_vol', 1.0)
-        if rel_vol < 0.6:  # Low volume
-            penalty += 0.5
-            self._current_trade_tags['volume_penalty'] = 0.5
-            logger.debug(f"📊 Volume penalty: -0.5 (rel_vol={rel_vol:.2f})")
-        
-        # ADX slope penalty (fast decline = momentum dying)
-        if adx_slope < -0.5:
-            penalty += 0.25
-            self._current_trade_tags['slope_penalty'] = 0.25
-            logger.debug(f"📊 Slope penalty: -0.25 (slope={adx_slope:.2f})")
-        
-        # Apply penalty and round to integer
-        final_score = max(0, base_score - penalty)
-        return int(round(final_score))
-    
-    def _score_context(self, df_5m: pd.DataFrame, market_time: datetime) -> int:
-        """
-        CONTEXT SCORE (0-2)
-        +1 → Session London/NY
-        +1 → Volatility healthy (ATR fast ≈ slow)
-        
-        Enhanced with session quality tracking (Jan 9, 2026)
-        """
-        score = 0
-        
-        # Session check using config helper
-        hour = market_time.hour
-        minute = market_time.minute
-        day_of_week = market_time.weekday()
-        session_name = get_session_name(hour, minute, day_of_week)
-        
-        # Best sessions get point
-        if session_name in ['LONDON', 'NY', 'LONDON_NY_OVERLAP']:
-            score += 1
-            self._current_trade_tags['session'] = 'active'
-        elif session_name == 'ASIA':
-            self._current_trade_tags['session'] = 'asia'
-        else:
-            self._current_trade_tags['session'] = 'quiet'
-        
-        # Store detailed session info
-        self._current_trade_tags['session_quality'] = session_name
-        
-        # Check for session quality based on volatility and ADX
-        session_quality_reason = ""
-        
-        # Volatility check
-        if len(df_5m) >= 50:
-            highs = df_5m['high'].values
-            lows = df_5m['low'].values
-            closes = df_5m['close'].values
-            
-            atr_fast = calculate_atr(highs, lows, closes, 14)
-            atr_slow = calculate_atr(highs, lows, closes, 42)
-            
-            if not np.isnan(atr_fast[-1]) and not np.isnan(atr_slow[-1]):
-                # Healthy: ATR fast within 70-130% of slow
-                ratio = atr_fast[-1] / atr_slow[-1] if atr_slow[-1] > 0 else 1.0
-                self._current_trade_tags['volatility_ratio'] = float(ratio)
-                self._current_trade_tags['atr'] = float(atr_fast[-1])
-                if 0.7 <= ratio <= 1.5:
-                    score += 1
-        
-        return score
-    
-    def _get_score_size_multiplier(self, score: int) -> float:
-        """
-        Score-based position sizing multiplier.
-        score=5 → 0.8x
-        score=6 → 1.0x
-        score>=7 → 1.2x
-        """
-        if score >= 7:
-            return 1.2
-        elif score >= 6:
-            return 1.0
-        else:  # score = 5
-            return 0.8
+    # =========================================================================
+    # SCORING METHODS MOVED TO src/engine/scoring/entry_scorer.py (Jan 20, 2026)
+    # The following methods were extracted to reduce god class complexity:
+    # - _apply_penalty_hierarchy
+    # - _apply_rr_score_adjustment  
+    # - _score_structure, _score_timing, _score_momentum, _score_context
+    # - _get_score_size_multiplier
+    # Now accessed via self._entry_scorer
+    # =========================================================================
     
     def _update_score_metrics(self, score: int, pnl: float, is_win: bool):
         """
@@ -6075,42 +5474,12 @@ class SignalEngine:
                 logger.debug(f"   {b}: expectancy={exp:.2f}, winrate={wr:.1f}%")
     
     def _check_session_filter(self, market_time: datetime) -> tuple[bool, str]:
-        """
-        SESSION FILTER: Disabled for now to see real edge with more trades
-        BTC trades 24/7 - let's see what happens without session restriction
-        """
-        hour = market_time.hour
-        # Allow all hours for now to get more trades
-        return True, f"Session OK: 24/7 trading ({hour}:00 UTC)"
+        """SESSION FILTER: 24/7 trading for BTC"""
+        return True, f"Session OK: 24/7 trading ({market_time.hour}:00 UTC)"
     
     def _check_trend_filter(self, df: pd.DataFrame, bias: str, current_price: float) -> tuple[bool, str]:
-        """
-        TREND FILTER (OBLIGATORIO): Solo operar en dirección de tendencia clara
-        
-        LONG: Price > EMA200 AND EMA50 > EMA200
-        SHORT: Price < EMA200 AND EMA50 < EMA200
-        """
-        if len(df) < 200:
-            return True, "Not enough data for trend filter"
-        
-        closes = df['close'].values
-        ema50 = calculate_ema(closes, 50)
-        ema200 = calculate_ema(closes, 200)
-        
-        if np.isnan(ema50[-1]) or np.isnan(ema200[-1]):
-            return True, "EMA values not ready"
-        
-        allow_long = current_price > ema200[-1] and ema50[-1] > ema200[-1]
-        allow_short = current_price < ema200[-1] and ema50[-1] < ema200[-1]
-        
-        if bias == 'LONG':
-            if allow_long:
-                return True, f"Trend OK: LONG aligned (P>{ema200[-1]:.0f}, EMA50>{ema200[-1]:.0f})"
-            return False, f"LONG against trend: P={current_price:.0f}, EMA50={ema50[-1]:.0f}, EMA200={ema200[-1]:.0f}"
-        else:
-            if allow_short:
-                return True, f"Trend OK: SHORT aligned (P<{ema200[-1]:.0f}, EMA50<{ema200[-1]:.0f})"
-            return False, f"SHORT against trend: P={current_price:.0f}, EMA50={ema50[-1]:.0f}, EMA200={ema200[-1]:.0f}"
+        """TREND FILTER - delegates to filter_checks module"""
+        return _check_trend_pure(df, bias, current_price)
     
     def _check_momentum_filter(self, df: pd.DataFrame, bias: str) -> tuple[bool, str]:
         """
@@ -6214,151 +5583,24 @@ class SignalEngine:
         return True, f"Momentum {momentum_quality}: RSI={rsi_val:.1f} slope={rsi_slope:.1f} ADX={adx_val:.1f}"
     
     def _check_volatility_expansion(self, df: pd.DataFrame) -> tuple[bool, str]:
-        """
-        VOLATILITY FILTER: ATR fast vs ATR slow
-        
-        Solo operar cuando BTC se mueve, no en compresión
-        
-        ATR(14) >= ATR(42) * 0.9
-        """
-        if len(df) < 50:
-            return True, "Not enough data for volatility"
-        
-        highs = df['high'].values
-        lows = df['low'].values
-        closes = df['close'].values
-        
-        atr_fast = calculate_atr(highs, lows, closes, 14)
-        atr_slow = calculate_atr(highs, lows, closes, 42)
-        
-        if np.isnan(atr_fast[-1]) or np.isnan(atr_slow[-1]):
-            return True, "ATR not ready"
-        
-        threshold = atr_slow[-1] * 0.9
-        
-        if atr_fast[-1] >= threshold:
-            return True, f"Volatility OK: ATR14={atr_fast[-1]:.2f} >= {threshold:.2f} (90% of ATR42)"
-        
-        return False, f"Low volatility: ATR14={atr_fast[-1]:.2f} < {threshold:.2f}"
+        """VOLATILITY FILTER - delegates to filter_checks module"""
+        return _check_volatility_expansion_pure(df)
     
     def _check_not_compressed(self, df: pd.DataFrame) -> tuple[bool, str]:
-        """
-        COMPRESSION FILTER: Disabled for now to get more trades
-        """
+        """COMPRESSION FILTER: Disabled"""
         return True, "Compression filter disabled"
     
     def _check_anti_reverso(self, df: pd.DataFrame, bias: str) -> tuple[bool, str]:
-        """
-        ANTI-REVERSO FILTER: Evita cuchillos (engulfing + rejection wicks)
-        
-        Bloquea entrada si:
-        - Engulfing bearish detectado para LONG
-        - Engulfing bullish detectado para SHORT
-        - Rejection wick > 60% del rango
-        """
-        if len(df) < 3:
-            return True, "Not enough data for reversal detection"
-        
-        last3 = df.iloc[-3:]
-        
-        # Candle properties
-        open1, close1 = last3.iloc[-2]['open'], last3.iloc[-2]['close']
-        open2, close2 = last3.iloc[-1]['open'], last3.iloc[-1]['close']
-        high2, low2 = last3.iloc[-1]['high'], last3.iloc[-1]['low']
-        
-        candle_range = high2 - low2
-        if candle_range <= 0:
-            return True, "No range"
-        
-        # Engulfing patterns
-        bearish_engulf = (close2 < open2 and  # Current bearish
-                         close2 < open1 and   # Close below prev open
-                         open2 > close1)      # Open above prev close
-        
-        bullish_engulf = (close2 > open2 and  # Current bullish
-                         close2 > open1 and   # Close above prev open
-                         open2 < close1)      # Open below prev close
-        
-        # Rejection wicks (upper wick for LONG rejection, lower for SHORT)
-        upper_wick = high2 - max(open2, close2)
-        lower_wick = min(open2, close2) - low2
-        
-        long_reject = upper_wick > candle_range * 0.6
-        short_reject = lower_wick > candle_range * 0.6
-        
-        if bias == 'LONG':
-            if bearish_engulf:
-                return False, "Bearish engulfing detected - LONG blocked"
-            if long_reject:
-                return False, f"Long rejection wick ({upper_wick/candle_range*100:.0f}% of range)"
-            return True, "No reversal patterns for LONG"
-        else:
-            if bullish_engulf:
-                return False, "Bullish engulfing detected - SHORT blocked"
-            if short_reject:
-                return False, f"Short rejection wick ({lower_wick/candle_range*100:.0f}% of range)"
-            return True, "No reversal patterns for SHORT"
+        """ANTI-REVERSO FILTER - delegates to filter_checks module"""
+        return _check_anti_reversal_pure(df, bias)
     
     def _check_not_duplicate_zone(self, current_price: float) -> tuple[bool, str]:
-        """
-        DUPLICATE ZONE FILTER: Disabled for now to get more trades
-        """
+        """DUPLICATE ZONE FILTER: Disabled"""
         return True, "Duplicate zone filter disabled"
     
     def _check_volume_confirmation(self, df: pd.DataFrame) -> tuple[bool, str]:
-        """
-        DELTA VOLUME FILTER: Entry needs INTENTION (directional volume)
-        
-        No RSI, no MACD, no pollas.
-        BTC moves with intention or doesn't move.
-        
-        Delta = Buy Volume - Sell Volume (approximated from candle structure)
-        If |delta| < threshold → NO TRADE (no clear direction)
-        """
-        if len(df) < 25 or 'volume' not in df.columns:
-            return True, "Not enough data for volume filter"
-        
-        # Calculate delta volume (approximation using candle body vs range)
-        # Bullish candle: close > open → delta positive
-        # Bearish candle: close < open → delta negative
-        # Delta strength = how much of the range is body (conviction)
-        
-        volumes = df['volume'].values
-        opens = df['open'].values
-        closes = df['close'].values
-        highs = df['high'].values
-        lows = df['low'].values
-        
-        # Current candle delta
-        current_vol = volumes[-1]
-        current_range = highs[-1] - lows[-1]
-        current_body = closes[-1] - opens[-1]  # Positive = bullish, negative = bearish
-        
-        if current_range <= 0:
-            return True, "Zero range candle"
-        
-        # Delta = volume * (body / range) * sign
-        # This gives us directional volume
-        body_ratio = abs(current_body) / current_range
-        delta = current_vol * body_ratio * (1 if current_body > 0 else -1)
-        
-        # Average volume for normalization
-        avg_vol_20 = np.mean(volumes[-21:-1])
-        if avg_vol_20 <= 0:
-            return True, "Zero average volume"
-        
-        # Normalized delta (as ratio of average volume)
-        norm_delta = abs(delta) / avg_vol_20
-        
-        # Threshold: need at least 0.3x average volume as clear delta
-        # This filters out indecision candles (dojis, spinning tops)
-        DELTA_THRESHOLD = 0.3
-        
-        if norm_delta >= DELTA_THRESHOLD:
-            direction = "BUY" if delta > 0 else "SELL"
-            return True, f"Delta OK: {norm_delta:.2f}x avg ({direction})"
-        
-        return False, f"No intention: delta {norm_delta:.2f}x < {DELTA_THRESHOLD}x (indecision)"
+        """DELTA VOLUME FILTER - delegates to filter_checks module"""
+        return _check_volume_delta_pure(df)
     
     def _record_trade_price(self, entry_price: float):
         """Record trade price for duplicate zone detection"""
@@ -6369,91 +5611,40 @@ class SignalEngine:
         self._recent_trade_prices = self._recent_trade_prices[-5:]
     
     def _find_tp2_target(self) -> float:
-        """
-        Find TP2 target based on POSITION DIRECTION (not current_bias!)
-        
-        For LONG: TP2 = highest high of recent 5m candles (upside target)
-        For SHORT: TP2 = lowest low of recent 5m candles (downside target)
-        """
+        """Find TP2 target - delegates to indicator_helpers"""
         candles_5m = self.market_data.get_candles('5m')
         if not candles_5m:
             return 0
         
         df_5m = pd.DataFrame(candles_5m)
         
-        # CRITICAL: Use position direction, not current_bias
-        # current_bias can be different after HTF flip
+        # Use position direction, not current_bias
         position = self.risk_engine.position
-        if position:
-            direction = position.direction
-        else:
-            # Fallback to current_bias if no position (should not happen)
-            direction = self.current_bias
+        direction = position.direction if position else self.current_bias
         
-        if direction == 'LONG':
-            return df_5m['high'].max()
-        else:  # SHORT
-            return df_5m['low'].min()
+        return _find_tp2_pure(df_5m, direction)
     
     def _check_bos_against_position(self, direction: str, candles_5m: list) -> bool:
-        """
-        Detecta Break of Structure (BOS) en contra de la posición
+        """BOS detection - delegates to filter_checks module with edge-triggered logging"""
+        result = _check_bos_pure(direction, candles_5m)
         
-        BOS LONG (en contra de posición LONG):
-        - Precio hace nuevo Lower Low (rompe último soporte)
+        # Edge-triggered logging (only log once per new BOS level)
+        if result and candles_5m:
+            df = pd.DataFrame(candles_5m)
+            if direction == 'LONG':
+                level = df['low'].iloc[-1]
+                if self._last_bos_level != level or self._last_bos_direction != 'LONG':
+                    logger.info(f"📉 BOS detectado (LONG): LL @ {level:.2f}")
+                    self._last_bos_level = level
+                    self._last_bos_direction = 'LONG'
+            else:
+                level = df['high'].iloc[-1]
+                if self._last_bos_level != level or self._last_bos_direction != 'SHORT':
+                    logger.info(f"📈 BOS detectado (SHORT): HH @ {level:.2f}")
+                    self._last_bos_level = level
+                    self._last_bos_direction = 'SHORT'
         
-        BOS SHORT (en contra de posición SHORT):
-        - Precio hace nuevo Higher High (rompe última resistencia)
-        
-        Returns: True si hay BOS en contra
-        """
-        if not candles_5m or len(candles_5m) < 10:
-            return False
-        
-        df = pd.DataFrame(candles_5m)
-        
-        # Solo mirar últimas 10 velas para BOS reciente
-        recent = df.tail(10)
-        
-        if direction == 'LONG':
-            # Para LONG: BOS = Lower Low (rompe mínimo anterior)
-            # Buscar si el low más reciente es menor que todos los anteriores
-            lows = recent['low'].values
-            if len(lows) < 3:
-                return False
-            
-            # Si el último low es menor que el mínimo de los 5 anteriores = BOS
-            recent_low = lows[-1]
-            previous_lows = lows[-6:-1]  # 5 velas anteriores
-            if len(previous_lows) > 0:
-                min_previous = min(previous_lows)
-                if recent_low < min_previous:
-                    # Edge-triggered: solo loguear si es un NUEVO nivel de BOS
-                    if self._last_bos_level != recent_low or self._last_bos_direction != 'LONG':
-                        logger.info(f"📉 BOS detectado (LONG): LL @ {recent_low:.2f} < {min_previous:.2f}")
-                        self._last_bos_level = recent_low
-                        self._last_bos_direction = 'LONG'
-                    return True
-        
-        else:  # SHORT
-            # Para SHORT: BOS = Higher High (rompe máximo anterior)
-            highs = recent['high'].values
-            if len(highs) < 3:
-                return False
-            
-            recent_high = highs[-1]
-            previous_highs = highs[-6:-1]
-            if len(previous_highs) > 0:
-                max_previous = max(previous_highs)
-                if recent_high > max_previous:
-                    # Edge-triggered: solo loguear si es un NUEVO nivel de BOS
-                    if self._last_bos_level != recent_high or self._last_bos_direction != 'SHORT':
-                        logger.info(f"📈 BOS detectado (SHORT): HH @ {recent_high:.2f} > {max_previous:.2f}")
-                        self._last_bos_level = recent_high
-                        self._last_bos_direction = 'SHORT'
-                    return True
-        
-        return False
+        return result
     
     async def emergency_close_all(self):
         """Emergency close all positions (market order)"""

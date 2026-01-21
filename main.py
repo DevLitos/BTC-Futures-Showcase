@@ -142,6 +142,9 @@ from src.monitoring.metrics import (
 # 10. BTC CONTEXT FEED (Jan 15, 2026)
 from src.engine.btc_context_feed import get_btc_context_feed
 
+# 11. HEALTH BRIDGE (Jan 20, 2026) - For FastAPI integration
+from src.core.health_bridge import HealthBridge, HealthBridgeWriter, get_health_bridge
+
 # Legacy (mantener compatibilidad)
 from src.output.output_manager import OutputManager
 
@@ -265,6 +268,13 @@ class TradingSystemOrchestrator:
         # 7. HEALTH STATUS - Update with signal engine reference
         self.health_status = health_status
         
+        # 8. HEALTH BRIDGE WRITER - Export health status for FastAPI
+        self.health_bridge_writer = HealthBridgeWriter(
+            health_status=self.health_status,
+            interval_seconds=5.0,
+            bridge=get_health_bridge()
+        )
+        
         self.tasks = []
         self.demo_mode = DEMO_MODE
         self.is_running = False
@@ -374,7 +384,7 @@ class TradingSystemOrchestrator:
         4. Notify user of recovery actions
         """
         from datetime import datetime, UTC
-        from src.engine.risk_engine import Position
+        from src.engine.risk.risk_engine import Position
         
         logger.info("🔄 STARTUP RECOVERY: Checking for orphan positions/orders...")
         
@@ -518,7 +528,7 @@ class TradingSystemOrchestrator:
                             logger.info(f"   ✅ TP tracked at {existing_tp:.2f}")
                         
                         # Transition signal engine to MANAGE state
-                        from src.engine.state_machine import BotState
+                        from src.engine.state.state_machine import BotState
                         if hasattr(self.signal_engine, 'state_machine'):
                             self.signal_engine.state_machine.transition_to(BotState.MANAGE, "Adopted existing position")
                             self.signal_engine._stops_set = sl_active  # Track if SL needs to be set
@@ -813,6 +823,25 @@ class TradingSystemOrchestrator:
             # Start kill switch monitor task
             self.tasks.append(asyncio.create_task(self._kill_switch_monitor(), name="KillSwitchMonitor"))
             
+            # 🔥 DEBUG: Event loop heartbeat (reduced logging in production)
+            async def _event_loop_heartbeat():
+                """Print heartbeat every 60s to confirm event loop is alive"""
+                count = 0
+                while True:
+                    count += 1
+                    # Log every 60 seconds
+                    if count % 60 == 0:
+                        all_tasks = [t for t in asyncio.all_tasks() if not t.done()]
+                        logger.debug(f"💓 EVENT_LOOP_HEARTBEAT #{count//60}min | Active tasks: {len(all_tasks)}")
+                    await asyncio.sleep(1.0)
+            self.tasks.append(asyncio.create_task(_event_loop_heartbeat(), name="EventLoopHeartbeat"))
+            
+            # Start health bridge writer (for FastAPI integration)
+            # 🔥 FIX (Jan 21, 2026): Now uses run_in_executor for file I/O
+            self.health_bridge_writer.start()
+            logger.info("✓ Health bridge writer started (FastAPI can read health_status.json)")
+            
+            # 🔥 DEBUG: Temporarily disable Telegram to test if it's blocking
             # Start Telegram command listener (/stop, /force_stop)
             if self.output_manager:
                 self.output_manager.set_force_exit_callback(self.signal_engine.emergency_close_all)
@@ -1048,19 +1077,43 @@ class TradingSystemOrchestrator:
                 logger.info("📊 SYSTEM STATUS (5min report)")
                 
                 # Signal engine
+                extra_health_data = {}
                 if self.signal_engine:
                     status = self.signal_engine.get_status()
                     logger.info(f"Signal Engine: {status.get('state', 'unknown')}")
                     
+                    # Collect data for health bridge
+                    extra_health_data['current_regime'] = status.get('regime', 'UNKNOWN')
+                    
                     # Log health monitor summary
                     if status.get('health'):
                         health = status['health']
+                        extra_health_data['trades_today'] = health.get('trades_today', 0)
+                        extra_health_data['win_rate_today'] = health.get('win_rate', 0.0)
+                        
                         logger.info(f"Health: trades_today={health.get('trades_today', 0)}, "
                                    f"fill_rate={health.get('fill_rate', 1.0):.0%}, "
                                    f"integrity_errors={health.get('integrity_errors', 0)}, "
                                    f"avg_latency={health.get('avg_latency_ms', 0):.0f}ms")
                     if status.get('health_alert'):
                         logger.warning(f"⚠️ Health Alert: {status['health_alert']}")
+                    
+                    # Position info for health bridge
+                    if self.signal_engine.risk_engine.position:
+                        pos = self.signal_engine.risk_engine.position
+                        self.health_status.set_position(
+                            symbol=pos.symbol,
+                            side=pos.direction,
+                            size=pos.size
+                        )
+                        extra_health_data['position_entry_price'] = pos.entry_price
+                        extra_health_data['position_unrealized_pnl'] = getattr(pos, 'unrealized_pnl', 0.0)
+                    else:
+                        self.health_status.clear_position()
+                
+                # Update health bridge with extra data
+                if hasattr(self, 'health_bridge_writer'):
+                    self.health_bridge_writer.update_extra_data(extra_health_data)
                 
                 # External data
                 if self.external_data:
@@ -1140,6 +1193,10 @@ class TradingSystemOrchestrator:
         
         # Mark as shutting down
         self.health_status.set_healthy(False, "shutting_down")
+        
+        # Stop health bridge writer
+        if hasattr(self, 'health_bridge_writer'):
+            self.health_bridge_writer.stop()
         
         try:
             # 1. Stop signal engine (cierra posiciones)

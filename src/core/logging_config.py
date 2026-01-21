@@ -552,6 +552,8 @@ def configure_logging(settings: Settings) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("ccxt").setLevel(logging.WARNING)
+    logging.getLogger("numba").setLevel(logging.WARNING)  # 🔥 FIX: Numba JIT logs flood at DEBUG
+    logging.getLogger("numba.core").setLevel(logging.WARNING)
     
     # Initialize audit logger
     _audit_logger = AuditLogger(settings.log_path, settings.run_id)

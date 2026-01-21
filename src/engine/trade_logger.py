@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TradeRecord:
+class TradeLogRecord:
     """Complete trade record for persistence."""
     
     # Identity
@@ -108,7 +108,7 @@ class TradeLogger:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
         self.current_file = self._get_log_file()
-        self.active_trades: Dict[str, TradeRecord] = {}
+        self.active_trades: Dict[str, TradeLogRecord] = {}
         
         logger.info(f"TradeLogger initialized: {self.log_dir}")
     
@@ -178,7 +178,7 @@ class TradeLogger:
         trade_id = self._generate_trade_id()
         now = datetime.now(UTC)
         
-        record = TradeRecord(
+        record = TradeLogRecord(
             trade_id=trade_id,
             symbol=symbol,
             direction=direction,
@@ -230,12 +230,12 @@ class TradeLogger:
         mfe_r: float = None,
         mae_r: float = None,
         exit_tags: List[str] = None
-    ) -> Optional[TradeRecord]:
+    ) -> Optional[TradeLogRecord]:
         """
         Complete a trade and persist to log.
         
         Returns:
-            Completed TradeRecord
+            Completed TradeLogRecord
         """
         if trade_id not in self.active_trades:
             logger.warning(f"Trade {trade_id} not found in active trades")
@@ -283,7 +283,7 @@ class TradeLogger:
         
         return record
     
-    def _write_record(self, record: TradeRecord):
+    def _write_record(self, record: TradeLogRecord):
         """Write trade record to JSONL file."""
         try:
             # Refresh file path in case day changed
@@ -298,7 +298,7 @@ class TradeLogger:
         self,
         start_date: str = None,
         end_date: str = None
-    ) -> List[TradeRecord]:
+    ) -> List[TradeLogRecord]:
         """
         Load trades from log files.
         
@@ -307,7 +307,7 @@ class TradeLogger:
             end_date: End date (YYYY-MM-DD), None for today
         
         Returns:
-            List of TradeRecords
+            List of TradeLogRecords
         """
         trades = []
         
@@ -325,7 +325,7 @@ class TradeLogger:
                     for line in f:
                         if line.strip():
                             data = json.loads(line)
-                            trades.append(TradeRecord(**data))
+                            trades.append(TradeLogRecord(**data))
             except Exception as e:
                 logger.error(f"Error loading {log_file}: {e}")
         

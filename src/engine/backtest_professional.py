@@ -18,8 +18,8 @@ from src.engine.market_data import SynchronizedMultiTimeframeBuffer
 from src.engine.filters import (
     KillConditionsFilter, BlackSwanFilter, HTFFilter, LTFTriggerFilter
 )
-from src.engine.risk_engine import RiskEngine
-from src.engine.state_machine import StateMachine, BotState
+from src.engine.risk.risk_engine import RiskEngine
+from src.engine.state.state_machine import StateMachine, BotState
 from src.engine.indicators import (
     calculate_ema, calculate_atr, calculate_adx,
     calculate_relative_volume, calculate_orderbook_imbalance
@@ -29,8 +29,8 @@ from src.engine.core_utils import (
     PositionSizer, get_position_sizer
 )
 from src.engine.time_provider import get_time_provider, TimeProvider, reset_time_provider
-from src.engine.edge_enforcement import EdgeEnforcement
-from src.engine.activity_regime import EnforcementMode
+from src.engine.edge.edge_enforcement import EdgeEnforcement
+from src.engine.regime.activity_regime import EnforcementMode
 
 logger = logging.getLogger(__name__)
 

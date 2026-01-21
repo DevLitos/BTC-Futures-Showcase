@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, UTC
 import logging
 
 # Import canonical state types - SINGLE SOURCE OF TRUTH
-from .state_types import StrategyState, StateTransition, get_state_size_multiplier, can_trade_in_state
+from src.engine.state.state_types import StrategyState, StateTransition, get_state_size_multiplier, can_trade_in_state
 
 
 class StrategyStateMachine:

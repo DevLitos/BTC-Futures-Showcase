@@ -21,14 +21,14 @@ from datetime import datetime, timedelta, UTC
 from typing import Dict, List, Optional, Tuple
 import logging
 
-from src.engine.trading_regime import TradingRegime, REGIME_CHARACTERISTICS
+from src.engine.regime.trading_regime import TradingRegime, REGIME_CHARACTERISTICS
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TradeRecord:
-    """Record of a trade for frequency tracking."""
+class FrequencyTradeEntry:
+    """Record of a trade for frequency tracking (local to frequency controller)"""
     timestamp: datetime
     regime: TradingRegime
     direction: str
@@ -100,7 +100,7 @@ class TradeFrequencyController:
     SESSION_START_HOUR = 0
     
     def __init__(self):
-        self._trades: List[TradeRecord] = []
+        self._trades: List[FrequencyTradeEntry] = []
         self._session_start: Optional[datetime] = None
         self._last_trade_time: Optional[datetime] = None
         self._consecutive_losses = 0
@@ -247,7 +247,7 @@ class TradeFrequencyController:
         """
         now = datetime.now(UTC)
         
-        self._trades.append(TradeRecord(
+        self._trades.append(FrequencyTradeEntry(
             timestamp=now,
             regime=regime,
             direction=direction,

@@ -216,6 +216,7 @@ class KrakenFuturesWebSocket:
     
     async def _message_loop(self):
         """Loop principal de mensajes"""
+        msg_count = 0
         while self.is_connected and not self._shutdown:
             try:
                 # Use kill threshold + 5s buffer for socket timeout
@@ -226,8 +227,22 @@ class KrakenFuturesWebSocket:
                 # Update heartbeat
                 self.last_tick = time.time()
                 
+                # 🔥 DEBUG: Log first 20 messages only
+                if msg_count < 20:
+                    feed = data.get('feed', data.get('event', 'unknown'))
+                    logger.info(f"🔍 WS msg #{msg_count}: feed={feed}")
+                
                 # Procesar por tipo
                 await self._process_message(data)
+                
+                # 🔥 FIX (Jan 21, 2026): Rate limit message processing
+                # Yield after every message, plus small sleep every 100 messages
+                # to ensure other tasks get CPU time (WS can send 1000+ msgs/sec)
+                msg_count += 1
+                await asyncio.sleep(0)  # Always yield
+                # Breather every 100 msgs to prevent event loop starvation
+                if msg_count % 100 == 0:
+                    await asyncio.sleep(0.01)  # 10ms breather every 100 msgs
                 
             except asyncio.CancelledError:
                 logger.info("Message loop cancelled")
@@ -378,6 +393,12 @@ class KrakenFuturesWebSocket:
                 bids = data.get('bids', [])
                 asks = data.get('asks', [])
                 
+                # 🔥 DEBUG: Log snapshot size
+                logger.info(f"📚 BOOK SNAPSHOT: {len(bids)} bids, {len(asks)} asks - processing...")
+                start_time = time.time()
+                
+                # 🔥 FIX (Jan 21, 2026): Yield to event loop during large snapshots
+                count = 0
                 for bid in bids:
                     if len(bid) >= 2:
                         price, qty = float(bid[0]), float(bid[1])
@@ -385,6 +406,9 @@ class KrakenFuturesWebSocket:
                         self.depth_buffer.append(depth_event)
                         if self.on_depth:
                             await self.on_depth(depth_event)
+                        count += 1
+                        if count % 100 == 0:  # Yield every 100 items
+                            await asyncio.sleep(0)
                 
                 for ask in asks:
                     if len(ask) >= 2:
@@ -393,6 +417,13 @@ class KrakenFuturesWebSocket:
                         self.depth_buffer.append(depth_event)
                         if self.on_depth:
                             await self.on_depth(depth_event)
+                        count += 1
+                        if count % 100 == 0:  # Yield every 100 items
+                            await asyncio.sleep(0)
+                
+                # 🔥 DEBUG
+                elapsed = time.time() - start_time
+                logger.info(f"📚 BOOK SNAPSHOT processed in {elapsed:.3f}s")
             
             elif feed_type == 'book':
                 # Incremental update
