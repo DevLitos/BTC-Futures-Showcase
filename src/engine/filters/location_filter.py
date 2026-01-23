@@ -119,6 +119,14 @@ class LocationContext:
     veto_short: bool = False
     veto_reasons: List[str] = None
     
+    # 🔥 FIX (Jan 22, 2026): Score penalties instead of hard vetoes
+    location_penalty_long: float = 0.0    # Penalty for long at extremes
+    location_penalty_short: float = 0.0   # Penalty for short at extremes
+    
+    # 🔥 NEW (Jan 22, 2026): Size caps for RANGE + extremes
+    size_cap_long: float = 1.0            # Size multiplier for longs
+    size_cap_short: float = 1.0           # Size multiplier for shorts
+    
     def __post_init__(self):
         if self.veto_reasons is None:
             self.veto_reasons = []
@@ -409,13 +417,25 @@ class LocationFilter:
         
         if is_range_regime:
             if context.in_extreme_high:
-                # Check for breakout override
+                # 🔥 FIX (Jan 22, 2026): NO hard veto, use progressive penalties + size caps
+                # A trade at 95% percentile can still work if entry is good
                 if not context.is_breakout_up:
-                    can_long = False
+                    # Progressive penalty based on percentile
+                    # 90-92%: -0.5 | 92-95%: -1.0 | 95%+: -1.5
+                    if context.percentile_60d >= 95:
+                        context.location_penalty_long = -1.5
+                        context.size_cap_long = 0.25  # 🔥 Severe cap
+                    elif context.percentile_60d >= 92:
+                        context.location_penalty_long = -1.0
+                        context.size_cap_long = 0.4
+                    else:
+                        context.location_penalty_long = -0.5
+                        context.size_cap_long = 0.6
                     reasons.append(
-                        f"EXTREME_HIGH_VETO: In RANGE regime at {context.percentile_60d:.0f}th percentile "
-                        f"(>{self.config.EXTREME_HIGH_PERCENTILE}%) - NO LONG"
+                        f"EXTREME_HIGH_PENALTY: At {context.percentile_60d:.0f}th percentile "
+                        f"→ penalty {context.location_penalty_long:.1f}, size_cap={context.size_cap_long}"
                     )
+                    # NO hard veto: can_long stays True
                 else:
                     reasons.append(
                         f"EXTREME_HIGH_OVERRIDE: At {context.percentile_60d:.0f}th pct but BREAKOUT detected "
@@ -423,13 +443,22 @@ class LocationFilter:
                     )
             
             if context.in_extreme_low:
-                # Check for breakdown override
+                # 🔥 FIX (Jan 22, 2026): NO hard veto, use progressive penalties + size caps
                 if not context.is_breakout_down:
-                    can_short = False
+                    if context.percentile_60d <= 5:
+                        context.location_penalty_short = -1.5
+                        context.size_cap_short = 0.25  # 🔥 Severe cap
+                    elif context.percentile_60d <= 8:
+                        context.location_penalty_short = -1.0
+                        context.size_cap_short = 0.4
+                    else:
+                        context.location_penalty_short = -0.5
+                        context.size_cap_short = 0.6
                     reasons.append(
-                        f"EXTREME_LOW_VETO: In RANGE regime at {context.percentile_60d:.0f}th percentile "
-                        f"(<{self.config.EXTREME_LOW_PERCENTILE}%) - NO SHORT"
+                        f"EXTREME_LOW_PENALTY: At {context.percentile_60d:.0f}th percentile "
+                        f"→ penalty {context.location_penalty_short:.1f}, size_cap={context.size_cap_short}"
                     )
+                    # NO hard veto: can_short stays True
                 else:
                     reasons.append(
                         f"EXTREME_LOW_OVERRIDE: At {context.percentile_60d:.0f}th pct but BREAKDOWN detected"

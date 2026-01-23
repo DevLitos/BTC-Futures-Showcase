@@ -295,6 +295,56 @@ class Settings(BaseSettings):
     )
     
     # =========================================================================
+    # Engine Timing Configuration
+    # =========================================================================
+    reconcile_interval_seconds: int = Field(
+        default=60,
+        alias="RECONCILE_INTERVAL_SECONDS",
+        description="Interval between position reconciliation cycles",
+        ge=10,
+        le=300
+    )
+    heartbeat_interval_seconds: int = Field(
+        default=60,
+        alias="HEARTBEAT_INTERVAL_SECONDS",
+        description="Interval between heartbeat log messages",
+        ge=10,
+        le=300
+    )
+    health_bridge_interval_seconds: float = Field(
+        default=5.0,
+        alias="HEALTH_BRIDGE_INTERVAL_SECONDS",
+        description="Interval for health status file writes",
+        ge=1.0,
+        le=60.0
+    )
+    
+    # =========================================================================
+    # Exchange Timeouts
+    # =========================================================================
+    exchange_timeout_short: float = Field(
+        default=10.0,
+        alias="EXCHANGE_TIMEOUT_SHORT",
+        description="Timeout for simple exchange queries (seconds)",
+        ge=5.0,
+        le=60.0
+    )
+    exchange_timeout_medium: float = Field(
+        default=30.0,
+        alias="EXCHANGE_TIMEOUT_MEDIUM",
+        description="Timeout for order operations (seconds)",
+        ge=10.0,
+        le=120.0
+    )
+    exchange_timeout_long: float = Field(
+        default=60.0,
+        alias="EXCHANGE_TIMEOUT_LONG",
+        description="Timeout for complex operations (seconds)",
+        ge=30.0,
+        le=300.0
+    )
+    
+    # =========================================================================
     # Validators
     # =========================================================================
     

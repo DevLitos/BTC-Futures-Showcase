@@ -90,25 +90,28 @@ class HybridATRTrailing:
     """
     
     # R-Lock thresholds
+    # FIX (Jan 22, 2026): Punto 6 - Retrasar BE lock para no matar trades prematuramente
+    # Old: BE at 0.8R killed winners during normal pullbacks
+    # New: BE at 1.2R (after TP1), let trade breathe
     R_LOCK_TIERS = [
-        (0.8, 0.0, 1),    # (MFE threshold, lock at R, tier)
-        (1.0, 0.4, 2),
-        (1.5, 0.9, 3),
-        (2.2, 1.6, 4),
-        (3.0, 2.3, 5),
+        (1.2, 0.0, 1),    # (MFE threshold, lock at R, tier) - BE after TP1 hit
+        (1.8, 0.6, 2),    # Lock 0.6R at 1.8R MFE (was 1.0→0.4)
+        (2.5, 1.2, 3),    # Lock 1.2R at 2.5R MFE (was 1.5→0.9)
+        (3.5, 2.0, 4),    # Lock 2.0R at 3.5R MFE (was 2.2→1.6)
+        (5.0, 3.5, 5),    # Lock 3.5R at 5.0R MFE (for runners)
     ]
     
     # ATR K factors by regime
-    # NOTE: Adjusted per review (Jan 15, 2026):
-    # - RANGE: 1.8 (was 1.5, too aggressive for BTC 1m/3m)
-    # - TREND: 2.8 (was 2.5, give more room for pullbacks)
-    # - VOLATILITY: 3.2 (was 3.0)
-    # - CONSERVATIVE: 2.0 (was 1.8)
+    # NOTE: Adjusted per review (Jan 22, 2026):
+    # - RANGE: 2.0 (was 1.8, BTC 1m spikes need room)
+    # - TREND: 2.5 (was 2.8, don't give back too much in trend)
+    # - VOLATILITY: 3.5 (was 3.2, extra room for spikes)
+    # - CONSERVATIVE: 2.2 (was 2.0)
     K_FACTORS = {
-        TrailingRegime.TREND: 2.8,
-        TrailingRegime.RANGE: 1.8,
-        TrailingRegime.VOLATILITY: 3.2,
-        TrailingRegime.CONSERVATIVE: 2.0,
+        TrailingRegime.TREND: 2.5,
+        TrailingRegime.RANGE: 2.0,
+        TrailingRegime.VOLATILITY: 3.5,
+        TrailingRegime.CONSERVATIVE: 2.2,
     }
     
     # Swing reference lookback (candles)

@@ -24,6 +24,8 @@ class FilterDecision:
             return  # Hard block
         score += decision.score_adjust
         tags.update(decision.tags)
+        
+    🔥 FIX (Jan 22, 2026): Added size_factor for position size caps
     """
     allow: bool                                    # True = pass, False = hard block
     score_adjust: float = 0.0                      # Score adjustment (+/-)
@@ -33,6 +35,7 @@ class FilterDecision:
     tags: Dict[str, Any] = field(default_factory=dict)  # Tags for trade analysis
     cooldown_seconds: int = 0                      # Request pause after decision
     regime_source: Optional[str] = None            # Which filter set the regime (for dedup)
+    size_factor: float = 1.0                       # 🔥 NEW: Size multiplier (0.25-1.0)
     
     def __str__(self) -> str:
         status = "✅ ALLOW" if self.allow else "❌ BLOCK"
@@ -53,7 +56,8 @@ class FilterDecision:
             reasons=self.reasons + other.reasons,
             tags={**self.tags, **other.tags},
             cooldown_seconds=max(self.cooldown_seconds, other.cooldown_seconds),
-            regime_source=other.regime_source if other.regime_source else self.regime_source
+            regime_source=other.regime_source if other.regime_source else self.regime_source,
+            size_factor=min(self.size_factor, other.size_factor)  # 🔥 Most restrictive wins
         )
     
     def merge_dedup(self, other: 'FilterDecision', 
@@ -94,7 +98,8 @@ class FilterDecision:
             reasons=self.reasons + other.reasons,
             tags={**self.tags, **other.tags},
             cooldown_seconds=max(self.cooldown_seconds, other.cooldown_seconds),
-            regime_source=other.regime_source if other.regime_source else self.regime_source
+            regime_source=other.regime_source if other.regime_source else self.regime_source,
+            size_factor=min(self.size_factor, other.size_factor)  # 🔥 Most restrictive wins
         )
     
     @classmethod

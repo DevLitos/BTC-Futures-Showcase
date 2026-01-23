@@ -709,16 +709,18 @@ class PositionSizer:
         
         if capital < DynamicRiskConfig.MICRO_ACCOUNT_THRESHOLD:
             # MICRO ACCOUNT: Percentage-based sizing
-            # Use 55% of capital as base margin to achieve ~$200 notional after multipliers
-            MICRO_ACCOUNT_MARGIN_PCT = 0.55  # 55% of capital per trade
+            # 🔥 FIX (Jan 22, 2026): Increased from 55% to 80% to get minimum $500 notional
+            # With $160 capital: 80% × $160 = $128 margin × 10x = $1280 notional ≈ $450 after multipliers
+            MICRO_ACCOUNT_MARGIN_PCT = 0.80  # 80% of capital per trade
             
             base_margin = capital * MICRO_ACCOUNT_MARGIN_PCT
             
             # Apply leverage to get notional exposure
             position_notional = base_margin * leverage
             
-            # Ensure minimum notional (exchange may reject tiny orders)
-            position_notional = max(position_notional, DynamicRiskConfig.MIN_NOTIONAL_USD * leverage)
+            # 🔥 FIX (Jan 22, 2026): Minimum notional of $500 (before multipliers)
+            MIN_BASE_NOTIONAL = 500.0  # Ensures ~$200-300 after worst case multipliers
+            position_notional = max(position_notional, MIN_BASE_NOTIONAL)
             
             base_size = position_notional / entry_price
             
@@ -824,12 +826,17 @@ class PositionSizer:
                                state_multiplier: float = 1.0,
                                edge_multiplier: float = 1.0,
                                defensive_multiplier: float = 1.0,
+                               volatility_regime: str = "NORMAL",
+                               session_name: str = "OTHER",
                                risk_pct: Optional[float] = None,
                                leverage: Optional[int] = None) -> Tuple[float, Dict[str, float]]:
         """
         Calculate final position size with all multipliers.
         
         This is the main entry point for position sizing.
+        
+        FIX (Jan 22, 2026): Puntos 8+9 - Added volatility_regime and session_name
+        for adaptive position sizing based on market conditions.
         
         Args:
             capital: Available capital
@@ -838,12 +845,16 @@ class PositionSizer:
             state_multiplier: From StrategyStateMachine
             edge_multiplier: From EdgeScore
             defensive_multiplier: From BlackSwanFilter
+            volatility_regime: "LOW_VOL", "NORMAL", "HIGH_VOL", "SPIKE"
+            session_name: "LONDON", "NY", "ASIA", etc.
             risk_pct: Override risk percentage
             leverage: Override leverage
             
         Returns:
             Tuple (final_size, breakdown_dict)
         """
+        from src.engine.config import VolatilityRegime, SessionQuality
+        
         base_size = self.calculate_base_size(
             capital=capital,
             entry_price=entry_price,
@@ -852,12 +863,34 @@ class PositionSizer:
             leverage=leverage
         )
         
-        return self.apply_multipliers(
+        # Get volatility regime multiplier (Punto 8)
+        volatility_mult = VolatilityRegime.get_size_multiplier(volatility_regime)
+        
+        # Get session quality multiplier (Punto 9)
+        session_mult = SessionQuality.get_session_size_mult(session_name)
+        
+        final_size, breakdown = self.apply_multipliers(
             base_size=base_size,
             state_multiplier=state_multiplier,
             edge_multiplier=edge_multiplier,
             defensive_multiplier=defensive_multiplier
         )
+        
+        # Apply volatility and session multipliers
+        final_size = final_size * volatility_mult * session_mult
+        
+        # Update breakdown
+        breakdown['volatility_mult'] = volatility_mult
+        breakdown['session_mult'] = session_mult
+        breakdown['final'] = final_size
+        
+        logger.debug(
+            f"Size: {base_size:.6f} * state({state_multiplier}) * edge({edge_multiplier}) "
+            f"* defensive({defensive_multiplier}) * vol({volatility_mult}) * session({session_mult}) "
+            f"= {final_size:.6f}"
+        )
+        
+        return final_size, breakdown
 
 
 # =============================================================================

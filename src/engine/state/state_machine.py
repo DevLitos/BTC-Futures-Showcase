@@ -238,11 +238,30 @@ class StateMachine:
             self.consecutive_losses = 0
             self.total_wins += 1
             logger.debug(f"WIN recorded - consecutive losses reset to 0")
-        elif is_real_trade and not is_admin_event and pnl < 0:
-            # Only count as loss if it's a real trade with actual loss
-            self.consecutive_losses += 1
-            self.total_losses += 1
-            logger.info(f"📉 REAL LOSS recorded ({exit_reason}) - consecutive losses: {self.consecutive_losses}")
+        elif is_real_trade and not is_admin_event:
+            # 🔥 FIX (Jan 22, 2026): EXCHANGE_STOP_LOSS MUST count as loss
+            # The old logic required `pnl < 0`, but when exchange executes SL
+            # we often don't have accurate PnL at detection time.
+            # If exit_reason is SL/STOP type, it's a loss regardless of reported pnl.
+            is_sl_type = (
+                exit_reason.upper() in REAL_LOSS_REASONS or
+                'SL' in exit_reason.upper() or
+                'STOP' in exit_reason.upper()
+            )
+            
+            if is_sl_type:
+                # SL hit = ALWAYS a loss (even if pnl is 0 or slightly positive due to timing)
+                self.consecutive_losses += 1
+                self.total_losses += 1
+                logger.info(f"📉 REAL LOSS recorded ({exit_reason}) - SL type exit counts as loss - consecutive losses: {self.consecutive_losses}")
+            elif pnl < 0:
+                # Other real trade with negative pnl
+                self.consecutive_losses += 1
+                self.total_losses += 1
+                logger.info(f"📉 REAL LOSS recorded ({exit_reason}) - negative PnL - consecutive losses: {self.consecutive_losses}")
+            else:
+                # Real trade but positive/zero pnl and not SL type
+                logger.info(f"📊 Trade closed ({exit_reason}) with PnL ${pnl:.2f} - not counting as loss")
         else:
             # Administrative event - don't count as loss
             logger.info(f"⚪ Administrative close ({exit_reason}) - NOT counted as loss (consecutive: {self.consecutive_losses})")

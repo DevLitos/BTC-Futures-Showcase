@@ -227,10 +227,10 @@ class KrakenFuturesWebSocket:
                 # Update heartbeat
                 self.last_tick = time.time()
                 
-                # 🔥 DEBUG: Log first 20 messages only
-                if msg_count < 20:
+                # Log first 10 messages for startup verification
+                if msg_count < 10:
                     feed = data.get('feed', data.get('event', 'unknown'))
-                    logger.info(f"🔍 WS msg #{msg_count}: feed={feed}")
+                    logger.debug(f"WS msg #{msg_count}: feed={feed}")
                 
                 # Procesar por tipo
                 await self._process_message(data)
@@ -393,11 +393,11 @@ class KrakenFuturesWebSocket:
                 bids = data.get('bids', [])
                 asks = data.get('asks', [])
                 
-                # 🔥 DEBUG: Log snapshot size
-                logger.info(f"📚 BOOK SNAPSHOT: {len(bids)} bids, {len(asks)} asks - processing...")
-                start_time = time.time()
+                # Log large snapshots at DEBUG level
+                if len(bids) > 50 or len(asks) > 50:
+                    logger.debug(f"Processing book snapshot: {len(bids)} bids, {len(asks)} asks")
                 
-                # 🔥 FIX (Jan 21, 2026): Yield to event loop during large snapshots
+                # Yield to event loop during large snapshots
                 count = 0
                 for bid in bids:
                     if len(bid) >= 2:
@@ -420,10 +420,6 @@ class KrakenFuturesWebSocket:
                         count += 1
                         if count % 100 == 0:  # Yield every 100 items
                             await asyncio.sleep(0)
-                
-                # 🔥 DEBUG
-                elapsed = time.time() - start_time
-                logger.info(f"📚 BOOK SNAPSHOT processed in {elapsed:.3f}s")
             
             elif feed_type == 'book':
                 # Incremental update

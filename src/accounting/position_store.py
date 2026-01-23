@@ -471,6 +471,10 @@ class PositionStore:
         # Move to history
         self._order_history.append(order)
         
+        # 🔒 FIX (Jan 22, 2026): Trim order history to prevent memory leak
+        if len(self._order_history) > 500:
+            self._order_history = self._order_history[-250:]
+        
         logger.info(f"❌ Order canceled: {order_id} | reason={reason}")
     
     def mark_order_rejected(self, order: TrackedOrder, reason: str = "") -> None:
@@ -539,6 +543,10 @@ class PositionStore:
                 'timestamp': ts.isoformat(),
             }
             self._fill_history.append(fill_record)
+            
+            # 🔒 FIX (Jan 22, 2026): Trim fill history to prevent memory leak
+            if len(self._fill_history) > 1000:
+                self._fill_history = self._fill_history[-500:]
             
             # Update order if tracked
             order = self._orders.get(order_id)

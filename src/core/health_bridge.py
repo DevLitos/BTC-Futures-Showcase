@@ -263,10 +263,20 @@ class HealthBridge:
             
         except json.JSONDecodeError as e:
             logger.warning(f"Invalid health status JSON: {e}")
-            return self._cached_status  # Return stale cache if available
+            # Only return stale cache if it's not too old (max 5 minutes)
+            if self._cached_status and self._last_read_time:
+                cache_age = (datetime.now(UTC) - self._last_read_time).total_seconds()
+                if cache_age < 300:  # 5 minutes max staleness
+                    return self._cached_status
+            return None
         except Exception as e:
             logger.error(f"Failed to read health status: {e}")
-            return self._cached_status
+            # Only return stale cache if it's not too old
+            if self._cached_status and self._last_read_time:
+                cache_age = (datetime.now(UTC) - self._last_read_time).total_seconds()
+                if cache_age < 300:
+                    return self._cached_status
+            return None
     
     def is_bot_alive(self, max_age_seconds: float = 30.0) -> bool:
         """
@@ -369,15 +379,16 @@ class HealthBridgeWriter:
         logger.info("Health bridge writer stopped")
     
     async def _write_loop(self) -> None:
-        """Background loop that writes health status."""
-        import asyncio
+        """Background loop that writes health status to file.
         
+        Uses run_in_executor to prevent blocking the event loop during file I/O.
+        """
         while self._running:
             try:
                 with self._lock:
                     extra = dict(self._extra_data)
                 
-                # 🔥 FIX (Jan 21, 2026): Run file I/O in executor to avoid blocking event loop
+                # Run file I/O in executor to avoid blocking event loop
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
                     None,  # Use default executor (ThreadPoolExecutor)

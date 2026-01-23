@@ -44,9 +44,14 @@ class HealthMetrics:
     sl_hits_by_funding: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     tp_hits_by_funding: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     
-    # Latency tracking
+    # Latency tracking (ONLY pure MARKET orders - not conversions)
     avg_fill_latency_ms: float = 0.0
     max_fill_latency_ms: float = 0.0
+    
+    # 🔥 SEPARATED: LIMIT→MARKET conversions (damage control, NOT execution quality)
+    # These are INFORMATIONAL ONLY - never trigger kill switch
+    limit_to_market_conversions: int = 0
+    limit_to_market_avg_time_ms: float = 0.0
     
     # Integrity issues
     integrity_errors_count: int = 0
@@ -79,7 +84,13 @@ class SystemHealthMonitor:
         self.MAX_LATENCY_MS = 30000  # Alert if any fill > 30 seconds
         
         # History for trend detection
-        self._fill_latencies: List[float] = []
+        self._fill_latencies: List[float] = []  # ONLY pure MARKET orders
+        self._conversion_times: List[float] = []  # LIMIT→MARKET (separate, informational)
+        
+        # 🔥 FIX (Jan 23, 2026): Auto-heal by TIME, not by fills
+        # Kill switch was a deadlock: required fills to heal but couldn't fill while dead
+        self._last_latency_problem: Optional[datetime] = None
+        self.LATENCY_HEAL_MINUTES = 5  # Auto-heal after 5 minutes without NEW problems
         
         logger.info("SystemHealthMonitor initialized")
     
@@ -114,14 +125,67 @@ class SystemHealthMonitor:
         """Record order placement"""
         self.metrics.orders_placed += 1
     
-    def record_order_filled(self, latency_ms: float = 0):
-        """Record successful fill"""
+    def record_order_filled(self, latency_ms: float = 0, order_type: str = 'market', was_converted: bool = False):
+        """Record successful fill
+        
+        Args:
+            latency_ms: Time from order placement to fill
+            order_type: 'market' or 'limit' - only PURE market orders affect health
+            was_converted: True if LIMIT→MARKET conversion (damage control path)
+        
+        CRITICAL DESIGN (Jan 23, 2026):
+        - LIMIT orders waiting = normal trading, IGNORED
+        - LIMIT→MARKET = damage control decision, SEPARATE METRICS (informational only)
+        - Pure MARKET = actual execution quality, TRACKED for health
+        
+        This separation prevents:
+        1. Contaminating execution stats with risk decisions
+        2. Training bot to shut down during volatility
+        3. False positives from normal order flow
+        """
         self.metrics.orders_filled += 1
         
-        if latency_ms > 0:
-            self._fill_latencies.append(latency_ms)
-            self.metrics.max_fill_latency_ms = max(self.metrics.max_fill_latency_ms, latency_ms)
-            self.metrics.avg_fill_latency_ms = sum(self._fill_latencies) / len(self._fill_latencies)
+        if latency_ms <= 0:
+            return
+        
+        # =====================================================================
+        # PATH 1: LIMIT orders (waiting for price) - IGNORED completely
+        # =====================================================================
+        if order_type.lower() == 'limit':
+            # Normal: limit orders wait for price, this is NOT latency
+            if latency_ms > 60000:
+                logger.debug(f"Health: LIMIT filled after {latency_ms/1000:.0f}s (normal price wait)")
+            return
+        
+        # =====================================================================
+        # PATH 2: LIMIT→MARKET conversions - SEPARATE METRICS (never kills)
+        # This is a RISK DECISION, not execution quality
+        # =====================================================================
+        if was_converted:
+            self.metrics.limit_to_market_conversions += 1
+            self._conversion_times.append(latency_ms)
+            self.metrics.limit_to_market_avg_time_ms = sum(self._conversion_times) / len(self._conversion_times)
+            logger.info(f"Health: LIMIT→MARKET conversion #{self.metrics.limit_to_market_conversions} "
+                       f"took {latency_ms/1000:.1f}s (damage control - not affecting health score)")
+            return  # NEVER affects health status
+        
+        # =====================================================================
+        # PATH 3: Pure MARKET orders - THIS is execution quality
+        # =====================================================================
+        LATENCY_CAP_MS = 30000  # 30s cap for extreme API issues
+        effective_latency = min(latency_ms, LATENCY_CAP_MS)
+        
+        if latency_ms > LATENCY_CAP_MS:
+            logger.warning(f"Health: Capping extreme MARKET latency {latency_ms:.0f}ms → {LATENCY_CAP_MS}ms")
+        
+        self._fill_latencies.append(effective_latency)
+        self.metrics.max_fill_latency_ms = max(self.metrics.max_fill_latency_ms, effective_latency)
+        self.metrics.avg_fill_latency_ms = sum(self._fill_latencies) / len(self._fill_latencies)
+        
+        # Track if this is a problem (for time-based auto-heal)
+        if effective_latency > self.MAX_LATENCY_MS:
+            self._last_latency_problem = datetime.now(UTC)
+            logger.warning(f"Health: High MARKET latency {effective_latency:.0f}ms recorded")
     
     def record_order_canceled(self):
         """Record order cancellation"""
@@ -197,9 +261,32 @@ class SystemHealthMonitor:
             alerts.append(f"INTEGRITY_ERRORS: {self.metrics.integrity_errors_count} > {self.MAX_INTEGRITY_ERRORS}")
             is_healthy = False
         
-        # Check latency
-        if self.metrics.max_fill_latency_ms > self.MAX_LATENCY_MS:
-            alerts.append(f"HIGH_LATENCY: {self.metrics.max_fill_latency_ms:.0f}ms > {self.MAX_LATENCY_MS}ms")
+        # Check latency - TIME-BASED auto-heal
+        # 🔥 FIX (Jan 23, 2026): Auto-heal by TIME, not by fills
+        # Old design was a deadlock: needed fills to heal but couldn't fill while dead
+        #
+        # New design:
+        # - Problem detected → record timestamp
+        # - If no NEW problems for LATENCY_HEAL_MINUTES → auto-healed
+        # - Kill switch depends on SYSTEM state, not MARKET activity
+        
+        latency_is_problem = False
+        if self._last_latency_problem:
+            minutes_since_problem = (datetime.now(UTC) - self._last_latency_problem).total_seconds() / 60
+            
+            if minutes_since_problem < self.LATENCY_HEAL_MINUTES:
+                # Still in problem window
+                latency_is_problem = True
+                alerts.append(f"HIGH_LATENCY: problem {minutes_since_problem:.1f}min ago (heals in {self.LATENCY_HEAL_MINUTES - minutes_since_problem:.1f}min)")
+            else:
+                # Auto-healed by time!
+                old_max = self.metrics.max_fill_latency_ms
+                if old_max > self.MAX_LATENCY_MS:
+                    logger.info(f"Health: ✅ AUTO-HEALED by time ({self.LATENCY_HEAL_MINUTES}min without problems)")
+                    self.metrics.max_fill_latency_ms = 0  # Reset
+                    self._last_latency_problem = None
+        
+        if latency_is_problem:
             is_healthy = False
         
         # Check for side mismatches (critical) - qty mismatches are not critical
@@ -249,10 +336,13 @@ class SystemHealthMonitor:
     
     def reset_daily(self):
         """Reset daily metrics (called at midnight)"""
-        logger.info(f"Health: Daily reset | trades={self.metrics.trades_today} fills={self.metrics.orders_filled}/{self.metrics.orders_placed}")
+        logger.info(f"Health: Daily reset | trades={self.metrics.trades_today} fills={self.metrics.orders_filled}/{self.metrics.orders_placed} "
+                   f"conversions={self.metrics.limit_to_market_conversions}")
         
         self.metrics = HealthMetrics()
         self._fill_latencies = []
+        self._conversion_times = []
+        self._last_latency_problem = None
         self.day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     
     def log_summary(self):

@@ -78,8 +78,10 @@ class HealthStatus:
     max_ws_silence_seconds: int = 30
     max_loop_silence_seconds: int = 60
     
-    # Lock for thread-safety
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Lock for thread-safety (RLock allows re-entrant calls from same thread)
+    # CRITICAL: Must be RLock because get_full_status() calls is_live()/is_ready()
+    # which also acquire the lock. With Lock, this causes DEADLOCK.
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     
     def set_ws_connected(self, connected: bool) -> None:
         with self._lock:

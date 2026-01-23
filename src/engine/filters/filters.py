@@ -290,10 +290,18 @@ class HTFFilter:
     - Simplified to work with limited data
     - Uses EMA50 only (not EMA200) when data < 200 candles
     - Logs all decisions for debugging
+    
+    FIX (Jan 23, 2026): ADX Classification
+    - ADX < 18: RANGE mode (scalp stops, mean-reversion)
+    - ADX 18-25: WEAK_TREND mode (cautious trend-following)
+    - ADX >= 25: TREND mode (full trend-following)
     """
     
     def __init__(self, backtest_mode: bool = False):
         self.backtest_mode = backtest_mode
+        # 🔥 FIX (Jan 23, 2026): Store last regime mode for downstream use
+        self.last_htf_regime_mode: str = 'UNKNOWN'
+        self.last_htf_adx: float = 0.0
     
     def check(self, df_1h: pd.DataFrame, current_price: float, 
               correlation_data: Optional[dict] = None) -> Tuple[bool, Optional[str], str]:
@@ -301,6 +309,10 @@ class HTFFilter:
         Check HTF filters
         Returns: (passed: bool, bias: Optional[str], reason: str)
         bias can be 'LONG' or 'SHORT'
+        
+        After calling check(), access:
+        - self.last_htf_regime_mode: 'RANGE', 'WEAK_TREND', 'TREND', or 'LOW_ADX'
+        - self.last_htf_adx: The ADX value used for classification
         """
         # Minimum data requirement: need at least 50 candles for EMA50
         if len(df_1h) < 50:
@@ -402,11 +414,32 @@ class HTFFilter:
         # FULL VALIDATION FOR LIVE TRADING
         # =========================================================
         
-        # Check ADX strength (only in live mode)
-        # ADX defines REGIME, not timing
-        if adx <= HTFFilters.MIN_ADX:
-            logger.info(f"⛔ HTF rejected: ADX {adx:.2f} <= {HTFFilters.MIN_ADX} (no trend regime)")
-            return False, None, f"ADX {adx:.2f} <= {HTFFilters.MIN_ADX}"
+        # 🔥 FIX (Jan 23, 2026): ADX is a CLASSIFIER with CORRECT thresholds
+        # ADX < 18: RANGE → scalp logic, 2.0x ATR stops, mean-reversion
+        # ADX 18-25: WEAK_TREND → cautious trend-following
+        # ADX >= 25: TREND → full trend logic, 3.0x ATR stops
+        #
+        # Previous bug: ADX 15.3 was classified as TREND → wrong!
+        
+        # Determine regime based on ADX with CORRECT thresholds
+        if adx >= HTFFilters.ADX_TREND_MIN:
+            regime_mode = 'TREND'
+        elif adx >= HTFFilters.ADX_RANGE_MAX:
+            regime_mode = 'WEAK_TREND'
+        elif adx >= 12:
+            regime_mode = 'RANGE'
+        else:
+            regime_mode = 'LOW_ADX'  # Very low ADX < 12, chop
+        
+        # 🔥 Store for downstream access
+        self.last_htf_regime_mode = regime_mode
+        self.last_htf_adx = adx
+        
+        logger.info(f"📊 HTF ADX={adx:.1f} → Mode: {regime_mode} (thresholds: <{HTFFilters.ADX_RANGE_MAX}=RANGE, {HTFFilters.ADX_RANGE_MAX}-{HTFFilters.ADX_TREND_MIN}=WEAK_TREND, >={HTFFilters.ADX_TREND_MIN}=TREND)")
+        
+        # 🔥 ADX NO LONGER BLOCKS - but mode is critical for downstream logic
+        if adx < HTFFilters.ADX_RANGE_MAX:
+            logger.info(f"📊 HTF: ADX {adx:.2f} < {HTFFilters.ADX_RANGE_MAX} → {regime_mode} mode (affects stop sizing)")
         
         # =========================================================
         # ADX SLOPE - INFORMATION ONLY, NEVER BLOCKS

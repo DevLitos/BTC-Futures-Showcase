@@ -118,6 +118,7 @@ class EntryFilterPipeline:
                  
                  # Context
                  market_time: datetime = None,
+                 regime_mode: str = 'TREND',  # 🔥 FIX (Jan 22): Added regime_mode parameter
                  
                  # Control
                  early_exit: bool = True) -> FilterDecision:
@@ -155,7 +156,8 @@ class EntryFilterPipeline:
         if self.volatility_shock_filter.enabled:
             decision = self.volatility_shock_filter.evaluate(
                 df=df_5m,
-                market_time=market_time
+                market_time=market_time,
+                timeframe='5m'  # 🔥 FIX (Jan 22): Pass timeframe for TF-specific thresholds
             )
             decision.regime_source = 'volatility_shock'
             self._last_decisions['volatility_shock'] = decision
@@ -187,11 +189,14 @@ class EntryFilterPipeline:
         # ===== 3. MACRO TREND (15m + 1h EMA200 + slope) =====
         # CONTEXT category - use merge_dedup to avoid double penalty with other context filters
         if self.macro_trend_filter.enabled and bias:
+            # 🔥 FIX (Jan 22): Use regime_mode parameter directly
+            # In RANGE mode, macro slope never hard-blocks (only penalizes)
             decision = self.macro_trend_filter.evaluate(
                 df_15m=df_15m,
                 df_1h=df_1h,
                 current_price=current_price,
-                bias=bias
+                bias=bias,
+                regime_mode=regime_mode
             )
             decision.regime_source = 'macro_trend'  # Mark source for dedup
             self._last_decisions['macro_trend'] = decision

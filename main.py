@@ -243,7 +243,7 @@ class TradingSystemOrchestrator:
         # 5. PERSISTENCIA
         self.trade_logger = TradeLogger(settings.persistence_backend, 
                                         settings.database_url.get_secret_value() if settings.database_url else None)
-        self.reconciler = PositionReconciler(self.execution)
+        self.reconciler = PositionReconciler(self.execution, symbol=CCXT_SYMBOL)
         
         # 5.5 OUTPUT MANAGER
         self.output_manager = OutputManager()
@@ -263,7 +263,11 @@ class TradingSystemOrchestrator:
                                          execution=self.execution,
                                          external_data=self.external_data,
                                          trade_logger=self.trade_logger,
-                                         output_manager=self.output_manager)
+                                         output_manager=self.output_manager,
+                                         order_book=self.order_book)
+        
+        # 6.1 Connect reconciler to signal engine (CRITICAL for position state sync)
+        self.reconciler.set_signal_engine(self.signal_engine)
         
         # 7. HEALTH STATUS - Update with signal engine reference
         self.health_status = health_status
@@ -823,13 +827,12 @@ class TradingSystemOrchestrator:
             # Start kill switch monitor task
             self.tasks.append(asyncio.create_task(self._kill_switch_monitor(), name="KillSwitchMonitor"))
             
-            # 🔥 DEBUG: Event loop heartbeat (reduced logging in production)
+            # Event loop heartbeat (logs every minute to confirm system is alive)
             async def _event_loop_heartbeat():
-                """Print heartbeat every 60s to confirm event loop is alive"""
+                """Print heartbeat every minute to confirm event loop is alive"""
                 count = 0
                 while True:
                     count += 1
-                    # Log every 60 seconds
                     if count % 60 == 0:
                         all_tasks = [t for t in asyncio.all_tasks() if not t.done()]
                         logger.debug(f"💓 EVENT_LOOP_HEARTBEAT #{count//60}min | Active tasks: {len(all_tasks)}")
@@ -837,11 +840,10 @@ class TradingSystemOrchestrator:
             self.tasks.append(asyncio.create_task(_event_loop_heartbeat(), name="EventLoopHeartbeat"))
             
             # Start health bridge writer (for FastAPI integration)
-            # 🔥 FIX (Jan 21, 2026): Now uses run_in_executor for file I/O
+            # Uses run_in_executor for non-blocking file I/O
             self.health_bridge_writer.start()
             logger.info("✓ Health bridge writer started (FastAPI can read health_status.json)")
             
-            # 🔥 DEBUG: Temporarily disable Telegram to test if it's blocking
             # Start Telegram command listener (/stop, /force_stop)
             if self.output_manager:
                 self.output_manager.set_force_exit_callback(self.signal_engine.emergency_close_all)
@@ -1099,23 +1101,29 @@ class TradingSystemOrchestrator:
                         logger.warning(f"⚠️ Health Alert: {status['health_alert']}")
                     
                     # Position info for health bridge
+                    logger.debug("📊 [MON] About to check position...")
                     if self.signal_engine.risk_engine.position:
                         pos = self.signal_engine.risk_engine.position
+                        logger.debug("📊 [MON] Position found, calling set_position...")
                         self.health_status.set_position(
                             symbol=pos.symbol,
                             side=pos.direction,
                             size=pos.size
                         )
+                        logger.debug("📊 [MON] set_position done")
                         extra_health_data['position_entry_price'] = pos.entry_price
                         extra_health_data['position_unrealized_pnl'] = getattr(pos, 'unrealized_pnl', 0.0)
                     else:
                         self.health_status.clear_position()
                 
                 # Update health bridge with extra data
+                logger.debug("📊 [MON] About to update health_bridge_writer...")
                 if hasattr(self, 'health_bridge_writer'):
                     self.health_bridge_writer.update_extra_data(extra_health_data)
+                logger.debug("📊 [MON] health_bridge_writer done")
                 
                 # External data
+                logger.debug("📊 [MON] About to get external_data status...")
                 if self.external_data:
                     ext_status = self.external_data.get_status()
                     can_trade, reason = self.external_data.can_trade()
@@ -1143,16 +1151,24 @@ class TradingSystemOrchestrator:
                     logger.info(f"Funding: {ext_status['funding']['current_rate']*100:.4f}%")
                 
                 # Reconciliation
+                logger.debug("📊 [MON] About to get reconciler status...")
                 if self.reconciler:
                     recon = await self.reconciler.get_status()
                     logger.info(f"Last Reconcile: {recon['last_reconcile']}")
+                logger.debug("📊 [MON] reconciler done")
                 
                 # Position Store sync (NEW - source of truth)
+                logger.debug("📊 [MON] About to sync position store...")
                 try:
                     runtime_config = get_runtime_config()
                     if runtime_config.mode == RuntimeMode.LIVE:
                         position_store = get_position_store()
-                        sync_result = await position_store.sync_from_exchange(self.execution.exchange)
+                        logger.debug("📊 [MON] Calling sync_from_exchange...")
+                        sync_result = await asyncio.wait_for(
+                            position_store.sync_from_exchange(self.execution.exchange),
+                            timeout=15.0
+                        )
+                        logger.debug("📊 [MON] sync_from_exchange done")
                         
                         if sync_result.get('discrepancies'):
                             for d in sync_result['discrepancies']:
@@ -1161,6 +1177,8 @@ class TradingSystemOrchestrator:
                             pos = position_store.get_position(CCXT_SYMBOL)
                             pos_str = f"{pos.side} {pos.size:.6f}" if pos and not pos.is_flat else "FLAT"
                             logger.info(f"Position (exchange truth): {pos_str}")
+                except asyncio.TimeoutError:
+                    logger.error("⏰ Position store sync TIMEOUT (15s)")
                 except Exception as e:
                     logger.error(f"Position sync error in monitoring: {e}")
                 

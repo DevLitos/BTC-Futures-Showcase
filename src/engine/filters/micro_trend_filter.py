@@ -382,12 +382,18 @@ class MicroTrendFilter:
     
     # Strength thresholds (applied AFTER hysteresis)
     # Reduced (Jan 15, 2026) to catch trends faster with confluence boost
+    # 🔥 FIX (Jan 22, 2026): Strength threshold for hard block raised
+    # RANGE mode: only hard block if strength > 60% AND ADX < 14
     STRENGTH_HARD_BLOCK = 0.55     # Reduced from 0.65 (confluence boost adds confidence)
+    STRENGTH_HARD_BLOCK_RANGE = 0.60  # 🔥 NEW: Higher threshold for RANGE mode
     STRENGTH_SOFT_BLOCK = 0.40     # Reduced from 0.45
     STRENGTH_WARNING = 0.25
     
     # Minimum score for RSI override to work
     RSI_OVERRIDE_MIN_BASE_SCORE = 5  # Only override if base score >= 5
+    
+    # 🔥 NEW: ADX threshold for conditional hard block in RANGE
+    ADX_LOW_FOR_RANGE_BLOCK = 14.0  # In RANGE, only hard block if ADX < this
     
     def __init__(self, 
                  hard_block_enabled: bool = True,
@@ -416,9 +422,16 @@ class MicroTrendFilter:
               current_price: float, 
               htf_bias: str,
               market_time: Optional[datetime] = None,
-              base_score: int = 0) -> Tuple[bool, str, MicroTrendState]:
+              base_score: int = 0,
+              regime_mode: str = None,  # 🔥 NEW: 'TREND', 'RANGE', 'BREAKOUT'
+              adx_value: float = None    # 🔥 NEW: Current ADX for conditional block
+              ) -> Tuple[bool, str, MicroTrendState]:
         """
         Check micro-trend filter with all improvements.
+        
+        🔥 FIX (Jan 22, 2026): Added conditional hard block for RANGE mode.
+        In RANGE + high strength + low ADX → hard block
+        In TREND or high ADX → only penalty
         
         Args:
             df_5m: 5m candles (regime detection)
@@ -427,6 +440,8 @@ class MicroTrendFilter:
             htf_bias: 'LONG' or 'SHORT'
             market_time: Current time (for caching)
             base_score: Current entry score (for conditional RSI override)
+            regime_mode: 'TREND', 'RANGE', 'BREAKOUT' (for conditional block)
+            adx_value: Current ADX value (for conditional block)
         
         Returns:
             (allowed, reason, state)
@@ -757,16 +772,40 @@ class MicroTrendFilter:
         allowed = True
         reason = ""
         
+        # 🔥 FIX (Jan 22, 2026): Conditional hard block based on regime_mode
         # Hard block only if:
         # 1. Opposing with high strength
         # 2. State confirmed by hysteresis
         # 3. hard_block_enabled
-        should_hard_block = (
-            is_opposing and 
-            state.confirmed_strength >= self.STRENGTH_HARD_BLOCK and
-            self._bars_in_trend >= self.HYSTERESIS_BARS_TO_BLOCK and
-            self.hard_block_enabled
-        )
+        # 4. 🔥 NEW: In RANGE mode, only block if strength >= 60% AND ADX < 14
+        #    In TREND mode, only penalty (no hard block)
+        
+        strength_threshold = self.STRENGTH_HARD_BLOCK
+        should_hard_block = False
+        
+        if is_opposing and self._bars_in_trend >= self.HYSTERESIS_BARS_TO_BLOCK:
+            if regime_mode == 'RANGE':
+                # RANGE: Only hard block if strength very high AND ADX very low (chop)
+                adx_is_low = (adx_value is not None and adx_value < self.ADX_LOW_FOR_RANGE_BLOCK)
+                if state.confirmed_strength >= self.STRENGTH_HARD_BLOCK_RANGE and adx_is_low:
+                    should_hard_block = self.hard_block_enabled
+                    logger.info(f"🔒 RANGE hard block: strength={state.confirmed_strength:.0%}, ADX={adx_value:.1f}")
+                else:
+                    # In RANGE with decent ADX: only penalty
+                    should_hard_block = False
+                    if state.confirmed_strength >= self.STRENGTH_SOFT_BLOCK:
+                        logger.info(f"⚠️ RANGE soft block: strength={state.confirmed_strength:.0%}, ADX={adx_value:.1f if adx_value else 'N/A'} - penalty only")
+            elif regime_mode == 'TREND':
+                # TREND: Never hard block, only penalty
+                should_hard_block = False
+                if state.confirmed_strength >= self.STRENGTH_HARD_BLOCK:
+                    logger.info(f"⚠️ TREND mode: micro opposing (str={state.confirmed_strength:.0%}) - penalty only, no hard block")
+            else:
+                # Default/BREAKOUT: Original logic
+                should_hard_block = (
+                    state.confirmed_strength >= self.STRENGTH_HARD_BLOCK and
+                    self.hard_block_enabled
+                )
         
         if should_hard_block:
             allowed = False

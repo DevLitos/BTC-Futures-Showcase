@@ -317,11 +317,12 @@ class PositionReconciler:
     Detecta desync automáticamente
     """
     
-    def __init__(self, execution_engine, signal_engine=None):
+    def __init__(self, execution_engine, signal_engine=None, reconcile_interval: int = 60, symbol: str = 'BTC/USD:USD'):
         self.execution_engine = execution_engine
         self.signal_engine = signal_engine  # Reference to get expected position
+        self.symbol = symbol  # Trading symbol for position queries
         self.last_reconcile = None
-        self.reconcile_interval = 60  # 1 min
+        self.reconcile_interval = reconcile_interval
         self.is_running = False  # Control flag para evitar bucles infinitos
         self._last_discrepancy = None
         self._exit_in_progress = False  # Lock during exits
@@ -345,17 +346,15 @@ class PositionReconciler:
     
     async def start(self):
         """Start periodic reconciliation"""
-        logger.info("🔄 PositionReconciler started (interval=60s)")
+        logger.info(f"🔄 PositionReconciler started (interval={self.reconcile_interval}s)")
         self.is_running = True
         
-        # 🔥 FIX (Jan 21, 2026): Wait before first reconciliation to let system stabilize
-        # This prevents blocking the event loop during startup
-        logger.info("⏳ Reconciler: waiting 10s before first reconciliation...")
-        await asyncio.sleep(10.0)
+        # Wait before first reconciliation to let system stabilize
+        # This prevents conflicts with startup recovery checks
+        await asyncio.sleep(3.0)
         
         while self.is_running:
             try:
-                # 🔥 FIX (Jan 21, 2026): Add timeout to prevent blocking
                 await asyncio.wait_for(self.reconcile(), timeout=15.0)
             except asyncio.TimeoutError:
                 logger.warning("⏰ PositionReconciler.reconcile() TIMEOUT (15s)")
@@ -397,21 +396,15 @@ class PositionReconciler:
         
         Returns: True si OK, False si desync
         """
-        import asyncio
-        # 🔥 DEBUG: Show all active tasks
-        tasks = [t for t in asyncio.all_tasks() if not t.done()]
-        logger.info(f"📊 ACTIVE TASKS ({len(tasks)}): {[t.get_name() for t in tasks]}")
-        
         # Skip reconciliation during exits to prevent state corruption
         if self._exit_in_progress:
             logger.debug(f"Reconciliation skipped: exit in progress ({self._exit_reason})")
             return True
         
         try:
-            logger.info("🔍 Reconcile: about to call get_position...")
             # Get exchange position (source of truth)
-            exchange_pos = await self.execution_engine.get_position('BTC/USD:USD')
-            logger.info(f"🔍 Reconcile: get_position returned: {exchange_pos is not None}")
+            exchange_pos = await self.execution_engine.get_position(self.symbol)
+            logger.debug(f"Reconcile: exchange_pos={'present' if exchange_pos else 'none'}")
             
             # Get expected position from bot state
             expected = self._get_expected_position()

@@ -43,7 +43,8 @@ class Position:
     def __init__(self, symbol: str, direction: str, entry_price: float, 
                  size: float, stop_loss: float, atr_1m: float,
                  market_time: datetime = None,
-                 trade_type: TradeType = TradeType.LONG_MAIN):
+                 trade_type: TradeType = TradeType.LONG_MAIN,
+                 regime_mode: str = 'TREND'):  # 🔥 NEW: regime_mode for BE logic
         # ===== INPUT VALIDATION =====
         if not symbol:
             raise ValueError("symbol cannot be empty")
@@ -65,6 +66,7 @@ class Position:
         self.symbol = symbol
         self.direction = direction  # 'LONG' or 'SHORT'
         self.trade_type = trade_type  # LONG_MAIN, SHORT_STRUCTURAL, or SHORT_PULLBACK
+        self.regime_mode = regime_mode  # 🔥 NEW: 'TREND', 'RANGE', 'BREAKOUT'
         self.entry_price = entry_price
         self.size = size
         self.stop_loss = stop_loss
@@ -153,21 +155,70 @@ class Position:
         self.avg_bb_width = 0.0
         
         # =====================================================================
+        # ANTI RE-ENTRY TRACKING (Jan 23, 2026)
+        # Track entry conditions for "no reentry without new edge"
+        # =====================================================================
+        self.entry_conditions = {}  # Store entry conditions for comparison
+        self.entry_atr = atr_1m  # Store ATR at entry for price range comparison
+        
+        # =====================================================================
+        # WORST-TRADE PREVENTION (Jan 23, 2026)
+        # Track thesis validity for max loss limiting
+        # =====================================================================
+        self.thesis_intact = True  # Assume thesis is valid until proven otherwise
+        self.thesis_invalidation_reason = None
+        self.thesis_last_check_candle = 0
+        
+        # =====================================================================
+        # CHECKPOINT IDEMPOTENCY (Jan 23, 2026)
+        # Prevent repeated checkpoint actions and log spam
+        # =====================================================================
+        self.time_checkpoint_profit_partial_done = False  # Only one TIME_IN_PROFIT partial
+        self.time_checkpoint_last_action: Optional[str] = None  # Last checkpoint action taken
+        self.time_checkpoint_last_r_bucket: Optional[float] = None  # Last logged R bucket (0.05R increments)
+        self.last_management_action_time: Optional[datetime] = None  # Debounce management actions
+        self.MANAGEMENT_COOLDOWN_SEC = 30  # Seconds to wait between management actions
+        
+        # =====================================================================
         # HYBRID ATR TRAILING (Jan 15, 2026)
+        # 🔥 FIX (Jan 22, 2026): Use regime_mode from parameter, not hardcoded TREND
         # =====================================================================
         # Initialize hybrid trailing stop manager
         self.hybrid_trailing: Optional[HybridATRTrailing] = None
         self.use_hybrid_trailing = True  # Feature flag
         
         if self.use_hybrid_trailing:
-            # Detect initial regime from market context (default to TREND)
-            initial_regime = TrailingRegime.TREND
+            # 🔥 FIX: Use regime_mode passed from SignalEngine (SINGLE SOURCE OF TRUTH)
+            # Map regime_mode string to TrailingRegime enum
+            # Handles both simplified (TREND/RANGE) and EdgeRegime values
+            regime_map = {
+                # Simplified values
+                'TREND': TrailingRegime.TREND,
+                'TREND_EXPANSION': TrailingRegime.TREND,
+                'BREAKOUT': TrailingRegime.TREND,
+                'RANGE': TrailingRegime.RANGE,
+                'TREND_EXHAUSTION': TrailingRegime.RANGE,
+                'MEAN_REVERSION': TrailingRegime.RANGE,
+                'CHOPPY_DEAD': TrailingRegime.RANGE,
+                # EdgeRegime values (from EdgeRegimeClassifier)
+                'EXPANSION_TREND_CONTINUATION': TrailingRegime.TREND,  # REGIME_A
+                'COMPRESSION_FAKEOUTS': TrailingRegime.RANGE,          # REGIME_B
+                'NEWS_DRIVEN_UNSTABLE': TrailingRegime.RANGE,          # REGIME_C
+                'LOW_PARTICIPATION_CHOP': TrailingRegime.RANGE,        # REGIME_D
+                'UNKNOWN': TrailingRegime.RANGE,
+                'INSUFFICIENT_DATA': TrailingRegime.RANGE,
+            }
+            # Handle both upper and original case
+            regime_key = regime_mode.upper() if regime_mode else 'RANGE'
+            initial_regime = regime_map.get(regime_key, TrailingRegime.RANGE)
+            
             self.hybrid_trailing = create_hybrid_trailing(
                 entry_price=entry_price,
                 initial_stop=stop_loss,
                 direction=direction,
                 regime_str=initial_regime.value
             )
+            logger.info(f"🎯 Trailing using regime={initial_regime.value} (from regime_mode={regime_mode})")
         
         logger.info(f"Position opened: {direction} {size} {symbol} @ {entry_price:.2f} | SL: {stop_loss:.2f} | TP1: {self.tp1_price:.2f}")
     
@@ -400,6 +451,7 @@ class Position:
         
         # =====================================================================
         # LEGACY STEPPED TRAILING (fallback if hybrid disabled)
+        # 🔥 FIX (Jan 22, 2026): Added regime-aware BE logic
         # =====================================================================
         risk = abs(self.entry_price - self.initial_stop_loss)
         if risk <= 0:
@@ -430,23 +482,40 @@ class Position:
                 self.trailing_stop = min(self.trailing_stop, new_stop)
             logger.debug(f"📈 TRAILING STEP 3: MFE {mfe_r:.2f}R >= 1.5R → Lock +0.9R")
         
-        elif mfe_r >= 1.0:
-            # Lock in +0.4R
-            if self.direction == 'LONG':
-                new_stop = self.entry_price + (risk * 0.4)
-                self.trailing_stop = max(self.trailing_stop, new_stop)
+        elif mfe_r >= 1.2:
+            # 🔥 FIX (Jan 22, 2026): BE level depends on regime_mode
+            # TREND: BE at 1.2R (give runners room)
+            # RANGE: BE at this level already (was 1.0R but now at 1.2R for RANGE)
+            # Lock in +0.4R for TREND, BE for RANGE
+            if self.regime_mode == 'RANGE':
+                # RANGE: Lock BE earlier (less runners expected)
+                if self.direction == 'LONG':
+                    self.trailing_stop = max(self.trailing_stop, self.entry_price)
+                else:
+                    self.trailing_stop = min(self.trailing_stop, self.entry_price)
+                logger.debug(f"📈 TRAILING (RANGE): MFE {mfe_r:.2f}R >= 1.2R → Lock BE")
             else:
-                new_stop = self.entry_price - (risk * 0.4)
-                self.trailing_stop = min(self.trailing_stop, new_stop)
-            logger.debug(f"📈 TRAILING STEP 2: MFE {mfe_r:.2f}R >= 1.0R → Lock +0.4R")
+                # TREND/BREAKOUT: Lock +0.4R (give room)
+                if self.direction == 'LONG':
+                    new_stop = self.entry_price + (risk * 0.4)
+                    self.trailing_stop = max(self.trailing_stop, new_stop)
+                else:
+                    new_stop = self.entry_price - (risk * 0.4)
+                    self.trailing_stop = min(self.trailing_stop, new_stop)
+                logger.debug(f"📈 TRAILING STEP 2: MFE {mfe_r:.2f}R >= 1.2R → Lock +0.4R")
         
-        elif mfe_r >= 0.8:
-            # FASE 1: Trailing only activates at 0.8R MFE (lock in breakeven)
-            if self.direction == 'LONG':
-                self.trailing_stop = max(self.trailing_stop, self.entry_price)
-            else:
-                self.trailing_stop = min(self.trailing_stop, self.entry_price)
-            logger.debug(f"📈 TRAILING STEP 1: MFE {mfe_r:.2f}R >= 0.8R → Lock BE (FASE 1 threshold)")
+        elif mfe_r >= 1.0:
+            # 🔥 FIX: RANGE locks BE at 1.0R (more defensive)
+            if self.regime_mode == 'RANGE':
+                if self.direction == 'LONG':
+                    # Lock at -0.2R (slightly protective but not full BE)
+                    new_stop = self.entry_price - (risk * 0.2)
+                    self.trailing_stop = max(self.trailing_stop, new_stop)
+                else:
+                    new_stop = self.entry_price + (risk * 0.2)
+                    self.trailing_stop = min(self.trailing_stop, new_stop)
+                logger.debug(f"📈 TRAILING (RANGE): MFE {mfe_r:.2f}R >= 1.0R → Lock -0.2R")
+            # TREND: no action at 1.0R, wait for 1.2R
     
     def increment_candle_count(self):
         """Increment candle count for mediocre trade detection"""
@@ -513,57 +582,327 @@ class Position:
         return False
     
     def check_mediocre_trade_exit(self, n_candles: int = 6, mfe_threshold: float = 0.3,
-                                     adx: float = None, atr_ratio: float = None) -> bool:
+                                     adx: float = None, atr_ratio: float = None,
+                                     current_price: float = None,
+                                     vwap: float = None, last_lh: float = None,
+                                     vah: float = None) -> dict:
         """
-        KILL SWITCH: Exit stagnant trades early (TIME_INVALIDATION)
+        TIME_INVALIDATION INTELIGENTE (Jan 23, 2026)
         
-        HYBRID LOGIC (Jan 9, 2026):
-        Close ONLY if ALL conditions are met:
-        1. candles >= n_candles (6)
-        2. MFE < threshold_R (0.3R) - trade hasn't proven direction
-        3. ADX < 20 - market is NOT trending (optional, defaults to True if not provided)
-        4. ATR ratio < 0.8 - volatility is compressed (optional, defaults to True if not provided)
+        CAMBIO CRÍTICO: Timeout = checkpoint, NO gatillo ciego.
         
-        This avoids:
-        - Killing slow but directional trades in trending markets
-        - Staying stuck in dead ranges with no volatility
+        En lugar de cerrar automáticamente, evalúa:
+        1. Si hay invalidación ESTRUCTURAL real (no numérica)
+        2. El estado del P&L (profit/flat/loss)
+        3. Si cerrar empeoraría el trade vs esperar
+        
+        REGLA DE ORO: TIME_INVALIDATION NUNCA puede cerrar un trade 
+        con más pérdida que -0.25R. Si estás en -0.1R y no hay invalidación
+        estructural, NO cierras "por tiempo" a -0.6R después.
         
         Args:
             n_candles: Number of candles before checking (default 6)
             mfe_threshold: Minimum MFE in R required (default 0.3R)
-            adx: Current ADX value (if None, condition is considered met)
-            atr_ratio: Current ATR / Average ATR (if None, condition is considered met)
+            adx: Current ADX value
+            atr_ratio: Current ATR / Average ATR
+            current_price: Current price for P&L calculation
+            vwap: Current VWAP for structural invalidation
+            last_lh: Last Lower High for structure check
+            vah: Value Area High for structure check
         
-        Returns: True if trade should be killed
+        Returns: 
+            dict with action and details, or None if no action needed
+            Possible actions: 'CLOSE', 'PARTIAL', 'REDUCE_RISK', 'HOLD'
         """
+        from src.engine.config import ExitHierarchy
+        
         if self.candle_count < n_candles:
-            return False
+            return None  # Not yet at checkpoint
         
         mfe_r = self.calculate_mfe_r()
         
-        # Condition 1: MFE too low (didn't prove direction)
+        # Calculate current R (actual P&L right now)
+        if current_price is None:
+            return None
+        
+        initial_risk = abs(self.entry_price - self.initial_stop_loss)
+        if initial_risk <= 0:
+            return None
+            
+        if self.direction == 'LONG':
+            current_r = (current_price - self.entry_price) / initial_risk
+        else:
+            current_r = (self.entry_price - current_price) / initial_risk
+        
+        # =====================================================================
+        # REGLA CRÍTICA: Límite de pérdida por TIME_INVALIDATION
+        # Si ya estamos en -0.25R o peor, cerrar INMEDIATAMENTE
+        # =====================================================================
+        max_loss_r = ExitHierarchy.TIME_INVALIDATION_MAX_LOSS_R
+        
+        if current_r <= max_loss_r:
+            logger.warning(
+                f"☠️ TIME_INVALIDATION: Loss {current_r:.2f}R exceeds limit {max_loss_r}R | "
+                f"Closing immediately to prevent worse loss"
+            )
+            return {
+                'action': 'CLOSE',
+                'reason': 'TIME_INVALIDATION_MAX_LOSS',
+                'current_r': current_r,
+                'max_loss_r': max_loss_r,
+                'candles': self.candle_count
+            }
+        
+        # =====================================================================
+        # Si MFE >= threshold, trade está probándose - NO matar
+        # =====================================================================
         if mfe_r >= mfe_threshold:
-            return False  # Trade is proving itself, don't kill
+            return None
         
-        # Condition 2: ADX check (skip if market is trending)
+        # =====================================================================
+        # Check condiciones de mercado (ADX, ATR)
+        # Si mercado está trending o volatilidad OK, dar más tiempo
+        # =====================================================================
         ADX_THRESHOLD = 20
+        ATR_RATIO_THRESHOLD = 0.8
+        
+        market_alive = False
         if adx is not None and adx >= ADX_THRESHOLD:
-            # Market is trending - give trade more time
-            logger.debug(f"📊 TIME_INVALIDATION skipped: ADX={adx:.1f} >= {ADX_THRESHOLD} (trending market)")
-            return False
+            market_alive = True
+            logger.debug(f"📊 TIME checkpoint: ADX={adx:.1f} >= {ADX_THRESHOLD} (trending)")
         
-        # Condition 3: Volatility check (skip if volatility is expanding)
-        ATR_RATIO_THRESHOLD = 0.8  # Below 80% of average = compressed
         if atr_ratio is not None and atr_ratio >= ATR_RATIO_THRESHOLD:
-            # Volatility is normal/expanding - trade might move soon
-            logger.debug(f"📊 TIME_INVALIDATION skipped: ATR ratio={atr_ratio:.2f} >= {ATR_RATIO_THRESHOLD} (volatility OK)")
-            return False
+            market_alive = True
+            logger.debug(f"📊 TIME checkpoint: ATR ratio={atr_ratio:.2f} >= {ATR_RATIO_THRESHOLD} (vol OK)")
         
-        # ALL conditions met: market is dead/lateral, kill the trade
+        # =====================================================================
+        # COMPORTAMIENTO SEGÚN P&L ACTUAL
+        # =====================================================================
+        
+        # A) EN PROFIT (>= 0.1R): Parcial + runner
+        # 🔥 FIX (Jan 23, 2026): IDEMPOTENCY - Only allow ONE TIME_IN_PROFIT partial
+        if current_r >= 0.1:
+            # Check if we already did the TIME_IN_PROFIT partial
+            if self.time_checkpoint_profit_partial_done:
+                # Already executed - return HOLD instead of repeating
+                logger.debug(f"⏱️ TIME checkpoint in PROFIT: {current_r:.2f}R | Partial already done, holding runner")
+                return {
+                    'action': 'HOLD',
+                    'reason': 'TIME_IN_PROFIT_PARTIAL_ALREADY_DONE',
+                    'current_r': current_r,
+                    'candles': self.candle_count
+                }
+            
+            partial_pct = ExitHierarchy.TIME_IN_PROFIT_PARTIAL_PCT
+            logger.info(
+                f"⏱️ TIME checkpoint in PROFIT: {current_r:.2f}R | "
+                f"Action: {partial_pct:.0%} partial, keep runner (ONE-SHOT)"
+            )
+            return {
+                'action': 'PARTIAL',
+                'reason': 'TIME_IN_PROFIT',
+                'current_r': current_r,
+                'partial_pct': partial_pct,
+                'keep_runner': True,
+                'candles': self.candle_count
+            }
+        
+        # B) FLAT o pequeña pérdida: Evaluar si mercado está vivo
+        if market_alive:
+            # Mercado activo - dar más tiempo, solo ajustar stop
+            # 🔥 FIX (Jan 23, 2026): Rate-limited logging - only log on R bucket change
+            current_r_bucket = round(current_r * 20) / 20  # 0.05R increments
+            adx_str = f"{adx:.1f}" if adx is not None else "N/A"
+            
+            # Only log if R bucket changed (avoid spam)
+            if self.time_checkpoint_last_r_bucket != current_r_bucket:
+                self.time_checkpoint_last_r_bucket = current_r_bucket
+                logger.info(
+                    f"⏱️ TIME checkpoint FLAT (market alive): {current_r:.2f}R | "
+                    f"ADX={adx_str} | Holding"
+                )
+            # else: skip logging (same bucket)
+            
+            return {
+                'action': 'HOLD',
+                'reason': 'MARKET_ALIVE',
+                'current_r': current_r,
+                'candles': self.candle_count,
+                'market_indicators': {'adx': adx, 'atr_ratio': atr_ratio}
+            }
+        
+        # C) Mercado muerto + flat: Evaluar invalidación estructural
+        structural_invalid = self._check_structural_invalidation(
+            current_price, vwap, last_lh, vah
+        )
+        
+        if structural_invalid:
+            # Estructura invalidada - cerrar
+            logger.warning(
+                f"☠️ TIME_INVALIDATION + STRUCTURE INVALID: {current_r:.2f}R | "
+                f"{structural_invalid['reason']}"
+            )
+            return {
+                'action': 'CLOSE',
+                'reason': f"TIME_STRUCTURAL_INVALID: {structural_invalid['reason']}",
+                'current_r': current_r,
+                'candles': self.candle_count,
+                'structural_details': structural_invalid
+            }
+        
+        # D) Mercado muerto pero estructura intacta - reducir riesgo, no cerrar
+        # Solo cerrar si ya estamos cerca del límite
+        if current_r <= max_loss_r + 0.1:  # Dentro de 0.1R del límite
+            logger.info(
+                f"⏱️ TIME checkpoint near limit: {current_r:.2f}R | "
+                f"Structure intact but close to max loss - REDUCE RISK"
+            )
+            return {
+                'action': 'REDUCE_RISK',
+                'reason': 'TIME_NEAR_LIMIT',
+                'current_r': current_r,
+                'move_stop_to_r': max_loss_r,
+                'candles': self.candle_count
+            }
+        
+        # E) Default: Mercado muerto, estructura OK, pérdida moderada
+        # Cerrar porque no hay edge ya
         adx_str = f"ADX={adx:.1f}" if adx else "ADX=N/A"
         atr_str = f"ATR_ratio={atr_ratio:.2f}" if atr_ratio else "ATR=N/A"
-        logger.warning(f"☠️ TIME_INVALIDATION: {self.candle_count} velas, MFE={mfe_r:.2f}R < {mfe_threshold}R | {adx_str} | {atr_str}")
-        return True
+        logger.warning(
+            f"☠️ TIME_INVALIDATION: {self.candle_count} velas, MFE={mfe_r:.2f}R, "
+            f"current={current_r:.2f}R | {adx_str} | {atr_str}"
+        )
+        return {
+            'action': 'CLOSE',
+            'reason': 'TIME_INVALIDATION_DEAD_MARKET',
+            'current_r': current_r,
+            'mfe_r': mfe_r,
+            'candles': self.candle_count
+        }
+    
+    def _check_structural_invalidation(self, current_price: float, 
+                                        vwap: float = None, 
+                                        last_lh: float = None,
+                                        vah: float = None) -> dict:
+        """
+        Verifica invalidación ESTRUCTURAL real (no numérica).
+        
+        SHORT invalida si:
+        - Precio reclaim VWAP con aceptación
+        - Rotura de último Lower High  
+        - Recuperar VAH con aceptación
+        
+        LONG invalida si:
+        - Precio pierde VWAP con aceptación
+        - Rotura de último Higher Low
+        - Perder VAL con aceptación
+        
+        Returns:
+            dict con 'invalid': True/False y 'reason' si invalida
+        """
+        if current_price is None:
+            return None
+        
+        # Track acceptance candles (simplified - would need candle tracking)
+        # For now, check if price is clearly on wrong side
+        
+        if self.direction == 'SHORT':
+            # SHORT invalida si precio está claramente ARRIBA de niveles clave
+            if vwap and current_price > vwap * 1.001:  # 0.1% above VWAP
+                self.thesis_intact = False
+                self.thesis_invalidation_reason = f'VWAP_RECLAIM: {current_price:.2f} > {vwap:.2f}'
+                return {
+                    'invalid': True,
+                    'reason': f'VWAP_RECLAIM: price {current_price:.2f} > VWAP {vwap:.2f}'
+                }
+            
+            if last_lh and current_price > last_lh:
+                self.thesis_intact = False
+                self.thesis_invalidation_reason = f'LH_BROKEN: {current_price:.2f} > {last_lh:.2f}'
+                return {
+                    'invalid': True,
+                    'reason': f'LH_BROKEN: price {current_price:.2f} > LH {last_lh:.2f}'
+                }
+            
+            if vah and current_price > vah * 1.001:
+                self.thesis_intact = False
+                self.thesis_invalidation_reason = f'VAH_RECLAIM: {current_price:.2f} > {vah:.2f}'
+                return {
+                    'invalid': True,
+                    'reason': f'VAH_RECLAIM: price {current_price:.2f} > VAH {vah:.2f}'
+                }
+        
+        elif self.direction == 'LONG':
+            # LONG invalida si precio está claramente DEBAJO de niveles clave
+            if vwap and current_price < vwap * 0.999:  # 0.1% below VWAP
+                self.thesis_intact = False
+                self.thesis_invalidation_reason = f'VWAP_LOST: {current_price:.2f} < {vwap:.2f}'
+                return {
+                    'invalid': True,
+                    'reason': f'VWAP_LOST: price {current_price:.2f} < VWAP {vwap:.2f}'
+                }
+            
+            # last_lh for LONG would be last Higher Low (last_hl)
+            # Simplified for now
+        
+        return None
+    
+    def check_worst_trade_prevention(self, current_price: float) -> dict:
+        """
+        WORST-TRADE PREVENTION (Jan 23, 2026)
+        
+        "Si no invalida la tesis, no puede ser el peor trade del día"
+        
+        Si el trade está dentro de tesis (no invalida estructura), 
+        su pérdida máxima está limitada por:
+        - hard stop (invalidation)
+        - cap de pérdida por tesis válida (ej. -0.25R)
+        
+        Si llega a -0.25R ANTES de invalidar estructura:
+        - El stop está mal ubicado para ese setup
+        - O el setup no era el correcto
+        - En ambos casos → SALIR
+        
+        Returns:
+            dict with action if should exit, None otherwise
+        """
+        from src.engine.config import ExitHierarchy
+        
+        if not ExitHierarchy.WORST_TRADE_PREVENTION_ENABLED:
+            return None
+        
+        # Calculate current R
+        initial_risk = abs(self.entry_price - self.initial_stop_loss)
+        if initial_risk <= 0:
+            return None
+        
+        if self.direction == 'LONG':
+            current_r = (current_price - self.entry_price) / initial_risk
+        else:
+            current_r = (self.entry_price - current_price) / initial_risk
+        
+        max_loss_when_thesis_intact = ExitHierarchy.THESIS_INTACT_MAX_LOSS_R
+        
+        # If thesis is intact and we hit the loss cap, exit
+        if self.thesis_intact and current_r <= max_loss_when_thesis_intact:
+            logger.warning(
+                f"🛡️ WORST-TRADE PREVENTION: Loss {current_r:.2f}R hit limit {max_loss_when_thesis_intact}R "
+                f"while thesis INTACT - setup was wrong"
+            )
+            return {
+                'action': 'CLOSE',
+                'reason': 'WORST_TRADE_PREVENTION',
+                'current_r': current_r,
+                'max_loss_r': max_loss_when_thesis_intact,
+                'thesis_intact': True,
+                'message': 'Loss limit hit before thesis invalidation - setup incorrect'
+            }
+        
+        # If thesis invalidated, let regular stop handle it
+        # (don't apply this cap, let it go to full stop if needed)
+        
+        return None
     
     def check_add_to_winner(self, current_price: float) -> dict:
         """
@@ -1139,16 +1478,23 @@ class Position:
         """
         SMART EXIT #3: Exit when approaching strong resistance/support (VPOC).
         
+        CAMBIO (Jan 23, 2026): VPOC_EXIT ahora es PARCIAL + RUNNER
+        - Cierra 70% de la posición (configurable)
+        - Deja 30% como runner con stop en BE
+        - Solo cierre total si MFE < 0.5R (no hay margen para runner)
+        
         Volume Profile POC (Point of Control) represents strongest resistance.
-        Exit before getting trapped.
+        Exit PARTIAL before getting trapped, keep runner for continuation.
         
         Args:
             current_price: Current market price
             vpoc_price: Volume Profile Point of Control price
         
         Returns:
-            Dict with exit details if near VPOC, None otherwise
+            Dict with exit details (partial or full), None otherwise
         """
+        from src.engine.config import ExitHierarchy
+        
         if not SmartExits.VPOC_EXIT_ENABLED:
             return None
         
@@ -1182,15 +1528,49 @@ class Position:
             reason = f"SHORT approaching VPOC support @ {vpoc_price:.2f}"
         
         if approaching_resistance:
-            logger.warning(f"🎯 VPOC EXIT: {reason} | Distance: {distance_pct:.2%} | MFE: {mfe_r:.2f}R")
-            return {
-                'action': 'VPOC_EXIT',
-                'current_price': current_price,
-                'vpoc_price': vpoc_price,
-                'distance_pct': distance_pct,
-                'mfe_r': mfe_r,
-                'reason': reason
-            }
+            # ================================================================
+            # NUEVO: VPOC_EXIT como parcial + runner (Jan 23, 2026)
+            # ================================================================
+            use_partial = ExitHierarchy.VPOC_EXIT_AS_PARTIAL
+            min_mfe_for_runner = ExitHierarchy.VPOC_MIN_MFE_FOR_RUNNER
+            
+            if use_partial and mfe_r >= min_mfe_for_runner:
+                # Suficiente profit para runner - hacer parcial
+                partial_pct = ExitHierarchy.VPOC_PARTIAL_CLOSE_PCT
+                runner_pct = ExitHierarchy.VPOC_RUNNER_PCT
+                runner_stop_r = ExitHierarchy.VPOC_RUNNER_STOP_R
+                
+                logger.warning(
+                    f"🎯 VPOC PARTIAL EXIT: {reason} | Distance: {distance_pct:.2%} | "
+                    f"MFE: {mfe_r:.2f}R | Closing {partial_pct:.0%}, runner {runner_pct:.0%}"
+                )
+                return {
+                    'action': 'VPOC_PARTIAL_EXIT',
+                    'current_price': current_price,
+                    'vpoc_price': vpoc_price,
+                    'distance_pct': distance_pct,
+                    'mfe_r': mfe_r,
+                    'reason': reason,
+                    'partial_pct': partial_pct,
+                    'runner_pct': runner_pct,
+                    'runner_stop_r': runner_stop_r,
+                    'is_partial': True
+                }
+            else:
+                # No hay suficiente profit para runner - cierre total
+                logger.warning(
+                    f"🎯 VPOC FULL EXIT: {reason} | Distance: {distance_pct:.2%} | "
+                    f"MFE: {mfe_r:.2f}R < {min_mfe_for_runner}R (no runner margin)"
+                )
+                return {
+                    'action': 'VPOC_EXIT',
+                    'current_price': current_price,
+                    'vpoc_price': vpoc_price,
+                    'distance_pct': distance_pct,
+                    'mfe_r': mfe_r,
+                    'reason': reason,
+                    'is_partial': False
+                }
         
         return None
     
@@ -1254,7 +1634,7 @@ class Position:
         
         return None
     
-    def check_volatility_squeeze_exit(self, bb_width: float, bb_avg_width: float) -> Optional[Dict]:
+    def check_volatility_squeeze_exit(self, bb_width: float, bb_avg_width: float, current_price: float) -> Optional[Dict]:
         """
         SMART EXIT #5: Exit during volatility squeeze.
         
@@ -1264,6 +1644,7 @@ class Position:
         Args:
             bb_width: Current Bollinger Band width (upper - lower)
             bb_avg_width: Average BB width (for comparison)
+            current_price: Current market price (for calculating current R)
         
         Returns:
             Dict with exit details if in squeeze, None otherwise
@@ -1287,14 +1668,37 @@ class Position:
         
         mfe_r = self.calculate_mfe_r()
         
-        # Only exit if in the "uncertain profit" zone
+        # Calculate current R (actual PnL right now)
+        initial_risk = abs(self.entry_price - self.stop_loss)
+        if initial_risk > 0:
+            if self.direction == 'LONG':
+                current_r = (current_price - self.entry_price) / initial_risk
+            else:
+                current_r = (self.entry_price - current_price) / initial_risk
+        else:
+            current_r = 0.0
+        
+        # Only exit if in the "uncertain profit" zone (based on MFE)
         if mfe_r < SmartExits.SQUEEZE_EXIT_MIN_MFE_R:
-            return None  # Not enough profit, hold
+            return None  # Not enough profit reached, hold
         
         if mfe_r > SmartExits.SQUEEZE_EXIT_MAX_MFE_R:
             return None  # Good profit, let it run
         
-        reason = f"Volatility squeeze (BB width {squeeze_ratio:.0%} of avg) with small profit {mfe_r:.2f}R"
+        # 🔒 FIX (Jan 22, 2026): Don't exit in squeeze if we've already given back profit
+        # If current_r is significantly negative, we've missed the exit window
+        # Better to hold for breakout or let SL handle it
+        if current_r < -0.2:  # Already down 0.2R or more
+            logger.debug(f"📦 SQUEEZE: Skipping exit, current_r={current_r:.2f} too negative (gave back profit)")
+            return None
+        
+        # 🔒 FIX (Jan 22, 2026): Don't call it "small profit" if current R is negative
+        if current_r >= 0:
+            profit_status = f"MFE {mfe_r:.2f}R, current +{current_r:.2f}R"
+        else:
+            profit_status = f"MFE was {mfe_r:.2f}R, now {current_r:.2f}R (gave back profit)"
+        
+        reason = f"Volatility squeeze (BB width {squeeze_ratio:.0%} of avg) | {profit_status}"
         logger.warning(f"📦 SQUEEZE EXIT: {reason}")
         
         return {
@@ -1303,6 +1707,7 @@ class Position:
             'bb_avg_width': bb_avg_width,
             'squeeze_ratio': squeeze_ratio,
             'mfe_r': mfe_r,
+            'current_r': current_r,
             'reason': reason
         }
     
@@ -1484,7 +1889,7 @@ class Position:
         
         # Priority 6: Volatility squeeze exit
         if bb_width is not None and bb_avg is not None:
-            squeeze_result = self.check_volatility_squeeze_exit(bb_width, bb_avg)
+            squeeze_result = self.check_volatility_squeeze_exit(bb_width, bb_avg, current_price)
             if squeeze_result:
                 return squeeze_result
         
@@ -1494,6 +1899,11 @@ class Position:
 class RiskEngine:
     """
     Manages position sizing, risk limits, and exit management
+    
+    UPDATED (Jan 23, 2026):
+    - Anti-reentry tracking: No reentry without new edge
+    - Worst-trade prevention: Cap losses when thesis intact
+    - Countertrend mode specific rules
     """
     
     def __init__(self, capital: float = 0.0):
@@ -1513,14 +1923,147 @@ class RiskEngine:
         self.winning_trades = []
         self.losing_trades = []
         
+        # =====================================================================
+        # ANTI RE-ENTRY TRACKING (Jan 23, 2026)
+        # Track last entry to prevent reentry without new edge
+        # =====================================================================
+        self.last_entry_price: Optional[float] = None
+        self.last_entry_direction: Optional[str] = None
+        self.last_entry_atr: Optional[float] = None
+        self.last_entry_time: Optional[datetime] = None
+        self.last_exit_reason: Optional[str] = None
+        self.last_entry_conditions: dict = {}  # Store entry conditions
+        
         # Lock for thread safety
         self._lock = asyncio.Lock()
+    
+    def check_reentry_allowed(self, entry_price: float, direction: str, 
+                               atr: float, new_conditions: dict = None) -> dict:
+        """
+        ANTI RE-ENTRY: Check if reentry is allowed at this price.
+        
+        Prohibir reentrar en mismo rango de precio sin nueva información:
+        - Mismo precio = ±0.2 ATR del último entry
+        - Misma dirección
+        - Sin nuevo edge (LH, breakdown+retest, nuevo POC)
+        
+        Args:
+            entry_price: Proposed entry price
+            direction: Proposed direction
+            atr: Current ATR for range calculation
+            new_conditions: Dict of current market conditions
+        
+        Returns:
+            dict with 'allowed': bool and 'reason': str
+        """
+        from src.engine.config import ExitHierarchy
+        
+        if not ExitHierarchy.ANTI_REENTRY_ENABLED:
+            return {'allowed': True, 'reason': 'Anti-reentry disabled'}
+        
+        # No previous entry to compare
+        if self.last_entry_price is None:
+            return {'allowed': True, 'reason': 'No previous entry'}
+        
+        # Different direction is always allowed
+        if direction != self.last_entry_direction:
+            return {'allowed': True, 'reason': 'Different direction'}
+        
+        # Calculate price range (±0.2 ATR)
+        use_atr = self.last_entry_atr if self.last_entry_atr else atr
+        price_range = use_atr * ExitHierarchy.SAME_PRICE_RANGE_ATR
+        
+        price_diff = abs(entry_price - self.last_entry_price)
+        
+        # If price is outside the "same price" range, allowed
+        if price_diff > price_range:
+            return {
+                'allowed': True, 
+                'reason': f'Price moved {price_diff:.2f} > {price_range:.2f} (0.2 ATR)'
+            }
+        
+        # Same price range - check for new edge
+        if new_conditions and ExitHierarchy.REQUIRE_NEW_EDGE_FOR_REENTRY:
+            new_edge = self._check_new_edge(new_conditions)
+            if new_edge['has_new_edge']:
+                return {
+                    'allowed': True,
+                    'reason': f"New edge detected: {new_edge['edge_type']}"
+                }
+        
+        # No new edge, same price = blocked
+        return {
+            'allowed': False,
+            'reason': (
+                f"BLOCKED: Same price range ({entry_price:.2f} vs last {self.last_entry_price:.2f}), "
+                f"same direction ({direction}), no new edge detected"
+            )
+        }
+    
+    def _check_new_edge(self, conditions: dict) -> dict:
+        """
+        Check if there's new edge information vs last entry.
+        
+        New edge conditions:
+        - new_lh_confirmed: New Lower High for shorts
+        - breakdown_retest: Breakdown + retest of structure
+        - new_poc_displacement: New POC / value area shift
+        - volume_regime_change: Significant volume change
+        """
+        has_edge = False
+        edge_type = None
+        
+        # Check each condition against stored conditions
+        if conditions.get('new_lh_confirmed') and not self.last_entry_conditions.get('lh_price') == conditions.get('lh_price'):
+            has_edge = True
+            edge_type = 'NEW_LH_CONFIRMED'
+        
+        elif conditions.get('breakdown_retest'):
+            has_edge = True
+            edge_type = 'BREAKDOWN_RETEST'
+        
+        elif conditions.get('poc_price') and self.last_entry_conditions.get('poc_price'):
+            poc_diff = abs(conditions['poc_price'] - self.last_entry_conditions['poc_price'])
+            if poc_diff > conditions.get('atr', 0) * 0.5:  # POC moved > 0.5 ATR
+                has_edge = True
+                edge_type = 'NEW_POC_DISPLACEMENT'
+        
+        elif conditions.get('volume_regime_change'):
+            has_edge = True
+            edge_type = 'VOLUME_REGIME_CHANGE'
+        
+        return {
+            'has_new_edge': has_edge,
+            'edge_type': edge_type
+        }
+    
+    def record_entry(self, entry_price: float, direction: str, atr: float,
+                     entry_time: datetime = None, conditions: dict = None):
+        """
+        Record entry details for anti-reentry tracking.
+        Called after successful position open.
+        """
+        self.last_entry_price = entry_price
+        self.last_entry_direction = direction
+        self.last_entry_atr = atr
+        self.last_entry_time = entry_time or datetime.now(UTC)
+        self.last_entry_conditions = conditions or {}
+    
+    def record_exit(self, exit_reason: str):
+        """Record exit reason for cooldown/reentry logic."""
+        self.last_exit_reason = exit_reason
     
     def create_position(self, symbol: str, direction: str, entry_price: float,
                        position_size: float, stop_loss: float, atr_1m: float,
                        market_time: datetime = None,
-                       trade_type: TradeType = TradeType.LONG_MAIN) -> Position:
-        """Create a new position object for tracking"""
+                       trade_type: TradeType = TradeType.LONG_MAIN,
+                       regime_mode: str = 'RANGE',
+                       entry_conditions: dict = None) -> Position:  # 🔥 FIX (Jan 23): Added entry_conditions
+        """
+        Create a new position object for tracking.
+        
+        UPDATED (Jan 23, 2026): Also records entry for anti-reentry tracking
+        """
         self.position = Position(
             symbol=symbol,
             direction=direction,
@@ -1529,8 +2072,19 @@ class RiskEngine:
             stop_loss=stop_loss,
             atr_1m=atr_1m,
             market_time=market_time,
-            trade_type=trade_type
+            trade_type=trade_type,
+            regime_mode=regime_mode  # 🔥 Pass regime for trailing
         )
+        
+        # Record entry for anti-reentry tracking
+        self.record_entry(
+            entry_price=entry_price,
+            direction=direction,
+            atr=atr_1m,
+            entry_time=market_time,
+            conditions=entry_conditions
+        )
+        
         return self.position
     
     async def sync_position_size(self, new_size: float, reason: str = "exchange sync") -> bool:
@@ -1556,6 +2110,40 @@ class RiskEngine:
                 self.position.size = new_size
                 logger.info(f"🔄 Position size sync ({reason}): {old_size:.6f} → {new_size:.6f}")
             return True
+    
+    async def clear_position(self, reason: str = "position closed") -> bool:
+        """
+        🔒 Thread-safe clearing of position.
+        
+        This method should be used instead of direct assignment to self.position = None
+        to prevent race conditions between multiple coroutines.
+        
+        Args:
+            reason: Reason for clearing (for logging)
+            
+        Returns:
+            True if position was cleared, False if already None
+        """
+        async with self._lock:
+            if self.position is None:
+                logger.debug(f"Position already None: {reason}")
+                return False
+            
+            logger.info(f"🔄 Position cleared ({reason})")
+            self.position = None
+            return True
+    
+    def clear_position_sync(self, reason: str = "position closed") -> bool:
+        """
+        Synchronous version for use in callbacks.
+        WARNING: Not thread-safe, use clear_position() when possible.
+        """
+        if self.position is None:
+            return False
+        
+        logger.info(f"🔄 Position cleared (sync: {reason})")
+        self.position = None
+        return True
     
     async def update_capital_from_balance(self, balance_dict: Dict) -> bool:
         """Update capital from exchange balance"""
@@ -1792,6 +2380,22 @@ class RiskEngine:
             pos.update_unrealized_pnl(current_price)
             
             # ================================================================
+            # 🔥 FIX (Jan 23, 2026): MANAGEMENT COOLDOWN - Prevent action spam
+            # After executing a management action, skip checks for N seconds
+            # This prevents cascading partial closes and race conditions
+            # ================================================================
+            if pos.last_management_action_time is not None:
+                cooldown_elapsed = (datetime.now(UTC) - pos.last_management_action_time).total_seconds()
+                if cooldown_elapsed < pos.MANAGEMENT_COOLDOWN_SEC:
+                    # Still in cooldown - skip management checks, only check critical SL
+                    logger.debug(f"⏸️ Management cooldown: {cooldown_elapsed:.1f}s / {pos.MANAGEMENT_COOLDOWN_SEC}s - only checking SL")
+                    # Only check stop loss during cooldown (critical safety)
+                    sl_check = pos.check_stop_hit(current_price, market_time=market_time)
+                    if sl_check:
+                        return await self._close_position(current_price, 'STOP_LOSS')
+                    return None  # Skip all other management during cooldown
+            
+            # ================================================================
             # PASO 3: Check promoción a RUNNER (antes de cualquier exit)
             # ================================================================
             pos.check_regime_promotion()
@@ -1854,21 +2458,118 @@ class RiskEngine:
                                 }
                     
                     # Handle full exit triggers (momentum, VPOC, squeeze)
+                    # 🔥 FIX (Jan 23, 2026): Handle VPOC_PARTIAL_EXIT
+                    elif action_type == 'VPOC_PARTIAL_EXIT':
+                        is_partial = smart_exit.get('is_partial', False)
+                        if is_partial:
+                            partial_pct = smart_exit.get('partial_pct', 0.7)
+                            close_size = pos.size * partial_pct
+                            remaining_size = pos.size - close_size
+                            
+                            if close_size < KRAKEN_BTC_MIN_SIZE:
+                                logger.info(f"🔄 VPOC PARTIAL skipped: close_size {close_size:.6f} < min")
+                            elif remaining_size > 0 and remaining_size < KRAKEN_BTC_MIN_SIZE:
+                                logger.info(f"🔄 VPOC: Remaining too small, closing FULL")
+                                return await self._close_position(current_price, 'VPOC_EXIT')
+                            else:
+                                runner_stop_r = smart_exit.get('runner_stop_r', 0.0)
+                                reason = smart_exit.get('reason', 'VPOC_PARTIAL')
+                                logger.info(f"💰 VPOC PARTIAL: Closing {partial_pct:.0%}, runner stop @ {runner_stop_r}R")
+                                return {
+                                    'action': 'PARTIAL_CLOSE',
+                                    'size': close_size,
+                                    'reason': 'VPOC_PARTIAL_EXIT',
+                                    'mfe_r': smart_exit.get('mfe_r', 0),
+                                    'move_stop_to_be': True,  # Move runner stop to BE
+                                    'runner_stop_r': runner_stop_r
+                                }
+                        else:
+                            return await self._close_position(current_price, 'VPOC_EXIT')
+                    
                     elif action_type in ('MOMENTUM_EXIT', 'VPOC_EXIT', 'VOLATILITY_SQUEEZE_EXIT'):
                         reason = smart_exit.get('reason', action_type)
                         logger.info(f"🚀 SMART EXIT: {action_type} - {reason}")
                         return await self._close_position(current_price, action_type)
                 
-                # 0. Check mediocre trade exit (kill stagnant trades early)
-                # HYBRID LOGIC (Jan 9, 2026): ADX + ATR ratio to avoid killing slow trends
-                if pos.check_mediocre_trade_exit(n_candles=6, adx=adx, atr_ratio=atr_ratio):
-                    return await self._close_position(current_price, 'TIME_INVALIDATION')
+                # 0. Check mediocre trade exit (TIME_INVALIDATION INTELIGENTE)
+                # 🔥 FIX (Jan 23, 2026): Now returns dict with action, not bool
+                time_check = pos.check_mediocre_trade_exit(
+                    n_candles=6, 
+                    adx=adx, 
+                    atr_ratio=atr_ratio,
+                    current_price=current_price,
+                    vwap=None,  # TODO: Pass VWAP from signal_engine
+                    last_lh=None,  # TODO: Pass from structure analysis
+                    vah=None  # TODO: Pass from volume profile
+                )
+                
+                if time_check:
+                    time_action = time_check.get('action', '')
+                    time_reason = time_check.get('reason', 'TIME_INVALIDATION')
+                    
+                    if time_action == 'CLOSE':
+                        logger.warning(f"☠️ TIME_INVALIDATION: {time_reason}")
+                        return await self._close_position(current_price, time_reason)
+                    
+                    elif time_action == 'PARTIAL':
+                        partial_pct = time_check.get('partial_pct', 0.6)
+                        close_size = pos.size * partial_pct
+                        remaining_size = pos.size - close_size
+                        
+                        if close_size >= KRAKEN_BTC_MIN_SIZE and remaining_size >= KRAKEN_BTC_MIN_SIZE:
+                            # 🔥 FIX (Jan 23, 2026): Mark partial as DONE to prevent cascading
+                            pos.time_checkpoint_profit_partial_done = True
+                            pos.last_management_action_time = datetime.now(UTC)
+                            logger.info(f"⏱️ TIME IN PROFIT: Closing {partial_pct:.0%}, keeping runner (MARKED DONE)")
+                            return {
+                                'action': 'PARTIAL_CLOSE',
+                                'size': close_size,
+                                'reason': 'TIME_IN_PROFIT_PARTIAL',
+                                'current_r': time_check.get('current_r', 0),
+                                'keep_runner': True
+                            }
+                        else:
+                            # Can't do partial due to min size - mark as done anyway to prevent spam
+                            pos.time_checkpoint_profit_partial_done = True
+                            logger.info(f"⏱️ TIME checkpoint: Can't do partial (size too small), holding runner")
+                    
+                    elif time_action == 'REDUCE_RISK':
+                        # Move stop closer but don't close
+                        move_to_r = time_check.get('move_stop_to_r', -0.15)
+                        initial_risk = abs(pos.entry_price - pos.initial_stop_loss)
+                        if pos.direction == 'LONG':
+                            new_stop = pos.entry_price - (abs(move_to_r) * initial_risk)
+                            if new_stop > pos.stop_loss:  # Only tighten, never loosen
+                                pos.stop_loss = new_stop
+                                pos.trailing_stop = new_stop
+                                logger.info(f"⏱️ TIME REDUCE_RISK: Stop moved to {new_stop:.2f} ({move_to_r}R)")
+                        else:
+                            new_stop = pos.entry_price + (abs(move_to_r) * initial_risk)
+                            if new_stop < pos.stop_loss:  # Only tighten
+                                pos.stop_loss = new_stop
+                                pos.trailing_stop = new_stop
+                                logger.info(f"⏱️ TIME REDUCE_RISK: Stop moved to {new_stop:.2f} ({move_to_r}R)")
+                    
+                    elif time_action == 'HOLD':
+                        # Market alive, keep holding
+                        logger.debug(f"⏱️ TIME checkpoint: Market alive, holding")
+                        # No action needed, continue
                 
                 # 0.5. ADD TO WINNER: Scale into proven winners (MFE >= 0.6R, no -0.2R touch)
                 add_action = pos.check_add_to_winner(current_price)
                 if add_action:
                     # Return add action to signal_engine for execution
                     return add_action
+                
+                # ============================================================
+                # 0.75. WORST-TRADE PREVENTION (Jan 23, 2026)
+                # If thesis intact but hitting loss cap, exit early
+                # ============================================================
+                worst_trade_check = pos.check_worst_trade_prevention(current_price)
+                if worst_trade_check and worst_trade_check.get('action') == 'CLOSE':
+                    reason = worst_trade_check.get('reason', 'WORST_TRADE_PREVENTION')
+                    logger.warning(f"🛡️ WORST-TRADE PREVENTION: {worst_trade_check.get('message', '')}")
+                    return await self._close_position(current_price, reason)
                 
                 # 1. Check stop loss (with grace period for first 10 min)
                 sl_check = pos.check_stop_hit(current_price, market_time=market_time)

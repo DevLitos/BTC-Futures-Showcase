@@ -76,7 +76,10 @@ REGIME_CONFIGS: Dict[EntryRegime, RegimeConfig] = {
         score_threshold_adj=0,            # Normal threshold
         size_multiplier=0.9,              # Slightly reduced (range = more trades)
         min_rr=0.5,                        # Lower RR target (quick scalps)
-        sl_atr_multiplier=3.0,            # FIX (Jan 20, 2026): Increased from 2.0 to 3.0 for fee survival
+        # 🔥 FIX (Jan 22, 2026): RANGE scalps need TIGHT stops
+        # 3.0x ATR converts "mean reversion scalp" into "fade con stop enorme"
+        # FULL: 2.0x | PROBE: 1.6x (applied in signal_engine based on entry_type)
+        sl_atr_multiplier=2.0,            # 🔥 REDUCED from 3.0 to 2.0 for proper scalps
         description="Mean reversion - quick scalps to value"
     ),
     EntryRegime.CHAOS: RegimeConfig(

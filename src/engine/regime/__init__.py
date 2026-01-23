@@ -4,12 +4,26 @@ Regime Module - Market regime classification and detection
 Reorganized from engine/ (Jan 20, 2026)
 
 Components:
+- RegimeContext: SINGLE SOURCE OF TRUTH for regime (Jan 22, 2026)
 - RegimeDetector: Entry-time regime (TREND_EXPANSION, RANGE, CHAOS, TREND_EXHAUSTION)
 - ManagementRegimeClassifier: Position management regime (TREND_EXPANSION, MEAN_REVERSION, CHOPPY_DEAD)
 - EdgeRegimeClassifier: Edge-based regime (REGIME_A, B, C, D)
 - ActivityRegimeAnalyzer: Activity-based regime for 24/7 markets
 - TradingRegimeClassifier: Trading-specific regime analysis
+
+🔥 FIX (Jan 22, 2026): Added RegimeContext as single source of truth
+All modules should read from RegimeContext instead of computing their own regime.
 """
+
+# 🔥 NEW: Regime Context - SINGLE SOURCE OF TRUTH (Jan 22, 2026)
+from src.engine.regime.regime_context import (
+    RegimeMode,
+    RegimeContext,
+    RegimeContextManager,
+    get_regime_context_manager,
+    get_current_regime_context,
+    get_trailing_regime,
+)
 
 # Entry-time regime detection
 from src.engine.regime.regime_detector import (
@@ -53,7 +67,13 @@ from src.engine.regime.trading_regime import (
 )
 
 __all__ = [
-    # Entry regime
+    # 🔥 NEW: Regime Context - SINGLE SOURCE OF TRUTH
+    'RegimeMode',
+    'RegimeContext',
+    'RegimeContextManager',
+    'get_regime_context_manager',
+    'get_current_regime_context',
+    'get_trailing_regime',
     'RegimeDetector',
     'EntryRegime',
     'RegimeConfig', 

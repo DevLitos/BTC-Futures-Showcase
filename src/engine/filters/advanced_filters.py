@@ -154,7 +154,7 @@ def check_session_quality(adx: float, volatility_bps: float, market_time: dateti
     
     # 🔒 FIX: Use market_time to prevent lookahead bias in backtest
     if market_time is None:
-        from .time_provider import current_time
+        from src.engine.time_provider import current_time
         market_time = current_time()
     
     current_hour = market_time.hour

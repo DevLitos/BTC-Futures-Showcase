@@ -106,9 +106,28 @@ class PositionMismatchError(ExecutionError):
 
 
 # Timeouts para operaciones de exchange (segundos)
+# These can be overridden via Settings if needed
 EXCHANGE_TIMEOUT_SHORT = 10.0   # Para consultas simples
 EXCHANGE_TIMEOUT_MEDIUM = 30.0  # Para órdenes
 EXCHANGE_TIMEOUT_LONG = 60.0    # Para operaciones complejas
+
+
+def get_exchange_timeouts():
+    """
+    Get exchange timeouts from settings if available, otherwise use defaults.
+    This allows runtime configuration without hardcoding.
+    """
+    try:
+        from src.core.settings import get_settings
+        settings = get_settings()
+        return (
+            settings.exchange_timeout_short,
+            settings.exchange_timeout_medium,
+            settings.exchange_timeout_long
+        )
+    except Exception:
+        return EXCHANGE_TIMEOUT_SHORT, EXCHANGE_TIMEOUT_MEDIUM, EXCHANGE_TIMEOUT_LONG
+
 
 # CRITICAL: Threshold for float comparison of position sizes
 # Avoids false positives from floating-point residue (e.g., 0.00000001)
@@ -252,12 +271,17 @@ class RESTExecutionEngine:
         # State tracking para logging de posiciones
         self._last_position_state = {}  # {symbol: (contracts, notional)}
         
-        # EXCHANGE AVAILABILITY TRACKING
+        # EXCHANGE AVAILABILITY TRACKING with circuit breaker
         self.is_exchange_available = True
         self._consecutive_rest_failures = 0
         self._last_rest_failure_time: float = 0
         self._rest_failure_log_count = 0  # For log throttling
         self._last_successful_rest_call: float = 0
+        
+        # 🔒 CIRCUIT BREAKER (Jan 22, 2026): Exponential backoff to avoid hammering
+        self._circuit_breaker_until: float = 0  # Timestamp when we can retry
+        self._backoff_seconds = 2.0  # Initial backoff
+        self._max_backoff_seconds = 60.0  # Cap at 60 seconds
         
         logger.info(f"RESTExecutionEngine initialized for {exchange}")
     
@@ -470,7 +494,7 @@ class RESTExecutionEngine:
         
         # For Kraken Futures, skip fetch_order entirely - it doesn't work reliably
         # and returns "UUID string too large" errors
-        is_kraken = self.exchange_type == 'krakenfutures'
+        is_kraken = self.exchange_name == 'krakenfutures'
         
         if not is_kraken:
             try:
@@ -524,18 +548,26 @@ class RESTExecutionEngine:
         if not self.exchange:
             return []
         
+        # 🔒 CIRCUIT BREAKER: Don't spam if in backoff
+        if self.is_circuit_breaker_open():
+            logger.debug(f"Circuit breaker open, skipping get_open_orders (wait {self.get_circuit_breaker_wait_time():.0f}s)")
+            return []
+        
         try:
             # 🔥 AUDIT FIX: Add timeout to prevent hanging
             orders = await asyncio.wait_for(
                 self.exchange.fetch_open_orders(symbol),
                 timeout=EXCHANGE_TIMEOUT_SHORT
             )
+            # Success - reset circuit breaker (but don't log recovery for routine calls)
+            if not self.is_exchange_available:
+                self._reset_circuit_breaker()
             return orders
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout fetching open orders for {symbol}")
+            self._handle_rest_error(Exception("Timeout fetching open orders"), "get_open_orders")
             return []
         except Exception as e:
-            logger.error(f"Error fetching open orders: {e}")
+            self._handle_rest_error(e, "get_open_orders")
             return []
     
     async def poll_fill_status(self, order_id: str, symbol: str, 
@@ -558,11 +590,16 @@ class RESTExecutionEngine:
         max_consecutive_errors = 5  # Bail out after 5 consecutive errors
         
         while time.monotonic() < deadline:
+            # 🔒 FIX (Jan 22, 2026): Check deadline at start of loop body too
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                break
+            
             try:
                 # Use wait_for to prevent get_order_status from hanging forever
                 order = await asyncio.wait_for(
                     self.get_order_status(order_id, symbol),
-                    timeout=min(10.0, deadline - time.monotonic())  # Max 10s per call
+                    timeout=min(10.0, max(1.0, remaining_time))  # Min 1s, max 10s
                 )
             
                 if not order:
@@ -687,33 +724,36 @@ class RESTExecutionEngine:
         return result
     
     async def get_position(self, symbol: str) -> Optional[Dict]:
-        """Consultar posición actual con timeout"""
+        """
+        Consultar posición actual con timeout.
+        
+        Returns:
+            Dict with position info if exists
+            None if no position
+            {'_error': str} if API error (caller MUST check for '_error' key)
+            {'_timeout': True, '_error': 'timeout'} if timeout
+        """
         if not self.exchange:
             return None
         
+        # 🔒 CIRCUIT BREAKER: Don't spam if in backoff
+        if self.is_circuit_breaker_open():
+            logger.debug(f"Circuit breaker open, skipping get_position (wait {self.get_circuit_breaker_wait_time():.0f}s)")
+            return {'_error': 'circuit_breaker', '_circuit_breaker': True}
+        
         try:
-            # 🔥 DEBUG: Log lock acquisition
-            logger.debug(f"get_position: attempting to acquire lock (locked={self._exchange_lock.locked()})")
             async with self._exchange_lock:
-                logger.debug("get_position: lock acquired, calling fetch_positions...")
-                
-                # 🔥 FIX (Jan 21, 2026): Add background task yield to prevent event loop starvation
-                # CCXT can block the event loop during DNS/SSL operations
-                await asyncio.sleep(0)  # Yield before starting
+                # Yield before CCXT call to prevent event loop starvation
+                await asyncio.sleep(0)
                 
                 positions = await asyncio.wait_for(
                     self.exchange.fetch_positions([symbol]),
                     timeout=EXCHANGE_TIMEOUT_SHORT
                 )
-                logger.debug("get_position: fetch_positions completed")
             
             if positions:
                 # Mark exchange as available on success
-                if not self.is_exchange_available:
-                    logger.info("✅ Exchange REST API recovered (get_position)")
-                    self.is_exchange_available = True
-                    self._consecutive_rest_failures = 0
-                    self._rest_failure_log_count = 0
+                self._reset_circuit_breaker()
                 return positions[0]
             
             return None
@@ -865,9 +905,11 @@ class RESTExecutionEngine:
             if raw_side in ('long', 'short'):
                 position_side = raw_side
             else:
-                # Fallback to contracts sign (less reliable for Kraken)
-                position_side = 'long' if contracts > 0 else 'short'
-                logger.warning(f"Position 'side' not available ({raw_side}), using contracts sign: {position_side}")
+                # 🔒 FIX (Jan 22, 2026): Don't fallback to contracts sign for Kraken
+                # Kraken always returns positive contracts, so sign is unreliable
+                logger.error(f"❌ Cannot determine position side (raw_side='{raw_side}') - aborting SL/TP placement")
+                logger.error(f"   Position data: contracts={contracts}, side={position.get('side')}")
+                return False
             position_size = abs(contracts)
             
             # 🔒 FIX (Jan 14, 2026): Validate position size before setting SL/TP
@@ -1088,8 +1130,9 @@ class RESTExecutionEngine:
             if raw_side in ('long', 'short'):
                 position_side = raw_side
             else:
-                position_side = 'long' if contracts > 0 else 'short'
-                logger.warning(f"Position 'side' not available, using contracts sign: {position_side}")
+                # 🔒 FIX (Jan 22, 2026): Don't fallback - abort if side unknown
+                logger.error(f"❌ Cannot determine position side (raw_side='{raw_side}') - aborting SL/TP")
+                return False
             position_size = abs(contracts)
             
             logger.info(f"📍 FIX#4 Optimized stops: SL={stop_loss:.2f}, TP={take_profit:.2f}")
@@ -1868,12 +1911,7 @@ class RESTExecutionEngine:
             result['position_synced'] = True
             
             # Mark exchange as available on success
-            if not self.is_exchange_available:
-                logger.info("✅ Exchange REST API recovered")
-            self.is_exchange_available = True
-            self._consecutive_rest_failures = 0
-            self._last_successful_rest_call = asyncio.get_event_loop().time()
-            self._rest_failure_log_count = 0
+            self._reset_circuit_breaker()
             
             logger.debug(f"Reconciled: {result['open_orders']} orders, "
                         f"{result['cancelled']} stale removed")
@@ -1885,10 +1923,11 @@ class RESTExecutionEngine:
             return {'success': False, 'error': str(e), 'exchange_available': self.is_exchange_available}
     
     def _handle_rest_error(self, error: Exception, operation: str):
-        """Handle REST API errors with availability tracking and log throttling"""
+        """Handle REST API errors with availability tracking, log throttling and circuit breaker"""
         error_str = str(error)
         self._consecutive_rest_failures += 1
-        self._last_rest_failure_time = asyncio.get_event_loop().time()
+        current_time = asyncio.get_event_loop().time()
+        self._last_rest_failure_time = current_time
         self._rest_failure_log_count += 1
         
         # Detect exchange outage (503, unavailable, timeout, etc.)
@@ -1899,15 +1938,44 @@ class RESTExecutionEngine:
         ])
         
         if is_outage:
+            # 🔒 CIRCUIT BREAKER: Set exponential backoff
+            self._backoff_seconds = min(self._backoff_seconds * 2, self._max_backoff_seconds)
+            self._circuit_breaker_until = current_time + self._backoff_seconds
+            
             if self.is_exchange_available:
                 logger.warning(f"⚠️ KRAKEN REST API OUTAGE - {operation} failed: {error_str[:100]}")
+                logger.warning(f"🔒 Circuit breaker active: backing off {self._backoff_seconds:.0f}s")
                 self.is_exchange_available = False
             elif self._rest_failure_log_count <= 3 or self._rest_failure_log_count % 20 == 0:
                 # Throttle repeated outage logs
-                logger.warning(f"⚠️ Exchange REST still down ({self._consecutive_rest_failures} failures)")
+                logger.warning(f"⚠️ Exchange REST still down ({self._consecutive_rest_failures} failures, backoff={self._backoff_seconds:.0f}s)")
         else:
             # Regular error - always log
             logger.error(f"Error in {operation}: {error_str}")
+    
+    def is_circuit_breaker_open(self) -> bool:
+        """Check if circuit breaker is blocking calls (in backoff period)"""
+        if self._circuit_breaker_until == 0:
+            return False
+        return asyncio.get_event_loop().time() < self._circuit_breaker_until
+    
+    def get_circuit_breaker_wait_time(self) -> float:
+        """Get seconds until circuit breaker allows retry"""
+        if self._circuit_breaker_until == 0:
+            return 0
+        remaining = self._circuit_breaker_until - asyncio.get_event_loop().time()
+        return max(0, remaining)
+    
+    def _reset_circuit_breaker(self):
+        """Reset circuit breaker on successful call"""
+        self._circuit_breaker_until = 0
+        self._backoff_seconds = 2.0  # Reset to initial
+        self._consecutive_rest_failures = 0
+        self._rest_failure_log_count = 0
+        if not self.is_exchange_available:
+            logger.info("✅ Exchange REST API recovered")
+        self.is_exchange_available = True
+        self._last_successful_rest_call = asyncio.get_event_loop().time()
     
     def get_availability_status(self) -> dict:
         """Get REST API availability status"""
@@ -1915,7 +1983,9 @@ class RESTExecutionEngine:
             'is_available': self.is_exchange_available,
             'consecutive_failures': self._consecutive_rest_failures,
             'seconds_since_failure': asyncio.get_event_loop().time() - self._last_rest_failure_time if self._last_rest_failure_time else 0,
-            'seconds_since_success': asyncio.get_event_loop().time() - self._last_successful_rest_call if self._last_successful_rest_call else 0
+            'seconds_since_success': asyncio.get_event_loop().time() - self._last_successful_rest_call if self._last_successful_rest_call else 0,
+            'circuit_breaker_open': self.is_circuit_breaker_open(),
+            'circuit_breaker_wait': self.get_circuit_breaker_wait_time()
         }
     
     async def place_market_order(self, symbol: str, side: str, amount: float,
@@ -1984,13 +2054,35 @@ class RESTExecutionEngine:
             # 🔥 FIX (Jan 20, 2026): Update position_store after market order fill
             # This keeps position_store in sync with exchange reality.
             # Critical for ADD_POSITION scale-ins that were not being tracked.
+            #
+            # 🔥 FIX (Jan 23, 2026): Use position.entryPrice as source of truth
+            # order.average can differ from position.entryPrice due to how Kraken
+            # reports fills vs position entries. Position is the truth.
             # =====================================================================
             try:
                 if order.get('status') == 'closed' and order.get('filled', 0) > 0:
                     position_store = get_position_store()
-                    fill_price = order.get('average') or order.get('price', 0)
                     fill_size = order.get('filled', amount)
                     order_id = order.get('id', '')
+                    
+                    # 🔥 Get actual entry price from exchange position (SOURCE OF TRUTH)
+                    # order.average may not match position.entryPrice on Kraken
+                    fill_price = order.get('average') or order.get('price', 0)
+                    try:
+                        # Short delay to let exchange update position
+                        await asyncio.sleep(0.3)
+                        positions = await self.exchange.fetch_positions([symbol])
+                        if positions:
+                            for pos in positions:
+                                if pos.get('symbol') == symbol and abs(float(pos.get('contracts', 0))) > 0:
+                                    real_entry = float(pos.get('entryPrice', 0))
+                                    if real_entry > 0:
+                                        if abs(real_entry - fill_price) > 1:  # Log if differs by more than $1
+                                            logger.info(f"📊 Using position.entryPrice {real_entry:.2f} (order.average was {fill_price:.2f})")
+                                        fill_price = real_entry
+                                    break
+                    except Exception as pos_err:
+                        logger.debug(f"Could not fetch position for entry price: {pos_err}")
                     
                     # Get fill ID from trades if available
                     trades = order.get('trades', [])
