@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 from src.engine.config import KillConditions
+from src.core.health import get_health_status
 
 class KrakenFuturesWebSocket:
     """
@@ -226,6 +227,14 @@ class KrakenFuturesWebSocket:
                 
                 # Update heartbeat
                 self.last_tick = time.time()
+                
+                # Update health status WS heartbeat
+                try:
+                    health = get_health_status()
+                    if health:
+                        health.update_ws_heartbeat()
+                except Exception:
+                    pass  # Don't let health tracking break WS
                 
                 # Log first 10 messages for startup verification
                 if msg_count < 10:

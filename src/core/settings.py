@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     """
     
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env.secrets", ".env.config"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",  # Ignore extra env vars
@@ -166,7 +166,8 @@ class Settings(BaseSettings):
     )
     storage_path: Path = Field(
         default=Path("storage"),
-        alias="STORAGE_PATH"
+        alias="STORAGE_PATH",
+        description="Storage directory path (relative or absolute)"
     )
     
     # =========================================================================
@@ -213,7 +214,8 @@ class Settings(BaseSettings):
     )
     log_path: Path = Field(
         default=Path("logs"),
-        alias="LOG_PATH"
+        alias="LOG_PATH",
+        description="Logs directory path (relative or absolute)"
     )
     
     # =========================================================================

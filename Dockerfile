@@ -100,16 +100,8 @@ RUN pip install --no-cache-dir /wheels/*.whl && \
     pip cache purge
 
 # Copy application code (order matters for cache)
-COPY --chown=trader:trader core/ ./core/
-COPY --chown=trader:trader engine/ ./engine/
-COPY --chown=trader:trader ingest/ ./ingest/
+COPY --chown=trader:trader src/ ./src/
 RUN mkdir -p /app/output && chown trader:trader /app/output
-COPY --chown=trader:trader monitoring/ ./monitoring/
-COPY --chown=trader:trader strategy/ ./strategy/
-COPY --chown=trader:trader accounting/ ./accounting/
-COPY --chown=trader:trader validation/ ./validation/
-COPY --chown=trader:trader modes/ ./modes/
-COPY --chown=trader:trader config/ ./config/
 COPY --chown=trader:trader main.py ./
 
 # Create directories with correct ownership

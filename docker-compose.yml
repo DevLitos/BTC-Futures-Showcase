@@ -33,6 +33,7 @@ services:
     # ⚠️ SECRETOS: Usar archivo separado con permisos 600
     env_file:
       - .env.secrets
+      - .env.config
     
     environment:
       - PYTHONUNBUFFERED=1
@@ -45,6 +46,9 @@ services:
       - HEALTH_PORT=8001
       # Time sync validation
       - MAX_TIME_DRIFT_MS=${MAX_TIME_DRIFT_MS:-500}
+      # En Docker, usar las rutas del contenedor (volúmenes montados)
+      - LOG_PATH=/app/logs
+      - STORAGE_PATH=/app/storage
     
     volumes:
       - ./logs:/app/logs
@@ -119,6 +123,7 @@ services:
     
     env_file:
       - .env.secrets
+      - .env.config
     
     environment:
       - PYTHONUNBUFFERED=1
@@ -128,6 +133,9 @@ services:
       - API_PORT=8080
       - API_KEY=${API_KEY:-}
       - API_RATE_LIMIT=${API_RATE_LIMIT:-60}
+      # En Docker, usar las rutas del contenedor (volúmenes montados)
+      - LOG_PATH=/app/logs
+      - STORAGE_PATH=/app/storage
     
     ports:
       # API expuesta en puerto configurable
@@ -218,6 +226,8 @@ services:
     user: "472:472"
     ports:
       - "127.0.0.1:3000:3000"
+    env_file:
+      - .env.secrets
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-changeme}
       - GF_USERS_ALLOW_SIGN_UP=false

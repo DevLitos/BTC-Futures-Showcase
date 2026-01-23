@@ -30,9 +30,13 @@ from pathlib import Path
 # 🔒 PHASE 1: Load env file FIRST (before any imports that might use env vars)
 # =====================================================================
 def load_env_file():
-    """Load environment variables from ~/.trad2_env or .env"""
-    # Try ~/.trad2_env first, then .env
-    env_files = [Path.home() / '.trad2_env', Path('.env')]
+    """Load environment variables from .env.secrets in project directory"""
+    # Load from .env.secrets in project directory
+    project_dir = Path(__file__).parent
+    env_files = [
+        project_dir / '.env.secrets',
+        project_dir / '.env.config',
+    ]
     
     for env_file in env_files:
         if env_file.exists():
