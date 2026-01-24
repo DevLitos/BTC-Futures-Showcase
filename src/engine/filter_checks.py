@@ -94,9 +94,9 @@ def check_momentum_filter(
     rsi_val = rsi[-1]
     rsi_slope = (rsi[-1] - rsi[-5]) / 5  # 5-period slope
     
-    # ADX for trend strength
-    adx = calculate_adx(highs, lows, closes, 14)
-    adx_val = adx[-1] if not np.isnan(adx[-1]) else 20.0
+    # ADX for trend strength - FIXED: calculate_adx returns (adx_values, adx_slope) tuple
+    adx_values, _ = calculate_adx(highs, lows, closes, 14)
+    adx_val = adx_values[-1] if not np.isnan(adx_values[-1]) else 20.0
     
     # ATR for volatility context
     atr = calculate_atr(highs, lows, closes, 14)

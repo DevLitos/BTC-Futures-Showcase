@@ -135,18 +135,20 @@ class EntryGateEvaluator:
     
     # =========================================================================
     # SCORING THRESHOLDS FOR SOFT GATES
+    # FIX (Jan 24, 2026): Lowered to match config.py changes
+    # Bot was at 0 trades in 9h due to restrictive thresholds
     # =========================================================================
     
     # Score-based sizing (replaces binary threshold)
-    SCORE_BLOCK_FLOOR = 4.5           # Below this = block
-    SCORE_PROBE_MAX = 5.5             # 4.5-5.5 = probe (0.25x)
-    SCORE_REDUCED_MAX = 6.5           # 5.5-6.5 = reduced (0.5x)
-    # Above 6.5 = full size
+    SCORE_BLOCK_FLOOR = 3.5           # Below this = block (was 4.5)
+    SCORE_PROBE_MAX = 4.5             # 3.5-4.5 = probe (0.25x) (was 5.5)
+    SCORE_REDUCED_MAX = 5.5           # 4.5-5.5 = reduced (0.5x) (was 6.5)
+    # Above 5.5 = full size
     
     # RR-based sizing
-    RR_BLOCK_FLOOR = 0.6              # Below 0.6 = mathematical roulette
-    RR_PROBE_MAX = 1.0                # 0.6-1.0 = probe size
-    RR_FULL_MIN = 1.2                 # Above 1.2 = full size
+    RR_BLOCK_FLOOR = 0.5              # Below 0.5 = mathematical roulette (was 0.6)
+    RR_PROBE_MAX = 0.8                # 0.5-0.8 = probe size (was 1.0)
+    RR_FULL_MIN = 1.0                 # Above 1.0 = full size (was 1.2)
     
     # LTF confirmations
     LTF_MAX_REQUIRED = 2              # Never require 3/3 confirmations
@@ -531,11 +533,11 @@ class EntryGateEvaluator:
         """
         Evaluate score gate with graduated sizing - SOFT.
         
-        Sizing:
-        - score < 4.5: Block (floor breach)
-        - 4.5 <= score < 5.5: Probe (0.25x)
-        - 5.5 <= score < 6.5: Reduced (0.5x)
-        - score >= 6.5: Full (1.0x)
+        Sizing (updated Jan 24, 2026):
+        - score < 3.5: Block (floor breach)
+        - 3.5 <= score < 4.5: Probe (0.25x)
+        - 4.5 <= score < 5.5: Reduced (0.5x)
+        - score >= 5.5: Full (1.0x)
         """
         if score < self.SCORE_BLOCK_FLOOR:
             return GateResult(
@@ -552,7 +554,7 @@ class EntryGateEvaluator:
                 category=GateCategory.SIZING,
                 passed=True,
                 size_multiplier=0.25,
-                reason=f"Score {score:.1f} in probe zone (4.5-5.5)",
+                reason=f"Score {score:.1f} in probe zone (3.5-4.5)",
                 details={'score': score, 'zone': 'probe'}
             )
         elif score < self.SCORE_REDUCED_MAX:
@@ -562,7 +564,7 @@ class EntryGateEvaluator:
                 category=GateCategory.SIZING,
                 passed=True,
                 size_multiplier=0.5,
-                reason=f"Score {score:.1f} in reduced zone (5.5-6.5)",
+                reason=f"Score {score:.1f} in reduced zone (4.5-5.5)",
                 details={'score': score, 'zone': 'reduced'}
             )
         else:
@@ -571,7 +573,7 @@ class EntryGateEvaluator:
                 gate_type=GateType.SOFT,
                 category=GateCategory.SIZING,
                 passed=True,
-                reason=f"Score {score:.1f} excellent (>= 6.5)",
+                reason=f"Score {score:.1f} excellent (>= 5.5)",
                 details={'score': score, 'zone': 'full'}
             )
     

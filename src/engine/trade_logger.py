@@ -69,6 +69,32 @@ class TradeLogRecord:
     
     # Additional metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # =========================================================================
+    # 🔥 ML DATA COLLECTION (Jan 24, 2026)
+    # Enhanced fields for machine learning training data
+    # =========================================================================
+    
+    # Feature snapshot at entry - ALL indicators for ML training
+    feature_snapshot: Dict[str, float] = field(default_factory=dict)
+    # Expected keys: adx_1h, adx_5m, adx_slope, atr_ratio, bb_width, 
+    #                percentile_60d, vwap_distance_atr, volume_ratio,
+    #                rsi_14, funding_rate, spread_pct, regime_duration_bars
+    
+    # MFE/MAE timing - when did best/worst occur?
+    candles_to_mfe: int = 0        # How many candles until MFE was hit
+    candles_to_mae: int = 0        # How many candles until MAE was hit
+    mfe_time: str = ""             # Timestamp when MFE occurred
+    mae_time: str = ""             # Timestamp when MAE occurred
+    
+    # Regime tracking - did conditions change during trade?
+    entry_regime: str = ""         # Regime at entry (TREND/RANGE/TRANSITION)
+    exit_regime: str = ""          # Regime at exit
+    regime_changed: bool = False   # True if regime changed during trade
+    
+    # Trading mode at entry
+    entry_trading_mode: str = ""   # TREND/RANGE/TRANSITION mode
+    entry_daily_regime: str = ""   # TREND_DAY/RANGE_DAY/TRANSITION_DAY
 
 
 class TradeLogger:
@@ -167,7 +193,11 @@ class TradeLogger:
         session: str = "OTHER",
         trade_type: str = "LONG_MAIN",
         score_breakdown: Dict[str, float] = None,
-        metadata: Dict[str, Any] = None
+        metadata: Dict[str, Any] = None,
+        # 🔥 ML Data Collection fields (Jan 24, 2026)
+        feature_snapshot: Dict[str, float] = None,
+        entry_trading_mode: str = "",
+        entry_daily_regime: str = ""
     ) -> str:
         """
         Start tracking a new trade.
@@ -204,7 +234,12 @@ class TradeLogger:
             entry_tags=entry_tags or [],
             exit_reason="",
             exit_tags=[],
-            metadata=metadata or {}
+            metadata=metadata or {},
+            # 🔥 ML fields
+            feature_snapshot=feature_snapshot or {},
+            entry_regime=regime,  # Store entry regime for comparison
+            entry_trading_mode=entry_trading_mode,
+            entry_daily_regime=entry_daily_regime
         )
         
         self.active_trades[trade_id] = record
@@ -213,12 +248,41 @@ class TradeLogger:
         
         return trade_id
     
-    def update_trade_mfe_mae(self, trade_id: str, mfe_r: float, mae_r: float):
-        """Update MFE/MAE during trade."""
+    def update_trade_mfe_mae(self, trade_id: str, mfe_r: float, mae_r: float, 
+                             candle_count: int = 0, current_regime: str = ""):
+        """
+        Update MFE/MAE during trade.
+        
+        🔥 ML Enhancement: Also tracks WHEN MFE/MAE occurred and regime changes
+        
+        Args:
+            trade_id: Trade identifier
+            mfe_r: Current MFE in R
+            mae_r: Current MAE in R  
+            candle_count: Current candle count since entry
+            current_regime: Current market regime (for drift detection)
+        """
         if trade_id in self.active_trades:
             record = self.active_trades[trade_id]
-            record.mfe_r = max(record.mfe_r, mfe_r)
-            record.mae_r = max(record.mae_r, mae_r)
+            now = datetime.now(UTC)
+            
+            # Track MFE timing - when was best price reached?
+            if mfe_r > record.mfe_r:
+                record.mfe_r = mfe_r
+                record.candles_to_mfe = candle_count
+                record.mfe_time = now.isoformat()
+            
+            # Track MAE timing - when was worst price reached?
+            if mae_r > record.mae_r:
+                record.mae_r = mae_r
+                record.candles_to_mae = candle_count
+                record.mae_time = now.isoformat()
+            
+            # Track regime changes during trade
+            if current_regime and record.entry_regime:
+                if current_regime != record.entry_regime and not record.regime_changed:
+                    record.regime_changed = True
+                    logger.debug(f"📊 Trade {trade_id}: Regime changed {record.entry_regime} → {current_regime}")
     
     def complete_trade(
         self,
@@ -229,7 +293,10 @@ class TradeLogger:
         pnl_r: float = None,
         mfe_r: float = None,
         mae_r: float = None,
-        exit_tags: List[str] = None
+        exit_tags: List[str] = None,
+        # 🔥 ML Data Collection fields (Jan 24, 2026)
+        exit_regime: str = "",
+        final_candle_count: int = 0
     ) -> Optional[TradeLogRecord]:
         """
         Complete a trade and persist to log.
@@ -243,6 +310,12 @@ class TradeLogger:
         
         record = self.active_trades.pop(trade_id)
         now = datetime.now(UTC)
+        
+        # 🔥 ML: Store exit regime for regime change detection
+        if exit_regime:
+            record.exit_regime = exit_regime
+            if record.entry_regime and exit_regime != record.entry_regime:
+                record.regime_changed = True
         
         # Calculate duration
         entry_dt = datetime.fromisoformat(record.entry_time.replace('Z', '+00:00'))

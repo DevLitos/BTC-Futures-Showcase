@@ -167,7 +167,7 @@ class EntryFilterPipeline:
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'volatility_shock'
                 self._last_aggregate = aggregate
-                logger.warning(f"⛔ FILTER BLOCK [volatility_shock]: {decision.reasons}")
+                logger.warning(f"[BLOCK] FILTER [volatility]: {decision.reasons[0] if decision.reasons else 'shock'}")
                 return aggregate
         
         # ===== 2. BB WIDTH (compression detection) =====
@@ -183,7 +183,7 @@ class EntryFilterPipeline:
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'bb_width'
                 self._last_aggregate = aggregate
-                logger.warning(f"⛔ FILTER BLOCK [bb_width]: {decision.reasons}")
+                logger.warning(f"[BLOCK] FILTER [bb_width]: {decision.reasons[0] if decision.reasons else 'compression'}")
                 return aggregate
         
         # ===== 3. MACRO TREND (15m + 1h EMA200 + slope) =====
@@ -206,7 +206,7 @@ class EntryFilterPipeline:
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'macro_trend'
                 self._last_aggregate = aggregate
-                logger.warning(f"⛔ FILTER BLOCK [macro_trend]: {decision.reasons}")
+                logger.warning(f"[BLOCK] FILTER [macro]: {decision.reasons[0] if decision.reasons else 'veto'}")
                 return aggregate
         
         # ===== 4. POST-SWEEP CONFIRMATION =====
@@ -228,7 +228,7 @@ class EntryFilterPipeline:
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'post_sweep'
                 self._last_aggregate = aggregate
-                logger.warning(f"⛔ FILTER BLOCK [post_sweep]: {decision.reasons}")
+                logger.warning(f"[BLOCK] FILTER [sweep]: {decision.reasons[0] if decision.reasons else 'blocked'}")
                 return aggregate
         
         # ===== 5. COST FILTER (if we have SL/TP) =====
@@ -249,7 +249,7 @@ class EntryFilterPipeline:
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'cost'
                 self._last_aggregate = aggregate
-                logger.warning(f"⛔ FILTER BLOCK [cost]: {decision.reasons}")
+                logger.warning(f"[BLOCK] FILTER [cost]: {decision.reasons[0] if decision.reasons else 'rr'}")
                 return aggregate
         
         # ===== 6. OVERTRADE FILTER (same-zone + reset) =====
@@ -272,7 +272,7 @@ class EntryFilterPipeline:
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'overtrade'
                 self._last_aggregate = aggregate
-                logger.warning(f"⛔ FILTER BLOCK [overtrade]: {decision.reasons}")
+                logger.warning(f"[BLOCK] FILTER [overtrade]: {decision.reasons[0] if decision.reasons else 'limit'}")
                 return aggregate
         
         # ===== 7. BTC CORRELATION FILTER (macro context) =====
@@ -290,7 +290,7 @@ class EntryFilterPipeline:
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'btc_correlation'
                 self._last_aggregate = aggregate
-                logger.warning(f"⛔ FILTER BLOCK [btc_correlation]: {decision.reasons}")
+                logger.warning(f"[BLOCK] FILTER [btc_corr]: {decision.reasons[0] if decision.reasons else 'blocked'}")
                 return aggregate
         
         # ===== FINAL AGGREGATE =====
@@ -300,9 +300,9 @@ class EntryFilterPipeline:
         if aggregate.score_adjust != 0:
             adj_str = f"{aggregate.score_adjust:+.1f}"
             if abs(aggregate.score_adjust) >= 1.5:
-                logger.info(f"📊 FILTER PIPELINE: score_adj={adj_str}, reasons={aggregate.reasons[:3]}")
+                logger.info(f"[DATA] FILTER: adj={adj_str}, {aggregate.reasons[0] if aggregate.reasons else 'ok'}")
             else:
-                logger.debug(f"FILTER PIPELINE: score_adj={adj_str}, reasons={aggregate.reasons[:3]}")
+                logger.debug(f"FILTER: adj={adj_str}, {aggregate.reasons[:2]}")
         
         return aggregate
     

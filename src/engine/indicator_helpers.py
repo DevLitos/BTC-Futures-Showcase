@@ -138,8 +138,9 @@ def calculate_adx_value(df: pd.DataFrame, period: int = 14) -> float:
     lows = df['low'].values
     closes = df['close'].values
     
-    adx = calculate_adx(highs, lows, closes, period)
-    return float(adx[-1]) if not np.isnan(adx[-1]) else 20.0
+    # FIXED: calculate_adx returns (adx_values, adx_slope) tuple
+    adx_values, _ = calculate_adx(highs, lows, closes, period)
+    return float(adx_values[-1]) if not np.isnan(adx_values[-1]) else 20.0
 
 
 def calculate_rsi_value(df: pd.DataFrame, period: int = 14) -> float:

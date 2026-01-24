@@ -57,17 +57,19 @@ class MacroTrendFilter(BaseFilter):
     SLOPE_STRONG_THRESHOLD = 0.001     # +0.1% = strong trend bonus
     
     # Score adjustments
+    # FIX (Jan 24, 2026): Reduced penalties - bot was at 0 trades in 9h
     ALIGNED_BONUS = 1.0            # Both TFs aligned with bias
-    PARTIAL_PENALTY = -1.5         # Only one TF aligned
-    SLOPE_MILD_PENALTY = -1.5      # Small opposing slope
-    SLOPE_MODERATE_PENALTY = -2.5  # Moderate opposing slope
+    PARTIAL_PENALTY = -0.75        # Only one TF aligned (was -1.5)
+    SLOPE_MILD_PENALTY = -0.5      # Small opposing slope (was -1.5)
+    SLOPE_MODERATE_PENALTY = -1.0  # Moderate opposing slope (was -2.5)
     
     # 🔥 NEW (Jan 22, 2026): Size caps when trading against macro slope
     # Different caps per regime_mode
+    # FIX (Jan 24, 2026): Raised caps to allow more trades
     SIZE_CAP_AGAINST_MACRO = {
-        'TREND': 0.5,      # Max 50% size when macro against in trend mode
-        'RANGE': 0.25,     # Only scalps against macro in range
-        'BREAKOUT': 0.4,   # Probe size for breakout attempts
+        'TREND': 0.6,      # Max 60% size when macro against in trend mode (was 0.5)
+        'RANGE': 0.4,      # Probe size in range (was 0.25)
+        'BREAKOUT': 0.5,   # Probe size for breakout attempts (was 0.4)
     }
     
     def __init__(self, 
@@ -236,12 +238,12 @@ class MacroTrendFilter(BaseFilter):
                     size_factor = 0.25  # Extra conservative
                     reasons.append(f"Extreme slope {veto_tf}: {worst_slope*100:.3f}% (penalty -3.0)")
                     tags['macro_slope_extreme_penalty'] = True
-                    logger.warning(f"⚠️ MACRO EXTREME SLOPE ({veto_tf}={worst_slope*100:.3f}%) - RANGE/BREAKOUT mode, penalty only, size={size_factor}")
+                    logger.debug(f"[WARN] MACRO EXTREME SLOPE ({veto_tf}={worst_slope*100:.3f}%)")
                 else:
                     # In TREND mode: hard block
                     tags['macro_slope_veto'] = True
                     tags['macro_veto_tf'] = veto_tf
-                    logger.warning(f"⛔ MACRO SLOPE VETO: {bias} blocked by {veto_tf} EMA200 slope ({worst_slope*100:.3f}%)")
+                    logger.warning(f"[BLOCK] MACRO SLOPE: {bias} blocked by {veto_tf} ({worst_slope*100:.3f}%)")
                     return FilterDecision(
                         allow=False,
                         regime="MACRO_VETO",
@@ -254,7 +256,7 @@ class MacroTrendFilter(BaseFilter):
                 score_adjust += self.SLOPE_MODERATE_PENALTY
                 reasons.append(f"Moderate opposing slope {veto_tf}: {worst_slope*100:.3f}%")
                 tags['macro_slope_moderate'] = True
-                logger.info(f"📊 MACRO: Moderate opposing slope ({veto_tf}={worst_slope*100:.3f}%) - penalty {self.SLOPE_MODERATE_PENALTY}, size={size_factor}")
+                logger.debug(f"[DATA] MACRO: Moderate slope ({veto_tf}={worst_slope*100:.3f}%)")
             
             elif slope_magnitude >= self.SLOPE_MILD_THRESHOLD:
                 # MILD slope - light penalty
@@ -275,16 +277,28 @@ class MacroTrendFilter(BaseFilter):
         )
         
         if bias == 'LONG' and (price_below_ema200_15m or price_below_ema200_1h):
-            # Block LONGs when price is below EMA200
+            # FIX (Jan 24, 2026): Don't hard block LONG below EMA200 in DISCOVERY mode
+            # Convert to penalty + size cap instead of hard veto
+            # The EMA200 veto was causing 0 trades in 9h
             below_tf = '15m' if price_below_ema200_15m else '1h'
-            tags['macro_price_veto'] = True
-            logger.warning(f"⛔ MACRO PRICE VETO: LONG blocked - price below EMA200({below_tf})")
-            return FilterDecision(
-                allow=False,
-                regime="MACRO_VETO",
-                reasons=[f"Price below EMA200({below_tf})"],
-                tags=tags
-            )
+            
+            # In RANGE/BREAKOUT or DISCOVERY: penalty only, no hard block
+            if regime_mode in ('RANGE', 'BREAKOUT', None):
+                tags['macro_price_penalty'] = True
+                score_adjust -= 2.0  # Heavy penalty but allow
+                size_factor = 0.25   # Probe size only
+                reasons.append(f"LONG below EMA200({below_tf}) - heavy penalty")
+                logger.info(f"[WARN] MACRO: LONG below EMA200({below_tf}) - penalty applied, probe size only")
+            else:
+                # In confirmed TREND mode: still block (true counter-trend)
+                tags['macro_price_veto'] = True
+                logger.warning(f"[BLOCK] MACRO: LONG blocked - price < EMA200({below_tf})")
+                return FilterDecision(
+                    allow=False,
+                    regime="MACRO_VETO",
+                    reasons=[f"Price below EMA200({below_tf})"],
+                    tags=tags
+                )
         
         if bias == 'SHORT' and (price_below_ema200_15m or price_below_ema200_1h):
             # For SHORT, "price_above_ema200" means price < EMA200 (inverted logic)

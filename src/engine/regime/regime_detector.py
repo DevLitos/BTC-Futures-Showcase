@@ -251,18 +251,19 @@ class RegimeDetector:
         # Base penalty calculation - GRADUAL, not step function
         # In DISCOVERY mode, we want information, not protection
         # Chase is expensive, but not wrong
-        if chase_atr <= 0.6:
+        # FIX (Jan 24, 2026): Reduced penalties - bot was at 0 trades in 9h
+        if chase_atr <= 0.8:              # Was 0.6
             base_penalty = 0.0  # No chase
-        elif chase_atr <= 1.0:
-            base_penalty = 0.5  # Light chase - common in BTC
-        elif chase_atr <= 1.5:
-            base_penalty = 1.0  # Moderate chase
-        elif chase_atr <= 2.0:
-            base_penalty = 1.5  # Heavy chase
-        elif chase_atr <= 2.5:
-            base_penalty = 2.0  # Very heavy chase
+        elif chase_atr <= 1.2:            # Was 1.0
+            base_penalty = 0.3  # Light chase - common in BTC (was 0.5)
+        elif chase_atr <= 1.8:            # Was 1.5  
+            base_penalty = 0.6  # Moderate chase (was 1.0)
+        elif chase_atr <= 2.3:            # Was 2.0
+            base_penalty = 1.0  # Heavy chase (was 1.5)
+        elif chase_atr <= 2.8:            # Was 2.5
+            base_penalty = 1.5  # Very heavy chase (was 2.0)
         else:
-            base_penalty = 2.5  # Extreme - almost blocking
+            base_penalty = 2.0  # Extreme - almost blocking (was 2.5)
         
         # Apply regime multiplier
         final_penalty = base_penalty * config.chasing_penalty_multiplier
@@ -289,11 +290,13 @@ class RegimeDetector:
             return True, "CHAOS regime - no trading"
         
         # Extreme chase always blocks
-        if chase_atr > 3.0:
+        # FIX (Jan 24, 2026): Raised from 3.0 to 4.0 - was too restrictive
+        if chase_atr > 4.0:
             return True, f"Extreme chase ({chase_atr:.1f} ATR) - too risky"
         
         # High chase in non-expansion blocks
-        if chase_atr > 2.0 and regime != EntryRegime.TREND_EXPANSION:
+        # FIX (Jan 24, 2026): Raised from 2.0 to 2.8
+        if chase_atr > 2.8 and regime != EntryRegime.TREND_EXPANSION:
             return True, f"High chase ({chase_atr:.1f} ATR) in {regime.value}"
         
         return False, ""

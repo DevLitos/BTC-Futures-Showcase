@@ -375,6 +375,31 @@ class Position:
             if current_price > self.highest_price:
                 self.highest_price = current_price
     
+    @property
+    def current_r_multiple(self) -> float:
+        """
+        Calculate current R-multiple based on unrealized PnL.
+        
+        R = current_profit / original_risk
+        Where original_risk = entry_price - original_stop_loss (1R)
+        
+        Returns:
+            float: Current R-multiple (negative if in loss, positive if in profit)
+                   e.g., -0.25 means losing 0.25R, +1.5 means up 1.5R
+        """
+        if self.original_stop_distance <= 0:
+            return 0.0  # Safety: avoid division by zero
+        
+        if self.direction == 'LONG':
+            current_profit = self.highest_price - self.entry_price if hasattr(self, '_last_update_price') else 0
+            # Use unrealized PnL normalized by position size
+            price_move = self.unrealized_pnl / self.size if self.size > 0 else 0
+        else:
+            price_move = self.unrealized_pnl / self.size if self.size > 0 else 0
+        
+        # R = price_move / original_stop_distance
+        return price_move / self.original_stop_distance
+
     def update_trailing_stop(self, current_price: float, atr_1m: float, market_time: datetime,
                              highs: np.ndarray = None, lows: np.ndarray = None,
                              regime_hint: str = None):
@@ -2351,7 +2376,12 @@ class RiskEngine:
                              rsi_1m: Optional[float] = None,
                              vpoc: Optional[float] = None,
                              bb_width: Optional[float] = None,
-                             bb_avg: Optional[float] = None) -> Optional[dict]:
+                             bb_avg: Optional[float] = None,
+                             # 🔥 ANOMALY DETECTION PARAMS (Jan 24, 2026)
+                             spread_bps: Optional[float] = None,
+                             spread_normal_bps: float = 3.0,
+                             last_tick_age_sec: Optional[float] = None,
+                             price_gap_pct: Optional[float] = None) -> Optional[dict]:
         """
         Manage open position with REGIME-BASED exit logic
         
@@ -2378,6 +2408,65 @@ class RiskEngine:
         async with self._lock:
             pos = self.position
             pos.update_unrealized_pnl(current_price)
+            
+            # ================================================================
+            # 🔥 ANOMALY-BASED EMERGENCY EXIT (Jan 24, 2026)
+            # Instead of fixed -0.25R limit that kills valid trades,
+            # detect OPERATIONAL ANOMALIES that indicate system/market issues
+            # where SL might fail to execute properly.
+            # 
+            # ANOMALY TRIGGERS:
+            # 1. Spread explosion (> 5x normal) = liquidity gone
+            # 2. Price gap (> 0.3% in 1 tick) = flash crash/spike
+            # 3. Feed stale (> 10s without tick) = connection issue
+            # 4. ATR explosion (> 4x normal) = extreme volatility
+            # 
+            # BACKSTOP: -1.0R hard limit as final safety net
+            # ================================================================
+            current_r = pos.current_r_multiple
+            
+            # --- ANOMALY DETECTION ---
+            anomaly_detected = False
+            anomaly_reason = ""
+            
+            # 1. Spread anomaly (liquidity evaporated)
+            if spread_bps is not None and spread_normal_bps > 0:
+                spread_ratio = spread_bps / spread_normal_bps
+                if spread_ratio > 5.0:  # > 5x normal spread
+                    anomaly_detected = True
+                    anomaly_reason = f"SPREAD_ANOMALY (spread={spread_bps:.1f}bps, {spread_ratio:.1f}x normal)"
+            
+            # 2. Price gap anomaly (flash crash/spike)
+            if price_gap_pct is not None and abs(price_gap_pct) > 0.3:
+                anomaly_detected = True
+                anomaly_reason = f"PRICE_GAP_ANOMALY (gap={price_gap_pct:.2f}%)"
+            
+            # 3. Feed stale anomaly (connection issues)
+            if last_tick_age_sec is not None and last_tick_age_sec > 10.0:
+                anomaly_detected = True
+                anomaly_reason = f"FEED_STALE_ANOMALY (age={last_tick_age_sec:.1f}s)"
+            
+            # 4. ATR explosion (extreme volatility)
+            if atr_ratio is not None and atr_ratio > 4.0:
+                anomaly_detected = True
+                anomaly_reason = f"VOLATILITY_ANOMALY (ATR_ratio={atr_ratio:.1f}x)"
+            
+            # EMERGENCY EXIT ON ANOMALY (any loss triggers)
+            if anomaly_detected and current_r < 0:
+                logger.warning(
+                    f"🚨 EMERGENCY ANOMALY EXIT: {anomaly_reason} | R={current_r:.3f} | "
+                    f"Closing to prevent SL failure"
+                )
+                return await self._close_position(current_price, f'EMERGENCY_ANOMALY ({anomaly_reason})')
+            
+            # HARD BACKSTOP: -1.0R absolute limit (catastrophic protection)
+            HARD_BACKSTOP_R = -1.0
+            if current_r < HARD_BACKSTOP_R:
+                logger.error(
+                    f"🚨🚨 HARD BACKSTOP EXIT: current_r={current_r:.3f}R < limit={HARD_BACKSTOP_R}R | "
+                    f"CRITICAL: Trade exceeded -1R, closing IMMEDIATELY"
+                )
+                return await self._close_position(current_price, f'HARD_BACKSTOP (R={current_r:.3f})')
             
             # ================================================================
             # 🔥 FIX (Jan 23, 2026): MANAGEMENT COOLDOWN - Prevent action spam
@@ -2506,6 +2595,28 @@ class RiskEngine:
                 if time_check:
                     time_action = time_check.get('action', '')
                     time_reason = time_check.get('reason', 'TIME_INVALIDATION')
+                    time_current_r = time_check.get('current_r', 0)
+                    
+                    # =====================================================================
+                    # 🚨 AUDIT CRÍTICO: TIME_INVALIDATION nunca puede cerrar peor que STOP
+                    # Si vemos R < stop_R, hay un bug grave en el sistema
+                    # =====================================================================
+                    stop_r = -1.0  # El stop debería ser -1R por diseño
+                    if time_action == 'CLOSE' and time_current_r < stop_r - 0.1:
+                        # ¡ALERTA! Cerrando peor que el stop loss teórico
+                        logger.critical(
+                            f"🚨🚨🚨 ILLEGAL TIME EXIT BELOW STOP 🚨🚨🚨\n"
+                            f"   Exit R: {time_current_r:.2f}R\n"
+                            f"   Stop R: {stop_r:.2f}R\n"
+                            f"   Entry: {pos.entry_price:.2f}\n"
+                            f"   SL: {pos.initial_stop_loss:.2f}\n"
+                            f"   Current: {current_price:.2f}\n"
+                            f"   REASON: {time_reason}\n"
+                            f"   ACTION: Check stop_loss placement or sync with exchange!"
+                        )
+                        # NO cerrar - algo está mal, dejar que el SL real actúe
+                        # El SL de exchange debería proteger
+                        return None
                     
                     if time_action == 'CLOSE':
                         logger.warning(f"☠️ TIME_INVALIDATION: {time_reason}")

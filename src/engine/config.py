@@ -5,6 +5,202 @@ All strategy parameters and thresholds
 
 from enum import Enum
 from typing import Literal
+from datetime import datetime, UTC
+
+
+# ============================================================================
+# DAILY REGIME DETECTOR (Jan 23, 2026) - IMPRESCINDIBLE
+# Determina si hoy es "día de tendencia" o "día de rango" al inicio
+# Esto cambia TODO el comportamiento del bot para el día
+# ============================================================================
+class DailyRegimeDetector:
+    """
+    Detector de régimen DIARIO - ejecutar una vez al inicio del día/sesión.
+    
+    🔥 CRÍTICO: El régimen diario debe sobreescribir comportamiento intradiario.
+    
+    TREND DAY (día de tendencia):
+    - Range diario > 1.5x ATR promedio
+    - ADX diario > 20
+    - Precio se aleja de VWAP sin volver
+    - Comportamiento: Trend-following, runners, stops amplios
+    
+    RANGE DAY (día de rango):
+    - Range diario < 1.0x ATR promedio
+    - ADX diario < 18
+    - Precio orbita VWAP
+    - Comportamiento: Mean-reversion, scalps, stops tight
+    
+    TRANSITION DAY:
+    - Entre RANGE y TREND
+    - Cautela, size reducido
+    """
+    
+    # Classification thresholds
+    RANGE_ATR_THRESHOLD = 1.0       # Daily range < 1.0x ATR = RANGE DAY
+    TREND_ATR_THRESHOLD = 1.5       # Daily range > 1.5x ATR = TREND DAY
+    ADX_RANGE_THRESHOLD = 18        # Daily ADX < 18 = RANGE DAY
+    ADX_TREND_THRESHOLD = 20        # Daily ADX > 20 = TREND DAY
+    
+    # Behavior modifications per daily regime
+    DAILY_REGIME_CONFIG = {
+        'TREND_DAY': {
+            'allow_runners': True,
+            'sl_atr_mult': 3.0,         # Wider stops
+            'tp_r_target': 2.0,         # Higher targets
+            'max_trades': 4,            # More trades allowed
+            'size_mult': 1.0,           # Full size
+            'score_adjust': 0,          # Normal threshold
+        },
+        'RANGE_DAY': {
+            'allow_runners': False,     # Quick exits
+            'sl_atr_mult': 2.0,         # Tight stops
+            'tp_r_target': 1.0,         # Quick targets
+            'max_trades': 3,            # Limited trades
+            'size_mult': 0.5,           # Half size
+            'score_adjust': +1,         # Stricter threshold
+        },
+        'TRANSITION_DAY': {
+            'allow_runners': True,
+            'sl_atr_mult': 2.5,
+            'tp_r_target': 1.5,
+            'max_trades': 3,
+            'size_mult': 0.7,
+            'score_adjust': +0.5,
+        }
+    }
+    
+    @classmethod
+    def classify_daily_regime(cls, daily_range: float, daily_atr: float, 
+                               daily_adx: float) -> str:
+        """
+        Classify daily regime at start of session.
+        
+        Args:
+            daily_range: Today's high - low so far
+            daily_atr: Average true range (daily)
+            daily_adx: Daily ADX value
+            
+        Returns:
+            'TREND_DAY', 'RANGE_DAY', or 'TRANSITION_DAY'
+        """
+        if daily_atr <= 0:
+            return 'RANGE_DAY'  # Default conservative
+        
+        range_ratio = daily_range / daily_atr
+        
+        # Use both ATR ratio AND ADX for classification
+        if range_ratio > cls.TREND_ATR_THRESHOLD and daily_adx > cls.ADX_TREND_THRESHOLD:
+            return 'TREND_DAY'
+        elif range_ratio < cls.RANGE_ATR_THRESHOLD or daily_adx < cls.ADX_RANGE_THRESHOLD:
+            return 'RANGE_DAY'
+        else:
+            return 'TRANSITION_DAY'
+    
+    @classmethod
+    def get_daily_config(cls, daily_regime: str) -> dict:
+        """Get behavior config for daily regime."""
+        return cls.DAILY_REGIME_CONFIG.get(daily_regime, cls.DAILY_REGIME_CONFIG['RANGE_DAY'])
+    
+    @classmethod
+    def log_daily_regime(cls, daily_regime: str, daily_range: float, 
+                         daily_atr: float, daily_adx: float) -> str:
+        """Generate log message for daily regime classification."""
+        config = cls.get_daily_config(daily_regime)
+        return (
+            f"📅 DAILY REGIME: {daily_regime}\\n"
+            f"   Range/ATR: {daily_range/daily_atr:.2f}x\\n"
+            f"   Daily ADX: {daily_adx:.1f}\\n"
+            f"   Config: SL={config['sl_atr_mult']}xATR, TP={config['tp_r_target']}R, "
+            f"Size={config['size_mult']*100:.0f}%"
+        )
+
+
+# ============================================================================
+# 🎯 ASYMMETRY DEFINITION (Jan 23, 2026) - CRITICAL
+# ============================================================================
+# El usuario dijo: "Ahora estás en el peor punto intermedio: no tienes wins 
+# pequeños, no tienes runners, y tus losses son variables."
+#
+# SOLUCIÓN: Elegimos UN CAMINO y lo aplicamos consistentemente.
+# 
+# CAMINO ELEGIDO: HIGH WINRATE + CONTROLLED LOSSES
+# - Target pequeño (1.0R) para maximizar winrate
+# - Pérdida máxima controlada (-0.35R absoluto máximo con TIME_INVALIDATION)
+# - NO chase runners en RANGE days
+# - SÍ chase runners SOLO en TREND days (daily regime = TREND_DAY)
+# 
+# REGLA DE ORO: Si un trade no va en profit en X minutos, EXIT.
+# No dejar que mediocre se convierta en pérdida.
+# ============================================================================
+class AsymmetryConfig:
+    """
+    ESTRATEGIA DE ASIMETRÍA: HIGH WINRATE + CONTROLLED LOSSES
+    
+    Filosofía:
+    - Wins pequeños pero FRECUENTES
+    - Losses pequeños y CONTROLADOS (nunca > 0.35R)
+    - TIME_INVALIDATION es TU AMIGO, no tu enemigo
+    
+    El edge viene de:
+    - Alta tasa de acierto (>55%)
+    - Pérdidas contenidas (promedio -0.20R, máximo -0.35R)
+    - NO de runners (esos son bonus, no estrategia base)
+    """
+    
+    # === TARGETS ===
+    # Target conservador para maximizar winrate
+    BASE_TP_R = 1.0                  # Target base = 1.0R
+    RANGE_DAY_TP_R = 0.8             # En RANGE_DAY, TP más corto (scalp)
+    TREND_DAY_TP_R = 1.5             # En TREND_DAY, dejamos correr un poco más
+    
+    # === STOPS - LA CLAVE DE LA ASIMETRÍA ===
+    # STOP NUNCA debe ser > TP. Eso destruye expectancy.
+    MAX_STOP_R = 1.0                 # Stop máximo = 1.0R (igual que TP)
+    
+    # TIME_INVALIDATION: EXIT RÁPIDO SI NO FUNCIONA
+    # Si el trade no avanza en X minutos, es mediocre = EXIT
+    TIME_INVALIDATION_CANDLES = 5   # 5 velas 1m = 5 min máximo
+    TIME_INVALIDATION_EXIT_R = 0.0  # Target: salir en breakeven o mejor
+    TIME_INVALIDATION_MAX_LOSS_R = -0.25  # MÁXIMO permitido: -0.25R
+    
+    # === PÉRDIDA MÁXIMA ABSOLUTA ===
+    # Si llegamos aquí, algo falló (slippage, gap, etc.)
+    ABSOLUTE_MAX_LOSS_R = -0.35     # NUNCA perder más de -0.35R
+    
+    # === RUNNERS (SOLO EN TREND DAYS) ===
+    ALLOW_RUNNERS = False           # Default OFF
+    RUNNER_TRIGGER_MFE = 1.5        # Solo considera runner si MFE > 1.5R
+    RUNNER_TRAIL_ATR = 2.0          # Trail a 2x ATR cuando tenemos runner
+    
+    # === VALIDACIÓN CONTINUA ===
+    @classmethod
+    def validate_trade_outcome(cls, exit_r: float, exit_reason: str) -> bool:
+        """
+        Validate that trade outcome respects asymmetry rules.
+        
+        Returns True if trade respected rules, False if violated.
+        Used for AUDIT and detection of bugs.
+        """
+        if exit_r < cls.ABSOLUTE_MAX_LOSS_R:
+            # VIOLATION: Lost more than allowed
+            return False
+        
+        if exit_reason == 'TIME_INVALIDATION' and exit_r < cls.TIME_INVALIDATION_MAX_LOSS_R:
+            # VIOLATION: TIME_INVALIDATION should exit at breakeven, not loss
+            return False
+        
+        return True
+    
+    @classmethod
+    def get_tp_for_regime(cls, daily_regime: str) -> float:
+        """Get TP target based on daily regime."""
+        if daily_regime == 'TREND_DAY':
+            return cls.TREND_DAY_TP_R
+        elif daily_regime == 'RANGE_DAY':
+            return cls.RANGE_DAY_TP_R
+        else:
+            return cls.BASE_TP_R
 
 
 # ============================================================================
@@ -453,7 +649,7 @@ class OperatingMode:
     MODE = "DISCOVERY"  # "DISCOVERY" or "PRODUCTION"
     
     # Mode-specific thresholds
-    DISCOVERY_SCORE_THRESHOLD = 5   # More permissive
+    DISCOVERY_SCORE_THRESHOLD = 4   # More permissive (was 5 - too restrictive)
     PRODUCTION_SCORE_THRESHOLD = 7  # Stricter
     
     # Risk per trade by mode
@@ -502,12 +698,13 @@ class OperatingMode:
     # =========================================================================
     # CAPA 4: MINIMUM ACTIVITY PER SESSION - Prevent "no trades" failures
     # If trades/session is below minimum, progressively relax filters
+    # FIX (Jan 24, 2026): More aggressive relaxation - bot was at 0 trades in 9h
     # =========================================================================
     MIN_TRADES_PER_SESSION = 1        # Minimum trades expected per 4h session
-    MIN_TRADES_PER_DAY = 3            # Minimum trades expected per day
+    MIN_TRADES_PER_DAY = 2            # Minimum trades expected per day (was 3)
     
     # Filter relaxation when activity is too low
-    LOW_ACTIVITY_SCORE_REDUCTION = 1  # Reduce threshold by 1 if low activity
+    LOW_ACTIVITY_SCORE_REDUCTION = 1.5  # Reduce threshold by 1.5 if low activity (was 1)
     
     # =========================================================================
     # SESSION QUALITY SIZING - Adjust size by session quality
@@ -783,11 +980,11 @@ class EntryGateConfig:
     
     # SCORE-BASED SIZING (replaces binary threshold)
     # Graduated sizing based on score quality
-    # FIX (Jan 22, 2026): Lowered thresholds - in Discovery we need volume
-    SCORE_BLOCK_FLOOR = 4.0          # Below this = block (was 4.5)
-    SCORE_PROBE_MAX = 5.0            # 4.0-5.0 = probe (0.25x) (was 5.5)
-    SCORE_REDUCED_MAX = 6.0          # 5.0-6.0 = reduced (0.5x) (was 6.5)
-    # Above 6.0 = full size (1.0x)
+    # FIX (Jan 24, 2026): Further lowered - bot was paralyzed with 0 trades in 9h
+    SCORE_BLOCK_FLOOR = 3.5          # Below this = block (was 4.0 - still too high)
+    SCORE_PROBE_MAX = 4.5            # 3.5-4.5 = probe (0.25x) (was 5.0)
+    SCORE_REDUCED_MAX = 5.5          # 4.5-5.5 = reduced (0.5x) (was 6.0)
+    # Above 5.5 = full size (1.0x)
     
     # RR-BASED SIZING
     # Graduated sizing based on risk:reward quality
@@ -874,7 +1071,7 @@ class HTFFilters:
     ADX_TREND_MIN = 25              # ADX >= 25 → TREND mode
     
     # Legacy (kept for backwards compatibility, but use new thresholds above)
-    MIN_ADX = 18                    # 🔥 Restored: ADX must be >= 18 for TREND classification
+    MIN_ADX = 20                    # 🔥 FIX (Jan 23): ADX must be >= 20 for ANY trend classification
     MIN_ADX_SLOPE = -999            # DEPRECATED: slope never blocks
     MIN_ATR_VS_MA = 0.70            # Allow contractions
     
@@ -890,6 +1087,140 @@ class HTFFilters:
     # Correlation filters (for NQ/ES)
     CHECK_CORRELATION = True
     CORRELATION_TIMEFRAME = '5m'
+
+
+# ============================================================================
+# RANGE MODE CONFIGURATION (Jan 23, 2026)
+# When ADX < 18, market is ranging - different rules apply
+# ============================================================================
+class RangeModeConfig:
+    """
+    Configuration for RANGE market regime (ADX < 18).
+    
+    🔥 CORRECCIÓN (Jan 23, 2026):
+    NO bloquear trades en RANGE - usar reglas diferentes.
+    BTC pasa 60-70% del tiempo en rango - hay que explotarlo.
+    
+    RANGE MODE RULES:
+    - Trades SÍ permitidos, pero SOLO en extremos (VAH/VAL/bands)
+    - Size reducido (50%)
+    - Stop más tight (2x ATR vs 3x en trend)
+    - TP corto + salida rápida
+    - Score threshold más alto
+    
+    TRANSITION MODE (ADX 18-20):
+    - Size 70%
+    - Score threshold +0.5
+    
+    TREND MODE (ADX > 20):
+    - Full size, normal rules
+    """
+    
+    # =========================================================================
+    # TRADE PERMISSIONS IN RANGE
+    # =========================================================================
+    ALLOW_TREND_TRADES = False      # NO trend trades at MID-RANGE
+    ALLOW_EXTREME_TRADES = True     # YES at VAH/VAL/extremes (mean-reversion)
+    
+    # Extreme definition (percentile of 60-day range)
+    EXTREME_HIGH_PERCENTILE = 90    # >= 90% = HIGH extreme (SHORT only)
+    EXTREME_LOW_PERCENTILE = 10     # <= 10% = LOW extreme (LONG only)
+    
+    # =========================================================================
+    # SIZE MULTIPLIERS BY MODE
+    # =========================================================================
+    RANGE_SIZE_MULT = 0.50          # 50% size in RANGE
+    TRANSITION_SIZE_MULT = 0.70     # 70% size in TRANSITION
+    TREND_SIZE_MULT = 1.0           # 100% size in TREND
+    
+    # =========================================================================
+    # SCORE THRESHOLD ADJUSTMENTS
+    # =========================================================================
+    RANGE_SCORE_ADD = 1.0           # +1.0 to threshold in RANGE (stricter)
+    TRANSITION_SCORE_ADD = 0.5      # +0.5 to threshold in TRANSITION
+    TREND_SCORE_ADD = 0.0           # No adjustment in TREND
+    
+    # =========================================================================
+    # STOP LOSS IN RANGE (tighter than trend)
+    # =========================================================================
+    RANGE_SL_ATR_MULTIPLIER = 2.0   # 2x ATR (vs 3x in trend)
+    RANGE_SL_MAX_PCT = 0.8          # Max 0.8% stop (tighter in chop)
+    
+    # =========================================================================
+    # TARGET/EXIT IN RANGE (faster exits)
+    # =========================================================================
+    RANGE_TP_R = 1.0                # TP at 1R (quick target)
+    RANGE_MAX_DURATION_MIN = 30     # Max 30 min in trade (vs 90 in trend)
+    RANGE_MIN_RR = 1.2              # Need RR >= 1.2 neto in range
+    
+    # =========================================================================
+    # TIME MANAGEMENT IN RANGE (faster exits)
+    # =========================================================================
+    RANGE_TIME_INVALIDATION_CANDLES = 4   # 4 candles (vs 6 in trend)
+    RANGE_MFE_THRESHOLD = 0.2             # Lower MFE threshold (faster exit)
+    
+    # =========================================================================
+    # TRADE LIMITS IN RANGE (prevent re-entry at same level)
+    # =========================================================================
+    RANGE_MAX_TRADES_PER_SESSION = 2      # Max 2 trades per session in range
+    RANGE_COOLDOWN_AFTER_LOSS_MIN = 20    # 20 min cooldown after loss in range
+    
+    # =========================================================================
+    # ADX THRESHOLDS FOR MODE CLASSIFICATION
+    # =========================================================================
+    ADX_RANGE_MAX = 18              # ADX < 18 = RANGE
+    ADX_TRANSITION_MAX = 20         # ADX 18-20 = TRANSITION
+    # ADX > 20 = TREND
+    
+    @classmethod
+    def get_trading_mode(cls, adx: float) -> str:
+        """Classify trading mode based on ADX."""
+        if adx < cls.ADX_RANGE_MAX:
+            return 'RANGE'
+        elif adx < cls.ADX_TRANSITION_MAX:
+            return 'TRANSITION'
+        else:
+            return 'TREND'
+    
+    @classmethod
+    def get_size_multiplier(cls, mode: str) -> float:
+        """Get position size multiplier for mode."""
+        if mode == 'RANGE':
+            return cls.RANGE_SIZE_MULT
+        elif mode == 'TRANSITION':
+            return cls.TRANSITION_SIZE_MULT
+        return cls.TREND_SIZE_MULT
+    
+    @classmethod
+    def get_score_adjustment(cls, mode: str) -> float:
+        """Get score threshold adjustment for mode."""
+        if mode == 'RANGE':
+            return cls.RANGE_SCORE_ADD
+        elif mode == 'TRANSITION':
+            return cls.TRANSITION_SCORE_ADD
+        return cls.TREND_SCORE_ADD
+    
+    @classmethod
+    def is_at_extreme(cls, percentile: float, bias: str) -> tuple:
+        """
+        Check if at valid extreme for the given bias.
+        
+        Returns:
+            (is_valid: bool, extreme_type: str or None)
+        """
+        if percentile >= cls.EXTREME_HIGH_PERCENTILE:
+            # At HIGH extreme - only SHORT is valid
+            if bias == 'SHORT':
+                return (True, 'HIGH')
+            return (False, 'HIGH')  # LONG not valid at top
+        elif percentile <= cls.EXTREME_LOW_PERCENTILE:
+            # At LOW extreme - only LONG is valid
+            if bias == 'LONG':
+                return (True, 'LOW')
+            return (False, 'LOW')  # SHORT not valid at bottom
+        
+        # Not at extreme
+        return (False, None)
 
 
 # ============================================================================
@@ -1197,14 +1528,17 @@ class SmartExits:
     
     # =========================================================================
     # 3. VPOC/RESISTANCE EXIT - Exit before hitting strong levels
+    # 🔥 FIX (Jan 23, 2026): Was exiting too early, killing expectancy
+    # Problem: VPOC exit at 0.3R means avg win = 0.2R, but losses = 0.5R+
+    # Solution: Require higher MFE and wider proximity
     # =========================================================================
     VPOC_EXIT_ENABLED = True
     
     # Distance to VPOC/resistance to trigger exit (as % of price)
-    VPOC_PROXIMITY_PCT = 0.002  # 0.2% = within 0.2% of VPOC
+    VPOC_PROXIMITY_PCT = 0.001  # 🔥 FIX: 0.1% = much closer to VPOC before exit (was 0.2%)
     
     # Minimum profit required before VPOC exit
-    VPOC_EXIT_MIN_MFE_R = 0.3  # Need at least 0.3R profit
+    VPOC_EXIT_MIN_MFE_R = 0.6  # 🔥 FIX: Need at least 0.6R profit (was 0.3R - too low!)
     
     # =========================================================================
     # 4. TIME-BASED PROFIT LOCK - Lock profits after time threshold
@@ -1708,28 +2042,31 @@ class DynamicScoreThreshold:
     This prevents low-quality trades from slipping through.
     """
     # Base threshold by regime
+    # FIX (Jan 24, 2026): Lowered all thresholds - bot was at 0 trades in 9h
     REGIME_THRESHOLD = {
-        "RANGE": 6.5,        # Stricter in range (need clean setup)
-        "TREND": 6.0,        # More permissive in trend (momentum helps)
-        "TREND_EXPANSION": 6.5,  # Stricter in expansion (more noise/slip)
-        "TREND_EXHAUSTION": 7.0,  # Very strict near exhaustion
-        "CONSOLIDATION": 6.5,
+        "RANGE": 5.0,            # Was 6.5 - too strict for range trading
+        "TREND": 4.5,            # Was 6.0 - let momentum carry us
+        "TREND_EXPANSION": 5.0,  # Was 6.5 - breakouts need fast entry
+        "TREND_EXHAUSTION": 5.5, # Was 7.0 - still be careful
+        "CONSOLIDATION": 5.0,    # Was 6.5
     }
     
     # Session adjustment (added to base threshold)
+    # FIX (Jan 24, 2026): Reduced penalties, bot was paralyzed
     SESSION_ADJUSTMENT = {
-        "ASIA": 0.5,           # +0.5 in Asia (lower quality)
+        "ASIA": 0.25,          # Was 0.5
         "LONDON": 0.0,         # No adjustment
         "NY": 0.0,             # No adjustment
-        "LONDON_NY_OVERLAP": -0.5,  # -0.5 in best session (can be looser)
-        "NY_OPEN_VOLATILE": 0.5,    # +0.5 in volatile open
-        "DEAD_HOURS": 1.0,     # +1.0 in dead hours (rarely trade)
-        "WEEKEND": 0.5,        # +0.5 on weekends
+        "LONDON_NY_OVERLAP": -0.5,  # -0.5 in best session
+        "NY_OPEN_VOLATILE": 0.25,   # Was 0.5
+        "DEAD_HOURS": 0.5,     # Was 1.0
+        "WEEKEND": 0.25,       # Was 0.5
         "OTHER": 0.0,
     }
     
     # Fallback for discovery mode
-    DISCOVERY_BASE = 5.0
+    # FIX (Jan 24, 2026): Lowered from 5.0 - bot was at 0 trades in 9h
+    DISCOVERY_BASE = 4.0
     
     @classmethod
     def get_threshold(cls, regime: str, session: str, is_discovery: bool = False) -> float:
@@ -1786,7 +2123,7 @@ class SessionTradeLimits:
     # 🔥 NEW: Mode-based multipliers
     MODE_TRADE_LIMIT_CAP = {
         "TREND": 4,      # Max 4 trades per session in TREND
-        "RANGE": 3,      # Max 3 trades per session in RANGE
+        "RANGE": 2,      # 🔥 FIX: Max 2 trades per session in RANGE (was 3)
         "BREAKOUT": 4,   # Max 4 trades per session in BREAKOUT
         "NO_TRADE": 0,   # No trades allowed
     }
@@ -1795,10 +2132,10 @@ class SessionTradeLimits:
     OVERRIDE_SCORE_THRESHOLD = 7.5
     # 🔥 NEW: Even stricter threshold in RANGE (more selective)
     OVERRIDE_IF_SCORE_GTE = 7.5  # Alias for compatibility
-    OVERRIDE_SCORE_THRESHOLD_RANGE = 8.0
+    OVERRIDE_SCORE_THRESHOLD_RANGE = 8.5  # 🔥 FIX: 8.5 in RANGE (was 8.0)
     
     # Max trades per day (across all sessions)
-    MAX_TRADES_PER_DAY = 8
+    MAX_TRADES_PER_DAY = 6  # 🔥 FIX: Reduced from 8 to 6 (prevent overtrading)
     
     @classmethod
     def get_limit(cls, session: str, regime_mode: str = None) -> int:
@@ -2089,7 +2426,8 @@ class ExitHierarchy:
     # C) REGLA CRÍTICA: Max loss por TIME_INVALIDATION
     # Si timeout y PnL <= -0.25R → cerrar inmediatamente
     # Si timeout y PnL > -0.25R → evaluar tesis, no cerrar peor
-    TIME_INVALIDATION_MAX_LOSS_R = -0.25  # Nunca cerrar peor que esto
+    # 🔥 FIX (Jan 24, 2026): Use AsymmetryConfig as single source of truth
+    TIME_INVALIDATION_MAX_LOSS_R = AsymmetryConfig.TIME_INVALIDATION_MAX_LOSS_R  # Nunca cerrar peor que esto
     
     # D) Comportamiento según estado de P&L en timeout
     TIME_IN_PROFIT_ACTION = "PARTIAL_AND_RUNNER"  # Reduce + dejar runner

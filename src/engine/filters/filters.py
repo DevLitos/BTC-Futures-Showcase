@@ -396,8 +396,8 @@ class HTFFilter:
             
             logger.debug(f"📊 HTF: Price in hysteresis zone (±{hysteresis_buffer:.0f} around EMA50={ema_50:.2f})")
         
-        # LOG OBLIGATORIO - decisión de bias
-        logger.info(f"📊 HTF bias decision | Price={current_price:.2f} | EMA50={ema_50:.2f} | EMA200={ema_200:.2f} | ADX={adx:.2f} | Slope={slope:.4f} → bias={bias}")
+        # Log bias decision (DEBUG level to reduce noise)
+        logger.debug(f"[DATA] HTF bias: Price={current_price:.2f} | EMA50={ema_50:.2f} | EMA200={ema_200:.2f} | ADX={adx:.2f} | Slope={slope:.4f} -> bias={bias}")
         
         # =========================================================
         # RELAXED FILTERS FOR BACKTEST MODE
@@ -435,11 +435,11 @@ class HTFFilter:
         self.last_htf_regime_mode = regime_mode
         self.last_htf_adx = adx
         
-        logger.info(f"📊 HTF ADX={adx:.1f} → Mode: {regime_mode} (thresholds: <{HTFFilters.ADX_RANGE_MAX}=RANGE, {HTFFilters.ADX_RANGE_MAX}-{HTFFilters.ADX_TREND_MIN}=WEAK_TREND, >={HTFFilters.ADX_TREND_MIN}=TREND)")
+        logger.debug(f"[DATA] HTF ADX={adx:.1f} -> Mode: {regime_mode}")
         
-        # 🔥 ADX NO LONGER BLOCKS - but mode is critical for downstream logic
+        # ADX NO LONGER BLOCKS - but mode is critical for downstream logic
         if adx < HTFFilters.ADX_RANGE_MAX:
-            logger.info(f"📊 HTF: ADX {adx:.2f} < {HTFFilters.ADX_RANGE_MAX} → {regime_mode} mode (affects stop sizing)")
+            logger.debug(f"[DATA] HTF: ADX {adx:.2f} < {HTFFilters.ADX_RANGE_MAX} -> {regime_mode} mode")
         
         # =========================================================
         # ADX SLOPE - INFORMATION ONLY, NEVER BLOCKS
@@ -452,7 +452,7 @@ class HTFFilter:
         # =========================================================
         # slope is logged and returned for tagging, but NEVER blocks entry
         if slope < -0.5:
-            logger.info(f"📊 HTF: ADX slope negative ({slope:.3f}) - INFO only, not blocking")
+            logger.debug(f"[DATA] HTF: ADX slope negative ({slope:.3f})")
         
         # Check ATR
         if atr <= atr_ma * HTFFilters.MIN_ATR_VS_MA:
@@ -463,7 +463,7 @@ class HTFFilter:
             if not self._check_correlation(bias, correlation_data):
                 return False, None, f"Correlation check failed for {bias}"
         
-        logger.info(f"✅ HTF Filter PASSED - Bias: {bias} | ADX: {adx:.2f} | Slope: {slope:.4f}")
+        logger.debug(f"[OK] HTF Filter PASSED - Bias: {bias} | ADX: {adx:.2f}")
         return True, bias, "HTF filter passed"
     
     def _check_correlation(self, bias: str, correlation_data: dict) -> bool:

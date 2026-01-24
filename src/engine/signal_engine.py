@@ -39,7 +39,9 @@ from src.engine.indicators import (
     calculate_ema, calculate_atr, calculate_adx, calculate_rsi, calculate_bollinger_bands
 )
 from src.engine.config import HTFFilters, RiskManagement, OperatingMode  # For logging thresholds + MODE
+from src.engine.config import DailyRegimeDetector  # 🔥 FIX (Jan 23): Daily regime classification
 from src.engine.regime import EdgeRegimeClassifier, RegimeDetector, EntryRegime, calculate_chase_atr
+from src.engine.regime import TrendIntelligence, TrendPhase, get_trend_intelligence  # 🔥 NEW: Trend cycle detection
 from src.engine.edge.edge_enforcement import EdgeEnforcement
 from src.engine.edge.edge_validator import ContextValidity
 from src.engine.core_utils import PositionSizer, get_position_sizer
@@ -111,6 +113,16 @@ from src.engine.indicator_helpers import (
 # 🔥 NEW (Jan 22, 2026): Entry Quality Gate - Hard rules before scoring
 from src.engine.entry_quality_gate import (
     EntryQualityGate, get_entry_quality_gate, GateDecision, GateResult
+)
+
+# 🧠 NEW (Jan 24, 2026): Intelligent Filter - Multi-layer decision system
+from src.engine.intelligent_filter import (
+    IntelligentFilter, get_intelligent_filter, FilterSeverity
+)
+
+# 🔥 NEW (Jan 24, 2026): Adaptive Entry System - Market-aware thresholds
+from src.engine.adaptive_entry import (
+    AdaptiveEntrySystem, get_adaptive_entry_system, MarketCondition
 )
 
 # NEW ARCHITECTURE: Position Store as Single Source of Truth
@@ -270,6 +282,24 @@ class SignalEngine:
         self._current_trade_type: TradeType = TradeType.LONG_MAIN  # Default
         self._current_trade_regime: str = 'RANGE'  # 🔥 FIX (Jan 22): Track regime for trailing stop
         
+        # =====================================================================
+        # 🔥 DAILY REGIME DETECTOR (Jan 23, 2026) - IMPRESCINDIBLE
+        # Classifies day as TREND_DAY, RANGE_DAY, or TRANSITION_DAY at session start
+        # This OVERRIDES intraday regime decisions for the entire day
+        # =====================================================================
+        self._daily_regime: str = 'RANGE_DAY'  # Default conservative
+        self._daily_regime_config: dict = DailyRegimeDetector.get_daily_config('RANGE_DAY')
+        self._daily_regime_last_update: datetime = None
+        
+        # =====================================================================
+        # 🔥 TREND INTELLIGENCE (Jan 23, 2026) - Detección de ciclos
+        # Detecta INICIO y FIN de tendencias, no solo estado actual
+        # Fases: ACCUMULATION → BIRTH → ACCELERATION → MATURE → EXHAUSTION → DEATH
+        # =====================================================================
+        self._trend_intelligence = get_trend_intelligence()
+        self._trend_phase: TrendPhase = TrendPhase.RANGE_BOUND
+        self._trend_last_update: datetime = None
+        
         # Regime classifier for volume-aware filtering
         self.regime_classifier = EdgeRegimeClassifier()
         
@@ -288,6 +318,21 @@ class SignalEngine:
         # Layer 1: Gate (hard rules) → Layer 2: Score → Layer 3: Execution
         # =====================================================================
         self._entry_gate = get_entry_quality_gate()
+        
+        # =====================================================================
+        # 🧠 INTELLIGENT FILTER - Multi-layer decision system (Jan 24, 2026)
+        # Accumulates penalties, no "entering anyway" - blocks if accumulated risk is too high
+        # =====================================================================
+        self._intelligent_filter = get_intelligent_filter()
+        
+        # =====================================================================
+        # 🔥 ADAPTIVE ENTRY SYSTEM (Jan 24, 2026)
+        # Market-aware thresholds that adjust based on:
+        # - Volatility (BB width, ADX)
+        # - Activity level (hours since last trade)
+        # - Market condition (dead, low, normal, high, extreme)
+        # =====================================================================
+        self._adaptive_entry = get_adaptive_entry_system()
         
         # Centralized position sizer for consistent sizing calculations
         self._position_sizer = get_position_sizer(
@@ -356,6 +401,13 @@ class SignalEngine:
         self._last_fp_block = None  # Last filter pipeline block
         self._last_pullback_block_log = None  # Rate limit pullback block logs
         self._loss_exit_types = {}  # Track loss exit types for analysis (dict not list!)
+        
+        # =====================================================================
+        # 🔥 ANOMALY DETECTION TRACKING (Jan 24, 2026)
+        # Track previous tick data to detect anomalies (gaps, staleness)
+        # =====================================================================
+        self._prev_tick_price: float = 0.0  # Previous tick price for gap detection
+        self._prev_tick_time: datetime = None  # Previous tick time for staleness detection
         
         # =====================================================================
         # INDICATOR CACHE - Avoid recalculating heavy indicators every tick
@@ -1143,6 +1195,16 @@ class SignalEngine:
         except Exception as e:
             logger.warning(f"⚠️ Important levels initialization error: {e} - continuing without")
             self.important_levels = None
+        
+        # 7. Log intelligence modules status
+        logger.info("=" * 60)
+        logger.info("🧠 INTELLIGENCE MODULES STATUS")
+        logger.info("=" * 60)
+        logger.info(f"📅 Daily Regime: {self._daily_regime} | Config: {self._daily_regime_config}")
+        logger.info(f"📈 Trend Intelligence: {self._trend_phase.value}")
+        logger.info(f"   Phase Detection: BIRTH → ACCEL → MATURE → EXHAUST → DEATH")
+        logger.info(f"   Current: {self._trend_intelligence.get_phase_description()}")
+        logger.info("=" * 60)
             
         logger.info(f"✅ Signal Engine initialized and ready | Capital: ${self.risk_engine.capital:.2f}")
     
@@ -1723,8 +1785,56 @@ class SignalEngine:
             logger.warning(f"⚠️ Anticipation engine error (non-fatal): {e}")
             # Continue without anticipation - it's optional enhancement
         
-        # ===== BLOQUE 1: HTF FILTER (1h) - CON CACHÉ INTRA-BAR =====
+        # ===== BLOQUE 0.5: DAILY REGIME DETECTOR (Jan 23, 2026) =====
+        # Update daily regime every 4 hours OR on first tick
+        # This changes ENTIRE bot behavior for the day
         candles_1h = self.market_data.get_candles('1h')
+        if candles_1h and len(candles_1h) >= 50:
+            should_update_daily_regime = (
+                self._daily_regime_last_update is None or
+                (market_time - self._daily_regime_last_update).total_seconds() > 14400  # 4 hours
+            )
+            
+            if should_update_daily_regime:
+                # Calculate daily indicators from 1h candles
+                highs_1h = np.array([c['high'] for c in candles_1h])
+                lows_1h = np.array([c['low'] for c in candles_1h])
+                closes_1h = np.array([c['close'] for c in candles_1h])
+                
+                # Daily range (last 24 1h candles)
+                daily_high = np.max(highs_1h[-24:]) if len(highs_1h) >= 24 else np.max(highs_1h)
+                daily_low = np.min(lows_1h[-24:]) if len(lows_1h) >= 24 else np.min(lows_1h)
+                daily_range = daily_high - daily_low
+                
+                # Daily ATR (from 1h data averaged)
+                atr_1h = calculate_atr(highs_1h, lows_1h, closes_1h, 14)
+                daily_atr = float(atr_1h[-1] * 24) if len(atr_1h) > 0 else daily_range  # Approx daily ATR
+                
+                # Daily ADX - FIXED: calculate_adx returns (adx_values, adx_slope) tuple
+                adx_1h_values, _ = calculate_adx(highs_1h, lows_1h, closes_1h, 14)
+                daily_adx = float(adx_1h_values[-1]) if len(adx_1h_values) > 0 and not np.isnan(adx_1h_values[-1]) else 15.0
+                
+                # Classify daily regime
+                new_daily_regime = DailyRegimeDetector.classify_daily_regime(
+                    daily_range=daily_range,
+                    daily_atr=daily_atr,
+                    daily_adx=daily_adx
+                )
+                
+                # Update state if changed
+                if new_daily_regime != self._daily_regime:
+                    logger.info(
+                        DailyRegimeDetector.log_daily_regime(
+                            new_daily_regime, daily_range, daily_atr, daily_adx
+                        )
+                    )
+                    self._daily_regime = new_daily_regime
+                    self._daily_regime_config = DailyRegimeDetector.get_daily_config(new_daily_regime)
+                
+                self._daily_regime_last_update = market_time
+        
+        # ===== BLOQUE 1: HTF FILTER (1h) - CON CACHÉ INTRA-BAR =====
+        # candles_1h already fetched above
         if not candles_1h or len(candles_1h) < 50:
             return
         
@@ -1749,11 +1859,231 @@ class SignalEngine:
             self._htf_cache_regime_mode = self.htf_filter.last_htf_regime_mode
             self._htf_cache_adx = self.htf_filter.last_htf_adx
             logger.debug(f"HTF cache updated: ts={last_1h_ts}, passed={htf_passed}, bias={bias}, regime_mode={self._htf_cache_regime_mode}, adx={self._htf_cache_adx:.1f}")
+            
+            # =================================================================
+            # 🔥 TREND INTELLIGENCE UPDATE (Jan 23, 2026)
+            # Update trend phase detection on each new 1h candle
+            # This detects trend BIRTH, ACCELERATION, EXHAUSTION, DEATH
+            # =================================================================
+            try:
+                last_candle = candles_1h[-1]
+                atr_1h_arr = calculate_atr(
+                    df_1h['high'].values, df_1h['low'].values, df_1h['close'].values, 14
+                )
+                atr_1h = float(atr_1h_arr[-1]) if len(atr_1h_arr) > 0 else 100.0
+                
+                trend_state = self._trend_intelligence.update(
+                    current_price=current_price,
+                    high=float(last_candle.get('high', current_price)),
+                    low=float(last_candle.get('low', current_price)),
+                    close=float(last_candle.get('close', current_price)),
+                    adx=self._htf_cache_adx,
+                    volume=float(last_candle.get('volume', 0)),
+                    atr=atr_1h,
+                    timestamp=market_time
+                )
+                
+                # Update phase tracking
+                old_phase = self._trend_phase
+                self._trend_phase = trend_state.current_phase
+                
+                if old_phase != self._trend_phase:
+                    logger.info(
+                        f"📈 TREND PHASE: {self._trend_intelligence.get_phase_description()}"
+                    )
+                    
+                # Store for trade tags
+                self._current_trade_tags['trend_phase'] = self._trend_phase.value
+                self._current_trade_tags['trend_direction'] = trend_state.direction.value
+                self._current_trade_tags['trend_entry_mode'] = trend_state.entry_mode
+                self._current_trade_tags['trend_bias'] = trend_state.trade_bias
+                
+            except Exception as e:
+                logger.debug(f"TrendIntelligence update error: {e}")
         else:
             # Usar caché
             htf_passed = self._htf_cache_passed
             bias = self._htf_cache_bias
             htf_reason = self._htf_cache_reason
+        
+        # =====================================================================
+        # 🔥 FIX (Jan 23, 2026): RANGE MODE - NOT BLOCK, USE DIFFERENT RULES
+        # When ADX < 18, we are in RANGE/CHOP - NOT trending
+        # 
+        # CORRECCIÓN CRÍTICA: No bloquear, usar MODO RANGE con reglas:
+        #   - Trades SÍ permitidos en EXTREMOS (VAH/VAL/VWAP bands)
+        #   - Size reducido (50%)
+        #   - Stop más tight (2x ATR vs 3x)
+        #   - TP corto + salida rápida
+        #   - Score threshold más alto (7.0 vs 6.0)
+        # 
+        # El rango es donde BTC pasa el 60-70% del tiempo - no podemos
+        # ignorarlo, hay que explotarlo correctamente.
+        # =====================================================================
+        htf_regime_mode = self._htf_cache_regime_mode
+        htf_adx = self._htf_cache_adx
+        
+        # =====================================================================
+        # 🔥 FIX (Jan 23, 2026): FAST REGIME DETECTION using 5m ADX
+        # Problem: Using only 1h ADX meant we could be 1 HOUR late detecting
+        # regime changes. An intraday bot needs faster detection.
+        # 
+        # Solution: Use 5m ADX for FAST detection, 1h ADX for CONFIRMATION
+        #   - If 5m ADX drops < 15 → IMMEDIATE RANGE MODE (don't wait for 1h)
+        #   - If 5m ADX > 25 AND 1h ADX > 18 → STRONG TREND
+        #   - Otherwise, use 1h ADX as primary
+        # =====================================================================
+        fast_adx = htf_adx  # Default to 1h
+        candles_5m = self.market_data.get_candles('5m')
+        if candles_5m and len(candles_5m) >= 30:
+            try:
+                df_5m_temp = pd.DataFrame(candles_5m[-30:])  # Last 30 candles = 2.5 hours
+                adx_5m_vals, _ = calculate_adx(
+                    df_5m_temp['high'].values, 
+                    df_5m_temp['low'].values, 
+                    df_5m_temp['close'].values, 
+                    14
+                )
+                if len(adx_5m_vals) > 0 and not np.isnan(adx_5m_vals[-1]):
+                    fast_adx = float(adx_5m_vals[-1])
+                    self._current_trade_tags['adx_5m_fast'] = fast_adx
+            except Exception as e:
+                logger.debug(f"Fast ADX calc error: {e}")
+        
+        # COMBINED REGIME DETECTION: Fast (5m) + Confirmation (1h)
+        # If 5m shows STRONG RANGE (ADX < 15), believe it immediately
+        # If 5m shows STRONG TREND (ADX > 25) AND 1h confirms (ADX > 18), it's TREND
+        # Otherwise, use 1h as primary
+        if fast_adx < 15:
+            # 5m says STRONG RANGE - don't wait for 1h
+            effective_adx = min(fast_adx, htf_adx)  # Use the more conservative (lower)
+        elif fast_adx > 25 and htf_adx > 18:
+            # 5m says STRONG TREND and 1h confirms - use the stronger signal
+            effective_adx = htf_adx  # Trust 1h for trend confirmation
+        else:
+            # Mixed signals - use weighted average favoring 1h for stability
+            effective_adx = htf_adx * 0.7 + fast_adx * 0.3
+        
+        # Store regime for downstream use
+        self._current_trade_tags['htf_regime_mode'] = htf_regime_mode
+        self._current_trade_tags['htf_adx'] = htf_adx
+        self._current_trade_tags['effective_adx'] = effective_adx
+        
+        # Determine trading mode based on EFFECTIVE ADX (not just 1h)
+        if effective_adx < 18:
+            trading_mode = 'RANGE'
+        elif effective_adx < 20:
+            trading_mode = 'TRANSITION'  # Less size, higher score threshold
+        else:
+            trading_mode = 'TREND'
+        
+        self._current_trade_tags['trading_mode'] = trading_mode
+        
+        # Log mode changes (rate limited)
+        if self._idle_eval_count % 60 == 1:
+            logger.info(
+                f"🎯 TRADING MODE: {trading_mode} | ADX_1h={htf_adx:.1f} | ADX_5m={fast_adx:.1f} | "
+                f"Effective={effective_adx:.1f} | Bias={bias}"
+            )
+        
+        # ===================================================================
+        # RANGE MODE RULES (ADX < 18)
+        # Not a block - different entry rules for ranging markets
+        # 🔥 FIX (Jan 23): MUST have location_context, otherwise NO TRADE
+        # 🔥 FIX (Jan 24): Calculate location_context EARLY if in RANGE mode
+        # ===================================================================
+        if trading_mode == 'RANGE':
+            # EARLY location_context calculation if missing
+            # This fixes timing bug where we check before calculating
+            if not self._location_context:
+                try:
+                    closes_1h_early = df_1h['close'].values
+                    highs_1h_early = df_1h['high'].values
+                    lows_1h_early = df_1h['low'].values
+                    volumes_1h_early = df_1h['volume'].values if 'volume' in df_1h.columns else np.ones(len(closes_1h_early))
+                    
+                    atr_1h_vals_early = calculate_atr(highs_1h_early, lows_1h_early, closes_1h_early, 14)
+                    atr_1h_early = atr_1h_vals_early[-1] if len(atr_1h_vals_early) > 0 else current_price * 0.01
+                    
+                    adx_1h_vals_early, _ = calculate_adx(highs_1h_early, lows_1h_early, closes_1h_early, 14)
+                    adx_1h_early = adx_1h_vals_early[-1] if len(adx_1h_vals_early) > 0 else 20.0
+                    
+                    location_cache_key_early = _ts_to_int(df_1h.iloc[-1].get('timestamp', 0))
+                    _, _, self._location_context = self.location_filter.check(
+                        closes_1h=closes_1h_early,
+                        highs_1h=highs_1h_early,
+                        lows_1h=lows_1h_early,
+                        volumes_1h=volumes_1h_early,
+                        current_price=current_price,
+                        atr_1h=atr_1h_early,
+                        adx_1h=adx_1h_early,
+                        bias=bias,
+                        regime='RANGE',
+                        cache_key=location_cache_key_early
+                    )
+                    logger.debug(f"📍 RANGE MODE: Calculated early location_context")
+                except Exception as e:
+                    logger.warning(f"⚠️ RANGE MODE: Failed to calculate early location_context: {e}")
+            
+            # In RANGE: Only trade at EXTREMES (VAH/VAL/VWAP deviation)
+            # Check if we're at an extreme using location context
+            at_extreme = False
+            extreme_type = None
+            
+            # 🔥 FIX: If no location_context, we can't determine if at extreme
+            # In RANGE mode without context = NO TRADE (conservative)
+            if not self._location_context:
+                if self._idle_eval_count % 120 == 1:
+                    logger.info(
+                        f"⏸️ RANGE MODE: No location context available | "
+                        f"Cannot determine if at extreme - SKIPPING"
+                    )
+                return
+            
+            pct_60d = self._location_context.percentile_60d
+            self._current_trade_tags['percentile_60d'] = pct_60d
+            
+            # Extreme = top 10% or bottom 10% of 60-day range
+            if pct_60d >= 90:
+                at_extreme = True
+                extreme_type = 'HIGH'  # Only SHORT allowed here
+                if bias == 'LONG':
+                    logger.debug(f"⛔ RANGE MODE: At 90th percentile - LONG blocked, only SHORT")
+                    return  # Can't long at the top in range
+            elif pct_60d <= 10:
+                at_extreme = True
+                extreme_type = 'LOW'  # Only LONG allowed here
+                if bias == 'SHORT':
+                    logger.debug(f"⛔ RANGE MODE: At 10th percentile - SHORT blocked, only LONG")
+                    return  # Can't short at the bottom in range
+            
+            if not at_extreme:
+                # NOT at extreme in RANGE mode - skip this trade
+                # Wait for price to reach VAH/VAL/extremes
+                if self._idle_eval_count % 120 == 1:  # Log every 2 min
+                    logger.info(
+                        f"⏸️ RANGE MODE: Not at extreme (pct={pct_60d:.0f}%) | "
+                        f"Waiting for VAH/VAL/VWAP bands"
+                    )
+                return
+            
+            # At extreme in RANGE - apply RANGE rules
+            self._current_trade_tags['range_mode_extreme'] = extreme_type
+            self._current_trade_tags['range_size_mult'] = 0.50  # 50% size
+            logger.info(
+                f"🎯 RANGE TRADE: {bias} at {extreme_type} extreme (pct={pct_60d:.0f}%) | "
+                f"Size=50% | Stop=2xATR"
+            )
+        
+        # ===================================================================
+        # TRANSITION MODE RULES (ADX 18-20)
+        # Cautious - reduced size, higher score threshold
+        # ===================================================================
+        elif trading_mode == 'TRANSITION':
+            self._current_trade_tags['transition_mode'] = True
+            self._current_trade_tags['transition_size_mult'] = 0.70  # 70% size
+            self._current_trade_tags['transition_score_add'] = 0.5  # +0.5 to threshold
+            logger.debug(f"⚠️ TRANSITION MODE: Size=70%, Score+0.5")
         
         # IMPROVED: Allow counter-trend trading in defensive mode
         # When market is volatile, both directions can present opportunities
@@ -1786,7 +2116,7 @@ class SignalEngine:
             should_log = (seconds_since_log >= 300) or (self._last_htf_state != 'rejected')
             
             if should_log:
-                logger.info(f"⛔ HTF filter rejected: {htf_reason}")
+                logger.info(f"[BLOCK] HTF filter: {htf_reason}")
                 
                 # Show detailed HTF values
                 ema_50 = df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
@@ -1795,8 +2125,8 @@ class SignalEngine:
                 adx = adx_vals[-1] if len(adx_vals) > 0 else 0
                 adx_slope = (adx_vals[-1] - adx_vals[-2]) if len(adx_vals) > 1 else 0
                 
-                logger.info(f"   📊 Price: ${current_price:.2f} | EMA50: ${ema_50:.2f} | EMA200: ${ema_200:.2f}")
-                logger.info(f"   📈 ADX: {adx:.2f} | Slope: {adx_slope:.4f}")
+                logger.debug(f"   [DATA] Price: ${current_price:.2f} | EMA50: ${ema_50:.2f} | EMA200: ${ema_200:.2f}")
+                logger.debug(f"   [UP] ADX: {adx:.2f} | Slope: {adx_slope:.4f}")
                 
                 self._last_htf_reject_log_time = market_time
                 self._last_htf_state = 'rejected'
@@ -1805,7 +2135,7 @@ class SignalEngine:
         self.current_bias = bias
         bias_label = f'{bias} (counter-trend)' if allow_countertrend else bias
         if self._last_htf_state != f'passed_{bias}':
-            logger.info(f"✅ HTF filter passed - Bias: {bias_label}")
+            logger.debug(f"[OK] HTF filter passed - Bias: {bias_label}")
             self._last_htf_state = f'passed_{bias}'
         
         # ===== BLOQUE 1.5: LOCATION FILTER (MACRO VETO) =====
@@ -2245,9 +2575,8 @@ class SignalEngine:
                     
                     # WARNING: Price 0.5-1% below EMA20 - apply extra penalty (handled in micro_trend)
                     elif distance_to_ema20 < -EMA_DISTANCE_WARNING_PCT:
-                        logger.info(
-                            f"⚠️ EMA DISTANCE WARNING: LONG entry {abs(distance_to_ema20)*100:.1f}% "
-                            f"below EMA20 - may face headwind"
+                        logger.debug(
+                            f"[WARN] EMA DISTANCE: LONG {abs(distance_to_ema20)*100:.1f}% below EMA20"
                         )
                         self._current_trade_tags['ema_distance_warning'] = True
                         self._current_trade_tags['ema20_distance_pct'] = distance_to_ema20 * 100
@@ -2306,7 +2635,7 @@ class SignalEngine:
             # Log which filter blocked
             blocker = filter_decision.tags.get('blocked_by', 'unknown')
             if self._last_fp_block is None or self._last_fp_block != f'{blocker}_{bias}':
-                logger.warning(f"⛔ FILTER PIPELINE BLOCK [{blocker}]: {filter_decision.reasons}")
+                logger.warning(f"[BLOCK] FILTER [{blocker}]: {filter_decision.reasons[0] if filter_decision.reasons else 'veto'}")
                 self._last_fp_block = f'{blocker}_{bias}'
             return
         else:
@@ -3051,6 +3380,41 @@ class SignalEngine:
             self._current_volatility_regime = VolatilityRegime.NORMAL
         
         # ==================================================================
+        # 🔥 ADAPTIVE MARKET CLASSIFICATION (Jan 24, 2026)
+        # Classify market condition based on BB width and ADX
+        # This adjusts ALL thresholds dynamically
+        # ==================================================================
+        try:
+            # Get BB width as percentage
+            cached_data = self._get_cached_indicators(market_time)
+            bb_width = cached_data.get('bb_width', 0)
+            bb_avg = cached_data.get('bb_avg', 1)
+            adx_for_adaptive = cached_data.get('adx_1h', 20)
+            
+            # Convert BB width to percentage
+            if bb_avg and bb_avg > 0 and current_price > 0:
+                bb_width_pct = (bb_width / current_price) * 100
+            else:
+                bb_width_pct = 0.5  # Default to normal
+            
+            # Classify market condition
+            market_condition = self._adaptive_entry.classify_market_condition(
+                bb_width_pct=bb_width_pct,
+                adx=adx_for_adaptive or 20
+            )
+            
+            self._current_trade_tags['market_condition'] = market_condition.value
+            self._current_trade_tags['bb_width_pct'] = round(bb_width_pct, 3)
+            
+            # Get adaptive thresholds
+            adaptive_thresholds = self._adaptive_entry.get_effective_thresholds(market_time)
+            self._current_trade_tags['adaptive_min_score'] = adaptive_thresholds.min_score
+            self._current_trade_tags['adaptive_chase_tol'] = adaptive_thresholds.chase_tolerance_atr
+            
+        except Exception as e:
+            logger.debug(f"Adaptive classification failed: {e}")
+        
+        # ==================================================================
         # 🎯 SCORE-BASED ENTRY SYSTEM (Score > Gates)
         # 4 blocks × 0-2 points + synergy = max 9
         # Dynamic threshold based on regime, session, and mode
@@ -3074,26 +3438,112 @@ class SignalEngine:
             is_discovery=is_discovery
         )
         
-        # CAPA 4: Reduce threshold if activity is too low (prevent "no trades" failure)
+        # =====================================================================
+        # 🔥 TREND INTELLIGENCE THRESHOLD ADJUSTMENT (Jan 23, 2026)
+        # Adjust threshold based on trend PHASE (cycle position)
+        # BIRTH = easiest entry, EXHAUSTION = hardest entry
+        # =====================================================================
+        trend_phase = self._trend_phase
+        trend_threshold_adj = 0
+        
+        if trend_phase == TrendPhase.TREND_BIRTH:
+            trend_threshold_adj = -1  # Easiest - catch the start
+            self._current_trade_tags['trend_phase_adj'] = 'BIRTH_BONUS'
+        elif trend_phase == TrendPhase.TREND_ACCELERATION:
+            trend_threshold_adj = -0.5  # Still good momentum
+            self._current_trade_tags['trend_phase_adj'] = 'ACCEL_BONUS'
+        elif trend_phase == TrendPhase.TREND_EXHAUSTION:
+            trend_threshold_adj = +1.5  # Much harder - trend dying
+            self._current_trade_tags['trend_phase_adj'] = 'EXHAUST_PENALTY'
+        elif trend_phase == TrendPhase.DISTRIBUTION:
+            trend_threshold_adj = +2  # Hardest - no new entries
+            self._current_trade_tags['trend_phase_adj'] = 'DISTRIB_PENALTY'
+        elif trend_phase == TrendPhase.TREND_DEATH:
+            # Reversal opportunity - but only for opposite direction
+            trend_state = self._trend_intelligence.state
+            if (trend_state.direction.value == 'BULLISH' and bias == 'SHORT') or \
+               (trend_state.direction.value == 'BEARISH' and bias == 'LONG'):
+                trend_threshold_adj = -0.5  # Reversal opportunity
+                self._current_trade_tags['trend_phase_adj'] = 'REVERSAL_BONUS'
+            else:
+                trend_threshold_adj = +2  # Wrong direction
+                self._current_trade_tags['trend_phase_adj'] = 'WRONG_DIR_PENALTY'
+        
+        base_threshold += trend_threshold_adj
+        if trend_threshold_adj != 0:
+            logger.info(f"📈 Trend phase {trend_phase.value}: threshold adjusted by {trend_threshold_adj:+.1f}")
+        
+        # =====================================================================
+        # 🔥 ANTI-PARALYSIS GUARD (Jan 24, 2026) - Intelligent threshold relaxation
+        # Problem: Bot had 0 trades in 9h due to accumulated filter penalties
+        # Solution: Progressive relaxation based on inactivity duration
+        #
+        # LEVELS:
+        # - 4+ hours without trade: -0.5 threshold (was -1.0 only after deficit)
+        # - 6+ hours without trade: -1.0 threshold + reduce filter penalties
+        # - 8+ hours without trade: -1.5 threshold + bypass soft filters
+        #
+        # This NEVER bypasses hard safety (chaos, extreme spread, HTF veto)
+        # Only relaxes quality gates (score threshold, chase penalty, etc.)
+        # =====================================================================
         daily_trades = self.state_machine.daily_trades if hasattr(self.state_machine, 'daily_trades') else 0
         hours_elapsed = (market_time - market_time.replace(hour=0, minute=0, second=0)).total_seconds() / 3600
+        
+        # Track time since last trade for progressive relaxation
+        last_trade_time = getattr(self, '_last_trade_time', None)
+        if last_trade_time is None:
+            hours_since_trade = hours_elapsed
+        else:
+            hours_since_trade = (market_time - last_trade_time).total_seconds() / 3600
         
         # Calculate expected vs actual trades
         expected_trades = max(1, int(hours_elapsed / 8) * OperatingMode.MIN_TRADES_PER_SESSION)
         activity_deficit = expected_trades - daily_trades
         
-        # If we're significantly below expected activity, relax threshold
+        # 🔥 NEW: Progressive anti-paralysis based on hours since last trade
+        anti_paralysis_reduction = 0.0
+        anti_paralysis_level = 0
+        
+        if hours_since_trade >= 8:
+            # LEVEL 3: Severe inactivity - maximum relaxation
+            anti_paralysis_reduction = 1.5
+            anti_paralysis_level = 3
+            self._current_trade_tags['anti_paralysis_level'] = 'SEVERE'
+            logger.warning(f"⚠️ ANTI-PARALYSIS L3: {hours_since_trade:.1f}h without trade → threshold -{anti_paralysis_reduction}")
+        elif hours_since_trade >= 6:
+            # LEVEL 2: Significant inactivity
+            anti_paralysis_reduction = 1.0
+            anti_paralysis_level = 2
+            self._current_trade_tags['anti_paralysis_level'] = 'SIGNIFICANT'
+            logger.info(f"📊 ANTI-PARALYSIS L2: {hours_since_trade:.1f}h without trade → threshold -{anti_paralysis_reduction}")
+        elif hours_since_trade >= 4:
+            # LEVEL 1: Mild inactivity
+            anti_paralysis_reduction = 0.5
+            anti_paralysis_level = 1
+            self._current_trade_tags['anti_paralysis_level'] = 'MILD'
+            logger.info(f"📊 ANTI-PARALYSIS L1: {hours_since_trade:.1f}h without trade → threshold -{anti_paralysis_reduction}")
+        
+        # Also add legacy activity deficit logic
         if activity_deficit >= 2 and hours_elapsed >= 4:
-            threshold_reduction = min(OperatingMode.LOW_ACTIVITY_SCORE_REDUCTION, activity_deficit)
-            self._entry_threshold = max(3, base_threshold - threshold_reduction)  # Never go below 3
-            if self._entry_threshold < base_threshold:
-                logger.info(f"📊 Low activity ({daily_trades}/{expected_trades} trades) → threshold {base_threshold} → {self._entry_threshold}")
-                self._current_trade_tags['low_activity_relaxed'] = True
+            legacy_reduction = min(OperatingMode.LOW_ACTIVITY_SCORE_REDUCTION, activity_deficit)
+            anti_paralysis_reduction = max(anti_paralysis_reduction, legacy_reduction)
+            self._current_trade_tags['low_activity_relaxed'] = True
+        
+        # Apply anti-paralysis reduction (never below floor of 3.0)
+        if anti_paralysis_reduction > 0:
+            final_threshold = max(3.0, base_threshold - anti_paralysis_reduction)
+            if final_threshold < base_threshold:
+                logger.info(f"📊 Anti-paralysis: {daily_trades} trades in {hours_elapsed:.1f}h → threshold {base_threshold:.1f} → {final_threshold:.1f}")
+            self._entry_threshold = final_threshold
         else:
             self._entry_threshold = base_threshold
         
+        # Store anti-paralysis level for use by other filters
+        self._anti_paralysis_level = anti_paralysis_level
+        self._current_trade_tags['hours_since_trade'] = round(hours_since_trade, 2)
+        
         # Log the regime-aware threshold
-        logger.debug(f"📊 Dynamic threshold: {self._entry_threshold} (regime={regime_for_threshold}, session={session_name}, discovery={is_discovery})")
+        logger.debug(f"📊 Dynamic threshold: {self._entry_threshold} (regime={regime_for_threshold}, session={session_name}, phase={trend_phase.value}, ap_level={anti_paralysis_level})")
         
         # Get 1h data for structure scoring
         candles_1h = self.market_data.get_candles('1h')
@@ -3536,6 +3986,19 @@ class SignalEngine:
                 logger.info(f"🚀 Trend expansion → chase penalty reduced to {TrendExpansionConfig.CHASE_PENALTY_MULT:.0%}")
                 self._current_trade_tags['expansion_chase_reduction'] = True
             
+            # =========================================================================
+            # 🔥 ANTI-PARALYSIS: Reduce chase penalty based on inactivity level
+            # If we haven't traded in hours, being picky about chase is counterproductive
+            # =========================================================================
+            anti_paralysis = getattr(self, '_anti_paralysis_level', 0)
+            if anti_paralysis > 0 and chase_penalty > 0:
+                # Reduce chase penalty by 25% per level (up to 75% reduction at L3)
+                reduction_factor = 1.0 - (0.25 * anti_paralysis)
+                original_penalty = chase_penalty
+                chase_penalty *= reduction_factor
+                logger.info(f"📊 Anti-paralysis L{anti_paralysis}: chase penalty {original_penalty:.2f} → {chase_penalty:.2f} (×{reduction_factor:.0%})")
+                self._current_trade_tags['ap_chase_reduction'] = reduction_factor
+            
             # Apply penalty to score
             if chase_penalty > 0:
                 adjusted_score = score - chase_penalty
@@ -3655,7 +4118,18 @@ class SignalEngine:
         
         # Calculate take profit
         risk = abs(current_price - stop_loss)
-        tp_multiplier = RiskManagement.TP1_RISK_MULTIPLE
+        
+        # 🔥 FIX (Jan 24, 2026): Use DAILY REGIME TP target from AsymmetryConfig
+        # This makes TP adaptive: shorter in RANGE_DAY (scalps), longer in TREND_DAY
+        from src.engine.config import AsymmetryConfig
+        daily_regime_tp = self._daily_regime_config.get('tp_r_target', AsymmetryConfig.BASE_TP_R)
+        tp_multiplier = daily_regime_tp
+        
+        # Log if different from base
+        if daily_regime_tp != AsymmetryConfig.BASE_TP_R:
+            logger.debug(f"📅 TP adjusted for {self._daily_regime}: {AsymmetryConfig.BASE_TP_R}R → {daily_regime_tp}R")
+            self._current_trade_tags['tp_regime_adjusted'] = True
+            self._current_trade_tags['tp_regime_target'] = daily_regime_tp
         
         if bias == 'LONG':
             take_profit = current_price + (risk * tp_multiplier)
@@ -3960,6 +4434,18 @@ class SignalEngine:
         # NOTE: funding_sizing_factor will be set later in the TIER 2 section
         # and applied via combined_defensive there
         
+        # =========================================================================
+        # 🔥 FIX (Jan 23, 2026): DAILY REGIME SIZE MODIFIER
+        # Apply daily regime-based position size adjustment
+        # TREND_DAY = 100%, RANGE_DAY = 50%, TRANSITION_DAY = 70%
+        # =========================================================================
+        daily_regime_size_mult = self._daily_regime_config.get('size_mult', 1.0)
+        if daily_regime_size_mult < 1.0:
+            logger.info(f"📅 Daily regime sizing: {self._daily_regime} → {daily_regime_size_mult:.0%}")
+            self._current_trade_tags['daily_regime'] = self._daily_regime
+            self._current_trade_tags['daily_regime_size_mult'] = daily_regime_size_mult
+            combined_defensive *= daily_regime_size_mult
+        
         # Calculate position size using centralized sizer
         position_size, size_breakdown = self._position_sizer.calculate_position_size(
             capital=self.risk_engine.capital,
@@ -4124,11 +4610,96 @@ class SignalEngine:
             # TAG: Entry timestamp for latency tracking (order->fill)
             self._current_trade_tags['entry_timestamp_ms'] = int(market_time.timestamp() * 1000)
             
-            # In PRODUCTION mode, these tags COULD block (but not in DISCOVERY)
-            if not OperatingMode.is_discovery():
-                # Production: Apply stricter gates if configured
-                # For now, we still enter but log the concern
-                pass
+            # =================================================================
+            # 🧠 INTELLIGENT FILTER - Final Decision Before Execution
+            # Accumulates ALL penalties and makes nuanced decision
+            # NO "entering anyway" - if risk is too high, BLOCK
+            # =================================================================
+            session_quality_str = self._current_trade_tags.get('session_quality', 'moderate')
+            is_weekend = market_time.weekday() >= 5 if market_time else False
+            
+            # Get tick age from tracking
+            tick_age = None
+            if self._prev_tick_time and market_time:
+                tick_age = (market_time - self._prev_tick_time).total_seconds()
+            
+            intelligent_decision = self._intelligent_filter.evaluate(
+                # Market Quality
+                spread_bps=None,  # TODO: Get from order book
+                spread_normal_bps=3.0,
+                feed_age_sec=tick_age,
+                atr_ratio=self._current_trade_tags.get('volatility_ratio'),
+                
+                # Session Quality
+                htf_adx=adx_1h,
+                session_name=self._current_trade_tags.get('session', 'unknown'),
+                day_of_week=market_time.weekday() if market_time else 0,
+                is_weekend=is_weekend,
+                
+                # Signal Quality
+                regime=self._current_regime.value if self._current_regime else "UNKNOWN",
+                chase_atr=self._current_trade_tags.get('chase_atr', 0.0),
+                micro_trend=micro_trend_str if 'micro_trend_str' in dir() else "NEUTRAL",
+                micro_strength=micro_strength if 'micro_strength' in dir() else 0.0,
+                entry_direction=bias,
+                has_bos=self._current_trade_tags.get('bos_confirmed', False),
+                near_level=(level_context.distance_below_atr < 1.0 if level_context else False),
+                
+                # Execution Quality (from recent trades)
+                recent_slippage_bps=0.0,  # TODO: Get from execution analytics
+                order_latency_ms=0.0,
+                recent_rejects=0,
+                
+                # System Health
+                consecutive_timeouts=0,  # TODO: Track
+                tick_latency_ms=0.0,
+                exchange_connected=True,
+                
+                market_time=market_time,
+            )
+            
+            # Store decision in tags
+            self._current_trade_tags['intelligent_filter_decision'] = intelligent_decision.decision_reason
+            self._current_trade_tags['intelligent_filter_penalty'] = intelligent_decision.accumulated_penalty
+            self._current_trade_tags['intelligent_filter_size_mult'] = intelligent_decision.final_size_multiplier
+            
+            # 🧠 INTELLIGENT FILTER DECISION
+            if not intelligent_decision.allow_entry:
+                logger.warning(f"🧠 INTELLIGENT FILTER BLOCK: {intelligent_decision.decision_reason}")
+                for f in intelligent_decision.active_filters:
+                    logger.info(f"   {f}")
+                self._current_trade_tags['skip_reason'] = 'intelligent_filter_block'
+                self.missed_tracker.log_blocked_signal(
+                    direction=bias,
+                    price=current_price,
+                    block_reason=f"Intelligent Filter: {intelligent_decision.decision_reason}",
+                    block_category='intelligent_filter',
+                    score=score,
+                    atr=self._last_momentum_atr
+                )
+                self._set_rejection_cooldown("Intelligent filter block", candles=3)
+                return
+            
+            # Apply intelligent filter modifiers
+            if intelligent_decision.accumulated_penalty > 0:
+                logger.info(f"🧠 INTELLIGENT FILTER: {intelligent_decision}")
+                # Apply size reduction from intelligent filter
+                position_size = position_size * intelligent_decision.final_size_multiplier
+                # Apply SL tightening
+                if intelligent_decision.sl_tightening_factor < 1.0:
+                    sl_distance = abs(stop_loss - current_price)
+                    tightened_distance = sl_distance * intelligent_decision.sl_tightening_factor
+                    if bias == 'LONG':
+                        stop_loss = current_price - tightened_distance
+                    else:
+                        stop_loss = current_price + tightened_distance
+                    logger.info(f"   SL tightened by {(1-intelligent_decision.sl_tightening_factor)*100:.0f}% → {stop_loss:.2f}")
+            
+            # Re-enforce minimum size
+            if position_size < KRAKEN_BTC_MIN_SIZE:
+                logger.warning(f"⚠️ Position size {position_size:.6f} below minimum after intelligent filter - blocking")
+                self._current_trade_tags['skip_reason'] = 'size_below_minimum_after_filter'
+                return
         else:
             logger.debug("📋 [BACKTEST] Skipping TIER2 validation")
         
@@ -4360,7 +4931,11 @@ class SignalEngine:
                             session=session_for_count,
                             trade_type=trade_type_name,
                             score_breakdown=breakdown.copy(),
-                            metadata={'worst_case_rr': worst_case_rr if 'worst_case_rr' in dir() else None}
+                            metadata={'worst_case_rr': worst_case_rr if 'worst_case_rr' in dir() else None},
+                            # 🔥 ML Data Collection (Jan 24, 2026)
+                            feature_snapshot=self._build_ml_feature_snapshot(),
+                            entry_trading_mode=self._current_trade_tags.get('trading_mode', ''),
+                            entry_daily_regime=self._daily_regime
                         )
                     except Exception as log_err:
                         logger.error(f"TradeLogger.start_trade() failed (backtest): {log_err} - continuing without trade logging")
@@ -4376,6 +4951,9 @@ class SignalEngine:
                     
                     # Go directly to MANAGE
                     self.state_machine.transition_to(BotState.MANAGE, "Instant fill (backtest)")
+                    
+                    # 🔥 ANTI-PARALYSIS: Update last trade time
+                    self._last_trade_time = market_time
                     
                     SIGNALS_GENERATED.labels(symbol=self.symbol, direction=bias).inc()
                     logger.info(f"🎯 Position opened: {bias} {fill_size} @ {fill_price:.2f}")
@@ -4882,8 +5460,14 @@ class SignalEngine:
                             session=session_for_count,
                             trade_type=trade_type_name,
                             score_breakdown=trade_score_breakdown,
-                            metadata={'worst_case_rr': trade_tags.get('rr_worst_case')}
+                            metadata={'worst_case_rr': trade_tags.get('rr_worst_case')},
+                            # 🔥 ML Data Collection (Jan 24, 2026)
+                            feature_snapshot=self._build_ml_feature_snapshot(),
+                            entry_trading_mode=trade_tags.get('trading_mode', ''),
+                            entry_daily_regime=self._daily_regime
                         )
+                        # 🔥 ANTI-PARALYSIS: Update last trade time for activity tracking
+                        self._last_trade_time = market_time
                     except Exception as log_err:
                         logger.error(f"TradeLogger.start_trade() failed: {log_err} - continuing without trade logging")
                         self._current_trade_id = None
@@ -5636,7 +6220,26 @@ class SignalEngine:
             return  # Don't make any decisions based on stale data
         
         # =====================================================================
-        # 🔒 FIX (Jan 13, 2026): SYNC SIZE FROM RECONCILER SNAPSHOT
+        # � ANOMALY DETECTION DATA (Jan 24, 2026)
+        # Calculate anomaly indicators for EMERGENCY system
+        # =====================================================================
+        price_gap_pct = None
+        last_tick_age_sec = None
+        
+        # Calculate price gap from previous tick
+        if self._prev_tick_price > 0 and current_price > 0:
+            price_gap_pct = ((current_price - self._prev_tick_price) / self._prev_tick_price) * 100
+        
+        # Calculate tick age (staleness)
+        if self._prev_tick_time is not None and market_time is not None:
+            last_tick_age_sec = (market_time - self._prev_tick_time).total_seconds()
+        
+        # Update tracking for next tick
+        self._prev_tick_price = current_price
+        self._prev_tick_time = market_time
+        
+        # =====================================================================
+        # �🔒 FIX (Jan 13, 2026): SYNC SIZE FROM RECONCILER SNAPSHOT
         # OPTIMIZED (Jan 20, 2026): Use cached snapshot instead of API call
         # The reconciler already polls exchange every 5 seconds
         # =====================================================================
@@ -5663,11 +6266,16 @@ class SignalEngine:
             has_bos_against=has_bos_against,
             market_time=market_time,
             adx=current_adx,           # For hybrid TIME_INVALIDATION
-            atr_ratio=atr_ratio,       # For volatility check
+            atr_ratio=atr_ratio,       # For volatility check (also anomaly detection)
             rsi_1m=rsi_1m,             # For momentum exit
             vpoc=vpoc_price,           # For VPOC resistance exit
             bb_width=bb_width,         # For volatility squeeze
-            bb_avg=bb_avg              # For volatility squeeze comparison
+            bb_avg=bb_avg,             # For volatility squeeze comparison
+            # 🔥 ANOMALY DETECTION PARAMS (Jan 24, 2026)
+            spread_bps=None,           # TODO: Get from order book when available
+            spread_normal_bps=3.0,     # BTC/USD typical spread
+            last_tick_age_sec=last_tick_age_sec,  # Feed staleness
+            price_gap_pct=price_gap_pct  # Price gap anomaly
         )
         
         if exit_action:
@@ -6980,6 +7588,84 @@ class SignalEngine:
     def _check_volume_confirmation(self, df: pd.DataFrame) -> tuple[bool, str]:
         """DELTA VOLUME FILTER - delegates to filter_checks module"""
         return _check_volume_delta_pure(df)
+    
+    def _build_ml_feature_snapshot(self) -> dict[str, float]:
+        """
+        Build feature snapshot for ML training data collection.
+        
+        🔥 ML Data Collection (Jan 24, 2026)
+        Captures all relevant indicators at entry moment for:
+        - Regime prediction model training
+        - Entry quality model training
+        - Exit timing model training
+        
+        Returns:
+            Dict with all ML-relevant features
+        """
+        features = {}
+        
+        try:
+            # From current trade tags (already computed)
+            tags = self._current_trade_tags
+            
+            # ADX features
+            features['adx_1h'] = tags.get('htf_adx', 0.0)
+            features['adx_5m'] = tags.get('adx_5m_fast', tags.get('adx_5m', 0.0))
+            features['effective_adx'] = tags.get('effective_adx', features['adx_1h'])
+            
+            # ATR features  
+            features['atr_1m'] = tags.get('atr_1m', 0.0)
+            features['atr_5m'] = tags.get('atr_5m', 0.0)
+            features['atr_ratio'] = tags.get('atr_ratio', 1.0)
+            
+            # Location features
+            features['percentile_60d'] = tags.get('percentile_60d', tags.get('location_pct_60d', 50.0))
+            features['location_headroom_atr'] = tags.get('location_headroom_atr', 0.0)
+            features['location_in_extreme'] = 1.0 if tags.get('location_in_extreme', False) else 0.0
+            
+            # RSI features
+            features['rsi_14'] = tags.get('rsi', tags.get('rsi_14', 50.0))
+            
+            # Bollinger features
+            features['bb_width'] = tags.get('bb_width', 0.0)
+            features['bb_squeeze'] = 1.0 if tags.get('bb_squeeze', False) else 0.0
+            
+            # Volume features
+            features['volume_ratio'] = tags.get('volume_ratio', 1.0)
+            features['cvd_bullish'] = 1.0 if tags.get('cvd_bullish', False) else 0.0
+            
+            # Regime features
+            features['trading_mode_trend'] = 1.0 if tags.get('trading_mode') == 'TREND' else 0.0
+            features['trading_mode_range'] = 1.0 if tags.get('trading_mode') == 'RANGE' else 0.0
+            features['trading_mode_transition'] = 1.0 if tags.get('trading_mode') == 'TRANSITION' else 0.0
+            
+            # Score components
+            features['score_structure'] = tags.get('score_structure', 0.0)
+            features['score_timing'] = tags.get('score_timing', 0.0)
+            features['score_momentum'] = tags.get('score_momentum', 0.0)
+            features['score_context'] = tags.get('score_context', 0.0)
+            features['score_synergy'] = tags.get('score_synergy', 0.0)
+            
+            # Session encoding
+            session = tags.get('session_quality', 'moderate')
+            features['session_good'] = 1.0 if session == 'good' else 0.0
+            features['session_poor'] = 1.0 if session == 'poor' else 0.0
+            
+            # External data
+            features['funding_rate'] = tags.get('funding_rate', 0.0)
+            features['spread_pct'] = tags.get('spread_pct', 0.0)
+            
+            # Recent trade history
+            features['consecutive_losses'] = float(self._consecutive_losses)
+            features['last_trade_pnl_r'] = tags.get('last_trade_pnl_r', 0.0)
+            
+            # Trend intelligence (if available)
+            features['trend_phase'] = tags.get('trend_phase', 'RANGE_BOUND')
+            
+        except Exception as e:
+            logger.warning(f"⚠️ ML feature snapshot error: {e}")
+        
+        return features
     
     def _record_trade_price(self, entry_price: float):
         """Record trade price for duplicate zone detection"""

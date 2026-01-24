@@ -789,17 +789,17 @@ class MicroTrendFilter:
                 adx_is_low = (adx_value is not None and adx_value < self.ADX_LOW_FOR_RANGE_BLOCK)
                 if state.confirmed_strength >= self.STRENGTH_HARD_BLOCK_RANGE and adx_is_low:
                     should_hard_block = self.hard_block_enabled
-                    logger.info(f"🔒 RANGE hard block: strength={state.confirmed_strength:.0%}, ADX={adx_value:.1f}")
+                    logger.debug(f"[LOCK] RANGE hard block: str={state.confirmed_strength:.0%}, ADX={adx_value:.1f}")
                 else:
                     # In RANGE with decent ADX: only penalty
                     should_hard_block = False
                     if state.confirmed_strength >= self.STRENGTH_SOFT_BLOCK:
-                        logger.info(f"⚠️ RANGE soft block: strength={state.confirmed_strength:.0%}, ADX={adx_value:.1f if adx_value else 'N/A'} - penalty only")
+                        logger.debug(f"[WARN] RANGE soft block: str={state.confirmed_strength:.0%}, ADX={adx_value:.1f if adx_value else 'N/A'}")
             elif regime_mode == 'TREND':
                 # TREND: Never hard block, only penalty
                 should_hard_block = False
                 if state.confirmed_strength >= self.STRENGTH_HARD_BLOCK:
-                    logger.info(f"⚠️ TREND mode: micro opposing (str={state.confirmed_strength:.0%}) - penalty only, no hard block")
+                    logger.debug(f"[WARN] TREND mode: micro opposing (str={state.confirmed_strength:.0%})")
             else:
                 # Default/BREAKOUT: Original logic
                 should_hard_block = (
@@ -842,11 +842,11 @@ class MicroTrendFilter:
                     reason = f"RSI REVERSAL OVERRIDE: {state.rsi_reversal_reason}"
                     if has_1m_confirm:
                         reason += " + 1m bullish"
-                    logger.info(f"🔄 {reason}")
+                    logger.debug(f"[SYNC] {reason}")
                 elif has_reversal:
                     # Has reversal but no confirmation - reduce penalty but don't override
                     state.score_adjustment = self.SCORE_SOFT_PENALTY
-                    logger.info(f"📊 RSI reversal detected but no 1m confirm - reducing penalty only")
+                    logger.debug(f"[DATA] RSI reversal detected but no 1m confirm")
             
             elif htf_bias == "SHORT" and state.rsi_5m > self.RSI_EXTREME_HIGH:
                 has_reversal = state.rsi_has_bearish_reversal
@@ -857,11 +857,11 @@ class MicroTrendFilter:
                     allowed = True
                     state.score_adjustment = self.SCORE_WARNING_PENALTY
                     reason = f"RSI REVERSAL OVERRIDE (bearish divergence detected)"
-                    logger.info(f"🔄 {reason}")
+                    logger.debug(f"[SYNC] {reason}")
         
         elif is_opposing:
             reason = f"MICRO {state.micro_trend}: str={state.confirmed_strength:.0%} (penalty={state.score_adjustment})"
-            logger.info(f"⚠️ {reason}")
+            logger.debug(f"[WARN] {reason}")
         
         elif is_aligned:
             reason = f"MICRO {state.micro_trend} ✓ (bonus={state.score_adjustment:+.0f})"

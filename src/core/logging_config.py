@@ -42,8 +42,93 @@ from src.core.settings import Settings, redact_secrets, SECRET_PATTERNS
 # Constants
 # =========================================================================
 
-LOG_FORMAT_TEXT = "%(asctime)s - %(name)-25s - %(levelname)-8s - [%(run_id)s] %(message)s"
-LOG_FORMAT_JSON = None  # JSON formatter handles this
+# Cleaner, more compact format for console
+LOG_FORMAT_TEXT = "%(asctime)s | %(levelname)-5s | %(shortname)-18s | %(message)s"
+LOG_FORMAT_FILE = "%(asctime)s - %(name)-25s - %(levelname)-8s - [%(run_id)s] %(message)s"
+
+# Short name mapping for common loggers
+LOGGER_SHORT_NAMES = {
+    "MainApp": "MAIN",
+    "src.ingest.kraken_websocket": "WS",
+    "src.engine.execution.execution": "EXEC",
+    "src.engine.market_data": "MARKET",
+    "src.engine.signal_engine": "SIGNAL",
+    "src.engine.filters.filters": "FILTER",
+    "src.engine.filters.filter_pipeline": "FILTER",
+    "src.engine.filters.macro_trend_filter": "MACRO",
+    "src.engine.filters.micro_trend_filter": "MICRO",
+    "src.engine.persistence": "PERSIST",
+    "src.engine.btc_context_feed": "CONTEXT",
+    "src.engine.external_data": "EXTERN",
+    "src.engine.important_levels": "LEVELS",
+    "src.engine.state.state_machine": "STATE",
+    "src.engine.system_health": "HEALTH",
+    "src.engine.risk.risk_engine": "RISK",
+    "src.accounting.position_store": "POS",
+    "src.output.output_manager": "OUTPUT",
+    "src.core.health_bridge": "BRIDGE",
+    "telegram.ext.Application": "TELEGRAM",
+}
+
+# =========================================================================
+# Emoji to ASCII mapping for clean terminal output
+# =========================================================================
+
+EMOJI_TO_ASCII = {
+    # Status indicators
+    "✅": "[OK]",
+    "✓": "[OK]",
+    "❌": "[FAIL]",
+    "⚠️": "[WARN]",
+    "⛔": "[BLOCK]",
+    "🔄": "[SYNC]",
+    "⏳": "[WAIT]",
+    
+    # Data/metrics
+    "📊": "[DATA]",
+    "📈": "[UP]",
+    "📉": "[DOWN]",
+    "💰": "[$]",
+    "💵": "[$]",
+    
+    # Actions
+    "▶️": "[START]",
+    "⏹️": "[STOP]",
+    "🎧": "[LISTEN]",
+    "🔔": "[ALERT]",
+    "💓": "[BEAT]",
+    "🐻": "[BEAR]",
+    "🐂": "[BULL]",
+    
+    # Technical
+    "🔧": "[CFG]",
+    "🔗": "[LINK]",
+    "🔒": "[LOCK]",
+    "🔓": "[UNLOCK]",
+    "📁": "[FILE]",
+    "📝": "[NOTE]",
+    "🎯": "[TARGET]",
+    "🛡️": "[SHIELD]",
+    "⚡": "[FAST]",
+    "🕐": "[TIME]",
+    
+    # Combined/special
+    "✔️": "[OK]",
+    "❗": "[!]",
+    "❓": "[?]",
+    "➡️": "->",
+    "⬆️": "^",
+    "⬇️": "v",
+    "↗️": "/^",
+    "↘️": "\\v",
+}
+
+
+def sanitize_message(msg: str) -> str:
+    """Replace Unicode emojis with ASCII equivalents for clean terminal output."""
+    for emoji, ascii_char in EMOJI_TO_ASCII.items():
+        msg = msg.replace(emoji, ascii_char)
+    return msg
 
 
 # =========================================================================
@@ -239,16 +324,19 @@ class JSONFormatter(logging.Formatter):
     
     Outputs each log record as a single JSON line, suitable for
     log aggregation systems (ELK, Loki, CloudWatch, etc.).
+    Automatically sanitizes emoji characters for clean terminal display.
     """
     
     def format(self, record: logging.LogRecord) -> str:
-        """Format record as JSON."""
+        """Format record as JSON with sanitized message."""
+        # Sanitize message to replace emojis with ASCII
+        message = sanitize_message(record.getMessage())
         
         log_data = {
             "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": message,
             "run_id": getattr(record, "run_id", "unknown"),
             "session_id": getattr(record, "session_id", "-"),
         }
@@ -275,6 +363,44 @@ class JSONFormatter(logging.Formatter):
                         log_data[key] = str(value)
         
         return json.dumps(log_data)
+
+
+class CleanTextFormatter(logging.Formatter):
+    """
+    Text formatter that sanitizes emoji characters for clean terminal output.
+    
+    This formatter produces human-readable text logs with:
+    - Shortened logger names for compact display
+    - ASCII-only characters for maximum terminal compatibility
+    - Proper alignment for easy scanning
+    - Compact level indicators (INFO->I, WARN->W, etc.)
+    """
+    
+    # Short level names for compact display
+    LEVEL_MAP = {
+        "DEBUG": "D",
+        "INFO": "I",
+        "WARNING": "W",
+        "ERROR": "E",
+        "CRITICAL": "C",
+    }
+    
+    def format(self, record: logging.LogRecord) -> str:
+        """Format record as clean text with sanitized message."""
+        # Make a copy to avoid modifying original record
+        record = logging.makeLogRecord(record.__dict__)
+        
+        # Use short logger name
+        record.shortname = LOGGER_SHORT_NAMES.get(record.name, record.name.split('.')[-1][:18])
+        
+        # Use short level name
+        record.levelname = self.LEVEL_MAP.get(record.levelname, record.levelname[0])
+        
+        # Sanitize the message
+        if record.msg:
+            record.msg = sanitize_message(str(record.msg))
+        
+        return super().format(record)
 
 
 # =========================================================================
@@ -530,7 +656,7 @@ def configure_logging(settings: Settings) -> None:
     if settings.log_format == "json":
         console_handler.setFormatter(JSONFormatter())
     else:
-        console_handler.setFormatter(logging.Formatter(LOG_FORMAT_TEXT))
+        console_handler.setFormatter(CleanTextFormatter(LOG_FORMAT_TEXT))
     
     root_logger.addHandler(console_handler)
     
@@ -544,7 +670,8 @@ def configure_logging(settings: Settings) -> None:
     file_handler.setLevel(logging.DEBUG)  # Capture all levels in file
     file_handler.addFilter(secret_filter)
     # No rate limiting on file (we want complete logs)
-    file_handler.setFormatter(logging.Formatter(LOG_FORMAT_TEXT))
+    # Use full format for file logs (includes run_id, full logger name)
+    file_handler.setFormatter(CleanTextFormatter(LOG_FORMAT_FILE))
     root_logger.addHandler(file_handler)
     
     # Suppress noisy loggers
@@ -552,7 +679,7 @@ def configure_logging(settings: Settings) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("ccxt").setLevel(logging.WARNING)
-    logging.getLogger("numba").setLevel(logging.WARNING)  # 🔥 FIX: Numba JIT logs flood at DEBUG
+    logging.getLogger("numba").setLevel(logging.WARNING)  # FIX: Numba JIT logs flood at DEBUG
     logging.getLogger("numba.core").setLevel(logging.WARNING)
     
     # Initialize audit logger

@@ -10,9 +10,13 @@ Components:
 - EdgeRegimeClassifier: Edge-based regime (REGIME_A, B, C, D)
 - ActivityRegimeAnalyzer: Activity-based regime for 24/7 markets
 - TradingRegimeClassifier: Trading-specific regime analysis
+- TrendIntelligence: Detección de INICIO/FIN de tendencias (Jan 23, 2026)
 
 🔥 FIX (Jan 22, 2026): Added RegimeContext as single source of truth
 All modules should read from RegimeContext instead of computing their own regime.
+
+🔥 NEW (Jan 23, 2026): TrendIntelligence for cycle detection
+Detects trend birth, acceleration, exhaustion, death - not just current state.
 """
 
 # 🔥 NEW: Regime Context - SINGLE SOURCE OF TRUTH (Jan 22, 2026)
@@ -23,6 +27,17 @@ from src.engine.regime.regime_context import (
     get_regime_context_manager,
     get_current_regime_context,
     get_trailing_regime,
+)
+
+# 🔥 NEW: Trend Intelligence - Cycle Detection (Jan 23, 2026)
+from src.engine.regime.trend_intelligence import (
+    TrendIntelligence,
+    TrendPhase,
+    TrendDirection as TrendIntelDirection,
+    TrendState,
+    TrendTransition,
+    get_trend_intelligence,
+    reset_trend_intelligence,
 )
 
 # Entry-time regime detection
@@ -79,6 +94,14 @@ __all__ = [
     'RegimeConfig', 
     'REGIME_CONFIGS',
     'calculate_chase_atr',
+    # 🔥 NEW: Trend Intelligence (Jan 23, 2026)
+    'TrendIntelligence',
+    'TrendPhase',
+    'TrendIntelDirection',
+    'TrendState',
+    'TrendTransition',
+    'get_trend_intelligence',
+    'reset_trend_intelligence',
     # Management regime
     'ManagementRegime',
     'ManagementRegimeClassifier',
