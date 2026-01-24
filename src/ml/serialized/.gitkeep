@@ -1,0 +1,3 @@
+# This directory stores serialized ML models
+# Models are saved as .pkl files
+# Do not commit actual model files (add *.pkl to .gitignore if needed)

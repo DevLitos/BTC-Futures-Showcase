@@ -125,6 +125,12 @@ class TrendIntelligence:
     # Confirmation requirements
     ACCEPTANCE_CANDLES = 3          # Candles needed for level acceptance
     SWING_LOOKBACK = 20             # Candles for swing detection
+    MIN_DATA_FOR_CONFIDENCE = 20    # Minimum candles for high confidence
+    
+    # 🔥 NEW (Jan 24): Warmup requirements for reliable state detection
+    MIN_WARMUP_FOR_LOW_CONFIDENCE = 6    # Minimum candles for 40%+ confidence
+    MIN_WARMUP_FOR_MED_CONFIDENCE = 12   # Minimum candles for 60%+ confidence
+    MIN_WARMUP_FOR_HIGH_CONFIDENCE = 24  # Minimum candles for 80%+ confidence
     
     def __init__(self):
         self._state = TrendState(
@@ -138,6 +144,233 @@ class TrendIntelligence:
         self._volume_history: List[float] = []
         self._high_history: List[float] = []
         self._low_history: List[float] = []
+        self._is_warmed_up = False
+        self._warmup_candles = 0
+        self._is_warmed_up = False
+        self._warmup_candles = 0
+        
+    def warm_start(
+        self,
+        highs: List[float],
+        lows: List[float],
+        closes: List[float],
+        volumes: List[float],
+        adx_values: List[float]
+    ) -> TrendState:
+        """
+        Initialize TrendIntelligence with historical data.
+        
+        Call this once at startup with the last N 1h candles to properly
+        calculate trend phase and confidence from the start.
+        
+        Args:
+            highs: List of high prices (oldest first)
+            lows: List of low prices
+            closes: List of close prices  
+            volumes: List of volumes
+            adx_values: List of ADX values (must be same length or will use last)
+            
+        Returns:
+            Current TrendState after processing historical data
+        """
+        if not closes:
+            logger.warning("warm_start called with empty data")
+            return self._state
+            
+        n = len(closes)
+        logger.info(f"🔥 TrendIntelligence warm_start with {n} historical candles")
+        
+        # Ensure all arrays same length
+        highs = list(highs)[-n:] if len(highs) >= n else list(highs)
+        lows = list(lows)[-n:] if len(lows) >= n else list(lows)
+        volumes = list(volumes)[-n:] if len(volumes) >= n else list(volumes) + [0.0] * (n - len(volumes))
+        
+        # ADX might be shorter due to warmup period
+        if len(adx_values) < n:
+            # Pad with first value or 15.0 (neutral)
+            first_adx = adx_values[0] if adx_values else 15.0
+            adx_values = [first_adx] * (n - len(adx_values)) + list(adx_values)
+        else:
+            adx_values = list(adx_values)[-n:]
+        
+        # Process each candle to build history and detect transitions
+        from datetime import datetime, UTC, timedelta
+        base_time = datetime.now(UTC) - timedelta(hours=n)
+        
+        for i in range(n):
+            self._price_history.append(closes[i])
+            self._high_history.append(highs[i])
+            self._low_history.append(lows[i])
+            self._volume_history.append(volumes[i])
+            self._adx_history.append(adx_values[i])
+        
+        # Trim to max 100
+        max_history = 100
+        for hist in [self._price_history, self._adx_history, self._volume_history,
+                     self._high_history, self._low_history]:
+            while len(hist) > max_history:
+                hist.pop(0)
+        
+        # Now run proper analysis with full history
+        self._warmup_candles = len(self._price_history)
+        
+        # Calculate metrics with historical data
+        self._update_adx_metrics(adx_values[-1] if adx_values else 15.0)
+        self._update_structure_metrics()
+        self._update_volume_metrics(volumes[-1] if volumes else 0.0)
+        
+        # Detect current phase
+        current_price = closes[-1]
+        adx = adx_values[-1] if adx_values else 15.0
+        atr = self._estimate_atr_from_history()
+        
+        new_phase, confidence, trigger = self._detect_phase_transition(
+            current_price, adx, atr, datetime.now(UTC)
+        )
+        
+        self._state.current_phase = new_phase
+        self._state.confidence = self._calculate_confidence(confidence)
+        self._is_warmed_up = True
+        
+        # Estimate phase age based on ADX stability
+        self._state.phase_age_candles = self._estimate_phase_age(adx_values)
+        
+        self._update_trading_implications()
+        
+        logger.info(
+            f"🧠 TrendIntelligence warmed up: {self._state.current_phase.value} | "
+            f"Direction: {self._state.direction.value} | "
+            f"Confidence: {self._state.confidence:.0%} | "
+            f"Age: ~{self._state.phase_age_candles} candles | "
+            f"ADX: {adx:.1f} (slope: {self._state.adx_slope:.2f}) | "
+            f"Data: {n} candles (min_high_conf: {self.MIN_WARMUP_FOR_HIGH_CONFIDENCE})"
+        )
+        
+        # 🔥 NEW: Log warning if confidence is low due to insufficient data
+        if self._state.confidence < 0.50:
+            logger.warning(
+                f"⚠️ TrendIntelligence LOW CONFIDENCE ({self._state.confidence:.0%}): "
+                f"Need {self.MIN_WARMUP_FOR_HIGH_CONFIDENCE - n} more candles for reliable detection"
+            )
+        
+        return self._state
+    
+    def _estimate_atr_from_history(self) -> float:
+        """Estimate ATR from historical high/low data"""
+        if len(self._high_history) < 14:
+            return 100.0
+        tr_list = []
+        for i in range(1, min(14, len(self._high_history))):
+            h = self._high_history[-i]
+            l = self._low_history[-i]
+            c = self._price_history[-i-1] if i < len(self._price_history) else self._price_history[-i]
+            tr = max(h - l, abs(h - c), abs(l - c))
+            tr_list.append(tr)
+        return np.mean(tr_list) if tr_list else 100.0
+    
+    def _estimate_phase_age(self, adx_values: List[float]) -> int:
+        """Estimate how long we've been in current phase based on ADX pattern"""
+        if len(adx_values) < 5:
+            return 1
+        
+        current_phase = self._state.current_phase
+        adx = adx_values[-1]
+        
+        # Count candles that match current phase criteria
+        age = 0
+        for i in range(len(adx_values) - 1, max(0, len(adx_values) - 30), -1):
+            adx_val = adx_values[i]
+            
+            if current_phase == TrendPhase.RANGE_BOUND:
+                if adx_val < self.ADX_BIRTH_THRESHOLD:
+                    age += 1
+                else:
+                    break
+            elif current_phase in [TrendPhase.TREND_BIRTH, TrendPhase.TREND_ACCELERATION]:
+                if adx_val > self.ADX_BIRTH_THRESHOLD:
+                    age += 1
+                else:
+                    break
+            elif current_phase == TrendPhase.TREND_MATURE:
+                if adx_val > self.ADX_MATURE_THRESHOLD:
+                    age += 1
+                else:
+                    break
+            elif current_phase in [TrendPhase.TREND_EXHAUSTION, TrendPhase.DISTRIBUTION]:
+                if adx_val < self.ADX_MATURE_THRESHOLD:
+                    age += 1  
+                else:
+                    break
+            else:
+                age += 1
+                if age > 5:
+                    break
+        
+        return max(1, age)
+    
+    def _calculate_confidence(self, base_confidence: float) -> float:
+        """
+        Calculate confidence based on data quality and base confidence.
+        
+        🔥 IMPROVED (Jan 24): More conservative warmup requirements.
+        Confidence must be EARNED through data, not assumed.
+        """
+        # Data quality factor: more data = higher confidence  
+        data_count = len(self._price_history)
+        
+        # 🔥 Stricter warmup requirements
+        if data_count < self.MIN_WARMUP_FOR_LOW_CONFIDENCE:
+            data_factor = 0.35  # Very low confidence with minimal data
+        elif data_count < self.MIN_WARMUP_FOR_MED_CONFIDENCE:
+            data_factor = 0.55  # Still cautious
+        elif data_count < self.MIN_WARMUP_FOR_HIGH_CONFIDENCE:
+            data_factor = 0.75  # Getting confident
+        elif data_count < self.MIN_DATA_FOR_CONFIDENCE:
+            data_factor = 0.85
+        else:
+            data_factor = 1.0  # Full confidence only with enough data
+        
+        # ADX clarity: how clear is the regime?
+        adx = self._state.adx_current
+        if adx > 30:
+            adx_factor = 1.0  # Very clear trend
+        elif adx > 25:
+            adx_factor = 0.95  # Clear trend
+        elif adx < 15:
+            adx_factor = 0.90  # Clear range  
+        elif adx < 18:
+            adx_factor = 0.80  # Probably range
+        else:
+            adx_factor = 0.70  # Transition zone - less certain
+        
+        # Structure clarity bonus
+        hh = self._state.higher_highs_count
+        ll = self._state.lower_lows_count
+        structure_bonus = 0.0
+        if (hh >= 2 and ll == 0) or (ll >= 2 and hh == 0):
+            structure_bonus = 0.10  # Clear structure adds confidence
+        elif hh > 0 or ll > 0:
+            structure_bonus = 0.05
+        
+        # Phase age bonus: longer in phase = more confidence
+        age = self._state.phase_age_candles
+        age_bonus = min(0.10, age * 0.02)  # Max +10% for being in phase 5+ candles
+        
+        # Combine factors (weighted average instead of pure multiplication)
+        raw_confidence = (base_confidence * 0.4 + data_factor * 0.3 + adx_factor * 0.3)
+        confidence = raw_confidence + structure_bonus + age_bonus
+        
+        # 🔥 NEW: Hard cap confidence based on warmup state
+        if not self._is_warmed_up:
+            confidence = min(confidence, 0.50)  # Max 50% before warmup complete
+        elif data_count < self.MIN_WARMUP_FOR_HIGH_CONFIDENCE:
+            confidence = min(confidence, 0.70)  # Max 70% with limited data
+        
+        return max(0.25, min(0.95, confidence))  # Clamp between 25-95%
+    
+    @property
+    def is_warmed_up(self) -> bool:
+        return self._is_warmed_up
         
     def update(
         self,
@@ -195,8 +428,9 @@ class TrendIntelligence:
             self._state.phase_age_candles = 0
         else:
             self._state.phase_age_candles += 1
-            
-        self._state.confidence = confidence
+        
+        # Use improved confidence calculation
+        self._state.confidence = self._calculate_confidence(confidence)
         self._update_trading_implications()
         
         return self._state

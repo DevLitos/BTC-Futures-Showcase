@@ -506,6 +506,142 @@ class TradeLogger:
         tag_stats.sort(key=lambda x: x.get('avg_r', 0), reverse=True)
         
         return tag_stats
+    
+    # =========================================================================
+    # 🔥 NEW (Jan 24, 2026): Score-based analysis for threshold optimization
+    # =========================================================================
+    
+    def get_stats_by_score_bucket(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Analyze trade performance by entry score buckets.
+        
+        Critical for understanding:
+        - Minimum viable score threshold
+        - Score vs actual performance correlation
+        - Whether high scores actually outperform
+        
+        Returns:
+            Dict with score bucket -> stats
+        """
+        trades = self.load_trades()
+        
+        if not trades:
+            return {}
+        
+        # Score buckets
+        buckets = {
+            'low_3_4': [],      # Score 3-4 (below typical threshold)
+            'marginal_4_5': [], # Score 4-5 (at threshold)
+            'ok_5_6': [],       # Score 5-6 (above threshold)
+            'good_6_7': [],     # Score 6-7 (good)
+            'high_7_plus': [],  # Score 7+ (strong)
+        }
+        
+        for t in trades:
+            score = t.entry_score
+            if score < 4:
+                buckets['low_3_4'].append(t)
+            elif score < 5:
+                buckets['marginal_4_5'].append(t)
+            elif score < 6:
+                buckets['ok_5_6'].append(t)
+            elif score < 7:
+                buckets['good_6_7'].append(t)
+            else:
+                buckets['high_7_plus'].append(t)
+        
+        results = {}
+        for bucket_name, bucket_trades in buckets.items():
+            if bucket_trades:
+                wins = [t for t in bucket_trades if t.pnl_r > 0]
+                total_r = sum(t.pnl_r for t in bucket_trades)
+                avg_mfe = sum(t.mfe_r for t in bucket_trades) / len(bucket_trades)
+                avg_mae = sum(t.mae_r for t in bucket_trades) / len(bucket_trades)
+                
+                results[bucket_name] = {
+                    'count': len(bucket_trades),
+                    'wins': len(wins),
+                    'losses': len(bucket_trades) - len(wins),
+                    'winrate': round(len(wins) / len(bucket_trades) * 100, 1),
+                    'total_r': round(total_r, 2),
+                    'avg_r': round(total_r / len(bucket_trades), 3),
+                    'avg_mfe': round(avg_mfe, 2),
+                    'avg_mae': round(avg_mae, 2),
+                    # Score range for reference
+                    'score_range': bucket_name,
+                }
+            else:
+                results[bucket_name] = {'count': 0, 'score_range': bucket_name}
+        
+        return results
+    
+    def get_score_performance_recommendation(self) -> Dict[str, Any]:
+        """
+        Analyze score performance to recommend optimal threshold.
+        
+        Returns:
+            Dict with:
+            - current_threshold: What score threshold we're using
+            - recommended_threshold: Data-driven recommendation
+            - analysis: Explanation of recommendation
+        """
+        bucket_stats = self.get_stats_by_score_bucket()
+        
+        # Find minimum score where expectancy is positive
+        min_profitable_score = None
+        for bucket in ['low_3_4', 'marginal_4_5', 'ok_5_6', 'good_6_7', 'high_7_plus']:
+            stats = bucket_stats.get(bucket, {})
+            if stats.get('count', 0) >= 5:  # Need at least 5 trades for significance
+                if stats.get('avg_r', -1) > 0:
+                    min_profitable_score = bucket
+                    break
+        
+        # Check if higher scores actually outperform
+        score_correlation = []
+        for bucket in ['marginal_4_5', 'ok_5_6', 'good_6_7', 'high_7_plus']:
+            stats = bucket_stats.get(bucket, {})
+            if stats.get('count', 0) >= 3:
+                score_correlation.append(stats.get('avg_r', 0))
+        
+        # Is correlation positive? (higher scores → better R)
+        correlation_positive = False
+        if len(score_correlation) >= 2:
+            correlation_positive = score_correlation[-1] > score_correlation[0]
+        
+        return {
+            'bucket_stats': bucket_stats,
+            'min_profitable_bucket': min_profitable_score,
+            'score_correlation_positive': correlation_positive,
+            'analysis': self._generate_score_analysis(bucket_stats, min_profitable_score, correlation_positive)
+        }
+    
+    def _generate_score_analysis(self, bucket_stats: Dict, min_profitable: Optional[str], corr_positive: bool) -> str:
+        """Generate human-readable analysis of score performance."""
+        lines = ["📊 SCORE PERFORMANCE ANALYSIS:"]
+        
+        # Bucket summary
+        for bucket in ['low_3_4', 'marginal_4_5', 'ok_5_6', 'good_6_7', 'high_7_plus']:
+            stats = bucket_stats.get(bucket, {})
+            count = stats.get('count', 0)
+            if count > 0:
+                wr = stats.get('winrate', 0)
+                avg_r = stats.get('avg_r', 0)
+                emoji = "✅" if avg_r > 0 else "❌"
+                lines.append(f"  {bucket}: {count} trades, {wr:.0f}% WR, {avg_r:+.2f}R {emoji}")
+        
+        # Recommendation
+        lines.append("")
+        if min_profitable:
+            lines.append(f"🎯 Minimum profitable bucket: {min_profitable}")
+        else:
+            lines.append("⚠️ No bucket with positive expectancy (need more data)")
+        
+        if corr_positive:
+            lines.append("📈 Higher scores DO correlate with better returns")
+        else:
+            lines.append("⚠️ Score-return correlation is weak or negative")
+        
+        return "\n".join(lines)
 
 
 # Singleton instance

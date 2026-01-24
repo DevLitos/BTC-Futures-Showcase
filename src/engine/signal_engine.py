@@ -125,6 +125,9 @@ from src.engine.adaptive_entry import (
     AdaptiveEntrySystem, get_adaptive_entry_system, MarketCondition
 )
 
+# 🤖 NEW (Jan 24, 2026): ML Entry Score Refinement - Shadow mode logging
+from src.ml.inference import get_ml_inference_engine
+
 # NEW ARCHITECTURE: Position Store as Single Source of Truth
 from src.core import RuntimeMode, get_runtime_config
 from src.accounting import get_position_store, TrackedPosition
@@ -333,6 +336,25 @@ class SignalEngine:
         # - Market condition (dead, low, normal, high, extreme)
         # =====================================================================
         self._adaptive_entry = get_adaptive_entry_system()
+        
+        # =====================================================================
+        # 🤖 ML INFERENCE ENGINE (Jan 24, 2026) - Entry Score Refinement
+        # SHADOW MODE: Logs predictions without affecting decisions
+        # Future: HYBRID mode will adjust score ±1 based on ML confidence
+        # =====================================================================
+        self._ml_inference = get_ml_inference_engine()
+        
+        # 🤖 ML STATUS LOG - Show ML state at startup
+        ml_stats = self._ml_inference.get_stats()
+        logger.info(f"🤖 ML ENGINE STATUS:")
+        logger.info(f"   Phase: {ml_stats['phase']}")
+        if ml_stats['model_loaded']:
+            logger.info(f"   Model: LOADED ✅ (AUC: {ml_stats['model_auc']:.3f})")
+            logger.info(f"   Drift Detection: {'ACTIVE ✅' if not ml_stats['drift_detected'] else '⚠️ DRIFT DETECTED'}")
+        else:
+            logger.info(f"   Model: NOT YET TRAINED")
+            logger.info(f"   → ML is collecting data in SHADOW mode")
+            logger.info(f"   → Run training after 100+ trades: uv run python -m src.ml.training.train_entry_model")
         
         # Centralized position sizer for consistent sizing calculations
         self._position_sizer = get_position_sizer(
@@ -1196,6 +1218,41 @@ class SignalEngine:
             logger.warning(f"⚠️ Important levels initialization error: {e} - continuing without")
             self.important_levels = None
         
+        # =====================================================================
+        # 🔥 TREND INTELLIGENCE WARM START (Jan 24, 2026)
+        # Initialize with historical 1h data for accurate phase/confidence
+        # =====================================================================
+        try:
+            candles_1h = self.market_data.get_candles('1h')
+            if candles_1h and len(candles_1h) >= 20:
+                logger.info(f"🔥 Warming up TrendIntelligence with {len(candles_1h)} 1h candles...")
+                
+                highs = [float(c.get('high', 0)) for c in candles_1h]
+                lows = [float(c.get('low', 0)) for c in candles_1h]
+                closes = [float(c.get('close', 0)) for c in candles_1h]
+                volumes = [float(c.get('volume', 0)) for c in candles_1h]
+                
+                # Calculate ADX values for history
+                from src.engine.indicators import calculate_adx
+                adx_values_arr, _ = calculate_adx(
+                    np.array(highs), np.array(lows), np.array(closes), 14
+                )
+                adx_values = [float(v) if not np.isnan(v) else 15.0 for v in adx_values_arr]
+                
+                # Warm start with historical data
+                self._trend_intelligence.warm_start(
+                    highs=highs,
+                    lows=lows,
+                    closes=closes,
+                    volumes=volumes,
+                    adx_values=adx_values
+                )
+                self._trend_phase = self._trend_intelligence.state.current_phase
+            else:
+                logger.warning(f"⚠️ Not enough 1h candles for TrendIntelligence warm start ({len(candles_1h) if candles_1h else 0} < 20)")
+        except Exception as e:
+            logger.warning(f"⚠️ TrendIntelligence warm start error: {e}")
+        
         # 7. Log intelligence modules status
         logger.info("=" * 60)
         logger.info("🧠 INTELLIGENCE MODULES STATUS")
@@ -1305,6 +1362,14 @@ class SignalEngine:
                 if time_since_heartbeat >= 60:
                     pos_status = "FLAT" if not self.risk_engine.has_open_position() else f"{self.risk_engine.position.direction} {self.risk_engine.position.size:.6f}"
                     logger.info(f"💓 HEARTBEAT: tick #{tick_count}, state={self.state_machine.state.name}, pos={pos_status}")
+                    
+                    # 🤖 ML STATUS (every 5 minutes = 300s = tick_count % 300 == 0)
+                    if tick_count % 300 == 0:
+                        ml_stats = self._ml_inference.get_stats()
+                        logger.info(f"🤖 ML STATUS: phase={ml_stats['phase']}, predictions={ml_stats['prediction_count']}, "
+                                    f"failures={ml_stats['model_failures']}, avg_latency={ml_stats['avg_latency_ms']:.1f}ms, "
+                                    f"drift={'⚠️ YES' if ml_stats['drift_detected'] else 'NO'}")
+                    
                     last_heartbeat_time = tick_start
                 
                 # 🔒 FIX (Jan 21, 2026): Add global timeout to _process_tick
@@ -1790,9 +1855,11 @@ class SignalEngine:
         # This changes ENTIRE bot behavior for the day
         candles_1h = self.market_data.get_candles('1h')
         if candles_1h and len(candles_1h) >= 50:
+            # 🔥 IMPROVED (Jan 24, 2026): Update daily regime every 1 hour instead of 4
+            # Also detect SIGNIFICANT changes that warrant immediate transition
             should_update_daily_regime = (
                 self._daily_regime_last_update is None or
-                (market_time - self._daily_regime_last_update).total_seconds() > 14400  # 4 hours
+                (market_time - self._daily_regime_last_update).total_seconds() > 3600  # 1 hour (was 4h)
             )
             
             if should_update_daily_regime:
@@ -1823,6 +1890,10 @@ class SignalEngine:
                 
                 # Update state if changed
                 if new_daily_regime != self._daily_regime:
+                    old_regime = self._daily_regime
+                    logger.info(
+                        f"🔄 DAILY REGIME TRANSITION: {old_regime} → {new_daily_regime}"
+                    )
                     logger.info(
                         DailyRegimeDetector.log_daily_regime(
                             new_daily_regime, daily_range, daily_atr, daily_adx
@@ -1830,6 +1901,10 @@ class SignalEngine:
                     )
                     self._daily_regime = new_daily_regime
                     self._daily_regime_config = DailyRegimeDetector.get_daily_config(new_daily_regime)
+                    
+                    # 🔥 Also update trade tags for tracking
+                    self._current_trade_tags['daily_regime'] = new_daily_regime
+                    self._current_trade_tags['daily_regime_changed_at'] = market_time.isoformat()
                 
                 self._daily_regime_last_update = market_time
         
@@ -3617,6 +3692,13 @@ class SignalEngine:
         self._entry_score = score
         self._score_breakdown = breakdown
         
+        # 🤖 ML: Copy score components to trade tags for feature extraction
+        self._current_trade_tags['score_structure'] = breakdown.get('structure', 0)
+        self._current_trade_tags['score_timing'] = breakdown.get('timing', 0)
+        self._current_trade_tags['score_momentum'] = breakdown.get('momentum', 0)
+        self._current_trade_tags['score_context'] = breakdown.get('context', 0)
+        self._current_trade_tags['score_synergy'] = breakdown.get('synergy', 0)
+        
         # Log score breakdown (includes synergy)
         synergy = breakdown.get('synergy', 0)
         logger.info(f"📊 ENTRY SCORE: {score}/9 [MODE={OperatingMode.MODE}] | Str:{breakdown['structure']} Tim:{breakdown['timing']} Mom:{breakdown['momentum']} Ctx:{breakdown['context']} Syn:{synergy}")
@@ -4702,6 +4784,33 @@ class SignalEngine:
                 return
         else:
             logger.debug("📋 [BACKTEST] Skipping TIER2 validation")
+        
+        # =====================================================================
+        # 🤖 ML SHADOW MODE - Log prediction without affecting decision
+        # Collects data for future ML model training
+        # In SHADOW phase: just logs, doesn't modify score
+        # In HYBRID phase: would adjust score ±1 based on ML confidence
+        # =====================================================================
+        try:
+            feature_snapshot = self._build_ml_feature_snapshot()
+            ml_adjusted_score, ml_prob, ml_reason = self._ml_inference.get_entry_adjustment(
+                rule_score=int(score),
+                feature_snapshot=feature_snapshot
+            )
+            
+            # Store ML prediction in trade tags for analysis
+            self._current_trade_tags['ml_win_prob'] = round(ml_prob, 4)
+            self._current_trade_tags['ml_adjusted_score'] = ml_adjusted_score
+            self._current_trade_tags['ml_reason'] = ml_reason
+            self._current_trade_tags['ml_phase'] = self._ml_inference.phase.name
+            
+            # In SHADOW mode: log only, don't modify score
+            # In HYBRID/PRIMARY mode: this would update score
+            # score = ml_adjusted_score  # Uncomment when ready for HYBRID
+            
+        except Exception as e:
+            logger.warning(f"⚠️ ML inference error (non-blocking): {e}")
+            self._current_trade_tags['ml_error'] = str(e)
         
         # ===== FIX #2: DETERMINE ORDER TYPE BASED ON MOMENTUM =====
         # Calculate price velocity from last 2 candles (1m)
@@ -6576,6 +6685,19 @@ class SignalEngine:
                         mae_r=mae_r
                     )
                     logger.debug(f"📊 Trade {self._current_trade_id} logged: exit={exit_reason}, pnl=${pnl:.2f}")
+                    
+                    # 🔥 ML DRIFT MONITORING (Jan 24, 2026)
+                    # Record outcome for model performance tracking
+                    ml_prob = self._current_trade_tags.get('ml_win_prob', 0.5)
+                    if self._ml_inference and ml_prob != 0.5:  # Only if ML made prediction
+                        drift_result = self._ml_inference.record_outcome(
+                            trade_id=self._current_trade_id,
+                            ml_prob=ml_prob,
+                            actual_win=is_win
+                        )
+                        if drift_result.get('drift_detected'):
+                            logger.warning("⚠️ ML model degradation detected - consider retraining")
+                            
                 except Exception as log_err:
                     logger.error(f"TradeLogger.complete_trade() failed: {log_err}")
                 self._current_trade_id = None  # Reset for next trade
@@ -7600,7 +7722,7 @@ class SignalEngine:
         - Exit timing model training
         
         Returns:
-            Dict with all ML-relevant features
+            Dict with all ML-relevant features matching ENTRY_FEATURES list
         """
         features = {}
         
@@ -7608,59 +7730,58 @@ class SignalEngine:
             # From current trade tags (already computed)
             tags = self._current_trade_tags
             
-            # ADX features
-            features['adx_1h'] = tags.get('htf_adx', 0.0)
-            features['adx_5m'] = tags.get('adx_5m_fast', tags.get('adx_5m', 0.0))
-            features['effective_adx'] = tags.get('effective_adx', features['adx_1h'])
+            # === Score components (from _calculate_and_evaluate_entry_score) ===
+            features['score_structure'] = float(tags.get('score_structure', 1.0))
+            features['score_timing'] = float(tags.get('score_timing', 1.0))
+            features['score_momentum'] = float(tags.get('score_momentum', 1.0))
+            features['score_context'] = float(tags.get('score_context', 1.0))
+            features['score_synergy'] = float(tags.get('score_synergy', 0.0))
             
-            # ATR features  
-            features['atr_1m'] = tags.get('atr_1m', 0.0)
-            features['atr_5m'] = tags.get('atr_5m', 0.0)
-            features['atr_ratio'] = tags.get('atr_ratio', 1.0)
+            # === Trend indicators ===
+            features['adx_1h'] = float(tags.get('htf_adx', tags.get('adx_1h', 20.0)))
+            features['adx_5m'] = float(tags.get('adx_5m_fast', tags.get('adx_5m', 20.0)))
+            features['effective_adx'] = float(tags.get('effective_adx', features['adx_1h']))
             
-            # Location features
-            features['percentile_60d'] = tags.get('percentile_60d', tags.get('location_pct_60d', 50.0))
-            features['location_headroom_atr'] = tags.get('location_headroom_atr', 0.0)
-            features['location_in_extreme'] = 1.0 if tags.get('location_in_extreme', False) else 0.0
-            
-            # RSI features
-            features['rsi_14'] = tags.get('rsi', tags.get('rsi_14', 50.0))
-            
-            # Bollinger features
-            features['bb_width'] = tags.get('bb_width', 0.0)
+            # === Volatility ===
+            features['atr_ratio'] = float(tags.get('atr_ratio', tags.get('volatility_ratio', 1.0)))
+            features['bb_width'] = float(tags.get('bb_width', 300.0))
             features['bb_squeeze'] = 1.0 if tags.get('bb_squeeze', False) else 0.0
             
-            # Volume features
-            features['volume_ratio'] = tags.get('volume_ratio', 1.0)
+            # === Location/Context ===
+            features['percentile_60d'] = float(tags.get('percentile_60d', tags.get('location_pct_60d', 50.0)))
+            features['location_headroom_atr'] = float(tags.get('location_headroom_atr', 5.0))
+            features['location_in_extreme'] = 1.0 if tags.get('location_in_extreme', False) else 0.0
+            
+            # === Momentum ===
+            features['rsi_14'] = float(tags.get('rsi', tags.get('rsi_14', 50.0)))
             features['cvd_bullish'] = 1.0 if tags.get('cvd_bullish', False) else 0.0
+            features['volume_ratio'] = float(tags.get('volume_ratio', 1.0))
             
-            # Regime features
-            features['trading_mode_trend'] = 1.0 if tags.get('trading_mode') == 'TREND' else 0.0
-            features['trading_mode_range'] = 1.0 if tags.get('trading_mode') == 'RANGE' else 0.0
-            features['trading_mode_transition'] = 1.0 if tags.get('trading_mode') == 'TRANSITION' else 0.0
-            
-            # Score components
-            features['score_structure'] = tags.get('score_structure', 0.0)
-            features['score_timing'] = tags.get('score_timing', 0.0)
-            features['score_momentum'] = tags.get('score_momentum', 0.0)
-            features['score_context'] = tags.get('score_context', 0.0)
-            features['score_synergy'] = tags.get('score_synergy', 0.0)
-            
-            # Session encoding
+            # === Session (one-hot) ===
             session = tags.get('session_quality', 'moderate')
             features['session_good'] = 1.0 if session == 'good' else 0.0
             features['session_poor'] = 1.0 if session == 'poor' else 0.0
             
-            # External data
-            features['funding_rate'] = tags.get('funding_rate', 0.0)
-            features['spread_pct'] = tags.get('spread_pct', 0.0)
+            # === Regime (one-hot) ===
+            trading_mode = tags.get('trading_mode', tags.get('regime', 'RANGE'))
+            features['trading_mode_trend'] = 1.0 if trading_mode in ('TREND', 'TREND_EXPANSION') else 0.0
+            features['trading_mode_range'] = 1.0 if trading_mode in ('RANGE', 'MEAN_REVERSION') else 0.0
+            features['trading_mode_transition'] = 1.0 if trading_mode in ('TRANSITION', 'TREND_EXHAUSTION') else 0.0
             
-            # Recent trade history
+            # === External data ===
+            features['funding_rate'] = float(tags.get('funding_rate', 0.0))
+            
+            # === Entry quality ===
+            features['chase_atr'] = float(tags.get('chase_atr', 0.0))
+            
+            # === Time features (BTC has strong intraday/weekly patterns) ===
+            from datetime import datetime
+            market_time = self.market_data.get_market_time() or datetime.utcnow()
+            features['day_of_week'] = float(market_time.weekday())  # 0=Monday, 6=Sunday
+            features['hour_utc'] = float(market_time.hour)          # 0-23 UTC
+            
+            # === Trade history ===
             features['consecutive_losses'] = float(self._consecutive_losses)
-            features['last_trade_pnl_r'] = tags.get('last_trade_pnl_r', 0.0)
-            
-            # Trend intelligence (if available)
-            features['trend_phase'] = tags.get('trend_phase', 'RANGE_BOUND')
             
         except Exception as e:
             logger.warning(f"⚠️ ML feature snapshot error: {e}")

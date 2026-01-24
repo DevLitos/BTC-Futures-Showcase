@@ -335,6 +335,104 @@ NOTIFICATIONS_SENT = Counter(
     ['channel'] # Canal (ej. 'telegram')
 )
 
+# =============================================================================
+# ML MODEL METRICS (Jan 24, 2026)
+# Monitoring for ML model performance, drift, and health
+# =============================================================================
+
+# Model phase and status
+ML_MODEL_PHASE = Gauge(
+    'ml_model_phase',
+    'Current ML deployment phase (0=DISABLED, 1=SHADOW, 2=HYBRID, 3=PRIMARY)',
+    ['model']  # 'entry_score', 'exit_timing', etc.
+)
+
+ML_MODEL_LOADED = Gauge(
+    'ml_model_loaded',
+    'Whether ML model is loaded and ready (1=loaded, 0=not loaded)',
+    ['model']
+)
+
+ML_MODEL_AUC = Gauge(
+    'ml_model_auc',
+    'Current model AUC (area under ROC curve)',
+    ['model']
+)
+
+# Drift detection
+ML_DRIFT_DETECTED = Gauge(
+    'ml_drift_detected',
+    'Whether model drift is detected (1=drift, 0=ok)',
+    ['model']
+)
+
+ML_ROLLING_AUC = Gauge(
+    'ml_rolling_auc',
+    'Rolling AUC over recent predictions window',
+    ['model']
+)
+
+ML_NEEDS_RETRAINING = Gauge(
+    'ml_needs_retraining',
+    'Whether model needs retraining based on drift (1=yes, 0=no)',
+    ['model']
+)
+
+# Prediction statistics
+ML_PREDICTIONS_TOTAL = Counter(
+    'ml_predictions_total',
+    'Total number of ML predictions made',
+    ['model', 'phase']
+)
+
+ML_PREDICTION_FAILURES = Counter(
+    'ml_prediction_failures_total',
+    'Total number of ML prediction failures',
+    ['model', 'reason']  # reason: timeout, model_error, feature_error
+)
+
+ML_PREDICTION_LATENCY = Histogram(
+    'ml_prediction_latency_seconds',
+    'Latency of ML predictions',
+    ['model'],
+    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1]
+)
+
+# Score adjustments (HYBRID mode)
+ML_SCORE_ADJUSTMENTS = Counter(
+    'ml_score_adjustments_total',
+    'Number of score adjustments by ML in HYBRID mode',
+    ['model', 'adjustment_type']  # boost, penalty, neutral
+)
+
+# Trade outcome tracking
+ML_TRADE_OUTCOMES = Counter(
+    'ml_trade_outcomes_total',
+    'Trade outcomes for ML accuracy tracking',
+    ['model', 'predicted', 'actual']  # predicted: high_prob/low_prob, actual: win/loss
+)
+
+
+def update_ml_metrics(stats: dict, model_name: str = 'entry_score'):
+    """
+    Update all ML metrics from inference engine stats.
+    
+    Called periodically from main loop or after each prediction.
+    """
+    # Map phase name to number
+    phase_map = {'DISABLED': 0, 'SHADOW': 1, 'HYBRID': 2, 'PRIMARY': 3}
+    phase_num = phase_map.get(stats.get('phase', 'DISABLED'), 0)
+    
+    ML_MODEL_PHASE.labels(model=model_name).set(phase_num)
+    ML_MODEL_LOADED.labels(model=model_name).set(1 if stats.get('model_loaded') else 0)
+    ML_MODEL_AUC.labels(model=model_name).set(stats.get('model_auc', 0.0))
+    
+    # Drift metrics
+    ML_DRIFT_DETECTED.labels(model=model_name).set(1 if stats.get('drift_detected') else 0)
+    ML_ROLLING_AUC.labels(model=model_name).set(stats.get('rolling_auc', 0.0))
+    ML_NEEDS_RETRAINING.labels(model=model_name).set(1 if stats.get('needs_retraining') else 0)
+
+
 # Para que estas métricas sean accesibles, necesitas exponer un endpoint HTTP.
 # Esto se hace fácilmente si tus servicios están construidos con FastAPI o Flask,
 # o puedes usar la función `start_http_server` de la librería.

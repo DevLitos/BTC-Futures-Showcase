@@ -47,3 +47,10 @@ polygon-api-client>=1.13.0
 
 # Async utilities
 aiofiles>=23.0.0
+
+# ============================================================
+# Machine Learning (Entry Score Refinement)
+# ============================================================
+scikit-learn>=1.4.0
+lightgbm>=4.3.0
+# shap>=0.44.0  # Opcional: interpretabilidad (descomentar si necesario)
