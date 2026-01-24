@@ -49,6 +49,8 @@ class ScoreBreakdown:
     synergy: int = 0
     micro_trend_adj: float = 0.0
     filter_pipeline_adj: float = 0.0
+    # 🔥 NEW (Jan 24): Late confirmation penalty
+    late_confirmation_penalty: float = 0.0
     penalty_hierarchy: Dict[str, Any] = field(default_factory=dict)
     adx_values: np.ndarray = field(default_factory=lambda: np.array([]))
     
@@ -56,7 +58,7 @@ class ScoreBreakdown:
     def total(self) -> int:
         """Calculate total score."""
         base = self.structure + self.timing + self.momentum + self.context + self.synergy
-        return max(0, int(base + self.micro_trend_adj + self.filter_pipeline_adj))
+        return max(0, int(base + self.micro_trend_adj + self.filter_pipeline_adj + self.late_confirmation_penalty))
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for logging."""
@@ -68,6 +70,7 @@ class ScoreBreakdown:
             'synergy': self.synergy,
             'micro_trend_adj': self.micro_trend_adj,
             'filter_pipeline_adj': self.filter_pipeline_adj,
+            'late_confirmation_penalty': self.late_confirmation_penalty,
             'total': self.total
         }
 
@@ -96,10 +99,91 @@ class TradeTags:
     penalty_hierarchy_saved: float = 0.0
     worst_context_penalty: Optional[str] = None
     worst_execution_penalty: Optional[str] = None
+    # 🔥 NEW (Jan 24): Late confirmation penalty tracking
+    late_confirmation_penalty: float = 0.0
+    candles_since_bos: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {k: v for k, v in self.__dict__.items()}
+
+
+# =============================================================================
+# 🔥 LATE CONFIRMATION PENALTY (Jan 24, 2026)
+# Penalizes "perfect" setups that took too long to confirm
+# 
+# PROBLEM: Score 7+ trades have negative expectancy because:
+# - When ALL confirmations align (score 9), the move already happened
+# - You enter at the TOP/BOTTOM of the move with no room left
+# - MFE is low, MAE is high → losing trade
+#
+# SOLUTION: Penalize high scores that took many candles to confirm
+# - Score 5-6 that confirms quickly → good (enters early)
+# - Score 8-9 that took forever → bad (enters late)
+# =============================================================================
+class LateConfirmationConfig:
+    """
+    Configuration for late confirmation penalty.
+    
+    Philosophy:
+    - Quick confirmation (2-3 candles) = early entry = good
+    - Slow confirmation (7+ candles) = late entry = penalize
+    - The more "perfect" the score, the MORE suspicious we are of lateness
+    """
+    
+    # If all 4 components have max score AND it took > N candles, penalize
+    PERFECT_SCORE_CANDLES_THRESHOLD = 5  # If perfect setup took > 5 candles
+    
+    # Penalty per "late" candle beyond threshold
+    PENALTY_PER_LATE_CANDLE = 0.5
+    
+    # Maximum penalty from late confirmation
+    MAX_LATE_PENALTY = 2.0
+    
+    # Only apply to scores above this (don't penalize already-weak setups)
+    MIN_SCORE_FOR_LATE_PENALTY = 7
+    
+    # Candle counting method
+    # We count candles since BOS started forming (using df_1m high/low breaks)
+    MAX_CANDLES_TO_CHECK = 10
+    
+    @classmethod
+    def calculate_penalty(
+        cls,
+        raw_score: int,
+        candles_since_bos: int,
+        all_components_maxed: bool
+    ) -> float:
+        """
+        Calculate late confirmation penalty.
+        
+        Args:
+            raw_score: Score before this penalty
+            candles_since_bos: How many candles since initial BOS signal
+            all_components_maxed: True if structure=2, timing=2, momentum=2, context=2
+            
+        Returns:
+            Penalty value (negative, to reduce score)
+        """
+        # Only apply to high scores
+        if raw_score < cls.MIN_SCORE_FOR_LATE_PENALTY:
+            return 0.0
+        
+        # Only apply if we detected slow confirmation
+        if candles_since_bos <= cls.PERFECT_SCORE_CANDLES_THRESHOLD:
+            return 0.0
+        
+        # Extra suspicion for "perfect" setups
+        suspicion_mult = 1.5 if all_components_maxed else 1.0
+        
+        # Calculate penalty
+        late_candles = candles_since_bos - cls.PERFECT_SCORE_CANDLES_THRESHOLD
+        penalty = late_candles * cls.PENALTY_PER_LATE_CANDLE * suspicion_mult
+        
+        # Cap penalty
+        penalty = min(penalty, cls.MAX_LATE_PENALTY)
+        
+        return -penalty
 
 
 class EntryScorer:
@@ -231,10 +315,83 @@ class EntryScorer:
                 else:
                     logger.info(f"📈 Filter pipeline bonus: {fp_adj:+.1f}")
         
+        # =====================================================================
+        # 7️⃣ LATE CONFIRMATION PENALTY (Jan 24, 2026)
+        # Penalize "perfect" setups that took too long to confirm
+        # This fixes negative expectancy on score 7+ trades
+        # =====================================================================
+        raw_score = self._breakdown.structure + self._breakdown.timing + \
+                    self._breakdown.momentum + self._breakdown.context + \
+                    self._breakdown.synergy
+        
+        # Check if all components are maxed (perfect setup → suspicious if late)
+        all_maxed = (
+            self._breakdown.structure == 2 and
+            self._breakdown.timing == 2 and
+            self._breakdown.momentum == 2 and
+            self._breakdown.context == 2
+        )
+        
+        # Count candles since BOS started forming
+        candles_since_bos = self._count_candles_since_bos(df_1m, bias)
+        
+        # Calculate late confirmation penalty
+        late_penalty = LateConfirmationConfig.calculate_penalty(
+            raw_score=raw_score,
+            candles_since_bos=candles_since_bos,
+            all_components_maxed=all_maxed
+        )
+        
+        if late_penalty < 0:
+            self._breakdown.late_confirmation_penalty = late_penalty
+            logger.warning(
+                f"⏰ LATE CONFIRMATION PENALTY: {late_penalty:+.1f} "
+                f"(candles_since_bos={candles_since_bos}, all_maxed={all_maxed})"
+            )
+            self._trade_tags.late_confirmation_penalty = late_penalty
+        
         # Update final score in tags
         self._trade_tags.score = self._breakdown.total
         
         return self._breakdown.total, self._breakdown.to_dict(), False
+    
+    def _count_candles_since_bos(self, df_1m: pd.DataFrame, bias: str) -> int:
+        """
+        Count how many candles since BOS (Break of Structure) started forming.
+        
+        This helps detect "late" entries where price moved a lot before we entered.
+        
+        Returns:
+            Number of candles since the initial BOS breakout (0 if very fresh)
+        """
+        if len(df_1m) < 10:
+            return 0
+        
+        max_lookback = min(LateConfirmationConfig.MAX_CANDLES_TO_CHECK, len(df_1m) - 1)
+        
+        # Get recent swing high/low to compare against
+        lookback_data = df_1m.iloc[-(max_lookback + 5):-max_lookback] if len(df_1m) > max_lookback + 5 else df_1m.iloc[:5]
+        
+        if len(lookback_data) < 3:
+            return 0
+        
+        if bias == 'LONG':
+            # Find when price first broke above recent high
+            reference_high = lookback_data['high'].max()
+            for i in range(max_lookback, 0, -1):
+                candle = df_1m.iloc[-i]
+                if candle['high'] > reference_high:
+                    # Found first breakout, count remaining candles
+                    return i - 1  # How many candles since that breakout
+        else:  # SHORT
+            # Find when price first broke below recent low
+            reference_low = lookback_data['low'].min()
+            for i in range(max_lookback, 0, -1):
+                candle = df_1m.iloc[-i]
+                if candle['low'] < reference_low:
+                    return i - 1
+        
+        return 0  # No clear BOS found in lookback period
     
     def _apply_penalty_hierarchy(
         self,
