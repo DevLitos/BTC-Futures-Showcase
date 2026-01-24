@@ -82,12 +82,12 @@ class MetricsTradeRecord:
     direction: str = ""  # LONG or SHORT
     
     # Entry
-    entry_time: datetime = None
+    entry_time: datetime | None = None
     entry_price: float = 0.0
     entry_size: float = 0.0
     
     # Exit
-    exit_time: datetime = None
+    exit_time: datetime | None = None
     exit_price: float = 0.0
     exit_reason: str = ""  # TP1, TP2, TRAILING, SL, TIME, MANUAL
     
@@ -146,7 +146,7 @@ class MetricsTradeRecord:
         return d
     
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'TradeRecord':
+    def from_dict(cls, data: Dict[str, Any]) -> 'MetricsTradeRecord':
         """Create from dictionary."""
         if isinstance(data.get('entry_time'), str):
             data['entry_time'] = datetime.fromisoformat(data['entry_time'])
@@ -167,7 +167,7 @@ class TradeMetricsCalculator:
     needed for proper edge analysis.
     """
     
-    def __init__(self, friction_config: FrictionConfig = None):
+    def __init__(self, friction_config: FrictionConfig | None = None):
         self.friction = friction_config or FrictionConfig()
     
     def calculate_r_multiple(self, 
@@ -320,16 +320,16 @@ class TradeMetricsCalculator:
                            exit_reason: str,
                            stop_loss: float,
                            tp1_price: float,
-                           tp2_price: float = None,
-                           high_during_trade: float = None,
-                           low_during_trade: float = None,
+                           tp2_price: float | None = None,
+                           high_during_trade: float | None = None,
+                           low_during_trade: float | None = None,
                            tp1_hit: bool = False,
                            tp2_hit: bool = False,
-                           atr_at_entry: float = None,
-                           avg_atr: float = None,
+                           atr_at_entry: float | None = None,
+                           avg_atr: float | None = None,
                            apply_friction: bool = True,
                            notes: str = "",
-                           tags: List[str] = None) -> MetricsTradeRecord:
+                           tags: List[str] | None = None) -> MetricsTradeRecord:
         """
         Build a complete TradeRecord with all calculated metrics.
         
@@ -474,7 +474,7 @@ class TradeLogger:
                 for line in f:
                     if line.strip():
                         data = json.loads(line)
-                        trades.append(TradeRecord.from_dict(data))
+                        trades.append(MetricsTradeRecord.from_dict(data))
         return trades
     
     def get_summary_stats(self) -> Dict[str, Any]:
@@ -620,7 +620,7 @@ def get_trade_logger() -> TradeLogger:
     return _trade_logger
 
 
-def get_metrics_calculator(friction_config: FrictionConfig = None) -> TradeMetricsCalculator:
+def get_metrics_calculator(friction_config: FrictionConfig | None = None) -> TradeMetricsCalculator:
     """Get global TradeMetricsCalculator instance."""
     global _metrics_calculator
     if _metrics_calculator is None:

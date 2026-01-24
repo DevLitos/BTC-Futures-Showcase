@@ -30,6 +30,9 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime, UTC
 import hashlib
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -167,7 +170,7 @@ class StrategyIdentityLock:
         """Handle component change detection"""
         # Component changed - logging for audit trail
         # Actual recording happens in _record_fingerprint_change()
-        self.logger.info(f"Component '{component_name}' changed: {old_hash[:8]}... -> {new_hash[:8]}...")
+        logger.info(f"Component '{component_name}' changed: {old_hash[:8]}... -> {new_hash[:8]}...")
     
     def _record_fingerprint_change(self,
                                    old_fp: StrategyFingerprint,
@@ -359,7 +362,7 @@ class StrategyIdentityLock:
             }
         }
     
-    def register_full_strategy(self, config: Dict) -> str:
+    def register_full_strategy(self, config: Dict) -> str | None:
         """
         Register complete strategy from configuration.
         

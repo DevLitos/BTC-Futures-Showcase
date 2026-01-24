@@ -84,7 +84,7 @@ class MLDriftDetector:
             return None
         
         try:
-            rolling_auc = roc_auc_score(actuals, preds)
+            rolling_auc = float(roc_auc_score(actuals, preds))  # pyright: ignore[reportPossiblyUnboundVariable]
             self._rolling_auc_history.append(rolling_auc)
             
             # Check if below threshold

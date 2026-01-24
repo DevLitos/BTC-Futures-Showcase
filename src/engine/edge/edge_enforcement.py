@@ -578,7 +578,7 @@ class EdgeEnforcement:
         Returns:
             ContextValidity object
         """
-        context = self.edge_validator.validate_context(
+        context = self.edge_validator.validate_context_legacy(
             atr_current=atr_current,
             atr_p30=atr_p30,
             session_range=session_range,

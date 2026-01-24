@@ -154,8 +154,8 @@ class EntryGateEvaluator:
     LTF_MAX_REQUIRED = 2              # Never require 3/3 confirmations
     
     def __init__(self,
-                 score_block_floor: float = None,
-                 rr_block_floor: float = None):
+                 score_block_floor: float | None = None,
+                 rr_block_floor: float | None = None):
         """Initialize with optional custom thresholds."""
         if score_block_floor is not None:
             self.SCORE_BLOCK_FLOOR = score_block_floor

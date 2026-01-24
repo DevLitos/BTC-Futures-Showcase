@@ -880,7 +880,7 @@ class TradingSystemOrchestrator:
         self.market_data.add_tick(tick)
         
         # Chequear heartbeat
-        if not self.kraken_ws.is_heartbeat_healthy():
+        if self.kraken_ws is not None and not self.kraken_ws.is_heartbeat_healthy():
             logger.critical("WebSocket heartbeat dead - EMERGENCY EXIT")
             await self.signal_engine.emergency_close_all()
             self.is_running = False
@@ -894,14 +894,17 @@ class TradingSystemOrchestrator:
     
     async def _on_depth(self, depth: dict):
         """Callback: update order book"""
+        if self.order_book is None:
+            return
         side = depth.get('side')
         price = depth.get('price')
         qty = depth.get('qty')
         
-        if side == 'bid':
-            self.order_book.update_bid(price, qty)
-        else:
-            self.order_book.update_ask(price, qty)
+        if price is not None and qty is not None:
+            if side == 'bid':
+                self.order_book.update_bid(float(price), float(qty))
+            else:
+                self.order_book.update_ask(float(price), float(qty))
     
     async def _on_candle_1m(self, candle: dict):
         """Callback: vela 1m cerrada"""
@@ -967,7 +970,7 @@ class TradingSystemOrchestrator:
                     
                     # Pause signal engine if it has a pause method
                     if hasattr(self.signal_engine, 'pause'):
-                        self.signal_engine.pause()
+                        self.signal_engine.pause()  # pyright: ignore[reportAttributeAccessIssue]
                 
                 # Track state for next iteration
                 self._kill_switch_was_active = is_now_active
@@ -977,7 +980,7 @@ class TradingSystemOrchestrator:
                     
                     # Resume signal engine if it has a resume method
                     if hasattr(self.signal_engine, 'resume'):
-                        self.signal_engine.resume()
+                        self.signal_engine.resume()  # pyright: ignore[reportAttributeAccessIssue]
                         
             except Exception as e:
                 logger.error(f"Error in kill switch monitor: {e}")
@@ -1137,7 +1140,7 @@ class TradingSystemOrchestrator:
                     exchange_issues = []
                     
                     if hasattr(self.market_data, 'get_availability_status'):
-                        ws_status = self.market_data.get_availability_status()
+                        ws_status = self.market_data.get_availability_status()  # pyright: ignore[reportAttributeAccessIssue]
                         if not ws_status.get('is_available', True):
                             exchange_available = False
                             exchange_issues.append("WS down")

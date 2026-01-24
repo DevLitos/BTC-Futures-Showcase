@@ -132,7 +132,7 @@ class EdgeRegimeClassifier:
         # Build metrics object
         metrics = RegimeMetrics(
             expansion_count=expansion_count,
-            expansion_quality=expansion_quality,
+            expansion_quality=float(expansion_quality),
             fakeout_rate=fakeout_rate,
             volatility_trend=volatility_trend,
             session_efficiency=session_efficiency,
@@ -240,7 +240,7 @@ class EdgeRegimeClassifier:
             scores[EdgeRegime.REGIME_D] += 10
         
         # Find highest scoring regime
-        best_regime = max(scores, key=scores.get)
+        best_regime = max(scores, key=lambda k: scores.get(k, 0.0) or 0.0)
         confidence = min(scores[best_regime] / 100.0, 1.0)
         
         # Require minimum confidence
@@ -383,7 +383,7 @@ class EdgeRegimeClassifier:
         
         return False
     
-    def get_dynamic_rr(self, atr_ratio: float = None) -> Tuple[float, str]:
+    def get_dynamic_rr(self, atr_ratio: float | None = None) -> Tuple[float, str]:
         """
         CAPA 2: Get dynamic Risk/Reward ratio based on current market regime.
         

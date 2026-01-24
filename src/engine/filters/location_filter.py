@@ -20,7 +20,7 @@ Date: January 2026
 import logging
 import numpy as np
 from typing import Tuple, Dict, Optional, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
 
@@ -117,7 +117,7 @@ class LocationContext:
     # Derived vetoes
     veto_long: bool = False
     veto_short: bool = False
-    veto_reasons: List[str] = None
+    veto_reasons: List[str] = field(default_factory=list)
     
     # 🔥 FIX (Jan 22, 2026): Score penalties instead of hard vetoes
     location_penalty_long: float = 0.0    # Penalty for long at extremes
@@ -170,7 +170,7 @@ class LocationFilter:
         can_long, can_short, reasons = filter.apply_vetoes(context, bias)
     """
     
-    def __init__(self, config: LocationConfig = None):
+    def __init__(self, config: LocationConfig | None = None):
         self.config = config or get_location_config()
         
         # Cache for efficiency (recalculate only on new 1h bar)
@@ -188,8 +188,8 @@ class LocationFilter:
         adx_1h: float,
         regime: str = "RANGE",
         regime_confidence: float = 0.5,
-        ytd_high: float = None,
-        ytd_low: float = None,
+        ytd_high: float | None = None,
+        ytd_low: float | None = None,
         cache_key: int = 0
     ) -> LocationContext:
         """
@@ -369,8 +369,8 @@ class LocationFilter:
     def apply_vetoes(
         self,
         context: LocationContext,
-        requested_bias: str = None,
-        htf_adx: float = None
+        requested_bias: str | None = None,
+        htf_adx: float | None = None
     ) -> Tuple[bool, bool, List[str]]:
         """
         Apply location-based veto rules.
@@ -560,11 +560,11 @@ class LocationFilter:
         current_price: float,
         atr_1h: float,
         adx_1h: float,
-        bias: str,
+        bias: str | None,
         regime: str = "RANGE",
         cache_key: int = 0,
-        ytd_high: float = None,
-        ytd_low: float = None
+        ytd_high: float | None = None,
+        ytd_low: float | None = None
     ) -> Tuple[bool, str, LocationContext]:
         """
         Convenience method: check if a specific trade direction is allowed.

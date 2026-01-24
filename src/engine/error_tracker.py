@@ -209,7 +209,7 @@ class ErrorTracker:
         )
         
         # Check for duplicate
-        if self._is_duplicate(event.error_hash):
+        if event.error_hash is not None and self._is_duplicate(event.error_hash):
             logger.debug(f"Duplicate error suppressed: [{source}] {message[:50]}...")
             return False
         

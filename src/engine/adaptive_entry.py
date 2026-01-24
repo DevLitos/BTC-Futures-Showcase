@@ -102,7 +102,7 @@ class TradeQueue:
         self.max_size = max_queue_size
         self.selection_interval = timedelta(minutes=selection_interval_minutes)
         self._queue: List[Dict] = []
-        self._last_selection: datetime = None
+        self._last_selection: datetime | None = None
     
     def add_candidate(self, 
                       direction: str,

@@ -1843,7 +1843,7 @@ def get_risk_for_session(hour: int, minute: int) -> float:
     return RiskManagement.RISK_ASIA_WEEKEND_PCT / 100.0
 
 
-def get_session_name(hour: int, minute: int, day_of_week: int = None) -> str:
+def get_session_name(hour: int, minute: int, day_of_week: int | None = None) -> str:
     """
     Get the name of the current trading session.
     
@@ -2138,7 +2138,7 @@ class SessionTradeLimits:
     MAX_TRADES_PER_DAY = 6  # 🔥 FIX: Reduced from 8 to 6 (prevent overtrading)
     
     @classmethod
-    def get_limit(cls, session: str, regime_mode: str = None) -> int:
+    def get_limit(cls, session: str, regime_mode: str | None = None) -> int:
         base_limit = cls.MAX_TRADES_PER_SESSION.get(session.upper(), 2)
         if regime_mode:
             mode_cap = cls.MODE_TRADE_LIMIT_CAP.get(regime_mode, 5)
@@ -2146,7 +2146,7 @@ class SessionTradeLimits:
         return base_limit
     
     @classmethod
-    def can_override(cls, score: float, regime_mode: str = None) -> bool:
+    def can_override(cls, score: float, regime_mode: str | None = None) -> bool:
         threshold = cls.OVERRIDE_SCORE_THRESHOLD
         if regime_mode == 'RANGE':
             threshold = cls.OVERRIDE_SCORE_THRESHOLD_RANGE

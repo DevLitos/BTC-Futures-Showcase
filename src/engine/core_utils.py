@@ -125,7 +125,7 @@ def safe_index(seq, index: int, default=None):
     return default
 
 
-def safe_slice(seq, start: int, end: int = None, default=None):
+def safe_slice(seq, start: int, end: int | None = None, default=None):
     """
     Safely slice a sequence.
     
@@ -422,7 +422,7 @@ def get_dynamic_risk_pct(equity: float) -> float:
 def calculate_compounding_size(equity: float, 
                                entry_price: float,
                                stop_loss: float,
-                               risk_pct: float = None) -> float:
+                               risk_pct: float | None = None) -> float:
     """
     PALANCA 2: Compounding obligatorio.
     
@@ -508,7 +508,7 @@ class SmartPartials:
         self.tp2_pct = tp2_pct
         self.runner_pct = runner_pct
     
-    def calculate_partial_sizes(self, total_size: float) -> Dict[str, float]:
+    def calculate_partial_sizes(self, total_size: float) -> Dict[str, float | Dict[str, float]]:
         """
         Calculate size for each partial.
         
@@ -601,7 +601,7 @@ class SmartPartials:
         }
 
 
-def get_smart_partials() -> SmartPartials:
+def get_smart_partials_from_config() -> SmartPartials:
     """
     Get SmartPartials instance with config values.
     
@@ -771,7 +771,7 @@ class PositionSizer:
                          base_size: float,
                          state_multiplier: float = 1.0,
                          edge_multiplier: float = 1.0,
-                         defensive_multiplier: float = 1.0) -> Tuple[float, Dict[str, float]]:
+                         defensive_multiplier: float = 1.0) -> Tuple[float, Dict[str, float | str | None]]:
         """
         Apply all multipliers to base size.
         
@@ -829,7 +829,7 @@ class PositionSizer:
                                volatility_regime: str = "NORMAL",
                                session_name: str = "OTHER",
                                risk_pct: Optional[float] = None,
-                               leverage: Optional[int] = None) -> Tuple[float, Dict[str, float]]:
+                               leverage: Optional[int] = None) -> Tuple[float, Dict[str, float | str | None]]:
         """
         Calculate final position size with all multipliers.
         

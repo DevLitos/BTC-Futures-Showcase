@@ -61,7 +61,7 @@ class DegradationMonitor:
         self.SIGNAL_RETENTION_DAYS = 30
         
         # 🔥 PERFORMANCE FIX: Cache metrics to avoid O(n) recalculation on every query
-        self._cached_metrics: Dict = None
+        self._cached_metrics: Dict | None = None
         self._metrics_dirty: bool = True  # Flag to indicate cache needs refresh
     
     def add_trade(self,
@@ -149,10 +149,10 @@ class DegradationMonitor:
         if len(mfes) == 0 or len(maes) == 0:
             return False
         
-        ratio = np.mean(mfes) / np.mean(maes)
+        ratio = float(np.mean(mfes)) / float(np.mean(maes))
         
         if ratio <= self.MFE_MAE_THRESHOLD:
-            severity = 1.0 - min(ratio / self.MFE_MAE_THRESHOLD, 1.0)
+            severity = float(1.0 - min(ratio / self.MFE_MAE_THRESHOLD, 1.0))
             self._record_signal('mfe_mae', severity)
             return True
         
@@ -206,10 +206,10 @@ class DegradationMonitor:
         Degraded: >= 12 hours average
         """
         durations = [t['duration'] for t in trades]
-        avg_duration = np.mean(durations)
+        avg_duration = float(np.mean(durations))
         
         if avg_duration >= self.AVG_DURATION_THRESHOLD:
-            severity = min(avg_duration / self.AVG_DURATION_THRESHOLD, 1.0)
+            severity = float(min(avg_duration / self.AVG_DURATION_THRESHOLD, 1.0))
             self._record_signal('duration', severity)
             return True
         

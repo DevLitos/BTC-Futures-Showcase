@@ -61,8 +61,8 @@ class BBWidthFilter(BaseFilter):
     
     def __init__(self, 
                  enabled: bool = True,
-                 extreme_threshold: float = None,
-                 range_threshold: float = None,
+                 extreme_threshold: float | None = None,
+                 range_threshold: float | None = None,
                  range_informative_mode: bool = True):
         """
         Args:
@@ -102,7 +102,7 @@ class BBWidthFilter(BaseFilter):
         # Width normalized by middle
         bb_width = (upper - lower) / middle if middle > 0 else 0.0
         
-        return bb_width, upper, lower, middle
+        return float(bb_width), float(upper), float(lower), float(middle)
     
     def get_bb_width_percentile(self, closes: np.ndarray, lookback: int = 100) -> float:
         """
@@ -133,8 +133,8 @@ class BBWidthFilter(BaseFilter):
         return percentile
     
     def evaluate(self, 
-                 df: pd.DataFrame = None,
-                 closes: np.ndarray = None,
+                 df: pd.DataFrame | None = None,
+                 closes: np.ndarray | None = None,
                  **kwargs) -> FilterDecision:
         """
         Evaluate BB width and return decision.
@@ -146,7 +146,7 @@ class BBWidthFilter(BaseFilter):
         # Extract closes
         if closes is None:
             if df is not None and 'close' in df.columns:
-                closes = df['close'].values
+                closes = df['close'].to_numpy()
             else:
                 return FilterDecision.allow_default()
         
@@ -162,7 +162,7 @@ class BBWidthFilter(BaseFilter):
         bb_width_pct = self.get_bb_width_percentile(closes)
         
         # Build tags
-        tags = {
+        tags: dict[str, float | str | bool | None] = {
             'bb_width': round(bb_width * 100, 3),  # As percentage
             'bb_width_percentile': round(bb_width_pct, 1),
             'bb_upper': round(upper, 2),

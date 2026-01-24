@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, UTC
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 import aiohttp
+from aiohttp import ClientTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +207,7 @@ class ImportantLevelsProvider:
                     'interval': 1440  # Daily
                 }
                 
-                async with session.get(self._kraken_spot_url, params=params, timeout=30) as resp:
+                async with session.get(self._kraken_spot_url, params=params, timeout=ClientTimeout(total=30)) as resp:
                     if resp.status != 200:
                         logger.warning(f"Kraken spot API returned {resp.status}, trying futures")
                         return await self._fetch_daily_candles_futures(limit)
@@ -260,7 +261,7 @@ class ImportantLevelsProvider:
                     'to': int(now.timestamp())
                 }
                 
-                async with session.get(self._kraken_futures_url, params=params, timeout=30) as resp:
+                async with session.get(self._kraken_futures_url, params=params, timeout=ClientTimeout(total=30)) as resp:
                     if resp.status != 200:
                         logger.error(f"Kraken futures API returned {resp.status}")
                         return []
@@ -470,23 +471,23 @@ class ImportantLevelsProvider:
     def get_level_context(
         self, 
         current_price: float, 
-        direction: str, 
+        direction: str | None, 
         atr_5m: float,
-        planned_tp: Optional[float] = None
+        planned_tp: float | None = None
     ) -> LevelContext:
         """
         Get context about nearby important levels for a potential trade.
         
         Args:
             current_price: Current market price
-            direction: 'LONG' or 'SHORT'
+            direction: 'LONG' or 'SHORT' (or None)
             atr_5m: Current ATR on 5m timeframe
             planned_tp: Planned take profit price (optional, for adjustment)
             
         Returns:
             LevelContext with blocking/confluence/TP adjustment info
         """
-        context = LevelContext(direction=direction)
+        context = LevelContext(direction=direction or 'LONG')
         
         if not self._levels or atr_5m <= 0:
             return context

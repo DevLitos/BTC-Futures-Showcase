@@ -232,7 +232,7 @@ class SlippageModel:
         slippage *= self._calibration_factor
         
         # Cap at maximum
-        return min(slippage, self.max_slippage_bps)
+        return float(min(slippage, self.max_slippage_bps))
     
     def record_actual(self, estimated_bps: float, actual_bps: float) -> None:
         """
@@ -285,7 +285,7 @@ class FundingModel:
         self._rate_history: deque = deque(maxlen=100)
         self._last_update: Optional[datetime] = None
     
-    def update_rate(self, rate: float, timestamp: datetime = None) -> None:
+    def update_rate(self, rate: float, timestamp: datetime | None = None) -> None:
         """Update current funding rate."""
         self._current_rate = rate
         self._last_update = timestamp or datetime.now(UTC)

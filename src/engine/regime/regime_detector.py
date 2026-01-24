@@ -214,7 +214,7 @@ class RegimeDetector:
         
         return False
     
-    def get_config(self, regime: EntryRegime = None) -> RegimeConfig:
+    def get_config(self, regime: EntryRegime | None = None) -> RegimeConfig:
         """Get configuration for a regime"""
         if regime is None:
             regime = self._last_regime
@@ -230,7 +230,7 @@ class RegimeDetector:
         """How many bars in current regime"""
         return self._regime_duration
     
-    def get_chase_penalty(self, chase_atr: float, regime: EntryRegime = None) -> float:
+    def get_chase_penalty(self, chase_atr: float, regime: EntryRegime | None = None) -> float:
         """
         Calculate chase penalty based on regime.
         
@@ -270,7 +270,7 @@ class RegimeDetector:
         
         return final_penalty
     
-    def should_block_trade(self, chase_atr: float, regime: EntryRegime = None) -> Tuple[bool, str]:
+    def should_block_trade(self, chase_atr: float, regime: EntryRegime | None = None) -> Tuple[bool, str]:
         """
         Determine if trade should be blocked entirely (not just penalized).
         

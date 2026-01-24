@@ -124,7 +124,7 @@ class MacroTrendFilter(BaseFilter):
         if df is None or len(df) < self.EMA_SLOW:
             return result
         
-        closes = df['close'].values
+        closes = df['close'].to_numpy()
         
         # Calculate EMAs
         ema50 = calculate_ema(closes, self.EMA_FAST)
@@ -166,11 +166,11 @@ class MacroTrendFilter(BaseFilter):
         return result
     
     def evaluate(self,
-                 df_15m: pd.DataFrame = None,
-                 df_1h: pd.DataFrame = None,
-                 current_price: float = None,
-                 bias: str = None,
-                 regime_mode: str = None,  # 🔥 NEW: 'TREND', 'RANGE', or 'BREAKOUT'
+                 df_15m: pd.DataFrame | None = None,
+                 df_1h: pd.DataFrame | None = None,
+                 current_price: float | None = None,
+                 bias: str | None = None,
+                 regime_mode: str | None = None,  # 🔥 NEW: 'TREND', 'RANGE', or 'BREAKOUT'
                  **kwargs) -> FilterDecision:
         """
         Evaluate macro trend conditions.
@@ -186,9 +186,13 @@ class MacroTrendFilter(BaseFilter):
         if current_price is None or bias is None:
             return FilterDecision.allow_default()
         
+        # Return early if no data available
+        if df_15m is None and df_1h is None:
+            return FilterDecision.allow_default()
+        
         # Check conditions on each timeframe
-        cond_15m = self.check_macro_conditions(df_15m, '15m', current_price, bias)
-        cond_1h = self.check_macro_conditions(df_1h, '1h', current_price, bias)
+        cond_15m = self.check_macro_conditions(df_15m, '15m', current_price, bias) if df_15m is not None else {}  # pyright: ignore[reportArgumentType]
+        cond_1h = self.check_macro_conditions(df_1h, '1h', current_price, bias) if df_1h is not None else {}  # pyright: ignore[reportArgumentType]
         
         # Build tags
         tags = {
@@ -226,7 +230,7 @@ class MacroTrendFilter(BaseFilter):
             veto_tf = '15m' if (bias == 'LONG' and slope_15m < slope_1h) or (bias == 'SHORT' and slope_15m > slope_1h) else '1h'
             
             # 🔥 Apply size cap when trading against macro
-            size_factor = self.SIZE_CAP_AGAINST_MACRO.get(regime_mode, 0.5)
+            size_factor = self.SIZE_CAP_AGAINST_MACRO.get(regime_mode or 'TREND', 0.5)
             tags['macro_size_cap'] = size_factor
             reasons.append(f"Size capped to {size_factor*100:.0f}% (against macro)")
             

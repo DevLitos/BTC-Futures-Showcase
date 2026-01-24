@@ -327,7 +327,7 @@ class ExchangeReconciler:
     
     def _release_hard_lock(self, reason: str):
         """Release HARD_LOCK state"""
-        if self._hard_lock_event is not None:
+        if self._hard_lock_event is not None and self._hard_lock_started is not None:
             duration_ms = (datetime.now(UTC) - self._hard_lock_started).total_seconds() * 1000
             logger.info(f"🔓 HARD_LOCK released ({duration_ms:.0f}ms): {reason}")
         
@@ -367,7 +367,7 @@ class ExchangeReconciler:
         if self._degraded_mode:
             return False, "DEGRADED_MODE: Exchange connection unstable - all trading blocked"
         
-        if self.is_hard_locked:
+        if self.is_hard_locked and self._hard_lock_event is not None:
             if self._hard_lock_until is not None:
                 remaining_ms = (self._hard_lock_until - datetime.now(UTC)).total_seconds() * 1000
                 return False, f"HARD_LOCK[{self._hard_lock_event.value}] ({remaining_ms:.0f}ms max): {self._hard_lock_reason}"
@@ -407,7 +407,7 @@ class ExchangeReconciler:
         return self._degraded_mode
     
     def enter_hard_lock(self, reason: str, event: HardLockEvent = HardLockEvent.MANUAL, 
-                        max_duration_ms: int = None):
+                        max_duration_ms: int | None = None):
         """
         Enter HARD_LOCK state for a specific event.
         
@@ -514,6 +514,19 @@ class ExchangeReconciler:
             max_duration_ms=10000  # 10s fallback for exit - needs time to confirm flat
         )
         logger.info(f"🔒 EXIT HARD_LOCK started: {reason}")
+
+    def notify_exit_completed(self) -> None:
+        """
+        Called when exit is confirmed complete.
+        
+        Releases the EXIT_PENDING hard-lock, allowing:
+        - Penalty application (if warranted)
+        - Cooldown to start
+        - State transition to IDLE
+        """
+        if self._hard_lock_event == HardLockEvent.EXIT_PENDING:
+            logger.info("🔓 EXIT HARD_LOCK released: Exit completed")
+            self._release_hard_lock("Exit completed")
     
     def is_exit_pending(self) -> bool:
         """Check if we're in an exit hard-lock"""
@@ -523,14 +536,14 @@ class ExchangeReconciler:
             datetime.now(UTC) < self._hard_lock_until
         )
     
-    async def reconcile(self) -> ExchangeSnapshot:
+    async def reconcile(self) -> ExchangeSnapshot | None:
         """
         Poll exchange and derive state.
         
         This is the ONLY method that changes state.
         
         Returns:
-            ExchangeSnapshot with current exchange state
+            ExchangeSnapshot with current exchange state, or None if no symbol set
         """
         if not self._symbol:
             logger.warning("Reconciler: No symbol set")
@@ -667,7 +680,7 @@ class ExchangeReconciler:
         
         return ReconcilerState.IDLE
     
-    def _transition_to(self, new_state: ReconcilerState, snapshot: ExchangeSnapshot = None):
+    def _transition_to(self, new_state: ReconcilerState, snapshot: ExchangeSnapshot | None = None):
         """Transition to new state and notify listeners"""
         old_state = self._state
         self._previous_state = old_state

@@ -254,7 +254,7 @@ class FundingRateMonitor:
             return 0.85
         return 1.0
     
-    def get_funding_score_penalty(self, bias: str = None) -> float:
+    def get_funding_score_penalty(self, bias: str | None = None) -> float:
         """
         Get score adjustment for funding rate.
         DIRECTIONAL: funding affects longs and shorts differently.
@@ -354,7 +354,7 @@ class FundingRateMonitor:
         delta = next_funding - now
         return max(0.0, delta.total_seconds() / 60.0)
     
-    def get_funding_info(self, bias: str = None) -> Dict:
+    def get_funding_info(self, bias: str | None = None) -> Dict:
         """
         Get complete funding information for tags and analysis.
         
@@ -550,7 +550,7 @@ class ExternalDataManager:
         
         return True, f"External data OK{funding_note}"
     
-    async def get_funding_rate(self, symbol: str = None) -> float:
+    async def get_funding_rate(self, symbol: str | None = None) -> float:
         """Get current funding rate (for backward compatibility)"""
         return self.funding.current_rate
     

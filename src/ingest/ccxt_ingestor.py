@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 class CCXTIngestor(baseIngestor.BaseIngestor):
 
-    def __init__(self, symbols: list, kafka_producer: kafkaProducer):
+    def __init__(self, symbols: list, kafka_producer: kafkaProducer):  # pyright: ignore[reportGeneralTypeIssues]
         self.symbols = symbols
         self.kafka_producer = kafka_producer
         self.exchange_class = ccxtpro.binance  # Clase, no instancia
@@ -37,7 +37,7 @@ class CCXTIngestor(baseIngestor.BaseIngestor):
                         if not self.running:
                             break
                         # CCXT provides timestamp in milliseconds, convert to nanoseconds
-                        timestamp_ms = int(trade['timestamp'])
+                        timestamp_ms = int(trade['timestamp'])  # pyright: ignore[reportArgumentType]
                         trade_data = {
                             "symbol": symbol,
                             "price": trade['price'],
@@ -46,7 +46,7 @@ class CCXTIngestor(baseIngestor.BaseIngestor):
                             "timestamp_ns": timestamp_ms * 1_000_000
                         }
 
-                        await self.kafka_producer.send_message("raw_trades", trade_data)
+                        await self.kafka_producer.send_message("raw_trades", trade_data)  # pyright: ignore[reportAttributeAccessIssue]
 
                 except asyncio.TimeoutError:
                     # Timeout es normal, continuar el loop

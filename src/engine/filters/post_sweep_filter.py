@@ -84,7 +84,7 @@ class PostSweepConfirmationFilter(BaseFilter):
                      prior_swing_low: float,
                      prior_swing_high: float,
                      atr: float,
-                     market_time: datetime = None) -> Optional[SweepZone]:
+                     market_time: datetime | None = None) -> Optional[SweepZone]:
         """
         Detect if current candle is a sweep.
         
@@ -209,10 +209,10 @@ class PostSweepConfirmationFilter(BaseFilter):
         return prior_high, prior_low
     
     def evaluate(self,
-                 df: pd.DataFrame = None,
-                 current_price: float = None,
-                 atr: float = None,
-                 bias: str = None,
+                 df: pd.DataFrame | None = None,
+                 current_price: float | None = None,
+                 atr: float | None = None,
+                 bias: str | None = None,
                  **kwargs) -> FilterDecision:
         """
         Evaluate post-sweep confirmation conditions.
@@ -226,10 +226,10 @@ class PostSweepConfirmationFilter(BaseFilter):
         if df is None or len(df) < 25 or current_price is None:
             return FilterDecision.allow_default()
         
-        highs = df['high'].values
-        lows = df['low'].values
-        opens = df['open'].values
-        closes = df['close'].values
+        highs = df['high'].to_numpy()
+        lows = df['low'].to_numpy()
+        opens = df['open'].to_numpy()
+        closes = df['close'].to_numpy()
         
         current_high = highs[-1]
         current_low = lows[-1]
@@ -244,7 +244,9 @@ class PostSweepConfirmationFilter(BaseFilter):
                         abs(highs[-i] - closes[-i-1]),
                         abs(lows[-i] - closes[-i-1]))
                 tr_values.append(tr)
-            atr = np.mean(tr_values) if tr_values else (current_high - current_low)
+            atr_value = float(np.mean(tr_values)) if tr_values else (current_high - current_low)
+        else:
+            atr_value = float(atr)
         
         # Get prior swings
         prior_swing_high, prior_swing_low = self.get_prior_swings(highs, lows)
@@ -252,7 +254,7 @@ class PostSweepConfirmationFilter(BaseFilter):
         # Check for new sweep
         new_sweep = self.detect_sweep(
             current_high, current_low, current_open, current_close,
-            prior_swing_low, prior_swing_high, atr
+            prior_swing_low, prior_swing_high, atr_value
         )
         
         if new_sweep and len(self._pending_sweeps) < self._max_pending:
@@ -276,7 +278,7 @@ class PostSweepConfirmationFilter(BaseFilter):
                                   if s.candles_since_sweep < 30]
         
         # Build tags
-        tags = {
+        tags: dict[str, int | str | bool] = {
             'sweep_pending_count': len(self._pending_sweeps),
             'sweep_confirmed_count': len(self._confirmed_sweeps),
         }

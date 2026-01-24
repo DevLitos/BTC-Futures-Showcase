@@ -119,7 +119,7 @@ class TradeStatisticsStore:
         slippage_stats = store.get_slippage_stats()
     """
     
-    def __init__(self, data_dir: str = None):
+    def __init__(self, data_dir: str | None = None):
         if data_dir is None:
             # Default to ./data/trades/
             data_dir = os.path.join(os.getcwd(), 'data', 'trades')
@@ -176,11 +176,11 @@ class TradeStatisticsStore:
                    f"P&L: {metrics.pnl_r:.2f}R | MFE: {metrics.mfe_r:.2f}R | MAE: {metrics.mae_r:.2f}R")
     
     def get_trades(self, 
-                   date_from: str = None, 
-                   date_to: str = None,
-                   direction: str = None,
-                   regime: str = None,
-                   min_score: float = None) -> List[TradeMetrics]:
+                   date_from: str | None = None, 
+                   date_to: str | None = None,
+                   direction: str | None = None,
+                   regime: str | None = None,
+                   min_score: float | None = None) -> List[TradeMetrics]:
         """
         Retrieve trades with optional filters.
         
@@ -227,7 +227,7 @@ class TradeStatisticsStore:
         return trades
     
     def analyze_mfe(self, 
-                    trades: List[TradeMetrics] = None,
+                    trades: List[TradeMetrics] | None = None,
                     last_n_days: int = 30) -> Dict:
         """
         Analyze MFE (Maximum Favorable Excursion) distribution.
@@ -278,7 +278,7 @@ class TradeStatisticsStore:
         return analysis
     
     def analyze_mae(self, 
-                    trades: List[TradeMetrics] = None,
+                    trades: List[TradeMetrics] | None = None,
                     last_n_days: int = 30) -> Dict:
         """
         Analyze MAE (Maximum Adverse Excursion) distribution.
@@ -328,7 +328,7 @@ class TradeStatisticsStore:
         return analysis
     
     def get_slippage_stats(self, 
-                           trades: List[TradeMetrics] = None,
+                           trades: List[TradeMetrics] | None = None,
                            last_n_days: int = 30) -> Dict:
         """
         Analyze actual vs expected slippage for model calibration.
@@ -380,7 +380,7 @@ class TradeStatisticsStore:
         return analysis
     
     def get_regime_performance(self, 
-                               trades: List[TradeMetrics] = None,
+                               trades: List[TradeMetrics] | None = None,
                                last_n_days: int = 30) -> Dict:
         """
         Analyze performance by regime.
@@ -432,7 +432,7 @@ class TradeStatisticsStore:
         return analysis
     
     def get_score_performance(self, 
-                              trades: List[TradeMetrics] = None,
+                              trades: List[TradeMetrics] | None = None,
                               last_n_days: int = 30) -> Dict:
         """
         Analyze performance by entry score buckets.
@@ -512,7 +512,7 @@ class TradeStatisticsStore:
 _trade_store: Optional[TradeStatisticsStore] = None
 
 
-def get_trade_store(data_dir: str = None) -> TradeStatisticsStore:
+def get_trade_store(data_dir: str | None = None) -> TradeStatisticsStore:
     """Get or create the trade store singleton."""
     global _trade_store
     if _trade_store is None:

@@ -471,6 +471,10 @@ class AuditLogger:
         }
         self.logger.info(json.dumps(event))
     
+    def log(self, event_type: str, **data):
+        """Public method to log an audit event."""
+        self._log_event(event_type, **data)
+    
     # Order events
     def order_placed(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                     order_type: str = "limit", client_order_id: Optional[str] = None, **extra):

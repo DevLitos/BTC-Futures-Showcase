@@ -617,25 +617,26 @@ PULLBACK_SHORT_CONSECUTIVE_LOSSES = Gauge(
 )
 
 
-def update_pullback_short_signal(symbol: str, blocked: bool = False, reason: str = ""):
+def update_pullback_short_signal(symbol: str | None, blocked: bool = False, reason: str = ""):
     """Update pullback short signal metrics."""
-    PULLBACK_SHORT_SIGNALS_TOTAL.labels(symbol=symbol).inc()
+    PULLBACK_SHORT_SIGNALS_TOTAL.labels(symbol=symbol or 'UNKNOWN').inc()
     if blocked and reason:
-        PULLBACK_SHORT_BLOCKS_TOTAL.labels(symbol=symbol, reason=reason).inc()
+        PULLBACK_SHORT_BLOCKS_TOTAL.labels(symbol=symbol or 'UNKNOWN', reason=reason).inc()
 
 
-def update_pullback_short_entry(symbol: str, extension_z: float):
+def update_pullback_short_entry(symbol: str | None, extension_z: float):
     """Update pullback short entry metrics."""
-    PULLBACK_SHORT_ENTRIES_TOTAL.labels(symbol=symbol).inc()
-    PULLBACK_SHORT_EXTENSION_Z.labels(symbol=symbol).observe(extension_z)
+    PULLBACK_SHORT_ENTRIES_TOTAL.labels(symbol=symbol or 'UNKNOWN').inc()
+    PULLBACK_SHORT_EXTENSION_Z.labels(symbol=symbol or 'UNKNOWN').observe(extension_z)
 
 
-def update_pullback_short_exit(symbol: str, pnl: float, is_win: bool, mfe_r: float, mae_r: float):
+def update_pullback_short_exit(symbol: str | None, pnl: float, is_win: bool, mfe_r: float, mae_r: float):
     """Update pullback short exit metrics."""
+    _sym = symbol or 'UNKNOWN'
     if is_win:
-        PULLBACK_SHORT_WINS_TOTAL.labels(symbol=symbol).inc()
+        PULLBACK_SHORT_WINS_TOTAL.labels(symbol=_sym).inc()
     else:
-        PULLBACK_SHORT_LOSSES_TOTAL.labels(symbol=symbol).inc()
+        PULLBACK_SHORT_LOSSES_TOTAL.labels(symbol=_sym).inc()
     
     # Update cumulative PnL (get current and add)
     # Note: For proper cumulative, you'd track in the engine and set here
@@ -643,8 +644,9 @@ def update_pullback_short_exit(symbol: str, pnl: float, is_win: bool, mfe_r: flo
     PULLBACK_SHORT_MAE_R.labels(symbol=symbol).observe(mae_r)
 
 
-def update_pullback_short_status(symbol: str, daily_count: int, consecutive_losses: int, cumulative_pnl: float):
+def update_pullback_short_status(symbol: str | None, daily_count: int, consecutive_losses: int, cumulative_pnl: float):
     """Update pullback short status gauges."""
-    PULLBACK_SHORT_DAILY_COUNT.labels(symbol=symbol).set(daily_count)
-    PULLBACK_SHORT_CONSECUTIVE_LOSSES.labels(symbol=symbol).set(consecutive_losses)
-    PULLBACK_SHORT_PNL_TOTAL.labels(symbol=symbol).set(cumulative_pnl)
+    _sym = symbol or 'UNKNOWN'
+    PULLBACK_SHORT_DAILY_COUNT.labels(symbol=_sym).set(daily_count)
+    PULLBACK_SHORT_CONSECUTIVE_LOSSES.labels(symbol=_sym).set(consecutive_losses)
+    PULLBACK_SHORT_PNL_TOTAL.labels(symbol=_sym).set(cumulative_pnl)

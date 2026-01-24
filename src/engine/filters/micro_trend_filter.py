@@ -281,7 +281,7 @@ class MicroTrendState:
     strength: float = 0.0
     
     # Debug
-    signal_breakdown: Dict[str, float] = field(default_factory=dict)
+    signal_breakdown: Dict[str, float | str | int] = field(default_factory=dict)
     
     def __post_init__(self):
         # Sync backwards compat fields
@@ -423,8 +423,8 @@ class MicroTrendFilter:
               htf_bias: str,
               market_time: Optional[datetime] = None,
               base_score: int = 0,
-              regime_mode: str = None,  # 🔥 NEW: 'TREND', 'RANGE', 'BREAKOUT'
-              adx_value: float = None    # 🔥 NEW: Current ADX for conditional block
+              regime_mode: str | None = None,  # 🔥 NEW: 'TREND', 'RANGE', 'BREAKOUT'
+              adx_value: float | None = None    # 🔥 NEW: Current ADX for conditional block
               ) -> Tuple[bool, str, MicroTrendState]:
         """
         Check micro-trend filter with all improvements.
@@ -454,9 +454,9 @@ class MicroTrendFilter:
             return True, "Insufficient data", state
         
         # Extract arrays
-        closes_5m = df_5m['close'].values
-        highs_5m = df_5m['high'].values
-        lows_5m = df_5m['low'].values
+        closes_5m = df_5m['close'].to_numpy()
+        highs_5m = df_5m['high'].to_numpy()
+        lows_5m = df_5m['low'].to_numpy()
         
         # =================================================================
         # 1. CALCULATE INDICATORS
@@ -534,7 +534,7 @@ class MicroTrendFilter:
         # =================================================================
         
         if df_1m is not None and len(df_1m) >= self.min_data_1m:
-            closes_1m = df_1m['close'].values
+            closes_1m = df_1m['close'].to_numpy()
             ema9_1m = calculate_ema(closes_1m, 9)
             ema20_1m = calculate_ema(closes_1m, 20)
             

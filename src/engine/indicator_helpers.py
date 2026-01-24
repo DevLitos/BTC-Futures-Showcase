@@ -77,9 +77,9 @@ def calculate_atr_1m(df_1m: pd.DataFrame, period: int = 14) -> float:
     if df_1m is None or len(df_1m) < period + 1:
         return 0.0
     
-    highs = df_1m['high'].values
-    lows = df_1m['low'].values
-    closes = df_1m['close'].values
+    highs = df_1m['high'].to_numpy()
+    lows = df_1m['low'].to_numpy()
+    closes = df_1m['close'].to_numpy()
     
     atr = calculate_atr(highs, lows, closes, period)
     return float(atr[-1]) if not np.isnan(atr[-1]) else 0.0
@@ -90,9 +90,9 @@ def calculate_atr_5m(df_5m: pd.DataFrame, period: int = 14) -> float:
     if df_5m is None or len(df_5m) < period + 1:
         return 0.0
     
-    highs = df_5m['high'].values
-    lows = df_5m['low'].values
-    closes = df_5m['close'].values
+    highs = df_5m['high'].to_numpy()
+    lows = df_5m['low'].to_numpy()
+    closes = df_5m['close'].to_numpy()
     
     atr = calculate_atr(highs, lows, closes, period)
     return float(atr[-1]) if not np.isnan(atr[-1]) else 0.0
@@ -103,9 +103,9 @@ def calculate_atr_generic(df: pd.DataFrame, period: int = 14) -> float:
     if df is None or len(df) < period + 1:
         return 0.0
     
-    highs = df['high'].values
-    lows = df['low'].values
-    closes = df['close'].values
+    highs = df['high'].to_numpy()
+    lows = df['low'].to_numpy()
+    closes = df['close'].to_numpy()
     
     atr = calculate_atr(highs, lows, closes, period)
     return float(atr[-1]) if not np.isnan(atr[-1]) else 0.0
@@ -134,9 +134,9 @@ def calculate_adx_value(df: pd.DataFrame, period: int = 14) -> float:
     if df is None or len(df) < period * 2:
         return 20.0  # Default neutral
     
-    highs = df['high'].values
-    lows = df['low'].values
-    closes = df['close'].values
+    highs = df['high'].to_numpy()
+    lows = df['low'].to_numpy()
+    closes = df['close'].to_numpy()
     
     # FIXED: calculate_adx returns (adx_values, adx_slope) tuple
     adx_values, _ = calculate_adx(highs, lows, closes, period)
@@ -148,19 +148,19 @@ def calculate_rsi_value(df: pd.DataFrame, period: int = 14) -> float:
     if df is None or len(df) < period + 1:
         return 50.0  # Default neutral
     
-    closes = df['close'].values
+    closes = df['close'].to_numpy()
     rsi = calculate_rsi(closes, period)
     return float(rsi[-1]) if not np.isnan(rsi[-1]) else 50.0
 
 
-def calculate_ema_values(df: pd.DataFrame) -> Dict[str, float]:
+def calculate_ema_values(df: pd.DataFrame) -> Dict[str, float | None]:
     """Calculate common EMA values (20, 50, 200)."""
-    result = {'ema20': None, 'ema50': None, 'ema200': None}
+    result: Dict[str, float | None] = {'ema20': None, 'ema50': None, 'ema200': None}
     
     if df is None or len(df) < 200:
         return result
     
-    closes = df['close'].values
+    closes = df['close'].to_numpy()
     
     ema20 = calculate_ema(closes, 20)
     ema50 = calculate_ema(closes, 50)
@@ -173,14 +173,14 @@ def calculate_ema_values(df: pd.DataFrame) -> Dict[str, float]:
     return result
 
 
-def calculate_bb_values(df: pd.DataFrame, period: int = 20, std_dev: float = 2.0) -> Dict[str, float]:
+def calculate_bb_values(df: pd.DataFrame, period: int = 20, std_dev: float = 2.0) -> Dict[str, float | None]:
     """Calculate Bollinger Band values."""
-    result = {'upper': None, 'middle': None, 'lower': None, 'width': None}
+    result: Dict[str, float | None] = {'upper': None, 'middle': None, 'lower': None, 'width': None}
     
     if df is None or len(df) < period:
         return result
     
-    closes = df['close'].values
+    closes = df['close'].to_numpy()
     upper, middle, lower = calculate_bollinger_bands(closes, period, std_dev)
     
     if not np.isnan(upper[-1]) and not np.isnan(lower[-1]):

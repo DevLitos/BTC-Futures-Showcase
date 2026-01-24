@@ -55,7 +55,7 @@ class AnticipationState:
     stop_loss: float = 0.0
     expected_target: float = 0.0
     time_valid_until: Optional[datetime] = None
-    reasons: List[str] = None
+    reasons: List[str] | None = None
     
     def __post_init__(self):
         if self.reasons is None:
@@ -108,11 +108,11 @@ class AnticipationEngine:
         closes = df_5m['close'].values
         
         # Calculate BB width
-        sma20 = pd.Series(closes).rolling(20).mean().values
-        std20 = pd.Series(closes).rolling(20).std().values
+        sma20 = pd.Series(closes).rolling(20).mean().values  # pyright: ignore[reportAttributeAccessIssue]
+        std20 = pd.Series(closes).rolling(20).std().values  # pyright: ignore[reportAttributeAccessIssue]
         
-        upper = sma20 + 2 * std20
-        lower = sma20 - 2 * std20
+        upper = sma20 + 2 * std20  # type: ignore[operator]
+        lower = sma20 - 2 * std20  # type: ignore[operator]
         
         # Width as percentage of price
         width_pct = ((upper - lower) / closes) * 100
@@ -156,9 +156,9 @@ class AnticipationEngine:
         
         from src.engine.indicators import calculate_adx
         
-        highs = df_5m['high'].values
-        lows = df_5m['low'].values
-        closes = df_5m['close'].values
+        highs = df_5m['high'].to_numpy()
+        lows = df_5m['low'].to_numpy()
+        closes = df_5m['close'].to_numpy()
         
         adx, _ = calculate_adx(highs, lows, closes, 14)
         if len(adx) < 5:
@@ -195,11 +195,11 @@ class AnticipationEngine:
         if len(df_5m) < 30 or 'volume' not in df_5m.columns:
             return False, 0.0, "No volume data"
         
-        volumes = df_5m['volume'].values
+        volumes = df_5m['volume'].to_numpy()
         
         # Recent vs average
-        avg_vol = np.mean(volumes[-30:])
-        recent_vol = np.mean(volumes[-5:])
+        avg_vol = float(np.mean(np.asarray(volumes[-30:])))
+        recent_vol = float(np.mean(np.asarray(volumes[-5:])))
         
         if avg_vol <= 0:
             return False, 0.0, "Invalid volume data"
@@ -216,7 +216,7 @@ class AnticipationEngine:
         
         return is_declining, decline_score, reason
     
-    def _detect_structure_building(self, df_5m: pd.DataFrame, current_price: float) -> Tuple[bool, str, float, float]:
+    def _detect_structure_building(self, df_5m: pd.DataFrame, current_price: float) -> Tuple[bool, str | None, float, float]:
         """
         Detect accumulation (HLs) or distribution (LHs) structure.
         
@@ -226,8 +226,8 @@ class AnticipationEngine:
         if len(df_5m) < 30:
             return False, None, 0.0, 0.0
         
-        highs = df_5m['high'].values[-20:]
-        lows = df_5m['low'].values[-20:]
+        highs = df_5m['high'].to_numpy()[-20:]
+        lows = df_5m['low'].to_numpy()[-20:]
         
         # Find swing points (simplified: local max/min over 3 bars)
         swing_highs = []
@@ -377,13 +377,13 @@ class AnticipationEngine:
             direction = htf_bias
         else:
             # Default based on recent momentum
-            closes = df_5m['close'].values[-10:]
+            closes = df_5m['close'].to_numpy()[-10:]
             direction = 'LONG' if closes[-1] > closes[0] else 'SHORT'
         
         # Calculate entry/SL/target
         # 🔥 FIX (Jan 22, 2026): Tight SL for anticipation - if no structure, use 0.6*ATR
         # This enforces "if no breakout soon, exit quickly" thesis
-        closes = df_5m['close'].values
+        closes = df_5m['close'].to_numpy()
         ema20 = pd.Series(closes).ewm(span=20, adjust=False).mean().iloc[-1]
         
         if direction == 'LONG':

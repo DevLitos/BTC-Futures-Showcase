@@ -42,7 +42,7 @@ def check_trend_filter(
     if len(df) < 200:
         return True, "Not enough data for trend filter"
     
-    closes = df['close'].values
+    closes = df['close'].to_numpy()
     ema50 = calculate_ema(closes, 50)
     ema200 = calculate_ema(closes, 200)
     
@@ -82,9 +82,9 @@ def check_momentum_filter(
     if len(df) < 50:
         return True, "Not enough data for momentum", "MODERATE", 100.0
     
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
+    closes = df['close'].to_numpy()
+    highs = df['high'].to_numpy()
+    lows = df['low'].to_numpy()
     
     # RSI with slope
     rsi = calculate_rsi(closes, 14)
@@ -148,9 +148,9 @@ def check_volatility_expansion(df: pd.DataFrame) -> Tuple[bool, str]:
     if len(df) < 50:
         return True, "Not enough data for volatility"
     
-    highs = df['high'].values
-    lows = df['low'].values
-    closes = df['close'].values
+    highs = df['high'].to_numpy()
+    lows = df['low'].to_numpy()
+    closes = df['close'].to_numpy()
     
     atr_fast = calculate_atr(highs, lows, closes, 14)
     atr_slow = calculate_atr(highs, lows, closes, 42)
@@ -242,11 +242,11 @@ def check_volume_delta(df: pd.DataFrame) -> Tuple[bool, str]:
     if len(df) < 25 or 'volume' not in df.columns:
         return True, "Not enough data for volume filter"
     
-    volumes = df['volume'].values
-    opens = df['open'].values
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
+    volumes = df['volume'].to_numpy()
+    opens = df['open'].to_numpy()
+    closes = df['close'].to_numpy()
+    highs = df['high'].to_numpy()
+    lows = df['low'].to_numpy()
     
     # Current candle delta
     current_vol = volumes[-1]
@@ -261,7 +261,7 @@ def check_volume_delta(df: pd.DataFrame) -> Tuple[bool, str]:
     delta = current_vol * body_ratio * (1 if current_body > 0 else -1)
     
     # Average volume for normalization
-    avg_vol_20 = np.mean(volumes[-21:-1])
+    avg_vol_20 = float(np.mean(np.asarray(volumes[-21:-1])))
     if avg_vol_20 <= 0:
         return True, "Zero average volume"
     
@@ -330,9 +330,9 @@ def check_atr_regime(
     if len(df_5m) < 20:
         return True, "Not enough data for ATR regime"
     
-    highs = df_5m['high'].values
-    lows = df_5m['low'].values
-    closes = df_5m['close'].values
+    highs = df_5m['high'].to_numpy()
+    lows = df_5m['low'].to_numpy()
+    closes = df_5m['close'].to_numpy()
     
     atr = calculate_atr(highs, lows, closes, 14)
     if np.isnan(atr[-1]):
@@ -446,9 +446,9 @@ def check_atr_regime_allows_entry(df_5m: pd.DataFrame) -> Tuple[bool, str]:
     if df_5m is None or len(df_5m) < 50:
         return True, "Not enough data for ATR regime"
     
-    highs = df_5m['high'].values
-    lows = df_5m['low'].values
-    closes = df_5m['close'].values
+    highs = df_5m['high'].to_numpy()
+    lows = df_5m['low'].to_numpy()
+    closes = df_5m['close'].to_numpy()
     
     # Calculate True Range for each candle
     atrs = []
@@ -486,9 +486,9 @@ def check_volatility_minimum(df_1m: pd.DataFrame, min_ratio: float = 0.75) -> Tu
     if df_1m is None or len(df_1m) < 200:
         return True, "Not enough data for volatility filter"
     
-    highs = df_1m['high'].values
-    lows = df_1m['low'].values
-    closes = df_1m['close'].values
+    highs = df_1m['high'].to_numpy()
+    lows = df_1m['low'].to_numpy()
+    closes = df_1m['close'].to_numpy()
     
     # Calculate True Range for each candle
     atrs = []

@@ -387,7 +387,7 @@ class EnhancedEdgeEnforcement:
             miss_reason=opportunity_data.get('reason', 'unknown')
         )
     
-    def get_diagnostic_report(self, override_key: str = None) -> Optional[Dict]:
+    def get_diagnostic_report(self, override_key: str | None = None) -> Optional[Dict]:
         """
         Get full diagnostic report (requires authorization).
         

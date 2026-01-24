@@ -212,14 +212,14 @@ class PeriodAnalyzer:
         
         # Calculate Sharpe-like ratio (using R values)
         if r_values and len(r_values) > 1:
-            r_std = np.std(r_values)
+            r_std = float(np.std(r_values))
             if r_std > 0:
                 metrics.sharpe_ratio = metrics.expectancy_r / r_std
             
             # Sortino (only downside deviation)
             downside = [r for r in r_values if r < 0]
             if downside:
-                downside_std = np.std(downside)
+                downside_std = float(np.std(downside))
                 if downside_std > 0:
                     metrics.sortino_ratio = metrics.expectancy_r / downside_std
         
@@ -241,7 +241,7 @@ class CrossValidator:
     - OOS: Optional additional month
     """
     
-    def __init__(self, config: ValidationConfig = None):
+    def __init__(self, config: ValidationConfig | None = None):
         self.config = config or ValidationConfig()
         
         # Baseline metrics (without the feature)
@@ -421,7 +421,7 @@ class FeatureFlagManager:
         """Check if a feature is enabled."""
         return self.flags.get(flag, FeatureFlagState(flag=flag)).enabled
     
-    def enable(self, flag: FeatureFlag, validation_result: ValidationResult = None):
+    def enable(self, flag: FeatureFlag, validation_result: ValidationResult | None = None):
         """Enable a feature flag."""
         if flag in self.flags:
             self.flags[flag].enabled = True
@@ -527,8 +527,8 @@ class StabilityAnalyzer:
             return 50.0, "NO_DATA"
         
         # Calculate coefficient of variation (lower = more stable)
-        mean_return = np.mean(returns)
-        std_return = np.std(returns)
+        mean_return = float(np.mean(returns))
+        std_return = float(np.std(returns))
         
         if mean_return == 0:
             cv = float('inf')
@@ -539,7 +539,7 @@ class StabilityAnalyzer:
         # CV of 0 = 100 (perfect stability)
         # CV of 1 = 50 (moderate stability)
         # CV of 2+ = 0 (unstable)
-        score = max(0, min(100, 100 - (cv * 50)))
+        score = float(max(0, min(100, 100 - (cv * 50))))
         
         # Determine description
         if score >= 80:
@@ -615,7 +615,7 @@ class SlippageSimulator:
     More conservative backtests = more reliable forward performance.
     """
     
-    def __init__(self, config: SlippageConfig = None):
+    def __init__(self, config: SlippageConfig | None = None):
         self.config = config or SlippageConfig()
     
     def apply_slippage(self,

@@ -462,7 +462,7 @@ class TradingRegimeClassifier:
         """Record regime change in history."""
         now = datetime.now(UTC)
         
-        if self.current_regime != TradingRegime.UNKNOWN:
+        if self.current_regime != TradingRegime.UNKNOWN and self.regime_start_time is not None:
             self.regime_history.append((self.current_regime, self.regime_start_time))
         
         self.current_regime = new_regime

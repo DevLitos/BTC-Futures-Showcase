@@ -60,6 +60,24 @@ warn_return_any = true
 warn_unused_ignores = true
 disallow_untyped_defs = false
 
+[tool.pyright]
+include = ["src", "main.py"]
+exclude = [
+    "deprecated",
+    "tests",
+    "tools",
+    "**/__pycache__",
+    "**/node_modules",
+    ".venv",
+    "docs",
+    "**/_archived",
+    "**/src/engine/_archived",
+]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+reportMissingImports = "error"
+reportMissingTypeStubs = "none"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

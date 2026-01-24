@@ -296,7 +296,7 @@ class MLInferenceEngine:
             self._entry_model.is_trained
         )
         model_auc = 0.0
-        if model_loaded and hasattr(self._entry_model, 'validation_auc'):
+        if model_loaded and self._entry_model is not None and hasattr(self._entry_model, 'validation_auc'):
             model_auc = self._entry_model.validation_auc or 0.0
         
         return {
@@ -339,16 +339,17 @@ class MLInferenceEngine:
             Drift stats including alerts if drift detected
         """
         actual = 1.0 if actual_win else 0.0
-        drift_result = self._drift_detector.update(ml_prob, actual)
+        alert_msg = self._drift_detector.update(ml_prob, int(actual))
+        drift_stats = self._drift_detector.get_stats()
         
-        if drift_result.get('drift_detected', False):
+        if drift_stats.get('drift_detected', False):
             logger.warning(
                 f"⚠️ ML DRIFT DETECTED for trade {trade_id}: "
-                f"rolling_auc={drift_result.get('rolling_auc', 0):.3f} < "
-                f"baseline={drift_result.get('baseline_auc', 0.55):.3f}"
+                f"rolling_auc={drift_stats.get('rolling_auc', 0):.3f} < "
+                f"baseline={drift_stats.get('baseline_auc', 0.55):.3f}"
             )
         
-        return drift_result
+        return drift_stats
     
     def get_drift_stats(self) -> Dict[str, Any]:
         """Get current drift detector statistics."""

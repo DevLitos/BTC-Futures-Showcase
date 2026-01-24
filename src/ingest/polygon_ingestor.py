@@ -51,7 +51,7 @@ class PolygonIngestor(BaseIngestor):
             try:
                 # Timeout para permitir verificar self.running
                 raw_message = await asyncio.wait_for(
-                    self.connection.recv(),
+                    self.connection.recv(),  # pyright: ignore[reportOptionalMemberAccess]
                     timeout=30.0
                 )
                 messages = json.loads(raw_message)
@@ -77,7 +77,7 @@ class PolygonIngestor(BaseIngestor):
                             "timestamp": timestamp
                         }
 
-                        await self.kafka_producer.send_message("raw_trades", trade_data)
+                        await self.kafka_producer.send_message("raw_trades", trade_data)  # pyright: ignore[reportAttributeAccessIssue]
             except asyncio.TimeoutError:
                 # Timeout normal, continuar para verificar running
                 continue
@@ -130,11 +130,11 @@ class PolygonIngestor(BaseIngestor):
 
 async def main():
     kafka_producer = KafkaProducer()
-    await kafka_producer.initialize()
+    await kafka_producer.initialize()  # pyright: ignore[reportAttributeAccessIssue]
 
     polygon_ingestor = PolygonIngestor(
         uri=WEBSOCKET_URL,
-        api_key=API_KEY,
+        api_key=API_KEY or "",  # Provide empty string fallback
         symbols=SYBOLS,
         kafka_producer=kafka_producer
     )
@@ -143,7 +143,7 @@ async def main():
         await polygon_ingestor.run()
     finally:
         await polygon_ingestor.close()
-        await kafka_producer.close()
+        await kafka_producer.close()  # pyright: ignore[reportAttributeAccessIssue]
     
 if __name__ == "__main__":
     # Para ejecutar este servicio:

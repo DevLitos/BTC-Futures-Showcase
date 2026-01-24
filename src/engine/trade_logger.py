@@ -180,8 +180,8 @@ class TradeLogger:
     
     def start_trade(
         self,
-        symbol: str,
-        direction: str,
+        symbol: str | None,
+        direction: str | None,
         entry_price: float,
         stop_loss: float,
         take_profit: float,
@@ -192,10 +192,10 @@ class TradeLogger:
         volatility_regime: str = "NORMAL",
         session: str = "OTHER",
         trade_type: str = "LONG_MAIN",
-        score_breakdown: Dict[str, float] = None,
-        metadata: Dict[str, Any] = None,
+        score_breakdown: Dict[str, float] | None = None,
+        metadata: Dict[str, Any] | None = None,
         # 🔥 ML Data Collection fields (Jan 24, 2026)
-        feature_snapshot: Dict[str, float] = None,
+        feature_snapshot: Dict[str, float] | None = None,
         entry_trading_mode: str = "",
         entry_daily_regime: str = ""
     ) -> str:
@@ -210,8 +210,8 @@ class TradeLogger:
         
         record = TradeLogRecord(
             trade_id=trade_id,
-            symbol=symbol,
-            direction=direction,
+            symbol=symbol or 'UNKNOWN',
+            direction=direction or 'UNKNOWN',
             trade_type=trade_type,
             entry_time=now.isoformat(),
             exit_time="",
@@ -244,7 +244,7 @@ class TradeLogger:
         
         self.active_trades[trade_id] = record
         
-        logger.info(f"📝 Trade started: {trade_id} | {direction} @ {entry_price:.2f} | Tags: {entry_tags}")
+        logger.info(f"📝 Trade started: {trade_id} | {direction or 'UNKNOWN'} @ {entry_price:.2f} | Tags: {entry_tags}")
         
         return trade_id
     
@@ -290,10 +290,10 @@ class TradeLogger:
         exit_price: float,
         exit_reason: str,
         pnl_usd: float,
-        pnl_r: float = None,
-        mfe_r: float = None,
-        mae_r: float = None,
-        exit_tags: List[str] = None,
+        pnl_r: float | None = None,
+        mfe_r: float | None = None,
+        mae_r: float | None = None,
+        exit_tags: List[str] | None = None,
         # 🔥 ML Data Collection fields (Jan 24, 2026)
         exit_regime: str = "",
         final_candle_count: int = 0
@@ -369,8 +369,8 @@ class TradeLogger:
     
     def load_trades(
         self,
-        start_date: str = None,
-        end_date: str = None
+        start_date: str | None = None,
+        end_date: str | None = None
     ) -> List[TradeLogRecord]:
         """
         Load trades from log files.

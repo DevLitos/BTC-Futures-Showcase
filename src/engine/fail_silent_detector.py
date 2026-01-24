@@ -164,7 +164,7 @@ class FailSilentDetector:
         
         # Average capture rate (when traded)
         capture_rates = [opp.capture_percentage for opp in captured]
-        avg_capture = np.mean(capture_rates) if capture_rates else 0.0
+        avg_capture = float(np.mean(capture_rates)) if capture_rates else 0.0
         
         # Participation rate
         participation = len(captured) / total if total > 0 else 0.0
@@ -265,7 +265,7 @@ class FailSilentDetector:
             reason_counts = {}
             for reason in missed_reasons:
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
-            most_common = max(reason_counts, key=reason_counts.get)
+            most_common = max(reason_counts, key=lambda k: reason_counts.get(k, 0) or 0)
             reasoning.append(f"Common miss reason: {most_common}")
         
         # Determine action

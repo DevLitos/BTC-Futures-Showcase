@@ -246,7 +246,7 @@ class ExecutionAnalytics:
     def record_order_sent(
         self,
         execution_id: str,
-        exchange_order_id: str = None
+        exchange_order_id: str | None = None
     ) -> None:
         """Record that order was sent to exchange."""
         tracker = self._active_executions.get(execution_id)

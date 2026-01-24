@@ -54,7 +54,10 @@ def get_api_key_from_settings() -> Optional[str]:
         from src.core.settings import get_settings
         settings = get_settings()
         if hasattr(settings, 'api_key') and settings.api_key:
-            return settings.api_key.get_secret_value() if hasattr(settings.api_key, 'get_secret_value') else settings.api_key
+            api_key = settings.api_key
+            if hasattr(api_key, 'get_secret_value'):
+                return api_key.get_secret_value()
+            return str(api_key)
     except Exception:
         pass
     return None

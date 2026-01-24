@@ -509,6 +509,7 @@ class PositionSnapshot:
     # P&L
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
+    funding_paid: float = 0.0       # Total funding paid/received
     
     # Risk management
     stop_loss: float = 0.0

@@ -12,7 +12,7 @@ These two state machines serve different purposes:
 
 from enum import Enum
 from typing import Optional
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, date, timedelta, UTC
 import logging
 import threading
 
@@ -82,7 +82,7 @@ class StateMachine:
         self.daily_drawdown_limit_pct: float = 0.03  # 3% max daily DD (configurable)
         self.is_daily_halt: bool = False  # Once True, stays True until manual reset
         self.daily_halt_reason: str = ""  # Why we halted
-        self._last_dd_check_date: Optional[datetime] = None  # Track date for reset
+        self._last_dd_check_date: Optional[date] = None  # Track date for reset
         
         # Performance tracking
         self.profit_factor = 0.0
@@ -134,6 +134,10 @@ class StateMachine:
                 log_msg += f" | Reason: {reason}"
             logger.info(log_msg)
 
+    def to_idle(self, reason: str = "") -> None:
+        """Convenience method to transition to IDLE state."""
+        self.transition_to(BotState.IDLE, reason)
+
     def can_trade(self) -> tuple[bool, str]:
         """
         Check if bot can enter new trades
@@ -144,7 +148,7 @@ class StateMachine:
             return False, f"Not in IDLE state (current: {self.state.value})"
         
         # Check cooldown
-        if self.is_in_cooldown():
+        if self.cooldown_until is not None and self.is_in_cooldown():
             remaining = (self.cooldown_until - self._get_time()).total_seconds()
             return False, f"In cooldown for {remaining:.0f} more seconds"
         
@@ -204,8 +208,8 @@ class StateMachine:
         - RECONCILE_CLOSE (exchange sync)
         
         This prevents the bot from penalizing itself for non-trade events.
-        """
-        if self.current_trade_id:
+        """        
+        if self.current_trade_id and self.trade_open_time is not None:
             duration = (self._get_time() - self.trade_open_time).total_seconds() / 60
             logger.info(f"Trade closed: {self.current_trade_id} | Reason: {exit_reason} | Duration: {duration:.1f}min | PnL: ${pnl:.2f}")
         

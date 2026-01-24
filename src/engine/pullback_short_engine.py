@@ -23,7 +23,7 @@ WHAT IT IS NOT:
 import logging
 import numpy as np
 import pandas as pd
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, date, UTC, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, List, Any
 from enum import Enum
@@ -108,7 +108,7 @@ class PullbackShortEngine:
         # State tracking
         self._breakout_cooldown_until: Optional[datetime] = None
         self._daily_trade_count: int = 0
-        self._last_trade_date: Optional[datetime] = None
+        self._last_trade_date: date | None = None
         self._consecutive_losses: int = 0
         self._disabled_until: Optional[datetime] = None
         self._cumulative_pnl: float = 0.0  # Track daily cumulative PnL
@@ -129,7 +129,7 @@ class PullbackShortEngine:
         
         logger.info("PullbackShortEngine initialized")
     
-    def is_enabled(self, is_live: bool = False, market_time: datetime = None) -> Tuple[bool, str]:
+    def is_enabled(self, is_live: bool = False, market_time: datetime | None = None) -> Tuple[bool, str]:
         """
         Check if pullback shorts are enabled.
         
@@ -266,18 +266,18 @@ class PullbackShortEngine:
             return signal
         
         # 1H indicators
-        closes_1h = df_1h['close'].values
-        highs_1h = df_1h['high'].values
-        lows_1h = df_1h['low'].values
+        closes_1h = df_1h['close'].to_numpy()
+        highs_1h = df_1h['high'].to_numpy()
+        lows_1h = df_1h['low'].to_numpy()
         ema50_1h = calculate_ema(closes_1h, 50)
         atr_1h = calculate_atr(highs_1h, lows_1h, closes_1h, 14)
         
         # 5M indicators
-        closes_5m = df_5m['close'].values
-        highs_5m = df_5m['high'].values
-        lows_5m = df_5m['low'].values
-        opens_5m = df_5m['open'].values
-        volumes_5m = df_5m['volume'].values if 'volume' in df_5m.columns else np.ones(len(df_5m))
+        closes_5m = df_5m['close'].to_numpy()
+        highs_5m = df_5m['high'].to_numpy()
+        lows_5m = df_5m['low'].to_numpy()
+        opens_5m = df_5m['open'].to_numpy()
+        volumes_5m = df_5m['volume'].to_numpy() if 'volume' in df_5m.columns else np.ones(len(df_5m))
         
         atr_5m = calculate_atr(highs_5m, lows_5m, closes_5m, 14)
         rsi_5m = calculate_rsi(closes_5m, 14)
@@ -468,7 +468,7 @@ class PullbackShortEngine:
         atr_avg = np.mean(atr_5m[-20:]) if len(atr_5m) >= 20 else current_atr_5m
         vol_ratio = current_atr_5m / atr_avg if atr_avg > 0 else 1.0
         activity_score = max(0.0, min(1.0, vol_ratio - 1.0))
-        signal.activity_score = activity_score
+        signal.activity_score = activity_score  # pyright: ignore[reportAttributeAccessIssue]
         
         # -----------------------------------------------------------------
         # ENTRY MODE: RETEST (LIMIT) or MARKET
@@ -545,7 +545,7 @@ class PullbackShortEngine:
         # TP2 = entry - k_tp2 * ATR_5m
         # -----------------------------------------------------------------
         if self.config.TP2_ENABLED:
-            k_tp2 = self.config.get_tp2_k(activity_score)
+            k_tp2 = self.config.get_tp2_k(float(activity_score))
             tp2_price = entry_price - (k_tp2 * current_atr_5m)
             signal.tp2_price = tp2_price
         else:
@@ -567,7 +567,7 @@ class PullbackShortEngine:
             'vwap': vwap_value,
             'ema20': ema20_value,
             'tp1_type': 'VWAP' if (vwap_value and vwap_value < entry_price) else 'ATR_FALLBACK',
-            'tp2_k': self.config.get_tp2_k(activity_score) if self.config.TP2_ENABLED else None,
+            'tp2_k': self.config.get_tp2_k(float(activity_score)) if self.config.TP2_ENABLED else None,
             'complementary_passed': complementary_passed
         }
         

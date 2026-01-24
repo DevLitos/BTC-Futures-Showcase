@@ -61,7 +61,7 @@ class FilterDecision:
         )
     
     def merge_dedup(self, other: 'FilterDecision', 
-                   dedup_regimes: List[str] = None) -> 'FilterDecision':
+                   dedup_regimes: List[str] | None = None) -> 'FilterDecision':
         """
         Merge decisions with regime-based deduplication.
         
@@ -168,11 +168,11 @@ class FilterPipeline:
         decision = pipeline.run(df_5m=df, current_price=price, ...)
     """
     
-    def __init__(self, filters: List[BaseFilter] = None):
-        self.filters = filters or []
+    def __init__(self, filters: List[tuple[str, BaseFilter]] | None = None):
+        self.filters: List[tuple[str, BaseFilter]] = filters or []
         self._last_decisions: Dict[str, FilterDecision] = {}
     
-    def add_filter(self, filter_instance: BaseFilter, name: str = None):
+    def add_filter(self, filter_instance: BaseFilter, name: str | None = None):
         """Add a filter to the pipeline"""
         self.filters.append((name or filter_instance.__class__.__name__, filter_instance))
     

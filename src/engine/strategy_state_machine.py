@@ -274,16 +274,17 @@ class StrategyStateMachine:
         
         return new_state, transition_reason
     
-    def _execute_transition(self, new_state: StrategyState, reason: str, metrics: dict, current_time: datetime) -> None:
+    def _execute_transition(self, new_state: StrategyState, reason: str | None, metrics: dict, current_time: datetime) -> None:
         """Executes the actual state transition"""
+        reason_str = reason or "unspecified"
         if new_state == StrategyState.DEGRADED:
-            self.transition_to_degraded(reason, metrics, current_time)
+            self.transition_to_degraded(reason_str, metrics, current_time)
         elif new_state == StrategyState.OBSERVATION:
-            self.transition_to_observation(reason, metrics, current_time)
+            self.transition_to_observation(reason_str, metrics, current_time)
         elif new_state == StrategyState.DEAD:
-            self.transition_to_dead(reason, metrics, current_time)
+            self.transition_to_dead(reason_str, metrics, current_time)
         elif new_state == StrategyState.ACTIVE:
-            self.transition_to_active(reason, metrics, current_time)
+            self.transition_to_active(reason_str, metrics, current_time)
     
     # ========================================================================
     # STATE INFORMATION

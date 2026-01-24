@@ -178,8 +178,8 @@ class MetricsCalculator:
             expectancy_r=self.calculate_expectancy(trades, window_size),
             win_rate=win_rate,
             profit_factor=self.calculate_profit_factor(recent),
-            avg_win_r=avg_win,
-            avg_loss_r=avg_loss,
+            avg_win_r=float(avg_win),
+            avg_loss_r=float(avg_loss),
             sample_size=len(recent),
             is_statistically_significant=len(trades) >= self.MIN_TRADES_FOR_SIGNIFICANCE
         )

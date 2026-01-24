@@ -135,7 +135,7 @@ class VolatilityShockFilter(BaseFilter):
                       highs: np.ndarray, 
                       lows: np.ndarray, 
                       closes: np.ndarray,
-                      period: int = None) -> float:
+                      period: int | None = None) -> float:
         """
         Calculate ATR using RMA (Wilder's smoothing).
         """
@@ -150,7 +150,7 @@ class VolatilityShockFilter(BaseFilter):
             tr_values.append(tr)
         
         if len(tr_values) < period:
-            return np.mean(tr_values) if tr_values else 0.0
+            return float(np.mean(tr_values)) if tr_values else 0.0
         
         # RMA (Wilder's Moving Average)
         atr = np.mean(tr_values[:period])
@@ -158,7 +158,7 @@ class VolatilityShockFilter(BaseFilter):
         for tr in tr_values[period:]:
             atr = alpha * tr + (1 - alpha) * atr
         
-        return atr
+        return float(atr)
     
     def detect_shock(self, 
                      current_high: float,
@@ -219,9 +219,9 @@ class VolatilityShockFilter(BaseFilter):
         return int(base * scale)
 
     def evaluate(self,
-                 df: pd.DataFrame = None,
-                 market_time: datetime = None,
-                 timeframe: str = None,
+                 df: pd.DataFrame | None = None,
+                 market_time: datetime | None = None,
+                 timeframe: str | None = None,
                  **kwargs) -> FilterDecision:
         """
         Evaluate volatility shock conditions.
@@ -297,9 +297,9 @@ class VolatilityShockFilter(BaseFilter):
                 tags={'shock_data_valid': False, 'timeframe': tf}
             )
         
-        highs = df['high'].values
-        lows = df['low'].values
-        closes = df['close'].values
+        highs = df['high'].to_numpy()
+        lows = df['low'].to_numpy()
+        closes = df['close'].to_numpy()
         
         # 🔥 FIX: Use CLOSED candle ([-2]) not live candle ([-1])
         # This avoids mid-candle false positives

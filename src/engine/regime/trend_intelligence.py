@@ -266,7 +266,7 @@ class TrendIntelligence:
             c = self._price_history[-i-1] if i < len(self._price_history) else self._price_history[-i]
             tr = max(h - l, abs(h - c), abs(l - c))
             tr_list.append(tr)
-        return np.mean(tr_list) if tr_list else 100.0
+        return float(np.mean(tr_list)) if tr_list else 100.0
     
     def _estimate_phase_age(self, adx_values: List[float]) -> int:
         """Estimate how long we've been in current phase based on ADX pattern"""
@@ -381,7 +381,7 @@ class TrendIntelligence:
         adx: float,
         volume: float,
         atr: float,
-        timestamp: datetime = None
+        timestamp: datetime | None = None
     ) -> TrendState:
         """
         Actualiza el estado de inteligencia de tendencia.

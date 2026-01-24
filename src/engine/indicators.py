@@ -5,17 +5,69 @@ Implements all required indicators: EMA, ADX, ATR, VWAP, Fibonacci, Volume, CVD
 
 import logging
 import numpy as np
+from numpy.typing import NDArray
 from numba import jit
-from typing import Tuple, Optional
+from typing import Any, Tuple, Optional, Union
 import pandas as pd
 
 
 logger = logging.getLogger(__name__)
 
+# =====================================================================
+# TYPE DEFINITIONS
+# =====================================================================
+# Internal type: what we work with after normalization (CLEAN)
+NumericArray = NDArray[np.float64]
+
+# Input type: what external callers can pass (BOUNDARY)
+# NOTE: InputArray includes Any to support legacy call sites using `.values`.
+# The Any is "burned" immediately in to_ndarray() - it NEVER propagates to core.
+# TODO: Migrate callers to pass Series/ndarray directly and remove Any.
+InputArray = Union[
+    NDArray[np.float64],
+    np.ndarray,
+    pd.Series,
+    pd.DataFrame,
+    Any,  # For .values, ArrayLike, ExtensionArray - normalized immediately
+]
+
+
+def to_ndarray(x: Optional[InputArray]) -> NumericArray:
+    """
+    Normalize any array-like input to np.ndarray (float64).
+    
+    This is the SINGLE POINT OF CONVERSION at the boundary.
+    All public functions call this before internal processing.
+    The Any type is "burned" here - core functions only see NumericArray.
+    
+    Args:
+        x: Any array-like input (pandas Series, DataFrame column, ndarray, list, etc.)
+           Cannot be None - will raise ValueError.
+        
+    Returns:
+        NumericArray: Normalized float64 ndarray for internal use
+        
+    Raises:
+        ValueError: If input is None
+    """
+    if x is None:
+        raise ValueError("Input cannot be None")
+    
+    # Fast path for ndarray (most common)
+    if isinstance(x, np.ndarray):
+        return x.astype(np.float64, copy=False) if x.dtype != np.float64 else x
+    
+    # Pandas objects - use to_numpy() which guarantees ndarray
+    if hasattr(x, "to_numpy"):
+        return x.to_numpy(dtype=np.float64)
+    
+    # Last resort for ArrayLike / Unknown / .values
+    return np.asarray(x, dtype=np.float64)
+
 
 @jit(nopython=True)
-def calculate_ema(prices: np.ndarray, period: int) -> np.ndarray:
-    """Calculate Exponential Moving Average"""
+def _jit_calculate_ema(prices: np.ndarray, period: int) -> np.ndarray:
+    """JIT-compiled EMA calculation (internal use)."""
     if len(prices) < period:
         return np.full(len(prices), np.nan)
 
@@ -29,9 +81,14 @@ def calculate_ema(prices: np.ndarray, period: int) -> np.ndarray:
     return ema
 
 
+def calculate_ema(prices: InputArray, period: int) -> np.ndarray:
+    """Calculate Exponential Moving Average. Accepts pd.Series or array-like."""
+    return _jit_calculate_ema(to_ndarray(prices), period)
+
+
 @jit(nopython=True)
-def calculate_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
-    """Calculate Average True Range"""
+def _jit_calculate_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """JIT-compiled ATR calculation (internal use)."""
     n = len(close)
     if n < period:
         return np.full(n, np.nan)
@@ -54,12 +111,19 @@ def calculate_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: 
     return atr
 
 
+def calculate_atr(
+    high: InputArray,
+    low: InputArray,
+    close: InputArray,
+    period: int = 14
+) -> np.ndarray:
+    """Calculate Average True Range. Accepts pd.Series or array-like."""
+    return _jit_calculate_atr(to_ndarray(high), to_ndarray(low), to_ndarray(close), period)
+
+
 @jit(nopython=True)
-def calculate_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Calculate ADX (Average Directional Index) and its slope
-    Returns: (adx_values, adx_slope)
-    """
+def _jit_calculate_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> Tuple[np.ndarray, np.ndarray]:
+    """JIT-compiled ADX calculation (internal use)."""
     n = len(close)
     if n < period + 1:
         return np.full(n, np.nan), np.full(n, np.nan)
@@ -127,12 +191,18 @@ def calculate_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: 
     return adx, adx_slope
 
 
-def calculate_rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
-    """Calculate RSI (Relative Strength Index).
+def calculate_adx(
+    high: InputArray,
+    low: InputArray,
+    close: InputArray,
+    period: int = 14
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Calculate ADX and slope. Accepts pd.Series or array-like."""
+    return _jit_calculate_adx(to_ndarray(high), to_ndarray(low), to_ndarray(close), period)
 
-    Returns an array the same length as `prices`, filled with `np.nan` where
-    insufficient history exists.
-    """
+
+def _base_calculate_rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
+    """Base RSI calculation (internal use)."""
     n = len(prices)
     if n < period + 1:
         return np.full(n, np.nan)
@@ -162,6 +232,11 @@ def calculate_rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
     return rsi
 
 
+def calculate_rsi(prices: InputArray, period: int = 14) -> np.ndarray:
+    """Calculate RSI. Accepts pd.Series or array-like."""
+    return _base_calculate_rsi(to_ndarray(prices), period)
+
+
 def calculate_vwap(df: pd.DataFrame, anchor: str = 'D') -> pd.Series:
     """
     Calculate VWAP (Volume Weighted Average Price)
@@ -186,7 +261,7 @@ def calculate_vwap(df: pd.DataFrame, anchor: str = 'D') -> pd.Series:
     df['tp_volume'] = df['typical_price'] * df['volume']
 
     # Group by anchor and calculate cumulative sums
-    df['date'] = df.index.to_period(anchor)
+    df['date'] = df.index.to_period(anchor)  # pyright: ignore[reportAttributeAccessIssue]
     df['cumulative_tp_vol'] = df.groupby('date')['tp_volume'].cumsum()
     df['cumulative_vol'] = df.groupby('date')['volume'].cumsum()
 
@@ -333,11 +408,8 @@ def is_price_between_emas(price: float, ema_fast: float, ema_slow: float) -> boo
     return min(ema_fast, ema_slow) <= price <= max(ema_fast, ema_slow)
 
 
-def calculate_bollinger_bands(prices: np.ndarray, period: int = 20, std_dev: float = 2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Calculate Bollinger Bands
-    Returns: (upper_band, middle_band, lower_band)
-    """
+def _base_calculate_bollinger_bands(prices: np.ndarray, period: int = 20, std_dev: float = 2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Base Bollinger Bands calculation (internal use)."""
     n = len(prices)
     if n < period:
         return np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)
@@ -356,6 +428,15 @@ def calculate_bollinger_bands(prices: np.ndarray, period: int = 20, std_dev: flo
         lower[i] = sma - std_dev * std
     
     return upper, middle, lower
+
+
+def calculate_bollinger_bands(
+    prices: InputArray,
+    period: int = 20,
+    std_dev: float = 2.0
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calculate Bollinger Bands. Accepts pd.Series or array-like."""
+    return _base_calculate_bollinger_bands(to_ndarray(prices), period, std_dev)
 
 
 # ============================================================================
@@ -574,7 +655,7 @@ def detect_breakout_impulse(
         'atr': atr
     }
     
-    return is_breakout, details
+    return is_breakout, details  # pyright: ignore[reportReturnType]
 
 
 def calculate_activity_score(
@@ -628,3 +709,14 @@ def calculate_activity_score(
     
     # Average of components
     return sum(scores) / len(scores)
+
+
+# =============================================================================
+# Aliases for backwards compatibility - the main functions now accept ArrayLike
+# =============================================================================
+
+safe_calculate_ema = calculate_ema
+safe_calculate_atr = calculate_atr
+safe_calculate_adx = calculate_adx
+safe_calculate_rsi = calculate_rsi
+safe_calculate_bollinger_bands = calculate_bollinger_bands

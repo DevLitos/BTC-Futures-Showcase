@@ -157,7 +157,7 @@ class MissedOpportunityTracker:
     
     def log_blocked_signal(
         self,
-        direction: str,
+        direction: str | None,
         price: float,
         block_reason: str,
         block_category: str,
@@ -168,7 +168,7 @@ class MissedOpportunityTracker:
         Log a signal that was blocked.
         
         Args:
-            direction: 'LONG' or 'SHORT'
+            direction: 'LONG' or 'SHORT' (or None if unknown)
             price: Current price (hypothetical entry)
             block_reason: Human-readable reason for block
             block_category: Category (filter, hard_lock, penalty, funding, session)
@@ -177,7 +177,7 @@ class MissedOpportunityTracker:
         """
         opp = MissedOpportunity(
             timestamp=datetime.now(UTC),
-            signal_direction=direction.upper(),
+            signal_direction=(direction or 'UNKNOWN').upper(),
             hypothetical_entry=price,
             block_reason=block_reason,
             block_category=block_category,
@@ -193,7 +193,7 @@ class MissedOpportunityTracker:
         
         logger.info(f"📊 MISSED: {direction} @ {price:.2f} blocked by {block_category}: {block_reason}")
     
-    def update_pending(self, current_price: float, current_time: datetime = None):
+    def update_pending(self, current_price: float, current_time: datetime | None = None):
         """
         Update all pending opportunities with new price.
         
@@ -299,6 +299,8 @@ class MissedOpportunityTracker:
     
     def _persist_opportunity(self, opp: MissedOpportunity):
         """Append opportunity to file"""
+        if self._persist_path is None:
+            return
         try:
             with open(self._persist_path, 'a') as f:
                 f.write(json.dumps(opp.to_dict()) + '\n')

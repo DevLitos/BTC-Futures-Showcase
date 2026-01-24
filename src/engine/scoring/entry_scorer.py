@@ -431,14 +431,14 @@ class EntryScorer:
         worst_context = 0.0
         worst_context_source = None
         if context_penalties:
-            worst_context_source = min(context_penalties, key=context_penalties.get)
-            worst_context = context_penalties[worst_context_source]
+            worst_context_source = min(context_penalties, key=lambda k: context_penalties.get(k, 0) or 0)
+            worst_context = context_penalties.get(worst_context_source, 0) or 0
         
         worst_execution = 0.0
         worst_execution_source = None
         if execution_penalties:
-            worst_execution_source = min(execution_penalties, key=execution_penalties.get)
-            worst_execution = execution_penalties[worst_execution_source]
+            worst_execution_source = min(execution_penalties, key=lambda k: execution_penalties.get(k, 0) or 0)
+            worst_execution = execution_penalties.get(worst_execution_source, 0) or 0
         
         total_hierarchical = worst_context + worst_execution
         
@@ -539,7 +539,7 @@ class EntryScorer:
             return 1, False, False  # Not enough data, allow with partial score
         
         # HTF alignment check
-        closes_1h = df_1h['close'].values
+        closes_1h = df_1h['close'].to_numpy()
         ema50_1h = calculate_ema(closes_1h, 50)
         
         if np.isnan(ema50_1h[-1]):
@@ -557,7 +557,7 @@ class EntryScorer:
             return 0, True, False
         
         # 5m structure check (price vs EMA20)
-        closes_5m = df_5m['close'].values
+        closes_5m = df_5m['close'].to_numpy()
         ema20_5m = calculate_ema(closes_5m, 20)
         
         if np.isnan(ema20_5m[-1]):
@@ -658,9 +658,9 @@ class EntryScorer:
         if len(df_5m) < 30:
             return 1
         
-        closes = df_5m['close'].values
-        highs = df_5m['high'].values
-        lows = df_5m['low'].values
+        closes = df_5m['close'].to_numpy()
+        highs = df_5m['high'].to_numpy()
+        lows = df_5m['low'].to_numpy()
         
         adx, _ = calculate_adx(highs, lows, closes, 14)
         
@@ -759,9 +759,9 @@ class EntryScorer:
         
         # Volatility check
         if len(df_5m) >= 50:
-            highs = df_5m['high'].values
-            lows = df_5m['low'].values
-            closes = df_5m['close'].values
+            highs = df_5m['high'].to_numpy()
+            lows = df_5m['low'].to_numpy()
+            closes = df_5m['close'].to_numpy()
             
             atr_fast = calculate_atr(highs, lows, closes, 14)
             atr_slow = calculate_atr(highs, lows, closes, 42)

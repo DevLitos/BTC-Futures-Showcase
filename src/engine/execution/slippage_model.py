@@ -289,7 +289,7 @@ class SlippageModel:
         entry_price: float,
         stop_loss: float,
         take_profit: float,
-        direction: str,
+        direction: str | None,
         order_type: OrderType = OrderType.LIMIT,
         volatility_ratio: float = 1.0,
         include_detailed_log: bool = False,
@@ -313,6 +313,10 @@ class SlippageModel:
         Returns:
             Worst-case RR (may be negative if setup is trash)
         """
+        # Guard: direction required for calculation
+        if direction is None:
+            return 0.0
+        
         # Calculate worst-case prices
         entry_wc = self.calculate_worst_case_entry(
             entry_price, direction, order_type, volatility_ratio, mode

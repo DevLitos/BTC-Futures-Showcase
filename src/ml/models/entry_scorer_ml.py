@@ -96,16 +96,16 @@ class EntryScoreML(MLModelBase):
         self.feature_names = feature_names
         
         # Create datasets
-        train_data = lgb.Dataset(X_train, label=y_train, feature_name=feature_names)
-        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+        train_data = lgb.Dataset(X_train, label=y_train, feature_name=feature_names)  # pyright: ignore[reportPossiblyUnboundVariable]
+        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)  # pyright: ignore[reportPossiblyUnboundVariable]
         
         # Train with early stopping
         callbacks = [
-            lgb.early_stopping(stopping_rounds=20, verbose=False),
-            lgb.log_evaluation(period=0),  # Suppress logging
+            lgb.early_stopping(stopping_rounds=20, verbose=False),  # pyright: ignore[reportPossiblyUnboundVariable]
+            lgb.log_evaluation(period=0),  # pyright: ignore[reportPossiblyUnboundVariable]  # Suppress logging
         ]
         
-        self.model = lgb.train(
+        self.model = lgb.train(  # pyright: ignore[reportPossiblyUnboundVariable]
             self.params,
             train_data,
             num_boost_round=self.params.get('n_estimators', 100),
@@ -119,8 +119,8 @@ class EntryScoreML(MLModelBase):
         val_preds = self.model.predict(X_val)
         
         if SKLEARN_AVAILABLE and len(np.unique(y_train)) > 1:
-            self.training_auc = roc_auc_score(y_train, train_preds)
-            self.validation_auc = roc_auc_score(y_val, val_preds)
+            self.training_auc = roc_auc_score(y_train, train_preds)  # pyright: ignore[reportPossiblyUnboundVariable]
+            self.validation_auc = roc_auc_score(y_val, val_preds)  # pyright: ignore[reportPossiblyUnboundVariable]
         else:
             self.training_auc = 0.0
             self.validation_auc = 0.0
@@ -138,9 +138,9 @@ class EntryScoreML(MLModelBase):
         )
         
         return {
-            'train_auc': self.training_auc,
-            'val_auc': self.validation_auc,
-            'n_iterations': self.model.best_iteration if self.model else 0,
+            'train_auc': float(self.training_auc),
+            'val_auc': float(self.validation_auc),
+            'n_iterations': int(self.model.best_iteration) if self.model else 0,
             'n_samples': len(X_train),
         }
     
@@ -214,7 +214,7 @@ class EntryScoreML(MLModelBase):
             # Restore model
             model_str = data.get('model_str')
             if model_str:
-                self.model = lgb.Booster(model_str=model_str)
+                self.model = lgb.Booster(model_str=model_str)  # pyright: ignore[reportPossiblyUnboundVariable]
             
             logger.info(f"📂 Model loaded from {path} (AUC: {self.validation_auc:.3f})")
             

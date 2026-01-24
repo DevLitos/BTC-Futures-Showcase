@@ -261,7 +261,7 @@ class BTCMarketContextFeed:
                     data = await resp.json()
                     
                     if data:
-                        df = pd.DataFrame(data, columns=[
+                        df = pd.DataFrame(data, columns=[  # pyright: ignore[reportArgumentType]
                             'timestamp', 'open', 'high', 'low', 'close', 'volume',
                             'close_time', 'quote_volume', 'trades', 'taker_buy_base',
                             'taker_buy_quote', 'ignore'
@@ -273,7 +273,7 @@ class BTCMarketContextFeed:
                             df[col] = df[col].astype(float)
                         
                         logger.debug(f"Fetched {len(df)} candles from Binance")
-                        return df
+                        return df  # pyright: ignore[reportReturnType]
                         
         except Exception as e:
             logger.error(f"Error fetching Binance candles: {e}")
@@ -288,9 +288,9 @@ class BTCMarketContextFeed:
             logger.warning(f"Insufficient candle data: {len(df) if df is not None else 0}")
             return
         
-        closes = df['close'].values
-        highs = df['high'].values
-        lows = df['low'].values
+        closes = df['close'].to_numpy()
+        highs = df['high'].to_numpy()
+        lows = df['low'].to_numpy()
         
         # Calculate EMAs
         ema20 = self._ema(closes, self.EMA_SHORT)

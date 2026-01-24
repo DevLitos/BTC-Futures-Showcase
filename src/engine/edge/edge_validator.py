@@ -356,8 +356,12 @@ class EdgeValidator:
         
         recent_trades = self.trade_history[-window_size:]
         
-        wins = [t for t in recent_trades if t.get('pnl', 0) > 0]
-        losses = [t for t in recent_trades if t.get('pnl', 0) <= 0]
+        # Calculate PnL from entry/exit prices
+        def get_pnl(t: DegradationTradeEntry) -> float:
+            return t.exit_price - t.entry_price
+        
+        wins = [t for t in recent_trades if get_pnl(t) > 0]
+        losses = [t for t in recent_trades if get_pnl(t) <= 0]
         
         if not wins and not losses:
             return 0.0
@@ -366,8 +370,8 @@ class EdgeValidator:
         win_rate = len(wins) / total if total > 0 else 0.0
         loss_rate = len(losses) / total if total > 0 else 0.0
         
-        avg_win = sum(t.get('pnl', 0) for t in wins) / len(wins) if wins else 0.0
-        avg_loss = abs(sum(t.get('pnl', 0) for t in losses) / len(losses)) if losses else 0.0
+        avg_win = sum(get_pnl(t) for t in wins) / len(wins) if wins else 0.0
+        avg_loss = abs(sum(get_pnl(t) for t in losses) / len(losses)) if losses else 0.0
         
         expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
         return expectancy
@@ -581,7 +585,7 @@ class EdgeValidator:
         
         report = {
             "timestamp": datetime.now(UTC).isoformat(),
-            "strategy_state": self.current_state.value,
+            "strategy_state": "UNKNOWN",  # NOTE: State tracking moved to StrategyStateMachine
             "sample_size": self.get_trade_count(),
             "position_multiplier": self.get_position_size_multiplier(),
             

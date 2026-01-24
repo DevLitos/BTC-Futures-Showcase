@@ -365,7 +365,7 @@ class PositionStore:
                 return order
         return None
     
-    def get_active_orders(self, symbol: str = None) -> List[TrackedOrder]:
+    def get_active_orders(self, symbol: str | None = None) -> List[TrackedOrder]:
         """Get all active orders, optionally filtered by symbol."""
         orders = [o for o in self._orders.values() if o.is_active]
         if symbol:
@@ -379,7 +379,7 @@ class PositionStore:
             if o.symbol == symbol and o.purpose == purpose and o.is_active
         ]
     
-    def has_active_orders(self, symbol: str = None) -> bool:
+    def has_active_orders(self, symbol: str | None = None) -> bool:
         """Check if there are active orders."""
         return len(self.get_active_orders(symbol)) > 0
     
@@ -496,14 +496,14 @@ class PositionStore:
     async def record_fill(
         self,
         order_id: str,
-        symbol: str,
+        symbol: str | None,
         side: str,  # 'buy' or 'sell'
         size: float,
         price: float,
         fee: float = 0.0,
         fill_type: str = 'UNKNOWN',
         fill_id: str = "",
-        timestamp: datetime = None
+        timestamp: datetime | None = None
     ) -> None:
         """
         Record a fill and update position state.
@@ -512,7 +512,7 @@ class PositionStore:
         
         Args:
             order_id: Exchange order ID
-            symbol: Trading symbol
+            symbol: Trading symbol (or None)
             side: 'buy' or 'sell' (exchange convention)
             size: Fill size
             price: Fill price
@@ -523,6 +523,11 @@ class PositionStore:
         """
         async with self._lock:
             ts = timestamp or datetime.now(UTC)
+            
+            # Guard: symbol is required
+            if symbol is None:
+                logger.warning(f"Fill ignored: symbol is None for order {order_id}")
+                return
             
             # Check for duplicate fill
             for existing in self._fill_history[-100:]:
@@ -972,7 +977,7 @@ class PositionStore:
                 self._order_history.append(order)
         return len(to_remove)
     
-    async def cleanup_zombie_orders(self, exchange, symbol: str = None, max_age_minutes: int = 5) -> Dict:
+    async def cleanup_zombie_orders(self, exchange, symbol: str | None = None, max_age_minutes: int = 5) -> Dict:
         """
         🔒 FIX (Jan 17, 2026): Zombie Order Reaper
         

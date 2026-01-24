@@ -133,7 +133,7 @@ class MarketQualityGate:
                  exchange_latency_ms: float = 0,
                  
                  # Time context
-                 market_time: datetime = None,
+                 market_time: datetime | None = None,
                  is_weekend: bool = False,
                  
                  # Recent fills quality

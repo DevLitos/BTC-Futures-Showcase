@@ -26,7 +26,7 @@ class KrakenFuturesWebSocket:
     - No trading logic
     """
     
-    def __init__(self, symbols: list = None):
+    def __init__(self, symbols: list | None = None):
         self.symbols = symbols or ['BTC/USD']
         self.ws = None
         self.is_connected = False
@@ -193,7 +193,7 @@ class KrakenFuturesWebSocket:
                 'product_ids': [kraken_symbol]
             }
             logger.info(f"   Trade subscription: {trade_sub}")
-            await self.ws.send(json.dumps(trade_sub))
+            await self.ws.send(json.dumps(trade_sub))  # pyright: ignore[reportOptionalMemberAccess]
             
             # 2. Order book depth
             book_sub = {
@@ -202,7 +202,7 @@ class KrakenFuturesWebSocket:
                 'product_ids': [kraken_symbol]
             }
             logger.info(f"   Book subscription: {book_sub}")
-            await self.ws.send(json.dumps(book_sub))
+            await self.ws.send(json.dumps(book_sub))  # pyright: ignore[reportOptionalMemberAccess]
             
             # 3. Ticker (Price fallback + Velocity) - NEW!
             ticker_sub = {
@@ -211,18 +211,19 @@ class KrakenFuturesWebSocket:
                 'product_ids': [kraken_symbol]
             }
             logger.info(f"   Ticker subscription: {ticker_sub}")
-            await self.ws.send(json.dumps(ticker_sub))
+            await self.ws.send(json.dumps(ticker_sub))  # pyright: ignore[reportOptionalMemberAccess]
             
             logger.info(f"✅ Subscription sent for {kraken_symbol}")
     
     async def _message_loop(self):
         """Loop principal de mensajes"""
         msg_count = 0
+        socket_timeout = self.heartbeat_kill_threshold + 5.0  # Declare outside try
         while self.is_connected and not self._shutdown:
             try:
                 # Use kill threshold + 5s buffer for socket timeout
                 socket_timeout = self.heartbeat_kill_threshold + 5.0
-                msg = await asyncio.wait_for(self.ws.recv(), timeout=socket_timeout)
+                msg = await asyncio.wait_for(self.ws.recv(), timeout=socket_timeout)  # pyright: ignore[reportOptionalMemberAccess]
                 data = json.loads(msg)
                 
                 # Update heartbeat

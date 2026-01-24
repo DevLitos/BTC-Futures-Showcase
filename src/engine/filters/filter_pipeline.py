@@ -102,22 +102,22 @@ class EntryFilterPipeline:
     
     def evaluate(self,
                  # Data inputs
-                 df_1m: pd.DataFrame = None,
-                 df_5m: pd.DataFrame = None,
-                 df_15m: pd.DataFrame = None,
-                 df_1h: pd.DataFrame = None,
-                 current_price: float = None,
+                 df_1m: pd.DataFrame | None = None,
+                 df_5m: pd.DataFrame | None = None,
+                 df_15m: pd.DataFrame | None = None,
+                 df_1h: pd.DataFrame | None = None,
+                 current_price: float | None = None,
                  
                  # Trade parameters
-                 bias: str = None,
-                 entry_price: float = None,
-                 stop_loss: float = None,
-                 target_price: float = None,
-                 spread: float = None,
-                 atr: float = None,
+                 bias: str | None = None,
+                 entry_price: float | None = None,
+                 stop_loss: float | None = None,
+                 target_price: float | None = None,
+                 spread: float | None = None,
+                 atr: float | None = None,
                  
                  # Context
-                 market_time: datetime = None,
+                 market_time: datetime | None = None,
                  regime_mode: str = 'TREND',  # 🔥 FIX (Jan 22): Added regime_mode parameter
                  
                  # Control

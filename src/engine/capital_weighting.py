@@ -207,9 +207,9 @@ class CapitalWeightCalculator:
     """
     
     def __init__(self, 
-                 setup_config: SetupWeightConfig = None,
-                 time_config: TimeRiskConfig = None,
-                 runner_config: RunnerConfig = None):
+                 setup_config: SetupWeightConfig | None = None,
+                 time_config: TimeRiskConfig | None = None,
+                 runner_config: RunnerConfig | None = None):
         self.setup_config = setup_config or SetupWeightConfig()
         self.time_config = time_config or TimeRiskConfig()
         self.runner_config = runner_config or RunnerConfig()
@@ -219,9 +219,9 @@ class CapitalWeightCalculator:
     
     def classify_setup(self, 
                        setup_type: str,
-                       mfe_mae_ratio: float = None,
-                       historical_win_rate: float = None,
-                       avg_r: float = None) -> SetupQuality:
+                       mfe_mae_ratio: float | None = None,
+                       historical_win_rate: float | None = None,
+                       avg_r: float | None = None) -> SetupQuality:
         """
         Classify a setup into quality tiers.
         
@@ -315,12 +315,12 @@ class CapitalWeightCalculator:
             return "ASIA"
     
     def calculate_total_weight(self,
-                              setup_type: str = None,
-                              setup_quality: SetupQuality = None,
-                              current_time: datetime = None,
-                              mfe_mae_ratio: float = None,
-                              historical_win_rate: float = None,
-                              avg_r: float = None) -> Tuple[float, Dict[str, Any]]:
+                              setup_type: str | None = None,
+                              setup_quality: SetupQuality | None = None,
+                              current_time: datetime | None = None,
+                              mfe_mae_ratio: float | None = None,
+                              historical_win_rate: float | None = None,
+                              avg_r: float | None = None) -> Tuple[float, Dict[str, Any]]:
         """
         Calculate total capital weight combining all factors.
         
@@ -431,7 +431,7 @@ class RunnerManager:
     - Lock in profits at key R levels
     """
     
-    def __init__(self, config: RunnerConfig = None):
+    def __init__(self, config: RunnerConfig | None = None):
         self.config = config or RunnerConfig()
     
     def should_activate_trailing(self, 
@@ -478,8 +478,8 @@ class RunnerManager:
                                current_r: float,
                                atr: float,
                                direction: str,
-                               swing_low: float = None,
-                               swing_high: float = None) -> Tuple[float, str]:
+                               swing_low: float | None = None,
+                               swing_high: float | None = None) -> Tuple[float, str]:
         """
         Calculate optimal trailing stop for runner.
         
@@ -634,8 +634,8 @@ def get_runner_manager() -> RunnerManager:
 
 
 def calculate_weighted_risk(base_risk_pct: float,
-                           setup_type: str = None,
-                           current_time: datetime = None) -> Tuple[float, Dict]:
+                           setup_type: str | None = None,
+                           current_time: datetime | None = None) -> Tuple[float, Dict]:
     """
     Convenience function to calculate weighted risk.
     

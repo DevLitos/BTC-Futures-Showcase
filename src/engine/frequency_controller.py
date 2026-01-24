@@ -125,7 +125,7 @@ class TradeFrequencyController:
     
     def can_trade(self, 
                   regime: TradingRegime,
-                  direction: str = None) -> FrequencyDecision:
+                  direction: str | None = None) -> FrequencyDecision:
         """
         Check if a new trade is allowed.
         
@@ -236,7 +236,7 @@ class TradeFrequencyController:
     def record_trade(self,
                      regime: TradingRegime,
                      direction: str,
-                     is_winner: bool = None) -> None:
+                     is_winner: bool | None = None) -> None:
         """
         Record a trade that was executed.
         
@@ -351,6 +351,6 @@ def reset_frequency_controller():
     _frequency_controller = None
 
 
-def can_trade_now(regime: TradingRegime, direction: str = None) -> FrequencyDecision:
+def can_trade_now(regime: TradingRegime, direction: str | None = None) -> FrequencyDecision:
     """Convenience function to check if trade is allowed."""
     return get_frequency_controller().can_trade(regime, direction)

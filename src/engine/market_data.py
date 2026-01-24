@@ -280,15 +280,15 @@ class SynchronizedMultiTimeframeBuffer:
         df = self._get_dataframe('1m')
         
         # ATR
-        highs = df['high'].values
-        lows = df['low'].values
-        closes = df['close'].values
+        highs = df['high'].to_numpy()
+        lows = df['low'].to_numpy()
+        closes = df['close'].to_numpy()
         
         atr = calculate_atr(highs, lows, closes, 14)[-1]
         self.indicators['1m']['atr'] = atr
         
         # Relative Volume
-        volumes = df['volume'].values
+        volumes = df['volume'].to_numpy()
         rel_vol = calculate_relative_volume(volumes, 20)[-1]
         self.indicators['1m']['rel_vol'] = rel_vol
         
@@ -302,10 +302,10 @@ class SynchronizedMultiTimeframeBuffer:
             return
         
         df = self._get_dataframe('5m')
-        closes = df['close'].values
-        highs = df['high'].values
-        lows = df['low'].values
-        volumes = df['volume'].values
+        closes = df['close'].to_numpy()
+        highs = df['high'].to_numpy()
+        lows = df['low'].to_numpy()
+        volumes = df['volume'].to_numpy()
         
         # EMAs
         ema20 = calculate_ema(closes, 20)[-1]
@@ -331,9 +331,9 @@ class SynchronizedMultiTimeframeBuffer:
             return
         
         df = self._get_dataframe('1h')
-        closes = df['close'].values
-        highs = df['high'].values
-        lows = df['low'].values
+        closes = df['close'].to_numpy()
+        highs = df['high'].to_numpy()
+        lows = df['low'].to_numpy()
         
         # EMAs
         ema50 = calculate_ema(closes, 50)[-1]

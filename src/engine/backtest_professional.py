@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 class BacktestTrade:
     """Representa un trade en el backtest"""
     def __init__(self, entry_time: datetime, entry_price: float, 
-                 direction: str, size: float, stop_loss: float, entry_params: Dict = None):
+                 direction: str, size: float, stop_loss: float, entry_params: Dict | None = None):
         self.entry_time = entry_time
         self.entry_price = entry_price
         self.direction = direction
@@ -113,14 +113,14 @@ class BacktestResults:
         if self.winning_trades == 0:
             return 0.0
         winning_pnls = [t.pnl for t in self.closed_trades if t.pnl > 0]
-        return np.mean(winning_pnls)
+        return float(np.mean(winning_pnls))
     
     @property
     def avg_loss(self) -> float:
         if self.losing_trades == 0:
             return 0.0
         losing_pnls = [t.pnl for t in self.closed_trades if t.pnl < 0]
-        return np.mean(losing_pnls)
+        return float(np.mean(losing_pnls))
     
     @property
     def profit_factor(self) -> float:
@@ -246,7 +246,7 @@ class ProfessionalBacktester:
                 'high': float(row['high']),
                 'low': float(row['low']),
                 'close': float(row['close']),
-                'volume': float(row.get('volume', 0)),
+                'volume': float(row.get('volume', 0) or 0),
             }
             candles_1m.append(candle)
         
@@ -523,7 +523,7 @@ class ProfessionalBacktester:
             if not self.current_trade:
                 direction, entry_params = self._check_entry_signal_real_strategy(close_price, timestamp)
                 
-                if direction:
+                if direction and entry_params:
                     position_size = (self.initial_balance * self.position_size_pct / 100) / close_price
                     
                     self.current_trade = BacktestTrade(

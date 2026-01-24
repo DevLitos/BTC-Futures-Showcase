@@ -52,7 +52,7 @@ class BTCCorrelationFilter(BaseFilter):
                  enabled: bool = True,
                  mode: str = "PENALTY",  # STRICT, PENALTY, CONTEXT_ONLY
                  is_btc_symbol: bool = True,  # True if trading BTC itself
-                 btc_feed: BTCMarketContextFeed = None):
+                 btc_feed: BTCMarketContextFeed | None = None):
         """
         Initialize BTC correlation filter.
         
@@ -78,8 +78,8 @@ class BTCCorrelationFilter(BaseFilter):
         logger.info(f"BTCCorrelationFilter initialized: enabled={enabled}, mode={self.mode}, is_btc={is_btc_symbol}")
     
     def evaluate(self,
-                 bias: str = None,
-                 market_time: datetime = None,
+                 bias: str | None = None,
+                 market_time: datetime | None = None,
                  **kwargs) -> FilterDecision:
         """
         Evaluate BTC correlation for trade.
@@ -213,7 +213,7 @@ class BTCCorrelationFilter(BaseFilter):
         
         return True
     
-    def _detect_regime_change(self, current_trend: str, market_time: datetime = None):
+    def _detect_regime_change(self, current_trend: str, market_time: datetime | None = None):
         """Detect BTC trend regime change."""
         if market_time is None:
             from datetime import UTC
@@ -225,7 +225,7 @@ class BTCCorrelationFilter(BaseFilter):
         
         self._last_trend = current_trend
     
-    def _in_regime_cooldown(self, market_time: datetime = None) -> bool:
+    def _in_regime_cooldown(self, market_time: datetime | None = None) -> bool:
         """Check if in cooldown after regime change."""
         if self._regime_change_time is None:
             return False

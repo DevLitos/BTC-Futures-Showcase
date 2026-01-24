@@ -27,7 +27,7 @@ Created: January 22, 2026
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 from datetime import datetime, timedelta
 from enum import Enum
@@ -49,7 +49,7 @@ class ExhaustionState:
     """Current exhaustion detection state"""
     level: ExhaustionLevel = ExhaustionLevel.NONE
     signal_count: int = 0
-    signals_detected: List[str] = None
+    signals_detected: List[str] = field(default_factory=list)
     confidence: float = 0.0
     recommended_action: str = "HOLD"  # HOLD, TIGHTEN, EXIT
     exit_urgency: float = 0.0  # 0-1, higher = more urgent
@@ -141,7 +141,7 @@ class MomentumExhaustionDetector:
         
         from src.engine.indicators import calculate_rsi
         
-        closes = df['close'].values
+        closes = df['close'].to_numpy()
         rsi = calculate_rsi(closes, 14)
         
         if len(rsi) < self.RSI_DIVERGENCE_BARS:
@@ -244,9 +244,9 @@ class MomentumExhaustionDetector:
         
         from src.engine.indicators import calculate_atr
         
-        highs = df['high'].values
-        lows = df['low'].values
-        closes = df['close'].values
+        highs = df['high'].to_numpy()
+        lows = df['low'].to_numpy()
+        closes = df['close'].to_numpy()
         
         atr = calculate_atr(highs, lows, closes, 14)
         if len(atr) < 10:
@@ -287,7 +287,7 @@ class MomentumExhaustionDetector:
         if len(df) < 20:
             return False, "Insufficient data"
         
-        closes = df['close'].values
+        closes = df['close'].to_numpy()
         
         # Calculate rolling velocity (price change per bar)
         velocities = np.diff(closes)
@@ -404,9 +404,10 @@ class MomentumExhaustionDetector:
             signals.append(f"🚀 {vel_reason}")
         
         # 6. Time extension
-        time_ext, time_reason = self._detect_time_extension(self._move_start_time, market_time)
-        if time_ext:
-            signals.append(f"⏱️ {time_reason}")
+        if self._move_start_time is not None:
+            time_ext, time_reason = self._detect_time_extension(self._move_start_time, market_time)
+            if time_ext:
+                signals.append(f"⏱️ {time_reason}")
         
         # Determine exhaustion level
         signal_count = len(signals)

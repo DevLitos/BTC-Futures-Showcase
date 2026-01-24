@@ -19,7 +19,7 @@ The output is a continuous edge_score from 0.0 to 1.0:
 - 0.6-1.0: High activity regime (full engagement)
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 from datetime import datetime, UTC
 import numpy as np
@@ -65,14 +65,12 @@ class EdgeScore:
     """
     value: float = 0.5                   # Continuous score 0-1
     regime: str = "NORMAL"               # LOW, NORMAL, HIGH
-    components: dict = None              # Breakdown of score components
-    blocking_reasons: List[str] = None   # Reasons if score < threshold
+    components: dict | None = None              # Breakdown of score components
+    blocking_reasons: List[str] = field(default_factory=list)   # Reasons if score < threshold
     
     def __post_init__(self):
         if self.components is None:
             self.components = {}
-        if self.blocking_reasons is None:
-            self.blocking_reasons = []
         
         # Auto-classify regime based on value
         if self.value < 0.3:

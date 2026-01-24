@@ -51,7 +51,7 @@ class AttributionScore:
             DegradationCause.STRATEGY_OBSOLESCENCE: self.strategy_obsolescence,
             DegradationCause.EXTERNAL_SHOCK: self.external_shock
         }
-        cause = max(scores, key=scores.get)
+        cause = max(scores, key=lambda k: scores.get(k, 0.0) or 0.0)
         return cause, scores[cause]
 
 

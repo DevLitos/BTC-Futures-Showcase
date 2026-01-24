@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # FIX #6: FUNDING RATE CONTROL
 # ============================================================================
 
-async def check_funding_rate_safe(external_data_manager, symbol: str, bias: str) -> Tuple[bool, str]:
+async def check_funding_rate_safe(external_data_manager, symbol: str | None, bias: str | None) -> Tuple[bool, str]:
     """
     FIX #6: Check if funding rate is safe for entry
     
@@ -30,6 +30,9 @@ async def check_funding_rate_safe(external_data_manager, symbol: str, bias: str)
     """
     if not FundingRateControl.ENABLED:
         return True, ""
+    
+    if not symbol:
+        return True, ""  # Can't check without symbol
     
     try:
         current_funding = await external_data_manager.get_funding_rate(symbol)
@@ -48,10 +51,10 @@ async def check_funding_rate_safe(external_data_manager, symbol: str, bias: str)
 
 async def should_exit_on_funding(
     external_data_manager, 
-    symbol: str, 
+    symbol: str | None, 
     bias: str,
     unrealized_pnl: float = 0.0,  # Pass current PnL
-    time_to_funding_min: float = None  # Minutes until next funding settlement
+    time_to_funding_min: float | None = None  # Minutes until next funding settlement
 ) -> Tuple[bool, str]:
     """
     FIX #6: Force exit if funding becomes EXTREMELY dangerous
@@ -95,6 +98,8 @@ async def should_exit_on_funding(
         
         # PROTECTION 2: Only exit if funding settlement is imminent (<30 min)
         # If settlement is far away, we might recover the loss before paying
+        if time_to_funding_min is None:
+            time_to_funding_min = 60.0
         if time_to_funding_min > 30.0:
             logger.debug(f"Funding extreme ({funding_pct:.4f}%) but settlement in {time_to_funding_min:.0f}min - holding")
             return False, ""
@@ -138,7 +143,7 @@ def is_weekend(hour_utc: int, day_of_week: int) -> bool:
     return False
 
 
-def check_session_quality(adx: float, volatility_bps: float, market_time: datetime = None) -> Tuple[bool, str]:
+def check_session_quality(adx: float, volatility_bps: float, market_time: datetime | None = None) -> Tuple[bool, str]:
     """
     FIX #9: Check if current session has adequate quality
     
@@ -188,7 +193,7 @@ def check_session_quality(adx: float, volatility_bps: float, market_time: dateti
 # FIX #10: HTF DIVERGENCE DETECTION
 # ============================================================================
 
-def check_htf_divergence(df_1h: pd.DataFrame, bias: str) -> Tuple[bool, str]:
+def check_htf_divergence(df_1h: pd.DataFrame, bias: str | None) -> Tuple[bool, str]:
     """
     FIX #10: Detect bearish (for LONG) or bullish (for SHORT) divergence
     
@@ -197,13 +202,13 @@ def check_htf_divergence(df_1h: pd.DataFrame, bias: str) -> Tuple[bool, str]:
     
     Returns: (divergence_detected: bool, reason: str)
     """
-    if not DivergenceFilters.ENABLED or len(df_1h) < 30:
+    if not DivergenceFilters.ENABLED or len(df_1h) < 30 or not bias:
         return False, ""
     
     try:
-        closes = df_1h['close'].values
-        highs = df_1h['high'].values
-        lows = df_1h['low'].values
+        closes = df_1h['close'].to_numpy()
+        highs = df_1h['high'].to_numpy()
+        lows = df_1h['low'].to_numpy()
         
         rsi = calculate_rsi(closes, DivergenceFilters.RSI_PERIOD)
         lookback = DivergenceFilters.LOOKBACK_PERIODS
@@ -211,10 +216,10 @@ def check_htf_divergence(df_1h: pd.DataFrame, bias: str) -> Tuple[bool, str]:
         if bias == 'LONG':
             # Bearish divergence: price makes new high but RSI doesn't
             current_high = highs[-1]
-            prev_high = np.max(highs[-lookback:-1])
+            prev_high = float(np.amax(np.asarray(highs[-lookback:-1])))
             
             current_rsi = rsi[-1]
-            prev_rsi = np.max(rsi[-lookback:-1])
+            prev_rsi = float(np.amax(np.asarray(rsi[-lookback:-1])))
             
             if current_high > prev_high and current_rsi < prev_rsi:
                 return True, f"Bearish divergence: Price high {current_high:.2f} > {prev_high:.2f} but RSI {current_rsi:.1f} < {prev_rsi:.1f}"
@@ -222,10 +227,10 @@ def check_htf_divergence(df_1h: pd.DataFrame, bias: str) -> Tuple[bool, str]:
         else:  # SHORT
             # Bullish divergence: price makes new low but RSI doesn't
             current_low = lows[-1]
-            prev_low = np.min(lows[-lookback:-1])
+            prev_low = float(np.amin(np.asarray(lows[-lookback:-1])))
             
             current_rsi = rsi[-1]
-            prev_rsi = np.min(rsi[-lookback:-1])
+            prev_rsi = float(np.amin(np.asarray(rsi[-lookback:-1])))
             
             if current_low < prev_low and current_rsi > prev_rsi:
                 return True, f"Bullish divergence: Price low {current_low:.2f} < {prev_low:.2f} but RSI {current_rsi:.1f} > {prev_rsi:.1f}"
@@ -278,13 +283,13 @@ def calculate_vpoc(df_1h: pd.DataFrame) -> Optional[float]:
         return None
 
 
-def check_vpoc_validity(current_price: float, vpoc: float, bias: str) -> Tuple[bool, str]:
+def check_vpoc_validity(current_price: float, vpoc: float | None, bias: str | None) -> Tuple[bool, str]:
     """
     FIX #11: Check if entry price is valid relative to VPOC
     
     Returns: (is_valid: bool, reason: str)
     """
-    if not VPOCFilters.ENABLED or vpoc is None:
+    if not VPOCFilters.ENABLED or vpoc is None or not bias:
         return True, ""
     
     if bias == 'LONG':
@@ -308,7 +313,7 @@ def check_vpoc_validity(current_price: float, vpoc: float, bias: str) -> Tuple[b
 # FIX #12: BTC CORRELATION CHECK
 # ============================================================================
 
-async def check_btc_trend(external_data_manager, bias: str) -> Tuple[bool, str]:
+async def check_btc_trend(external_data_manager, bias: str | None) -> Tuple[bool, str]:
     """
     FIX #12: Check BTC trend - don't trade LONG if BTC is DOWN
     
@@ -343,7 +348,7 @@ async def check_btc_trend(external_data_manager, bias: str) -> Tuple[bool, str]:
         if btc_candles is None or len(btc_candles) < 20:
             return True, "BTC data unavailable"
         
-        closes = btc_candles['close'].values
+        closes = btc_candles['close'].to_numpy()
         ema = calculate_ema(closes, CorrelationFilters.BTC_EMA_PERIOD)[-1]
         current_price = closes[-1]
         

@@ -224,7 +224,7 @@ class HybridATRTrailing:
                highs: np.ndarray,
                lows: np.ndarray,
                atr: float,
-               regime: TrailingRegime = None) -> TrailingState:
+               regime: TrailingRegime | None = None) -> TrailingState:
         """
         Update trailing stop based on current conditions.
         
@@ -366,7 +366,7 @@ class HybridATRTrailing:
         # Adjust k: -20% to +30% based on vol change
         adjustment = np.clip(vol_change * 1.5, -0.2, 0.3)
         
-        return base_k * (1 + adjustment)
+        return float(base_k * (1 + adjustment))
 
 
 # Factory function for integration with risk_engine

@@ -52,7 +52,7 @@ class RecoveryRequirements:
 class RecoveryProgress:
     """Tracks recovery progress"""
     phase: RecoveryPhase
-    started_at: datetime
+    started_at: datetime | None
     trades_completed: int
     trades_required: int
     current_metrics: Dict
@@ -65,7 +65,7 @@ class RecoveryProgress:
 class RecoveryAttempt:
     """Records a recovery attempt"""
     attempt_number: int
-    started_at: datetime
+    started_at: datetime | None
     ended_at: Optional[datetime]
     final_phase: RecoveryPhase
     trades_in_attempt: int

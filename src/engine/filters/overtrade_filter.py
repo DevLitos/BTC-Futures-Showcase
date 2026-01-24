@@ -253,11 +253,11 @@ class OvertradeFilter(BaseFilter):
         return ema[period-1:]
     
     def evaluate(self,
-                 df: pd.DataFrame = None,
-                 current_price: float = None,
-                 atr: float = None,
-                 bias: str = None,
-                 market_time: datetime = None,
+                 df: pd.DataFrame | None = None,
+                 current_price: float | None = None,
+                 atr: float | None = None,
+                 bias: str | None = None,
+                 market_time: datetime | None = None,
                  **kwargs) -> FilterDecision:
         """
         Evaluate overtrade conditions.
@@ -275,7 +275,7 @@ class OvertradeFilter(BaseFilter):
         market_time = market_time or datetime.utcnow()
         atr = atr or (current_price * 0.005)  # Default 0.5% ATR estimate
         
-        tags = {
+        tags: dict[str, bool | float | str | None] = {
             'zone_blocked': False,
             'awaiting_reset': False,
         }
@@ -304,9 +304,9 @@ class OvertradeFilter(BaseFilter):
         
         # ===== 2. STRUCTURE RESET CHECK =====
         if df is not None and len(df) >= self.RESET_LOOKBACK:
-            highs = df['high'].values
-            lows = df['low'].values
-            closes = df['close'].values
+            highs = df['high'].to_numpy()
+            lows = df['low'].to_numpy()
+            closes = df['close'].to_numpy()
             
             has_reset, reset_reason = self.check_structure_reset(
                 highs, lows, closes, current_price, bias

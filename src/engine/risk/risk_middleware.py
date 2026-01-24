@@ -100,7 +100,7 @@ class RiskEscalationConfig:
 class StreakTracker:
     """Tracks win/loss streaks for risk escalation."""
     
-    def __init__(self, config: RiskEscalationConfig = None):
+    def __init__(self, config: RiskEscalationConfig | None = None):
         self.config = config or RiskEscalationConfig()
         
         # Current streak tracking
@@ -507,8 +507,8 @@ class ThreePhaseTrailing:
     """
     
     def __init__(self, 
-                 config: TrailingPhaseConfig = None,
-                 be_calculator: BECalculator = None):
+                 config: TrailingPhaseConfig | None = None,
+                 be_calculator: BECalculator | None = None):
         self.config = config or TrailingPhaseConfig()
         self.be_calculator = be_calculator or BECalculator()
     
@@ -518,10 +518,10 @@ class ThreePhaseTrailing:
                                  stop_loss: float,
                                  position_size: float,
                                  direction: str,
-                                 regime: ManagementRegime = None,
-                                 recent_lows: List[float] = None,
-                                 recent_highs: List[float] = None,
-                                 atr: float = None) -> Tuple[float, str, int]:
+                                 regime: ManagementRegime | None = None,
+                                 recent_lows: List[float] | None = None,
+                                 recent_highs: List[float] | None = None,
+                                 atr: float | None = None) -> Tuple[float, str, int]:
         """
         Calculate trailing stop based on current phase.
         
@@ -641,9 +641,9 @@ class RiskManagerMiddleware:
     
     def __init__(self,
                  base_risk_pct: float = 0.8,
-                 setup_config: SetupWeightConfig = None,
-                 escalation_config: RiskEscalationConfig = None,
-                 trailing_config: TrailingPhaseConfig = None):
+                 setup_config: SetupWeightConfig | None = None,
+                 escalation_config: RiskEscalationConfig | None = None,
+                 trailing_config: TrailingPhaseConfig | None = None):
         
         self.base_risk_pct = base_risk_pct
         self.setup_config = setup_config or SetupWeightConfig()
@@ -689,7 +689,7 @@ class RiskManagerMiddleware:
                        entry_price: float,
                        stop_loss: float,
                        setup_name: str = "DEFAULT",
-                       regime: ManagementRegime = None,
+                       regime: ManagementRegime | None = None,
                        capital: float = 10000.0) -> AugmentedOrder:
         """
         Process a raw signal through the middleware.

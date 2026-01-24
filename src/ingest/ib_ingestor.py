@@ -4,11 +4,11 @@ import logging
 from . import base_ingestor as baseIngestor
 from . import kafka_producer as kafkaProducer
 
-logging = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 class IBIngestor(baseIngestor.BaseIngestor):
 
-    def __init__(self, symbols: list[str], kafka_producer: kafkaProducer, 
+    def __init__(self, symbols: list[str], kafka_producer: kafkaProducer,  # pyright: ignore[reportGeneralTypeIssues] 
     ib_host: str, ib_port: int, client_id: int = 1):
         self.symbols = symbols
         self.kafka_producer = kafka_producer
@@ -23,7 +23,7 @@ class IBIngestor(baseIngestor.BaseIngestor):
         for ticker in tickers:
             last_trade = ticker.last_trade
             last_size = ticker.last_size
-            timestamp_ns = util.time_ns()
+            timestamp_ns = util.time_ns()  # pyright: ignore[reportAttributeAccessIssue]
 
             if last_trade and last_size:
                 trade_data = {
@@ -34,7 +34,7 @@ class IBIngestor(baseIngestor.BaseIngestor):
                 }
 
                 # Track task for proper cleanup
-                task = asyncio.create_task(self.kafka_producer.send_message("raw_trades", trade_data))
+                task = asyncio.create_task(self.kafka_producer.send_message("raw_trades", trade_data))  # pyright: ignore[reportAttributeAccessIssue]
                 self._pending_tasks.append(task)
                 
                 # Clean completed tasks periodically

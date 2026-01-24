@@ -23,6 +23,7 @@ SECURITY:
 
 import os
 import uuid
+import asyncio
 import hashlib
 from pathlib import Path
 from datetime import datetime, UTC
@@ -496,7 +497,7 @@ class Settings(BaseSettings):
         Secrets are exposed here for CCXT initialization only.
         Never log the return value!
         """
-        creds = {"enableRateLimit": True}
+        creds: dict[str, str | bool | dict[str, str]] = {"enableRateLimit": True}
         
         api_key = self.effective_api_key
         secret = self.effective_secret
@@ -764,7 +765,6 @@ async def validate_startup(settings: Settings) -> dict:
     # Check API connectivity (if not demo/backtest)
     if not settings.demo_mode and not settings.is_backtest_mode:
         try:
-            import asyncio
             import ccxt.async_support as ccxt
             
             STARTUP_TIMEOUT = 30.0  # 30 seconds for startup validation

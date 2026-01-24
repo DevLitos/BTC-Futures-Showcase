@@ -41,7 +41,7 @@ USAGE:
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from typing import Optional, Dict, List, Callable, Any, Tuple
 import numpy as np
 import pandas as pd
@@ -264,7 +264,7 @@ class WalkForwardValidator:
         min_folds: int = 5,
         anchored: bool = True,  # Expanding train window
         gap_days: int = 1,  # Gap between train and test (prevent leakage)
-        criteria: ValidationCriteria = None
+        criteria: ValidationCriteria | None = None
     ):
         self.train_days = train_days
         self.test_days = test_days
@@ -342,14 +342,18 @@ class WalkForwardValidator:
         
         # Determine date range
         if isinstance(data.index, pd.DatetimeIndex):
-            start_date = data.index.min().to_pydatetime()
-            end_date = data.index.max().to_pydatetime()
+            start_ts = data.index.min()
+            end_ts = data.index.max()
+            start_date = start_ts.to_pydatetime() if pd.notna(start_ts) else datetime.now(UTC)  # pyright: ignore[reportAttributeAccessIssue, reportGeneralTypeIssues]
+            end_date = end_ts.to_pydatetime() if pd.notna(end_ts) else datetime.now(UTC)  # pyright: ignore[reportAttributeAccessIssue, reportGeneralTypeIssues]
         else:
-            start_date = pd.to_datetime(data['timestamp'].min())
-            end_date = pd.to_datetime(data['timestamp'].max())
+            start_ts = pd.to_datetime(data['timestamp'].min())
+            end_ts = pd.to_datetime(data['timestamp'].max())
+            start_date = start_ts.to_pydatetime() if pd.notna(start_ts) else datetime.now(UTC)  # pyright: ignore[reportAttributeAccessIssue, reportGeneralTypeIssues]
+            end_date = end_ts.to_pydatetime() if pd.notna(end_ts) else datetime.now(UTC)  # pyright: ignore[reportAttributeAccessIssue, reportGeneralTypeIssues]
         
         # Generate splits
-        splits = self.generate_splits(start_date, end_date)
+        splits = self.generate_splits(start_date, end_date)  # pyright: ignore[reportArgumentType]
         
         if len(splits) < self.min_folds:
             return WalkForwardResult(
@@ -487,15 +491,15 @@ class WalkForwardValidator:
             num_folds=n_folds,
             total_test_trades=total_trades,
             oos_return_pct=oos_return,
-            oos_sharpe=oos_sharpe,
+            oos_sharpe=float(oos_sharpe),
             oos_max_drawdown_pct=oos_max_dd,
-            oos_win_rate=oos_win_rate,
-            oos_profit_factor=oos_pf,
+            oos_win_rate=float(oos_win_rate),
+            oos_profit_factor=float(oos_pf),
             positive_folds=positive_folds,
             negative_folds=n_folds - positive_folds,
             consistency_ratio=positive_folds / n_folds if n_folds > 0 else 0,
-            avg_sharpe_degradation=avg_degradation,
-            avg_return_degradation=avg_return_deg,
+            avg_sharpe_degradation=float(avg_degradation),
+            avg_return_degradation=float(avg_return_deg),
             t_stat_return=t_stat,
             p_value_return=p_value,
             is_statistically_significant=p_value < self.criteria.required_significance,

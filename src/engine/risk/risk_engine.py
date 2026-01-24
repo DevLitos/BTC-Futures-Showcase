@@ -42,7 +42,7 @@ class Position:
     
     def __init__(self, symbol: str, direction: str, entry_price: float, 
                  size: float, stop_loss: float, atr_1m: float,
-                 market_time: datetime = None,
+                 market_time: datetime | None = None,
                  trade_type: TradeType = TradeType.LONG_MAIN,
                  regime_mode: str = 'TREND'):  # 🔥 NEW: regime_mode for BE logic
         # ===== INPUT VALIDATION =====
@@ -105,9 +105,13 @@ class Position:
         self.tp1_price = self._calculate_tp1(entry_price, stop_loss, direction)
         self.tp1_hit = False
         self.tp2_price: Optional[float] = None
+        self.take_profit: Optional[float] = None  # Exchange TP price when set
         
         # Trailing stop
         self.trailing_stop = stop_loss
+        
+        # ADX tracking for trend exhaustion detection
+        self._entry_adx: Optional[float] = None  # Store entry ADX for trend monitoring
         self.atr_1m = atr_1m
         
         # Smart BE (Breakeven) management
@@ -332,7 +336,7 @@ class Position:
         self.reduce_only_validated = True
         logger.info("✅ INTEGRITY: SL/TP confirmed as reduce-only")
     
-    def mark_exchange_sl_active(self, order_id: str = None):
+    def mark_exchange_sl_active(self, order_id: str | None = None):
         """
         Mark that SL is ACTIVE on the exchange.
         
@@ -375,6 +379,21 @@ class Position:
             if current_price > self.highest_price:
                 self.highest_price = current_price
     
+    def calculate_pnl(self, current_price: float) -> float:
+        """
+        Calculate PnL at a given price point.
+        
+        Args:
+            current_price: Current market price
+            
+        Returns:
+            float: PnL in USD (positive = profit, negative = loss)
+        """
+        if self.direction == 'LONG':
+            return (current_price - self.entry_price) * self.size
+        else:
+            return (self.entry_price - current_price) * self.size
+    
     @property
     def current_r_multiple(self) -> float:
         """
@@ -401,8 +420,8 @@ class Position:
         return price_move / self.original_stop_distance
 
     def update_trailing_stop(self, current_price: float, atr_1m: float, market_time: datetime,
-                             highs: np.ndarray = None, lows: np.ndarray = None,
-                             regime_hint: str = None):
+                             highs: np.ndarray | None = None, lows: np.ndarray | None = None,
+                             regime_hint: str | None = None):
         """
         HYBRID TRAILING - Combines R-stepped locks with ATR-adaptive trailing.
         
@@ -607,10 +626,10 @@ class Position:
         return False
     
     def check_mediocre_trade_exit(self, n_candles: int = 6, mfe_threshold: float = 0.3,
-                                     adx: float = None, atr_ratio: float = None,
-                                     current_price: float = None,
-                                     vwap: float = None, last_lh: float = None,
-                                     vah: float = None) -> dict:
+                                     adx: float | None = None, atr_ratio: float | None = None,
+                                     current_price: float | None = None,
+                                     vwap: float | None = None, last_lh: float | None = None,
+                                     vah: float | None = None) -> dict | None:
         """
         TIME_INVALIDATION INTELIGENTE (Jan 23, 2026)
         
@@ -807,9 +826,9 @@ class Position:
         }
     
     def _check_structural_invalidation(self, current_price: float, 
-                                        vwap: float = None, 
-                                        last_lh: float = None,
-                                        vah: float = None) -> dict:
+                                        vwap: float | None = None, 
+                                        last_lh: float | None = None,
+                                        vah: float | None = None) -> dict | None:
         """
         Verifica invalidación ESTRUCTURAL real (no numérica).
         
@@ -873,7 +892,7 @@ class Position:
         
         return None
     
-    def check_worst_trade_prevention(self, current_price: float) -> dict:
+    def check_worst_trade_prevention(self, current_price: float) -> dict | None:
         """
         WORST-TRADE PREVENTION (Jan 23, 2026)
         
@@ -929,7 +948,7 @@ class Position:
         
         return None
     
-    def check_add_to_winner(self, current_price: float) -> dict:
+    def check_add_to_winner(self, current_price: float) -> dict | None:
         """
         DYNAMIC SIZING: Add 0.5x position when trade proves itself
         
@@ -1050,8 +1069,8 @@ class Position:
         
         logger.warning(f"⚠️ BOS INVALIDATION: SL tightened to {self.stop_loss:.2f} ({tighten_pct*100:.0f}% closer)")
     
-    def check_stop_hit(self, current_price: float, current_low: float = None, 
-                       atr_1m: float = None, market_time: datetime = None) -> bool:
+    def check_stop_hit(self, current_price: float, current_low: float | None = None, 
+                       atr_1m: float | None = None, market_time: datetime | None = None) -> bool:
         """
         Check if stop loss was hit and MANUAL CLOSE is needed.
         
@@ -1212,7 +1231,7 @@ class Position:
         
         return False, "Estructura intacta"
     
-    def get_time_in_trade_minutes(self, market_time: datetime = None) -> float:
+    def get_time_in_trade_minutes(self, market_time: datetime | None = None) -> float:
         """
         Get time in trade in minutes.
         
@@ -1315,7 +1334,7 @@ class Position:
         
         return close_size
     
-    def should_force_exit_by_time(self, market_time: datetime = None, current_atr: float = None) -> tuple[bool, str]:
+    def should_force_exit_by_time(self, market_time: datetime | None = None, current_atr: float | None = None) -> tuple[bool, str]:
         """
         REDESIGNED (Jan 4, 2026): Stagnation-based exit, NOT clock-based.
         
@@ -1739,8 +1758,8 @@ class Position:
     def check_rsi_divergence_exit(
         self,
         current_price: float,
-        rsi_values: list,
-        price_values: list,
+        rsi_values: list | np.ndarray,
+        price_values: list | np.ndarray | None = None,
         lookback: int = 10
     ) -> Optional[Dict]:
         """
@@ -1753,7 +1772,7 @@ class Position:
         Args:
             current_price: Current market price
             rsi_values: List of recent RSI values (newest last)
-            price_values: List of recent prices (newest last)
+            price_values: List of recent prices (newest last), if None will skip divergence check
             lookback: Number of candles to check
         
         Returns:
@@ -1762,6 +1781,9 @@ class Position:
         from src.engine.config import DivergenceExitConfig
         
         if not DivergenceExitConfig.ENABLED:
+            return None
+        
+        if price_values is None:
             return None
         
         mfe_r = self.calculate_mfe_r()
@@ -1838,8 +1860,8 @@ class Position:
         from src.engine.config import TP1PercentageConfig
         return TP1PercentageConfig.get_tp1_pct(regime)
     
-    def update_smart_exit_indicators(self, rsi: float = None, bb_width: float = None, 
-                                      bb_avg: float = None, volume_ratio: float = None):
+    def update_smart_exit_indicators(self, rsi: float | None = None, bb_width: float | None = None, 
+                                      bb_avg: float | None = None, volume_ratio: float | None = None):
         """
         Update indicators used by smart exits.
         Call this on each candle to keep values fresh.
@@ -1857,10 +1879,10 @@ class Position:
         if bb_avg is not None:
             self.avg_bb_width = bb_avg
     
-    def check_all_smart_exits(self, current_price: float, rsi: float = None, 
-                               vpoc: float = None, bb_width: float = None,
-                               bb_avg: float = None, volume_ratio: float = 1.0,
-                               rsi_values: np.ndarray = None) -> Optional[Dict]:
+    def check_all_smart_exits(self, current_price: float, rsi: float | None = None, 
+                               vpoc: float | None = None, bb_width: float | None = None,
+                               bb_avg: float | None = None, volume_ratio: float = 1.0,
+                               rsi_values: np.ndarray | None = None) -> Optional[Dict]:
         """
         Master method: Check all smart exit conditions in priority order.
         
@@ -1963,7 +1985,7 @@ class RiskEngine:
         self._lock = asyncio.Lock()
     
     def check_reentry_allowed(self, entry_price: float, direction: str, 
-                               atr: float, new_conditions: dict = None) -> dict:
+                               atr: float, new_conditions: dict | None = None) -> dict:
         """
         ANTI RE-ENTRY: Check if reentry is allowed at this price.
         
@@ -2063,7 +2085,7 @@ class RiskEngine:
         }
     
     def record_entry(self, entry_price: float, direction: str, atr: float,
-                     entry_time: datetime = None, conditions: dict = None):
+                     entry_time: datetime | None = None, conditions: dict | None = None):
         """
         Record entry details for anti-reentry tracking.
         Called after successful position open.
@@ -2078,20 +2100,20 @@ class RiskEngine:
         """Record exit reason for cooldown/reentry logic."""
         self.last_exit_reason = exit_reason
     
-    def create_position(self, symbol: str, direction: str, entry_price: float,
+    def create_position(self, symbol: str | None, direction: str | None, entry_price: float,
                        position_size: float, stop_loss: float, atr_1m: float,
-                       market_time: datetime = None,
+                       market_time: datetime | None = None,
                        trade_type: TradeType = TradeType.LONG_MAIN,
                        regime_mode: str = 'RANGE',
-                       entry_conditions: dict = None) -> Position:  # 🔥 FIX (Jan 23): Added entry_conditions
+                       entry_conditions: dict | None = None) -> Position:  # 🔥 FIX (Jan 23): Added entry_conditions
         """
         Create a new position object for tracking.
         
         UPDATED (Jan 23, 2026): Also records entry for anti-reentry tracking
         """
         self.position = Position(
-            symbol=symbol,
-            direction=direction,
+            symbol=symbol or 'UNKNOWN',
+            direction=direction or 'UNKNOWN',
             entry_price=entry_price,
             size=position_size,
             stop_loss=stop_loss,
@@ -2102,13 +2124,14 @@ class RiskEngine:
         )
         
         # Record entry for anti-reentry tracking
-        self.record_entry(
-            entry_price=entry_price,
-            direction=direction,
-            atr=atr_1m,
-            entry_time=market_time,
-            conditions=entry_conditions
-        )
+        if direction is not None:
+            self.record_entry(
+                entry_price=entry_price,
+                direction=direction,
+                atr=atr_1m,
+                entry_time=market_time,
+                conditions=entry_conditions
+            )
         
         return self.position
     
@@ -2268,10 +2291,10 @@ class RiskEngine:
         
         return base_size
     
-    def calculate_stop_loss(self, entry_price: float, direction: str, 
+    def calculate_stop_loss(self, entry_price: float, direction: str | None, 
                            support_resistance: float, atr_1m: float,
-                           atr_ratio: float = None,
-                           regime_atr_mult: float = None) -> float:
+                           atr_ratio: float | None = None,
+                           regime_atr_mult: float | None = None) -> float:
         """
         Calculate technical stop loss with ATR buffer
         support_resistance: HL for LONG, LH for SHORT
@@ -2344,8 +2367,8 @@ class RiskEngine:
         logger.info(f"Stop loss calculated: {stop:.2f} (Structure: {support_resistance:.2f}±{buffer:.2f}, ATR min: {min_sl_distance:.2f} [{atr_multiplier}x])")
         return stop
     
-    async def open_position(self, symbol: str, direction: str, entry_price: float,
-                           stop_loss: float, atr_1m: float, hour: int, minute: int) -> Optional[Position]:
+    async def open_position(self, symbol: str | None, direction: str | None, entry_price: float,
+                           stop_loss: float, atr_1m: float, hour: int, minute: int) -> Position | None:
         """Open a new position"""
         async with self._lock:
             if self.position:
@@ -2359,18 +2382,18 @@ class RiskEngine:
                 return None
             
             # Create position
-            self.position = Position(symbol, direction, entry_price, size, stop_loss, atr_1m)
+            self.position = Position(symbol or 'UNKNOWN', direction or 'UNKNOWN', entry_price, size, stop_loss, atr_1m)
             
-            ORDERS_RECOMMENDED.labels(symbol=symbol, direction=direction).inc()
+            ORDERS_RECOMMENDED.labels(symbol=symbol or 'UNKNOWN', direction=direction or 'UNKNOWN').inc()
             
             return self.position
     
     async def manage_position(self, current_price: float, atr_1m: float, 
                              volume: float, avg_volume: float,
-                             tp2_target: Optional[float] = None,
-                             ema20_5m: Optional[float] = None,
+                             tp2_target: float | None = None,
+                             ema20_5m: float | None = None,
                              has_bos_against: bool = False,
-                             market_time: datetime = None,
+                             market_time: datetime | None = None,
                              adx: Optional[float] = None,
                              atr_ratio: Optional[float] = None,
                              rsi_1m: Optional[float] = None,
@@ -2490,7 +2513,8 @@ class RiskEngine:
             pos.check_regime_promotion()
             
             # Update trailing stop (solo aplica en régimen NORMAL)
-            pos.update_trailing_stop(current_price, atr_1m, market_time)
+            if market_time is not None:
+                pos.update_trailing_stop(current_price, atr_1m, market_time)
             
             # Set TP2 if provided and not yet set
             if tp2_target and not pos.tp2_price:
@@ -2738,9 +2762,11 @@ class RiskEngine:
             
             return None
     
-    async def _handle_tp1(self, current_price: float, regime: str = None) -> dict:
+    async def _handle_tp1(self, current_price: float, regime: str | None = None) -> dict | None:
         """Handle TP1 hit - close dynamic % and move stop to BE immediately"""
         pos = self.position
+        if pos is None:
+            return None
         
         # Get dynamic TP1 percentage based on regime
         if regime:
@@ -2870,6 +2896,10 @@ class RiskEngine:
         """Close entire position and update equity/drawdown"""
         pos = self.position
         
+        # Guard: position must exist
+        if pos is None:
+            return {'action': 'NONE', 'reason': 'No position to close'}
+        
         # Calculate final PnL
         if pos.direction == 'LONG':
             pnl = (current_price - pos.entry_price) * pos.size
@@ -2972,7 +3002,7 @@ class RiskEngine:
             'total_pnl': round(self.total_pnl, 2)
         }
     
-    async def update_from_exchange_position(self, position_data: dict, atr: float = None):
+    async def update_from_exchange_position(self, position_data: dict, atr: float | None = None):
         """
         Recover internal state from an existing on-chain position
         position_data: dict from CCXT fetch_position

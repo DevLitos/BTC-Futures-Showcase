@@ -57,8 +57,8 @@ class CostFilter(BaseFilter):
     
     def __init__(self, 
                  enabled: bool = True,
-                 fee_rate: float = None,
-                 min_net_r: float = None):
+                 fee_rate: float | None = None,
+                 min_net_r: float | None = None):
         super().__init__(enabled)
         if fee_rate:
             self.DEFAULT_FEE_RATE = fee_rate
@@ -95,7 +95,7 @@ class CostFilter(BaseFilter):
                                  entry_price: float,
                                  stop_loss: float,
                                  target_price: float,
-                                 fee_rate: float = None) -> Tuple[float, float, float]:
+                                 fee_rate: float | None = None) -> Tuple[float, float, float]:
         """
         Calculate net expected R after fees.
         
@@ -132,12 +132,12 @@ class CostFilter(BaseFilter):
         return gross_r, fee_r, net_r
     
     def evaluate(self,
-                 entry_price: float = None,
-                 stop_loss: float = None,
-                 target_price: float = None,
-                 spread: float = None,
-                 fee_rate: float = None,
-                 bias: str = None,
+                 entry_price: float | None = None,
+                 stop_loss: float | None = None,
+                 target_price: float | None = None,
+                 spread: float | None = None,
+                 fee_rate: float | None = None,
+                 bias: str | None = None,
                  **kwargs) -> FilterDecision:
         """
         Evaluate cost viability of trade.

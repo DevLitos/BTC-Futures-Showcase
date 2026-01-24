@@ -62,11 +62,14 @@ class EventType(Enum):
     TRADE_INTENT = auto()           # Strategy wants to trade
     
     # Order lifecycle events
+    ORDER_CREATED = auto()          # Order created locally
+    ORDER_PLACED = auto()           # Order placed on exchange
     ORDER_SUBMITTED = auto()        # Order sent to exchange
     ORDER_ACCEPTED = auto()         # Order accepted by exchange
     ORDER_FILLED = auto()           # Order fully filled
     ORDER_PARTIAL_FILL = auto()     # Order partially filled
     ORDER_CANCELED = auto()         # Order canceled
+    ORDER_CANCELLED = auto()        # Order cancelled (alias)
     ORDER_REJECTED = auto()         # Order rejected
     ORDER_EXPIRED = auto()          # Order expired
     
@@ -247,7 +250,7 @@ class EventBus:
             return []
         
         tasks = [
-            asyncio.create_task(handler(event))
+            asyncio.ensure_future(handler(event))
             for handler in handlers
         ]
         

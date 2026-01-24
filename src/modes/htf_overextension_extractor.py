@@ -284,7 +284,7 @@ class HTFOverextensionExtractor:
     - Use trailing/BE/scale-in
     """
     
-    def __init__(self, config: OverextensionConfig = None):
+    def __init__(self, config: OverextensionConfig | None = None):
         self.config = config or OverextensionConfig()
         
         # Lock state (after loss, lock until new HTF context)
@@ -700,9 +700,9 @@ def build_htf_context(df_1h: pd.DataFrame,
     if df_1h is None or len(df_1h) < ema50_period + 10:
         return HTFContext()
     
-    closes = df_1h['close'].values
-    highs = df_1h['high'].values
-    lows = df_1h['low'].values
+    closes = df_1h['close'].to_numpy()
+    highs = df_1h['high'].to_numpy()
+    lows = df_1h['low'].to_numpy()
     
     # Current candle
     current_close = float(closes[-1])
@@ -734,7 +734,7 @@ def build_htf_context(df_1h: pd.DataFrame,
     # Range expansion (current range vs average)
     current_range = current_high - current_low
     avg_range = np.mean(highs[-20:] - lows[-20:])
-    range_expanding = current_range > avg_range * 1.3
+    range_expanding = bool(current_range > avg_range * 1.3)
     
     # Weak close (bottom/top 30%)
     candle_range = current_high - current_low
@@ -786,11 +786,11 @@ def build_ltf_context(df_5m: pd.DataFrame,
     if df_5m is None or len(df_5m) < swing_lookback:
         return LTFContext()
     
-    closes = df_5m['close'].values
-    highs = df_5m['high'].values
-    lows = df_5m['low'].values
-    opens = df_5m['open'].values
-    volumes = df_5m['volume'].values if 'volume' in df_5m.columns else np.ones(len(closes))
+    closes = df_5m['close'].to_numpy()
+    highs = df_5m['high'].to_numpy()
+    lows = df_5m['low'].to_numpy()
+    opens = df_5m['open'].to_numpy()
+    volumes = df_5m['volume'].to_numpy() if 'volume' in df_5m.columns else np.ones(len(closes))
     
     # Current candle
     current_close = float(closes[-1])

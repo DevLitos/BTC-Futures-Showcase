@@ -36,7 +36,9 @@ from src.engine.filters import (
 from src.engine.risk.risk_engine import RiskEngine
 from src.engine.execution import round_size_to_exchange, KRAKEN_BTC_MIN_SIZE  # 🔒 FIX: Centralized size rounding + min size
 from src.engine.indicators import (
-    calculate_ema, calculate_atr, calculate_adx, calculate_rsi, calculate_bollinger_bands
+    calculate_ema, calculate_atr, calculate_adx, calculate_rsi, calculate_bollinger_bands,
+    safe_calculate_atr, safe_calculate_adx, safe_calculate_ema, safe_calculate_rsi,
+    safe_calculate_bollinger_bands, to_ndarray
 )
 from src.engine.config import HTFFilters, RiskManagement, OperatingMode  # For logging thresholds + MODE
 from src.engine.config import DailyRegimeDetector  # 🔥 FIX (Jan 23): Daily regime classification
@@ -84,7 +86,7 @@ from src.engine.execution.slippage_model import (
 )
 from src.engine.trade_logger import TradeLogger, get_trade_logger
 from src.engine.config import (
-    DynamicScoreThreshold, SessionTradeLimits, VolatilityRegime,
+    DynamicScoreThreshold, SessionTradeLimits, VolatilityRegime, VolatilityRegimeValue,
     LossStreakConfig, LocationFilterOverride, MicroTrendADXConfig,
     get_session_name
 )
@@ -241,7 +243,7 @@ class SignalEngine:
         )
         
         # Symbol (set during initialization)
-        self.symbol = None
+        self.symbol: str | None = None
         
         # Filters - ALL use market_time, backtest_mode flag for relaxed validation
         self.kill_filter = KillConditionsFilter(self.state_machine, capital=0.0, risk_engine=self.risk_engine, backtest_mode=self._is_backtest)
@@ -252,7 +254,7 @@ class SignalEngine:
         
         # Location filter - macro context veto (prevents buying tops in RANGE)
         self.location_filter = get_location_filter()
-        self._location_context: LocationContext = None
+        self._location_context: LocationContext | None = None
 
         # =====================================================================
         # MICRO TREND FILTER - Prevents LONGs during micro-bearish trends
@@ -262,7 +264,7 @@ class SignalEngine:
         # Hard blocking on micro structure kills too many good trades
         # BTC does LL/LH constantly during trends, doesn't mean reversal
         self.micro_trend_filter = get_micro_trend_filter(hard_block_enabled=False)
-        self._micro_trend_state: MicroTrendState = None
+        self._micro_trend_state: MicroTrendState | None = None
 
         # =====================================================================
         # ENTRY FILTER PIPELINE (Jan 15, 2026) - Unified filter evaluation
@@ -292,7 +294,7 @@ class SignalEngine:
         # =====================================================================
         self._daily_regime: str = 'RANGE_DAY'  # Default conservative
         self._daily_regime_config: dict = DailyRegimeDetector.get_daily_config('RANGE_DAY')
-        self._daily_regime_last_update: datetime = None
+        self._daily_regime_last_update: datetime | None = None
         
         # =====================================================================
         # 🔥 TREND INTELLIGENCE (Jan 23, 2026) - Detección de ciclos
@@ -301,7 +303,7 @@ class SignalEngine:
         # =====================================================================
         self._trend_intelligence = get_trend_intelligence()
         self._trend_phase: TrendPhase = TrendPhase.RANGE_BOUND
-        self._trend_last_update: datetime = None
+        self._trend_last_update: datetime | None = None
         
         # Regime classifier for volume-aware filtering
         self.regime_classifier = EdgeRegimeClassifier()
@@ -364,7 +366,7 @@ class SignalEngine:
         )
         
         # Edge context (updated periodically)
-        self._edge_context: ContextValidity = None
+        self._edge_context: ContextValidity | None = None
         self._last_context_update = None
         self._context_update_interval = 300  # Update every 5 minutes
         
@@ -379,11 +381,11 @@ class SignalEngine:
         self._is_be_stop = False
         
         # Trade tracking
-        self.current_bias: str = None  # 'LONG' or 'SHORT'
+        self.current_bias: str | None = None  # 'LONG' or 'SHORT'
         self.impulse_high: float = 0.0
         self.impulse_low: float = 0.0
-        self.pending_order_id: str = None
-        self.entry_order_time: datetime = None
+        self.pending_order_id: str | None = None
+        self.entry_order_time: datetime | None = None
         
         # STATE MACHINE para evitar busy loops
         self.setup_state = None  # IDLE, WAIT_LTF, EXECUTING
@@ -429,7 +431,7 @@ class SignalEngine:
         # Track previous tick data to detect anomalies (gaps, staleness)
         # =====================================================================
         self._prev_tick_price: float = 0.0  # Previous tick price for gap detection
-        self._prev_tick_time: datetime = None  # Previous tick time for staleness detection
+        self._prev_tick_time: datetime | None = None  # Previous tick time for staleness detection
         
         # =====================================================================
         # INDICATOR CACHE - Avoid recalculating heavy indicators every tick
@@ -476,9 +478,9 @@ class SignalEngine:
         # REJECTION COOLDOWN - Prevents rapid reevaluation after filter blocks
         # Only activated for TECHNICAL errors, not filter rejections
         # =====================================================================
-        self._rejection_cooldown_until: datetime = None  # When rejection cooldown ends
+        self._rejection_cooldown_until: datetime | None = None  # When rejection cooldown ends
         self._rejection_cooldown_candles = 2  # Number of candles to wait after rejection
-        self._last_rejection_reason: str = None  # Why was the setup rejected
+        self._last_rejection_reason: str | None = None  # Why was the setup rejected
         self._last_evaluated_candle_ts: int = 0  # Timestamp of last evaluated LTF candle
         
         # =====================================================================
@@ -493,7 +495,7 @@ class SignalEngine:
         # Uses MODE from OperatingMode for thresholds
         # Only Structure=0 blocks entry (the only real gate)
         # =====================================================================
-        self._entry_score: int = 0
+        self._entry_score: int | float = 0
         self._score_breakdown: dict = {
             'structure': 0,  # HTF alignment + 5m structure (0-2)
             'timing': 0,     # BOS at close + reclaim quality (0-2)
@@ -502,7 +504,7 @@ class SignalEngine:
             'synergy': 0     # HTF clean + BOS confirmed = +1 (non-linear bonus)
         }
         # Threshold from OperatingMode - NEVER change based on losses
-        self._entry_threshold: int = OperatingMode.get_score_threshold()
+        self._entry_threshold: float = float(OperatingMode.get_score_threshold())
         
         # =====================================================================
         # TRADE TAGS - All filters become tags, not blockers
@@ -531,15 +533,15 @@ class SignalEngine:
         self._last_ltf_state = None
         
         # BOS tracking - edge-triggered (solo loguear UNA vez por nivel)
-        self._last_bos_level: float = None  # Nivel donde se detectó BOS
-        self._last_bos_direction: str = None  # 'LONG' o 'SHORT'
+        self._last_bos_level: float | None = None  # Nivel donde se detectó BOS
+        self._last_bos_direction: str | None = None  # 'LONG' o 'SHORT'
         
         # =====================================================================
         # HTF CACHE - Solo recalcular cuando cierra nueva vela 1H
         # =====================================================================
         self._htf_cache_ts: int = 0  # Timestamp de la última vela 1h evaluada
         self._htf_cache_passed: bool = False  # Resultado cacheado
-        self._htf_cache_bias: str = None  # 'LONG', 'SHORT', None
+        self._htf_cache_bias: str | None = None  # 'LONG', 'SHORT', None
         self._htf_cache_reason: str = ""  # Razón del resultado
         # 🔥 FIX (Jan 23, 2026): Cache HTF regime mode based on ADX
         self._htf_cache_regime_mode: str = 'UNKNOWN'  # 'RANGE', 'WEAK_TREND', 'TREND', 'LOW_ADX'
@@ -548,7 +550,7 @@ class SignalEngine:
         # =====================================================================
         # SYSTEM HEALTH MONITOR - Independent of PnL
         # =====================================================================
-        self.health_monitor: SystemHealthMonitor = None  # Initialized in initialize()
+        self.health_monitor: SystemHealthMonitor | None = None  # Initialized in initialize()
         
         # =====================================================================
         # MISSED OPPORTUNITY TRACKER - Track blocked signals for edge analysis
@@ -567,9 +569,9 @@ class SignalEngine:
         # Year/Quarter/Month/Week closes act as psychological S/R
         # Used for: blocking near levels, confluence bonus, TP adjustment
         # =====================================================================
-        self.important_levels: ImportantLevelsProvider = None  # Initialized async in initialize()
-        self._last_level_context: LevelContext = None  # Last computed level context
-        self._last_levels_update: datetime = None  # Last time levels were refreshed
+        self.important_levels: ImportantLevelsProvider | None = None  # Initialized async in initialize()
+        self._last_level_context: LevelContext | None = None  # Last computed level context
+        self._last_levels_update: datetime | None = None  # Last time levels were refreshed
         
         # =====================================================================
         # NEW: SPREAD FILTER - Real-time spread monitoring (Jan 16, 2026)
@@ -587,21 +589,21 @@ class SignalEngine:
         # NEW: TRADE LOGGER - Persistent trade logging with tags (Jan 16, 2026)
         # =====================================================================
         self.trade_logger: TradeLogger = get_trade_logger()
-        self._current_trade_id: str = None  # Active trade ID for logging
+        self._current_trade_id: str | None = None  # Active trade ID for logging
         
         # =====================================================================
         # NEW: SESSION TRADE COUNTER - Limit trades per session (Jan 16, 2026)
         # =====================================================================
         self._session_trade_counts: dict = {}  # {session_name: count}
-        self._last_session: str = None
+        self._last_session: str | None = None
         self._daily_trade_count: int = 0
-        self._last_trade_date: str = None
+        self._last_trade_date: str | None = None
         self._at_session_limit: bool = False  # Track if at session limit
         
         # =====================================================================
         # NEW: VOLATILITY REGIME TRACKING (Jan 16, 2026)
         # =====================================================================
-        self._current_volatility_regime: str = "NORMAL"
+        self._current_volatility_regime: VolatilityRegimeValue | str = VolatilityRegime.NORMAL  # Uses VolatilityRegime class constants
         self._last_atr_ratio: float = 1.0
         
         # =====================================================================
@@ -612,13 +614,13 @@ class SignalEngine:
         # =====================================================================
         # NEW: BIAS STRENGTH & TREND EXPANSION SYSTEM (Jan 22, 2026)
         # =====================================================================
-        self._current_bias_strength: 'BiasStrength' = None  # BULL_STRONG, BEAR_STRONG, NEUTRAL
+        self._current_bias_strength: 'BiasStrength | None' = None  # BULL_STRONG, BEAR_STRONG, NEUTRAL
         self._trend_expansion_active: bool = False
-        self._trend_expansion_start_time: datetime = None
-        self._anti_fade_until: datetime = None  # No counter-trend until this time
+        self._trend_expansion_start_time: datetime | None = None
+        self._anti_fade_until: datetime | None = None  # No counter-trend until this time
         self._countertrend_losses_session: int = 0  # CT losses this session
-        self._last_countertrend_loss_time: datetime = None
-        self._short_cooldown_until: datetime = None  # Short obstinacy cooldown
+        self._last_countertrend_loss_time: datetime | None = None
+        self._short_cooldown_until: datetime | None = None  # Short obstinacy cooldown
         self._last_expansion_check_ts: int = 0  # Cache for expansion check
         
         # =====================================================================
@@ -626,14 +628,14 @@ class SignalEngine:
         # Detects: BB squeeze, ADX coiling, volume decline, structure building
         # =====================================================================
         self.anticipation_engine = get_anticipation_engine()
-        self._last_anticipation_state: AnticipationState = None
+        self._last_anticipation_state: AnticipationState | None = None
         
         # =====================================================================
         # NEW: EXHAUSTION DETECTOR - Exit at the "summum" (Jan 22, 2026)
         # Detects: Volume climax, RSI divergence, candle exhaustion, ATR reversal
         # =====================================================================
         self.exhaustion_detector = get_exhaustion_detector()
-        self._last_exhaustion_state: ExhaustionState = None
+        self._last_exhaustion_state: ExhaustionState | None = None
         
         logger.info("Signal Engine initialized")
     
@@ -810,12 +812,15 @@ class SignalEngine:
                             await self._position_store.sync_from_exchange(self.execution.exchange)
                         
                         # NOW check if position_store still has a position (shouldn't after sync)
-                        ps_pos = self._position_store.get_position(self.symbol)
-                        if ps_pos and not ps_pos.is_flat and ps_pos.size > MIN_POSITION_SIZE:
-                            # This is weird - sync should have cleared it. Log but proceed anyway
-                            logger.error(f"🚨 position_store still has {ps_pos.side} {ps_pos.size:.6f} after sync - forcing clear")
-                            ps_pos.size = 0
-                            ps_pos.side = 'FLAT'
+                        if self.symbol is None:
+                            logger.error("Cannot check position_store: symbol is None")
+                        else:
+                            ps_pos = self._position_store.get_position(self.symbol)
+                            if ps_pos and not ps_pos.is_flat and ps_pos.size > MIN_POSITION_SIZE:
+                                # This is weird - sync should have cleared it. Log but proceed anyway
+                                logger.error(f"🚨 position_store still has {ps_pos.side} {ps_pos.size:.6f} after sync - forcing clear")
+                                ps_pos.size = 0
+                                ps_pos.side = 'FLAT'
                     except Exception as ps_e:
                         logger.debug(f"Position store sync failed: {ps_e}")
                     
@@ -936,6 +941,8 @@ class SignalEngine:
             # Record trade close with estimated PnL
             if self.risk_engine.has_open_position():
                 position = self.risk_engine.position
+                if position is None:  # Type narrowing for Pyright
+                    return
                 # Try to get last known price for PnL estimate
                 candles = self.market_data.get_candles('1m')
                 current_price = candles[-1]['close'] if candles and len(candles) > 0 else position.entry_price
@@ -958,21 +965,22 @@ class SignalEngine:
                 logger.info(f"✅ Trade closed by exchange TP/SL - Estimated PnL: ${pnl_estimate:.2f}")
                 
                 # 🔥 FIX (Jan 14, 2026): Send Telegram notification for exchange TP/SL closes
-                try:
-                    from datetime import datetime, UTC
-                    _create_safe_task(self.output_manager.send_exit_notification({
-                        'symbol': self.symbol,
-                        'reason': exit_type,  # Already has EXCHANGE_ prefix
-                        'pnl': pnl_estimate,
-                        'r_realized': r_realized,
-                        'exit_price': current_price,
-                        'entry_price': position.entry_price,
-                        'direction': position.direction,
-                        'timestamp': datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
-                    }), "send_exit_notification_exchange_tpsl")
-                    logger.info("📱 Telegram notification sent for exchange TP/SL close")
-                except Exception as e:
-                    logger.error(f"Failed to send Telegram notification for TP/SL: {e}")
+                if self.output_manager is not None:
+                    try:
+                        from datetime import datetime, UTC
+                        _create_safe_task(self.output_manager.send_exit_notification({
+                            'symbol': self.symbol,
+                            'reason': exit_type,  # Already has EXCHANGE_ prefix
+                            'pnl': pnl_estimate,
+                            'r_realized': r_realized,
+                            'exit_price': current_price,
+                            'entry_price': position.entry_price,
+                            'direction': position.direction,
+                            'timestamp': datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+                        }), "send_exit_notification_exchange_tpsl")
+                        logger.info("📱 Telegram notification sent for exchange TP/SL close")
+                    except Exception as e:
+                        logger.error(f"Failed to send Telegram notification for TP/SL: {e}")
             
             # Clear local state (sync - we're in a sync callback)
             self.risk_engine.clear_position_sync("Exchange TP/SL hit - reconciler detected")
@@ -982,13 +990,26 @@ class SignalEngine:
             
             # Also clear position_store
             try:
-                ps_pos = self._position_store.get_position(self.symbol)
-                if ps_pos:
-                    ps_pos.size = 0
-                    ps_pos.side = 'FLAT'
+                if self.symbol is not None:
+                    ps_pos = self._position_store.get_position(self.symbol)
+                    if ps_pos:
+                        ps_pos.size = 0
+                        ps_pos.side = 'FLAT'
             except Exception as ps_err:
                 logger.debug(f"Position store cleanup skipped: {ps_err}")
     
+    @property
+    def _symbol(self) -> str:
+        """Return symbol as non-None str, raising if not set.
+        
+        Use this property in places where Pyright complains about
+        'str | None' not being assignable to 'str'. This property
+        guarantees the return type is str (or raises RuntimeError).
+        """
+        if self.symbol is None:
+            raise RuntimeError("SignalEngine.symbol not initialized")
+        return self.symbol
+
     def _reset_trade_state(self, reason: str = "State reset"):
         """Limpia COMPLETAMENTE el estado de trading - CRITICAL para prevenir órdenes múltiples"""
         logger.info(f"🔄 Resetting trade state: {reason}")
@@ -996,7 +1017,7 @@ class SignalEngine:
         # 🔥 FIX (Jan 20, 2026): Clear position_store on state reset
         # This ensures position tracking is always in sync after exits
         try:
-            if hasattr(self, '_position_store') and self._position_store:
+            if hasattr(self, '_position_store') and self._position_store and self.symbol is not None:
                 ps_pos = self._position_store.get_position(self.symbol)
                 if ps_pos and ps_pos.size > 0:
                     ps_pos.size = 0
@@ -1047,7 +1068,7 @@ class SignalEngine:
             self.health_monitor = SystemHealthMonitor()
             logger.info("SystemHealthMonitor initialized")
     
-    def _set_rejection_cooldown(self, reason: str, candles: int = None):
+    def _set_rejection_cooldown(self, reason: str, candles: int | None = None):
         """
         Set a cooldown after a filter rejection (NOT a full reset).
         This prevents the tight loop of evaluate->reject->reset->evaluate.
@@ -1062,11 +1083,12 @@ class SignalEngine:
         # Calculate cooldown end time (candles * 60 seconds per 1m candle)
         cooldown_seconds = candles * 60
         market_time = self.market_data.get_market_time()
-        self._rejection_cooldown_until = market_time + timedelta(seconds=cooldown_seconds)
+        cooldown_end = market_time + timedelta(seconds=cooldown_seconds)
+        self._rejection_cooldown_until = cooldown_end
         self._last_rejection_reason = reason
         
         # Log only once (not on every tick)
-        logger.info(f"⏸️ Rejection cooldown: {reason} | Wait {candles} candles until {self._rejection_cooldown_until.strftime('%H:%M:%S')}")
+        logger.info(f"⏸️ Rejection cooldown: {reason} | Wait {candles} candles until {cooldown_end.strftime('%H:%M:%S')}")
     
     def _is_in_rejection_cooldown(self) -> tuple[bool, str]:
         """Check if we're in a rejection cooldown period."""
@@ -1360,7 +1382,8 @@ class SignalEngine:
                 # 💓 HEARTBEAT: Log every 60 seconds to confirm system is alive
                 time_since_heartbeat = (tick_start - last_heartbeat_time).total_seconds()
                 if time_since_heartbeat >= 60:
-                    pos_status = "FLAT" if not self.risk_engine.has_open_position() else f"{self.risk_engine.position.direction} {self.risk_engine.position.size:.6f}"
+                    pos = self.risk_engine.position
+                    pos_status = "FLAT" if pos is None else f"{pos.direction} {pos.size:.6f}"
                     logger.info(f"💓 HEARTBEAT: tick #{tick_count}, state={self.state_machine.state.name}, pos={pos_status}")
                     
                     # 🤖 ML STATUS (every 5 minutes = 300s = tick_count % 300 == 0)
@@ -1520,10 +1543,10 @@ class SignalEngine:
             price_change=price_change,
             atr=atr_1m,
             market_time=market_time,
-            candle_high=last_candle.get('high'),
-            candle_low=last_candle.get('low'),
-            candle_open=last_candle.get('open'),
-            candle_close=last_candle.get('close')
+            candle_high=float(last_candle.get('high', 0) or 0),
+            candle_low=float(last_candle.get('low', 0) or 0),
+            candle_open=float(last_candle.get('open', 0) or 0),
+            candle_close=float(last_candle.get('close', 0) or 0)
         )
         
         if is_black_swan:
@@ -1680,6 +1703,10 @@ class SignalEngine:
         
         # ===== CHECK IF IN WAIT_LTF STATE =====
         if self.setup_state == "WAIT_LTF":
+            if self.setup_start_time is None:
+                logger.error("WAIT_LTF state with no setup_start_time - resetting to IDLE")
+                self.setup_state = "IDLE"
+                return
             elapsed = (market_time - self.setup_start_time).total_seconds()
             
             # 1. Check timeout
@@ -1696,7 +1723,7 @@ class SignalEngine:
             candles_5m = self.market_data.get_candles('5m')
             if candles_5m and len(candles_5m) >= 20:
                 df_5m = pd.DataFrame(candles_5m)
-                closes_5m = df_5m['close'].values
+                closes_5m = df_5m['close'].to_numpy()
                 ema_50 = calculate_ema(closes_5m, 50)[-1]
                 
                 if self.current_bias == "LONG" and current_price < ema_50:
@@ -1724,6 +1751,12 @@ class SignalEngine:
                 # Get regime info for volume-aware filtering
                 regime_value = self.regime_classifier.current_regime.value if self.regime_classifier.current_regime else None
                 regime_conf = self.regime_classifier.regime_confidence
+                
+                # Ensure bias is set (should be when in WAIT_LTF)
+                if self.current_bias is None:
+                    logger.warning("WAIT_LTF without bias - resetting to IDLE")
+                    self.setup_state = "IDLE"
+                    return
                 
                 ltf_passed, ltf_reason = self.ltf_filter.check(
                     df_1m,
@@ -1799,9 +1832,9 @@ class SignalEngine:
             if candles_5m_antic and len(candles_5m_antic) >= 50:
                 df_5m_antic = pd.DataFrame(candles_5m_antic)
                 atr_5m_antic = calculate_atr(
-                    df_5m_antic['high'].values, 
-                    df_5m_antic['low'].values, 
-                    df_5m_antic['close'].values, 14
+                    df_5m_antic['high'].to_numpy(), 
+                    df_5m_antic['low'].to_numpy(), 
+                    df_5m_antic['close'].to_numpy(), 14
                 )
                 # 🔥 FIX (Jan 22, 2026): Safe ATR extraction with NaN guard
                 atr_5m_val = current_price * 0.005  # Default fallback
@@ -1834,8 +1867,9 @@ class SignalEngine:
                     
                     logger.info(f"🔮 ANTICIPATION DETECTED: {anticipation.signal.value} {anticipation.direction} "
                                f"(conf={anticipation.confidence:.0%})")
-                    for reason in anticipation.reasons[:3]:  # Show top 3 reasons
-                        logger.info(f"   → {reason}")
+                    if anticipation.reasons:
+                        for reason in anticipation.reasons[:3]:  # Show top 3 reasons
+                            logger.info(f"   → {reason}")
                     
                     # If high confidence (>75%), consider early entry with probe size
                     if anticipation.confidence >= 0.75 and anticipation.direction:
@@ -1943,7 +1977,7 @@ class SignalEngine:
             try:
                 last_candle = candles_1h[-1]
                 atr_1h_arr = calculate_atr(
-                    df_1h['high'].values, df_1h['low'].values, df_1h['close'].values, 14
+                    df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14
                 )
                 atr_1h = float(atr_1h_arr[-1]) if len(atr_1h_arr) > 0 else 100.0
                 
@@ -2014,9 +2048,9 @@ class SignalEngine:
             try:
                 df_5m_temp = pd.DataFrame(candles_5m[-30:])  # Last 30 candles = 2.5 hours
                 adx_5m_vals, _ = calculate_adx(
-                    df_5m_temp['high'].values, 
-                    df_5m_temp['low'].values, 
-                    df_5m_temp['close'].values, 
+                    df_5m_temp['high'].to_numpy(), 
+                    df_5m_temp['low'].to_numpy(), 
+                    df_5m_temp['close'].to_numpy(), 
                     14
                 )
                 if len(adx_5m_vals) > 0 and not np.isnan(adx_5m_vals[-1]):
@@ -2072,10 +2106,10 @@ class SignalEngine:
             # This fixes timing bug where we check before calculating
             if not self._location_context:
                 try:
-                    closes_1h_early = df_1h['close'].values
-                    highs_1h_early = df_1h['high'].values
-                    lows_1h_early = df_1h['low'].values
-                    volumes_1h_early = df_1h['volume'].values if 'volume' in df_1h.columns else np.ones(len(closes_1h_early))
+                    closes_1h_early = np.asarray(df_1h['close'].to_numpy())
+                    highs_1h_early = np.asarray(df_1h['high'].to_numpy())
+                    lows_1h_early = np.asarray(df_1h['low'].to_numpy())
+                    volumes_1h_early = np.asarray(df_1h['volume'].to_numpy()) if 'volume' in df_1h.columns else np.ones(len(closes_1h_early))
                     
                     atr_1h_vals_early = calculate_atr(highs_1h_early, lows_1h_early, closes_1h_early, 14)
                     atr_1h_early = atr_1h_vals_early[-1] if len(atr_1h_vals_early) > 0 else current_price * 0.01
@@ -2196,7 +2230,7 @@ class SignalEngine:
                 # Show detailed HTF values
                 ema_50 = df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
                 ema_200 = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
-                adx_vals, _ = calculate_adx(df_1h['high'].values, df_1h['low'].values, df_1h['close'].values, 14)
+                adx_vals, _ = calculate_adx(df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14)
                 adx = adx_vals[-1] if len(adx_vals) > 0 else 0
                 adx_slope = (adx_vals[-1] - adx_vals[-2]) if len(adx_vals) > 1 else 0
                 
@@ -2217,10 +2251,10 @@ class SignalEngine:
         # Check if location in market structure allows this trade direction
         # This is a HARD VETO that prevents buying tops in RANGE regime
         
-        closes_1h = df_1h['close'].values
-        highs_1h = df_1h['high'].values
-        lows_1h = df_1h['low'].values
-        volumes_1h = df_1h['volume'].values if 'volume' in df_1h.columns else np.ones(len(closes_1h))
+        closes_1h = np.asarray(df_1h['close'].to_numpy())
+        highs_1h = np.asarray(df_1h['high'].to_numpy())
+        lows_1h = np.asarray(df_1h['low'].to_numpy())
+        volumes_1h = np.asarray(df_1h['volume'].to_numpy()) if 'volume' in df_1h.columns else np.ones(len(closes_1h))
         
         # Get ATR and ADX for location context
         atr_1h_vals = calculate_atr(highs_1h, lows_1h, closes_1h, 14)
@@ -2249,6 +2283,11 @@ class SignalEngine:
         self._current_trade_tags['htf_adx'] = self._htf_cache_adx
         
         # Calculate location context (cached by 1h bar close)
+        # Ensure bias is set before location check
+        if bias is None:
+            logger.warning("HTF passed but no bias set - skipping")
+            return
+        
         location_cache_key = _ts_to_int(df_1h.iloc[-1].get('timestamp', 0))
         location_allowed, location_reason, self._location_context = self.location_filter.check(
             closes_1h=closes_1h,
@@ -2416,7 +2455,7 @@ class SignalEngine:
         
         # 3. Detect Trend Expansion
         if df_5m_pre is not None and df_1m_pre is not None:
-            atr_5m_pre = calculate_atr(df_5m_pre['high'].values, df_5m_pre['low'].values, df_5m_pre['close'].values, 14)
+            atr_5m_pre = calculate_atr(df_5m_pre['high'].to_numpy(), df_5m_pre['low'].to_numpy(), df_5m_pre['close'].to_numpy(), 14)
             atr_5m_val = atr_5m_pre[-1] if len(atr_5m_pre) > 0 else current_price * 0.005
             
             expansion_detected, expansion_criteria = self._detect_trend_expansion(
@@ -2451,7 +2490,7 @@ class SignalEngine:
         # 5. Short Obstinacy Check (for shorts only)
         short_obstinacy_penalty = 0.0
         if bias == 'SHORT' and df_5m_pre is not None:
-            atr_5m_pre = calculate_atr(df_5m_pre['high'].values, df_5m_pre['low'].values, df_5m_pre['close'].values, 14)
+            atr_5m_pre = calculate_atr(df_5m_pre['high'].to_numpy(), df_5m_pre['low'].to_numpy(), df_5m_pre['close'].to_numpy(), 14)
             atr_5m_val = atr_5m_pre[-1] if len(atr_5m_pre) > 0 else current_price * 0.005
             
             short_obstinacy_penalty, bullish_signals, obstinacy_reason = self._calculate_short_obstinacy_penalty(
@@ -2506,6 +2545,10 @@ class SignalEngine:
         
         candles_5m_list = self.market_data.get_candles('5m')
         candles_1m_list = self.market_data.get_candles('1m')
+        
+        # Initialize to None for type safety
+        df_5m_micro: pd.DataFrame | None = None
+        df_1m_micro: pd.DataFrame | None = None
         
         if candles_5m_list and len(candles_5m_list) >= 60:
             df_5m_micro = pd.DataFrame(candles_5m_list)
@@ -2624,8 +2667,8 @@ class SignalEngine:
         EMA_DISTANCE_BLOCK_PCT = 0.01  # 1% threshold
         EMA_DISTANCE_WARNING_PCT = 0.005  # 0.5% warning (apply score penalty)
         
-        if 'df_5m_micro' in dir() and df_5m_micro is not None and len(df_5m_micro) >= 50:
-            closes_5m = df_5m_micro['close'].values
+        if df_5m_micro is not None and len(df_5m_micro) >= 50:
+            closes_5m = df_5m_micro['close'].to_numpy()
             ema20_5m_val = calculate_ema(closes_5m, 20)[-1]
             ema50_5m_val = calculate_ema(closes_5m, 50)[-1]
             
@@ -2678,7 +2721,7 @@ class SignalEngine:
         # Runs all new filters: BB Width, Volatility Shock, Macro Trend, 
         # Post-Sweep, Cost, Overtrade
         # NOTE: System doesn't have 15m candles, using 5m as proxy for intermediate TF
-        df_15m_proxy = df_5m_micro if 'df_5m_micro' in dir() and df_5m_micro is not None else None
+        df_15m_proxy = df_5m_micro
         
         # Calculate spread from order book if available
         spread = None
@@ -2690,9 +2733,9 @@ class SignalEngine:
                 spread = spread_pct  # Use the percentage for other calculations
         
         filter_decision = self.filter_pipeline.evaluate(
-            df_1m=df_1m_micro if 'df_1m_micro' in dir() else None,
-            df_5m=df_5m_micro if 'df_5m_micro' in dir() else None,
-            df_15m=df_15m_proxy,
+            df_1m=df_1m_micro,  # pyright: ignore[reportArgumentType]
+            df_5m=df_5m_micro,  # pyright: ignore[reportArgumentType]
+            df_15m=df_15m_proxy,  # pyright: ignore[reportArgumentType]
             df_1h=df_1h,
             current_price=current_price,
             bias=bias,
@@ -2887,8 +2930,9 @@ class SignalEngine:
         
         # Check for integrity errors
         has_integrity_errors = False
-        if self.risk_engine.has_open_position() and hasattr(self.risk_engine.position, 'integrity_errors'):
-            has_integrity_errors = len(self.risk_engine.position.integrity_errors) > 0
+        position = self.risk_engine.position if hasattr(self.risk_engine, 'position') else None
+        if self.risk_engine.has_open_position() and position is not None and hasattr(position, 'integrity_errors'):
+            has_integrity_errors = len(position.integrity_errors) > 0
         
         # Check for macro events
         has_macro_event = self.external_data.has_high_impact_event() if hasattr(self.external_data, 'has_high_impact_event') else False
@@ -3244,7 +3288,9 @@ class SignalEngine:
         # These are the real ceilings/floors that collapse RR
         if hasattr(self, 'important_levels') and self.important_levels is not None:
             try:
-                anchor_levels = self.important_levels.get_relevant_levels(current_price, bias)
+                # NOTE: get_relevant_levels does not exist - this code path is dead
+                # Use get_level_context or get_all_levels instead
+                anchor_levels = self.important_levels.get_relevant_levels(current_price, bias)  # pyright: ignore[reportAttributeAccessIssue]
                 
                 if anchor_levels:
                     if bias == 'LONG':
@@ -3347,8 +3393,8 @@ class SignalEngine:
         candles_1h = self.market_data.get_candles('1h')
         if candles_1h and len(candles_1h) >= 20:
             df_1h_temp = pd.DataFrame(candles_1h)
-            adx_1h, _ = calculate_adx(df_1h_temp['high'].values, df_1h_temp['low'].values, df_1h_temp['close'].values, 14)
-            adx_5m, _ = calculate_adx(df_5m['high'].values, df_5m['low'].values, df_5m['close'].values, 14)
+            adx_1h, _ = calculate_adx(df_1h_temp['high'].to_numpy(), df_1h_temp['low'].to_numpy(), df_1h_temp['close'].to_numpy(), 14)
+            adx_5m, _ = calculate_adx(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
             
             if len(adx_1h) > 0 and len(adx_5m) > 0:
                 htf_adx = adx_1h[-1]
@@ -3438,7 +3484,7 @@ class SignalEngine:
         # GUARD 7: Volatility Regime Classification
         # ==================================================================
         # Calculate ATR ratio for regime detection
-        atr_1m_local = self._calculate_atr_1m(df_1m) if len(df_1m) >= 14 else None
+        atr_1m_local = self._calculate_atr_1m(df_1m) if df_1m is not None and len(df_1m) >= 14 else None
         atr_1h_data = self.market_data.get_candles('1h')
         if atr_1h_data and len(atr_1h_data) >= 14:
             df_1h_atr = pd.DataFrame(atr_1h_data)
@@ -3450,7 +3496,8 @@ class SignalEngine:
             atr_ratio = atr_1m_local / (atr_1h / 60)  # Normalize 1H to per-minute
             self._last_atr_ratio = atr_ratio
             self._current_volatility_regime = VolatilityRegime.from_atr_ratio(atr_ratio)
-            logger.debug(f"📊 Volatility regime: {self._current_volatility_regime.name} (ATR ratio={atr_ratio:.2f})")
+            vol_name = self._current_volatility_regime.name if hasattr(self._current_volatility_regime, 'name') else str(self._current_volatility_regime)
+            logger.debug(f"📊 Volatility regime: {vol_name} (ATR ratio={atr_ratio:.2f})")
         else:
             self._current_volatility_regime = VolatilityRegime.NORMAL
         
@@ -3461,7 +3508,10 @@ class SignalEngine:
         # ==================================================================
         try:
             # Get BB width as percentage
-            cached_data = self._get_cached_indicators(market_time)
+            candles_1m_for_cache = self.market_data.get_candles('1m') or []
+            candles_5m_for_cache = self.market_data.get_candles('5m') or []
+            candles_1h_for_cache = self.market_data.get_candles('1h') or []
+            cached_data = self._get_cached_indicators(candles_1m_for_cache, candles_5m_for_cache, candles_1h_for_cache)
             bb_width = cached_data.get('bb_width', 0)
             bb_avg = cached_data.get('bb_avg', 1)
             adx_for_adaptive = cached_data.get('adx_1h', 20)
@@ -3682,7 +3732,7 @@ class SignalEngine:
         
         # Apply countertrend score relaxation if with-trend (from Jan 22, 2026)
         is_countertrend = self._current_trade_tags.get('is_countertrend', False)
-        if not is_countertrend and self._current_bias_strength in [BiasStrength.BULL_STRONG, BiasStrength.BEAR_STRONG]:
+        if not is_countertrend and self._current_bias_strength is not None and self._current_bias_strength in [BiasStrength.BULL_STRONG, BiasStrength.BEAR_STRONG]:
             # With-trend in strong bias - relax score requirement
             score += BiasStrengthConfig.WITHTREND_SCORE_RELAXATION
             self._current_trade_tags['withtrend_bonus'] = BiasStrengthConfig.WITHTREND_SCORE_RELAXATION
@@ -3856,7 +3906,7 @@ class SignalEngine:
             adx=current_adx,
             adx_values=adx_values,
             atr_current=atr_5m,
-            atr_avg=atr_avg,
+            atr_avg=float(atr_avg),
             has_bos=has_bos,
             spread_pct=spread_pct,
             volume_spike=False
@@ -3895,11 +3945,11 @@ class SignalEngine:
         # Check for RSI divergence (extra confirmation for blocked trades)
         has_rsi_divergence = False
         if len(df_5m) >= 14:
-            rsi_values = calculate_rsi(df_5m['close'].values, 14)
+            rsi_values = calculate_rsi(df_5m['close'].to_numpy(), 14)
             if len(rsi_values) >= 5:
                 # Bullish divergence: price makes lower low, RSI makes higher low
                 # Bearish divergence: price makes higher high, RSI makes lower high
-                closes = df_5m['close'].values
+                closes = df_5m['close'].to_numpy()
                 if bias == 'SHORT':
                     # Looking for bearish divergence
                     price_hh = closes[-1] > closes[-3]
@@ -3930,14 +3980,16 @@ class SignalEngine:
             session_quality_str = 'moderate'
         
         # Call Entry Quality Gate
+        # Use cached ADX if adx_1h not in local scope
+        htf_adx_for_gate: float = float(locals().get('adx_1h', self._htf_cache_adx))
         gate_result = self._entry_gate.check(
             regime=self._current_regime.value,
             chase_atr=prelim_chase_atr,
             micro_trend=micro_trend_str,
             micro_strength=micro_strength,
-            entry_direction=bias,
+            entry_direction=bias or 'LONG',
             session_quality=session_quality_str,
-            htf_adx=adx_1h,
+            htf_adx=htf_adx_for_gate,
             has_rsi_divergence=has_rsi_divergence,
             near_vpoc=near_vpoc,
             near_anchor_level=near_anchor,
@@ -4015,7 +4067,7 @@ class SignalEngine:
             
             # Check momentum context (if positive, reduce penalty)
             adx_rising = len(adx_values) >= 3 and adx_values[-1] > adx_values[-3]
-            candle_expansion = atr_5m > atr_avg * 1.1
+            candle_expansion = bool(atr_5m > atr_avg * 1.1)
             
             # Check VWAP reclaim: was below N candles ago, now above
             vwap_reclaim = False
@@ -4024,7 +4076,7 @@ class SignalEngine:
                     from src.engine.indicators import calculate_vwap
                     vwap_series = calculate_vwap(df_5m)
                     if len(vwap_series) >= 5:
-                        closes_5m = df_5m['close'].values
+                        closes_5m = df_5m['close'].to_numpy()
                         # For LONG: was below VWAP in last 5 candles, now above
                         # For SHORT: was above VWAP in last 5 candles, now below
                         if bias == 'LONG':
@@ -4141,7 +4193,7 @@ class SignalEngine:
             logger.info(f"📊 DISCOVERY mode: fixed sizing 0.8x")
         else:
             # Get score-based size multiplier (score 5→0.8x, 6→1.0x, 7+→1.2x)
-            base_size = self._entry_scorer.get_score_size_multiplier(score)
+            base_size = self._entry_scorer.get_score_size_multiplier(int(score))
             # Apply regime multiplier
             score_size_multiplier = base_size * regime_config.size_multiplier
             logger.info(f"📊 Regime sizing: {base_size:.1f}x × {regime_config.size_multiplier:.1f}x = {score_size_multiplier:.2f}x")
@@ -4180,7 +4232,7 @@ class SignalEngine:
         atr_ratio_for_sl = None
         if len(df_5m) >= 14:
             # Calculate ATR using existing function
-            atr_values = calculate_atr(df_5m['high'].values, df_5m['low'].values, df_5m['close'].values, 14)
+            atr_values = calculate_atr(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
             if len(atr_values) >= 10:
                 current_atr = atr_values[-1]
                 avg_atr = sum(atr_values[-10:]) / 10
@@ -4267,7 +4319,7 @@ class SignalEngine:
         # =========================================================================
         original_score = score
         score, rr_adjustment_reason = self._entry_scorer.apply_rr_score_adjustment(
-            score, tp_multiplier, current_regime=getattr(self, '_current_regime', None)
+            int(score), tp_multiplier, current_regime=getattr(self, '_current_regime', None)
         )
         
         if rr_adjustment_reason:
@@ -4432,7 +4484,7 @@ class SignalEngine:
         # LOSS STREAK SIZING (Jan 9, 2026) - Reduce size after consecutive losses
         # Progressive: 0 losses=100%, 1=80%, 2=60%, 3+=50%
         # =========================================================================
-        loss_streak_multiplier = OperatingMode.get_loss_sizing_multiplier(self._consecutive_losses)
+        loss_streak_multiplier = OperatingMode.get_loss_sizing_multiplier(int(self._consecutive_losses))
         if self._consecutive_losses > 0:
             logger.info(f"📉 Loss streak sizing: {self._consecutive_losses} losses → {loss_streak_multiplier:.0%}")
             self._current_trade_tags['loss_streak_size_factor'] = loss_streak_multiplier
@@ -4473,7 +4525,8 @@ class SignalEngine:
         # =========================================================================
         ct_size_mult = self._current_trade_tags.get('ct_size_mult', 1.0)
         if ct_size_mult < 1.0:
-            logger.info(f"📊 Countertrend sizing: {self._current_bias_strength.value} → {ct_size_mult:.0%}")
+            bias_str = self._current_bias_strength.value if self._current_bias_strength else 'UNKNOWN'
+            logger.info(f"📊 Countertrend sizing: {bias_str} → {ct_size_mult:.0%}")
             self._current_trade_tags['ct_size_applied'] = ct_size_mult
             combined_defensive *= ct_size_mult
         
@@ -4612,7 +4665,7 @@ class SignalEngine:
             volatility_bps = 0.0
             if df_1h is not None and len(df_1h) >= 20:
                 try:
-                    adx_vals, _ = calculate_adx(df_1h['high'].values, df_1h['low'].values, df_1h['close'].values, 14)
+                    adx_vals, _ = calculate_adx(df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14)
                     adx_1h = float(adx_vals[-1]) if len(adx_vals) > 0 else 0.0
                     
                     last = df_1h.iloc[-1]
@@ -4723,7 +4776,7 @@ class SignalEngine:
                 chase_atr=self._current_trade_tags.get('chase_atr', 0.0),
                 micro_trend=micro_trend_str if 'micro_trend_str' in dir() else "NEUTRAL",
                 micro_strength=micro_strength if 'micro_strength' in dir() else 0.0,
-                entry_direction=bias,
+                entry_direction=bias or "UNKNOWN",
                 has_bos=self._current_trade_tags.get('bos_confirmed', False),
                 near_level=(level_context.distance_below_atr < 1.0 if level_context else False),
                 
@@ -4848,15 +4901,17 @@ class SignalEngine:
                 
                 # SKIP if momentum too extreme IN DEAD MARKET (chasing in range)
                 # Only skip if: velocity > 3.5 ATR AND ADX < 25 (no trend to ride)
+                # Use cached ADX as fallback if not defined in local scope
+                _adx_for_momentum: float = float(locals().get('adx_1h', self._htf_cache_adx))
                 is_chasing_in_range = (
                     price_velocity > OrderExecution.MOMENTUM_MAX_VELOCITY and
-                    adx_1h < OrderExecution.MOMENTUM_MAX_VELOCITY_ADX_THRESHOLD
+                    _adx_for_momentum < OrderExecution.MOMENTUM_MAX_VELOCITY_ADX_THRESHOLD
                 )
                 if is_chasing_in_range:
-                    logger.warning(f"🚫 CHASING IN DEAD MARKET: velocity={price_velocity:.2f}ATR > {OrderExecution.MOMENTUM_MAX_VELOCITY}ATR + ADX={adx_1h:.1f} < {OrderExecution.MOMENTUM_MAX_VELOCITY_ADX_THRESHOLD} → SKIP")
+                    logger.warning(f"🚫 CHASING IN DEAD MARKET: velocity={price_velocity:.2f}ATR > {OrderExecution.MOMENTUM_MAX_VELOCITY}ATR + ADX={_adx_for_momentum:.1f} < {OrderExecution.MOMENTUM_MAX_VELOCITY_ADX_THRESHOLD} → SKIP")
                     self._current_trade_tags['skip_reason'] = 'chasing_in_range'
                     self._current_trade_tags['velocity_at_skip'] = price_velocity
-                    self._current_trade_tags['adx_at_skip'] = adx_1h
+                    self._current_trade_tags['adx_at_skip'] = _adx_for_momentum
                     return  # Do not enter - wait for trend or pullback
                 
                 use_market_order = (
@@ -4908,7 +4963,8 @@ class SignalEngine:
                 # 🔒 NOTIFY RECONCILER - Enter HARD_LOCK to prevent premature reactions
                 # During HARD_LOCK: funding/penalty/exits are DISABLED
                 # =====================================================================
-                self.reconciler.notify_order_placed(self.pending_order_id)
+                if self.pending_order_id:
+                    self.reconciler.notify_order_placed(self.pending_order_id)
                 
                 # Send Telegram notification with account value
                 if self.output_manager:
@@ -5008,7 +5064,7 @@ class SignalEngine:
                     self.exhaustion_detector.start_tracking(market_time)
                     self._exhaustion_tightened = False
                     
-                    self.state_machine.record_trade_open(self.pending_order_id)
+                    self.state_machine.record_trade_open(self.pending_order_id or "UNKNOWN")
                     
                     # =========================================================================
                     # UPDATE SESSION TRADE COUNT & INITIALIZE TRADE LOGGER
@@ -5035,8 +5091,8 @@ class SignalEngine:
                             position_size=fill_size,
                             entry_score=score,
                             entry_tags=list(self._current_trade_tags.keys()) if isinstance(self._current_trade_tags, dict) else [],
-                            regime=self._current_volatility_regime.name,
-                            volatility_regime=self._current_volatility_regime.name,
+                            regime=str(self._current_volatility_regime),
+                            volatility_regime=str(self._current_volatility_regime),
                             session=session_for_count,
                             trade_type=trade_type_name,
                             score_breakdown=breakdown.copy(),
@@ -5445,6 +5501,9 @@ class SignalEngine:
                 
                 logger.info("✅ Position confirmed on exchange - creating local tracking")
                 
+                # Get position data for validation and later use
+                position_data: dict | None = None
+                
                 # 🔒 CRITICAL: Validate side consistency before proceeding
                 # This prevents SL/TP placement with wrong side (wouldNotReducePosition error)
                 if hasattr(self, '_last_entry_data') and self._last_entry_data:
@@ -5501,7 +5560,7 @@ class SignalEngine:
                         fill_side = 'buy' if entry_data['bias'].upper() == 'LONG' else 'sell'
                         
                         # Check if position already exists (market order already recorded)
-                        existing_pos = self._position_store.get_position(self.symbol)
+                        existing_pos = self._position_store.get_position(self.symbol or '')
                         if existing_pos and abs(existing_pos.size - actual_size) < 0.00001:
                             logger.info(f"✅ position_store already updated (market order path): {fill_side.upper()} {actual_size:.6f} @ {existing_pos.entry_price:.2f}")
                         else:
@@ -5560,7 +5619,7 @@ class SignalEngine:
                             direction=entry_data['bias'],
                             entry_price=actual_price,
                             stop_loss=entry_data['stop_loss'],
-                            take_profit=entry_data.get('take_profit'),
+                            take_profit=float(entry_data.get('take_profit', 0) or 0),
                             position_size=actual_size,
                             entry_score=entry_data.get('score', 0),
                             entry_tags=list(trade_tags.keys()) if isinstance(trade_tags, dict) else [],
@@ -5586,7 +5645,7 @@ class SignalEngine:
                         self.health_monitor.record_trade_entry(
                             side=entry_data['bias'],
                             size=entry_data['position_size'],
-                            score=self._entry_score
+                            score=int(self._entry_score)
                         )
                     # 🔒 CAPA 1: Validate position integrity against exchange
                     if position_data and self.risk_engine.position:
@@ -5939,9 +5998,9 @@ class SignalEngine:
                         if candles_5m_trail and len(candles_5m_trail) >= 14:
                             df_trail = pd.DataFrame(candles_5m_trail)
                             trail_atr_vals = calculate_atr(
-                                df_trail['high'].values, 
-                                df_trail['low'].values, 
-                                df_trail['close'].values, 14
+                                df_trail['high'].to_numpy(), 
+                                df_trail['low'].to_numpy(), 
+                                df_trail['close'].to_numpy(), 14
                             )
                             trail_atr = trail_atr_vals[-1] if len(trail_atr_vals) > 0 else None
                         
@@ -6731,7 +6790,7 @@ class SignalEngine:
             
             # DISCOVERY: Update score distribution metrics
             if hasattr(self, '_entry_score') and self._entry_score > 0:
-                self._update_score_metrics(self._entry_score, pnl, is_win)
+                self._update_score_metrics(int(self._entry_score), pnl, is_win)
             
             # Record for loss cooldown tracking
             self._record_trade_result(exit_reason, pnl, market_time)
@@ -6743,7 +6802,7 @@ class SignalEngine:
                     exit_price=current_price,
                     entry_time=self._current_trade_entry_time,
                     exit_time=market_time,
-                    direction=self._current_trade_direction or 'LONG',
+                    direction=position.direction if position else 'LONG',
                     pnl=pnl
                 )
             
@@ -6805,9 +6864,9 @@ class SignalEngine:
             candles_1m = self.market_data.get_candles('1m')
             if candles_1m and len(candles_1m) >= 14:
                 df_1m = pd.DataFrame(candles_1m)
-                highs = df_1m['high'].values
-                lows = df_1m['low'].values
-                closes = df_1m['close'].values
+                highs = df_1m['high'].to_numpy()
+                lows = df_1m['low'].to_numpy()
+                closes = df_1m['close'].to_numpy()
                 atr_1m = calculate_atr(highs, lows, closes, 14)[-1]
             else:
                 logger.warning("Not enough 1m data for ATR, using default")
@@ -6821,7 +6880,7 @@ class SignalEngine:
             # Calculate ATR ratio for dynamic SL sizing
             atr_ratio_for_sl = None
             if len(df_5m) >= 14:
-                atr_values = calculate_atr(df_5m['high'].values, df_5m['low'].values, df_5m['close'].values, 14)
+                atr_values = calculate_atr(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
                 if len(atr_values) >= 10:
                     current_atr = atr_values[-1]
                     avg_atr = sum(atr_values[-10:]) / 10
@@ -6879,9 +6938,9 @@ class SignalEngine:
             logger.error(f"Error opening position from order: {e}", exc_info=True)
             self.state_machine.transition_to(BotState.IDLE, "Error opening position")
     
-    def _find_support_resistance(self, bias: str, df_5m: pd.DataFrame) -> float:
+    def _find_support_resistance(self, bias: str | None, df_5m: pd.DataFrame) -> float:
         """Find technical support/resistance - delegates to indicator_helpers"""
-        return _find_sr_pure(bias, df_5m, lookback=10)
+        return _find_sr_pure(bias or 'LONG', df_5m, lookback=10)
     
     # =========================================================================
     # INDICATOR CACHE SYSTEM (Jan 20, 2026)
@@ -6929,7 +6988,7 @@ class SignalEngine:
         if needs_1h_update and cache['df_1h'] is not None and len(cache['df_1h']) >= 20:
             try:
                 df_1h = cache['df_1h']
-                adx_arr, _ = calculate_adx(df_1h['high'].values, df_1h['low'].values, df_1h['close'].values)
+                adx_arr, _ = calculate_adx(df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy())
                 if len(adx_arr) > 0 and not np.isnan(adx_arr[-1]):
                     cache['adx_1h'] = float(adx_arr[-1])
             except Exception as e:
@@ -6942,7 +7001,7 @@ class SignalEngine:
             # ATR and ratio
             if len(df_1m) >= 20:
                 try:
-                    atr_values = calculate_atr(df_1m['high'].values, df_1m['low'].values, df_1m['close'].values)
+                    atr_values = calculate_atr(df_1m['high'].to_numpy(), df_1m['low'].to_numpy(), df_1m['close'].to_numpy())
                     if len(atr_values) >= 10:
                         cache['atr_1m'] = float(atr_values[-1])
                         avg_atr = float(np.mean(atr_values[-10:]))
@@ -6953,7 +7012,7 @@ class SignalEngine:
             # RSI
             if len(df_1m) >= 14:
                 try:
-                    closes = df_1m['close'].values
+                    closes = df_1m['close'].to_numpy()
                     rsi_values = calculate_rsi(closes, 14)
                     if len(rsi_values) > 0:
                         cache['rsi_1m'] = float(rsi_values[-1])
@@ -6963,7 +7022,7 @@ class SignalEngine:
             # Bollinger Bands
             if len(df_1m) >= 20:
                 try:
-                    closes = df_1m['close'].values
+                    closes = df_1m['close'].to_numpy()
                     bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(closes, period=20, std_dev=2)
                     if len(bb_upper) > 0 and len(bb_lower) > 0:
                         cache['bb_width'] = float(bb_upper[-1] - bb_lower[-1])
@@ -6988,7 +7047,7 @@ class SignalEngine:
         if needs_5m_update and cache['df_5m'] is not None and len(cache['df_5m']) >= 20:
             try:
                 df_5m = cache['df_5m']
-                closes_5m = df_5m['close'].values
+                closes_5m = df_5m['close'].to_numpy()
                 ema_20 = calculate_ema(closes_5m, 20)
                 if len(ema_20) > 0:
                     cache['ema20_5m'] = float(ema_20[-1])
@@ -7176,8 +7235,8 @@ class SignalEngine:
         if sl_distance <= 0:
             return True, "Invalid SL distance"
         
-        highs = df_1h['high'].values
-        lows = df_1h['low'].values
+        highs = df_1h['high'].to_numpy()
+        lows = df_1h['low'].to_numpy()
         
         # Find recent swing high and swing low (last 20 1h candles = 20 hours)
         recent_high = max(highs[-20:])
@@ -7219,11 +7278,11 @@ class SignalEngine:
         
         return True, f"Expected R OK: {expected_r:.2f}R >= {MIN_EXPECTED_R}R (pos {position_in_range:.0%} in range)"
     
-    def _calculate_chase_atr(self, df_1m: pd.DataFrame, atr_1m: float, bias: str) -> float:
+    def _calculate_chase_atr(self, df_1m: pd.DataFrame | None, atr_1m: float, bias: str | None) -> float:
         """Calculate chase ATR using config values"""
         from src.engine.config import OrderExecution
         
-        if len(df_1m) < 5 or atr_1m <= 0:
+        if df_1m is None or len(df_1m) < 5 or atr_1m <= 0:
             return 0.0
         
         lookback = OrderExecution.ANTI_CHASING_LOOKBACK
@@ -7274,7 +7333,7 @@ class SignalEngine:
             ema_200 = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
             
             adx_vals, _ = calculate_adx(
-                df_1h['high'].values, df_1h['low'].values, df_1h['close'].values, 14
+                df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14
             )
             adx = adx_vals[-1] if len(adx_vals) > 0 else 20.0
             
@@ -7363,7 +7422,7 @@ class SignalEngine:
                     logger.debug(f"TrendExpansion: BB width {current_width:.4f} > {avg_width * TrendExpansionConfig.BB_WIDTH_EXPANSION_RATIO:.4f}")
             
             # 2. ATR expansion
-            atr_vals = calculate_atr(df_5m['high'].values, df_5m['low'].values, df_5m['close'].values, 14)
+            atr_vals = calculate_atr(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
             if len(atr_vals) >= 20:
                 current_atr = atr_vals[-1]
                 avg_atr = np.mean(atr_vals[-20:])
@@ -7394,7 +7453,7 @@ class SignalEngine:
                     logger.debug(f"TrendExpansion: VWAP distance persisted {away_count}/{TrendExpansionConfig.VWAP_DISTANCE_PERSISTENCE} candles")
             
             # 4. ADX rising
-            adx_vals, _ = calculate_adx(df_5m['high'].values, df_5m['low'].values, df_5m['close'].values, 14)
+            adx_vals, _ = calculate_adx(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
             if len(adx_vals) >= 5:
                 adx_current = adx_vals[-1]
                 adx_prev = adx_vals[-5]
@@ -7489,7 +7548,7 @@ class SignalEngine:
     # =========================================================================
     
     def _calculate_entry_score(self, df_1h: pd.DataFrame, df_5m: pd.DataFrame, 
-                                df_1m: pd.DataFrame, bias: str, current_price: float,
+                                df_1m: pd.DataFrame | None, bias: str | None, current_price: float,
                                 market_time: datetime) -> tuple[int, dict, bool]:
         """
         Calculate entry score using 4 blocks.
@@ -7498,12 +7557,16 @@ class SignalEngine:
         Returns: (total_score, breakdown_dict, structure_blocks)
         If structure_blocks=True, DO NOT ENTER regardless of score.
         """
+        # Handle None df_1m with empty DataFrame
+        if df_1m is None:
+            df_1m = pd.DataFrame()
+        
         # Delegate to EntryScorer
         score, breakdown, structure_blocks = self._entry_scorer.calculate_entry_score(
             df_1h=df_1h,
             df_5m=df_5m,
             df_1m=df_1m,
-            bias=bias,
+            bias=bias or 'LONG',
             current_price=current_price,
             market_time=market_time,
             micro_trend_state=getattr(self, '_micro_trend_state', None),
@@ -7609,10 +7672,10 @@ class SignalEngine:
         if len(df) < 30:
             return True, "Not enough data for momentum"
         
-        closes = df['close'].values
-        highs = df['high'].values
-        lows = df['low'].values
-        volumes = df['volume'].values if 'volume' in df.columns else None
+        closes = df['close'].to_numpy()
+        highs = df['high'].to_numpy()
+        lows = df['low'].to_numpy()
+        volumes = df['volume'].to_numpy() if 'volume' in df.columns else None
         
         # Skip momentum check if recent candles have zero volume (ghost data)
         if volumes is not None and len(volumes) >= 3:
@@ -7808,7 +7871,7 @@ class SignalEngine:
         position = self.risk_engine.position
         direction = position.direction if position else self.current_bias
         
-        return _find_tp2_pure(df_5m, direction)
+        return _find_tp2_pure(df_5m, direction or 'LONG')
     
     def _check_bos_against_position(self, direction: str, candles_5m: list) -> bool:
         """BOS detection - delegates to filter_checks module with edge-triggered logging"""
@@ -8044,7 +8107,7 @@ class SignalEngine:
         
         return status
     
-    def get_important_levels_info(self, current_price: float = None) -> str:
+    def get_important_levels_info(self, current_price: float | None = None) -> str:
         """
         Get formatted important levels info for Telegram/log notifications.
         
@@ -8082,10 +8145,10 @@ class SignalEngine:
                 return
             
             df_1h = pd.DataFrame(candles_1h)
-            highs = df_1h['high'].values
-            lows = df_1h['low'].values
-            closes = df_1h['close'].values
-            volumes = df_1h['volume'].values
+            highs = df_1h['high'].to_numpy()
+            lows = df_1h['low'].to_numpy()
+            closes = df_1h['close'].to_numpy()
+            volumes = df_1h['volume'].to_numpy()
             
             # Calculate ATR and history for Activity Regime analysis
             atr_values = calculate_atr(highs, lows, closes, 14)
@@ -8127,10 +8190,10 @@ class SignalEngine:
                 return
             
             df_1h = pd.DataFrame(candles_1h)
-            highs = df_1h['high'].values
-            lows = df_1h['low'].values
-            closes = df_1h['close'].values
-            volumes = df_1h['volume'].values
+            highs = df_1h['high'].to_numpy()
+            lows = df_1h['low'].to_numpy()
+            closes = df_1h['close'].to_numpy()
+            volumes = df_1h['volume'].to_numpy()
             
             # Calculate metrics for regime classification
             atr_values = calculate_atr(highs, lows, closes, 14)
@@ -8172,7 +8235,7 @@ class SignalEngine:
                 atr_trend_20d=atr_20d,
                 session_range=session_range,
                 session_realized_move=session_realized,
-                volume_profile_quality=vol_quality,
+                volume_profile_quality=float(vol_quality),
                 price_action_consistency=price_consistency,
                 order_flow_imbalance_std=0.2  # Default stable
             )

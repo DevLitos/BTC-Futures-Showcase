@@ -126,7 +126,7 @@ class RegimeClassifier:
     def classify(self,
                  df_1h: pd.DataFrame,
                  spread_bps: float = 0.0,
-                 market_time: datetime = None) -> Tuple[str, RegimeConfig, Dict]:
+                 market_time: datetime | None = None) -> Tuple[str, RegimeConfig, Dict]:
         """
         Classify market regime based on ADX and liquidity.
         
@@ -151,9 +151,9 @@ class RegimeClassifier:
             logger.debug("RegimeClassifier: Insufficient data, defaulting to TREND")
             return 'TREND', REGIME_CONFIGS['TREND'], metadata
         
-        highs = df_1h['high'].values
-        lows = df_1h['low'].values
-        closes = df_1h['close'].values
+        highs = df_1h['high'].to_numpy()
+        lows = df_1h['low'].to_numpy()
+        closes = df_1h['close'].to_numpy()
         
         # Calculate ADX
         adx_values, adx_slope = calculate_adx(highs, lows, closes, 14)

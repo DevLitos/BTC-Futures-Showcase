@@ -209,7 +209,7 @@ class VersionManager:
             frozen_at=datetime.now(UTC).isoformat()
         )
     
-    def freeze_version(self, tag: str = None) -> str:
+    def freeze_version(self, tag: str | None = None) -> str:
         """
         Freeze current version to a snapshot file.
         
@@ -335,7 +335,7 @@ def get_version() -> str:
     return VERSION
 
 
-def freeze_current_version(tag: str = None) -> str:
+def freeze_current_version(tag: str | None = None) -> str:
     """Freeze current version to file."""
     return get_version_manager().freeze_version(tag)
 

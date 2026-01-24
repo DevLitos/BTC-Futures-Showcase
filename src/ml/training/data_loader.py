@@ -46,20 +46,22 @@ class TradeDataLoader:
         Returns:
             Number of trades loaded
         """
-        self._df = load_trades_from_jsonl(self.trade_logs_dir)
+        df = load_trades_from_jsonl(self.trade_logs_dir)
         
-        if self._df.empty:
+        if df.empty:
+            self._df = df
             return 0
         
         # Filter by date if specified
-        if min_date and 'entry_time' in self._df.columns:
-            self._df = self._df[self._df['entry_time'] >= min_date]
+        if min_date and 'entry_time' in df.columns:
+            df = df[df['entry_time'] >= min_date]  # pyright: ignore[reportAttributeAccessIssue]
         
-        if max_date and 'entry_time' in self._df.columns:
-            self._df = self._df[self._df['entry_time'] <= max_date]
+        if max_date and 'entry_time' in df.columns:
+            df = df[df['entry_time'] <= max_date]  # pyright: ignore[reportAttributeAccessIssue]
         
-        logger.info(f"Loaded {len(self._df)} trades")
-        return len(self._df)
+        self._df = df  # pyright: ignore[reportAttributeAccessIssue]
+        logger.info(f"Loaded {len(df)} trades")
+        return len(df)
     
     def get_train_val_split(
         self,

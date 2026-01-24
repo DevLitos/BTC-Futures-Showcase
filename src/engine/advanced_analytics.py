@@ -37,6 +37,7 @@ try:
     from src.engine.capital_weighting import TimeRiskConfig
     _CAPITAL_WEIGHTING_AVAILABLE = True
 except ImportError:
+    TimeRiskConfig = None  # type: ignore[misc, assignment]
     _CAPITAL_WEIGHTING_AVAILABLE = False
 
 # Integration with Market Regime
@@ -44,6 +45,8 @@ try:
     from src.engine.regime.market_regime import ManagementRegime, get_regime_classifier
     _MARKET_REGIME_AVAILABLE = True
 except ImportError:
+    ManagementRegime = None  # type: ignore[misc, assignment]
+    get_regime_classifier = None  # type: ignore[misc, assignment]
     _MARKET_REGIME_AVAILABLE = False
 
 # Integration with Risk Middleware
@@ -51,6 +54,8 @@ try:
     from src.engine.risk.risk_middleware import SetupGrade, get_risk_middleware
     _RISK_MIDDLEWARE_AVAILABLE = True
 except ImportError:
+    SetupGrade = None  # type: ignore[misc, assignment]
+    get_risk_middleware = None  # type: ignore[misc, assignment]
     _RISK_MIDDLEWARE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
@@ -89,7 +94,7 @@ class SLBinConfig:
     negative_expectancy_threshold: float = 0.0  # Below this = problem
 
 
-def classify_sl_bin(sl_distance: float, atr: float, config: SLBinConfig = None) -> str:
+def classify_sl_bin(sl_distance: float, atr: float, config: SLBinConfig | None = None) -> str:
     """
     Classify SL into size bins at trade entry.
     
@@ -132,7 +137,7 @@ class TradeInstrumentationData:
     symbol: str = ""
     
     # Entry details
-    entry_time: datetime = None
+    entry_time: datetime | None = None
     entry_price: float = 0.0
     direction: str = ""  # LONG or SHORT
     position_size: float = 0.0
@@ -217,7 +222,7 @@ class TradeInstrumenter:
                          atr: float = 0.0,
                          adx: float = 0.0,
                          setup_type: str = "DEFAULT",
-                         market_time: datetime = None,
+                         market_time: datetime | None = None,
                          **kwargs) -> TradeInstrumentationData:
         """
         Instrument a trade at entry time.
@@ -236,14 +241,14 @@ class TradeInstrumenter:
         atr_ratio = 1.0
         regime_mult = 1.0
         
-        if _MARKET_REGIME_AVAILABLE:
+        if _MARKET_REGIME_AVAILABLE and get_regime_classifier is not None:
             classifier = get_regime_classifier()
             regime = classifier.get_current_regime()
             if regime:
                 regime_str = regime.value
+                guidance = classifier.get_regime_guidance(regime)
+                regime_mult = guidance.risk_multiplier if guidance else 1.0
             atr_ratio = classifier.update_atr_baseline(atr) if atr > 0 else 1.0
-            guidance = classifier.get_regime_guidance(regime)
-            regime_mult = guidance.risk_multiplier if guidance else 1.0
         
         # Get setup grade if middleware available
         setup_grade = "B"
@@ -253,7 +258,7 @@ class TradeInstrumenter:
         base_risk = 0.8
         adjusted_risk = 0.8
         
-        if _RISK_MIDDLEWARE_AVAILABLE:
+        if _RISK_MIDDLEWARE_AVAILABLE and get_risk_middleware is not None:
             middleware = get_risk_middleware()
             grade = middleware.classify_setup(setup_type)
             setup_grade = grade.value
@@ -515,7 +520,7 @@ class SessionAnalyzer:
     @classmethod
     def get_risk_scale(cls, session: str) -> float:
         """Get risk scaling factor for session."""
-        if _CAPITAL_WEIGHTING_AVAILABLE:
+        if _CAPITAL_WEIGHTING_AVAILABLE and TimeRiskConfig is not None:
             config = TimeRiskConfig()
             multipliers = config.SESSION_MULTIPLIERS
             
@@ -998,8 +1003,8 @@ def get_analytics_engine() -> TradeAnalyticsEngine:
     return _analytics_engine
 
 
-def analyze_trades(trades: List[Dict] = None, 
-                   filepath: str = None) -> TradeAnalytics:
+def analyze_trades(trades: List[Dict] | None = None, 
+                   filepath: str | None = None) -> TradeAnalytics:
     """
     Convenience function to analyze trades.
     
@@ -1022,7 +1027,7 @@ def analyze_trades(trades: List[Dict] = None,
     return engine.compute_analytics(engine.trades)
 
 
-def print_analytics_report(filepath: str = None) -> None:
+def print_analytics_report(filepath: str | None = None) -> None:
     """Print comprehensive analytics report."""
     engine = get_analytics_engine()
     

@@ -34,7 +34,7 @@ class ImpulseTracker:
         self.impulse_atr = None  # ATR at impulse time
     
     def update_impulse(self, current_high: float, current_low: float, 
-                      current_atr: float, bos_confirmed: bool, market_time: datetime = None):
+                      current_atr: float, bos_confirmed: bool, market_time: datetime | None = None):
         """Update impulse after BOS confirmation"""
         if bos_confirmed and not self.bos_confirmed:
             # New impulse starts
@@ -57,7 +57,7 @@ class ImpulseTracker:
     
     def log_impulse_state(self, current_price: float, pullback_low: float, atr_5m: float):
         """Log detailed impulse information"""
-        if self.impulse_high:
+        if self.impulse_high and self.impulse_low:
             pullback = self.get_pullback_depth(pullback_low, atr_5m)
             impulse_range = self.impulse_high - self.impulse_low
             logger.debug(f"IMPULSE_STATE: High={self.impulse_high:.2f} Low={self.impulse_low:.2f} "
@@ -173,8 +173,8 @@ class BlackSwanFilter:
         self.defensive_until: Optional[datetime] = None
     
     def check(self, price_change: float, atr: float, market_time: datetime,
-              candle_high: float = None, candle_low: float = None,
-              candle_open: float = None, candle_close: float = None) -> Tuple[bool, str]:
+              candle_high: float | None = None, candle_low: float | None = None,
+              candle_open: float | None = None, candle_close: float | None = None) -> Tuple[bool, str]:
         """
         Check for black swan conditions
         
@@ -320,9 +320,9 @@ class HTFFilter:
             return False, None, f"Insufficient data for HTF filter ({len(df_1h)} < 50 candles)"
         
         # Calculate indicators
-        closes = df_1h['close'].values
-        highs = df_1h['high'].values
-        lows = df_1h['low'].values
+        closes = df_1h['close'].to_numpy()
+        highs = df_1h['high'].to_numpy()
+        lows = df_1h['low'].to_numpy()
         
         ema_50 = calculate_ema(closes, 50)[-1]
         
@@ -497,7 +497,7 @@ class HTFFilter:
         if len(df) < periods + 1:
             return False
         
-        recent_lows = df['low'].values[-periods:]
+        recent_lows = df['low'].to_numpy()[-periods:]
         for i in range(1, len(recent_lows)):
             if recent_lows[i] < recent_lows[i-1]:
                 return True
@@ -508,10 +508,10 @@ class HTFFilter:
         if len(df) < periods + 1:
             return False
         
-        recent_highs = df['high'].values[-periods-1:-1]
+        recent_highs = df['high'].to_numpy()[-periods-1:-1]
         current_high = df['high'].iloc[-1]
         
-        return current_high > np.max(recent_highs)
+        return current_high > float(np.amax(np.asarray(recent_highs)))
 
 
 class MTFStructureFilter:
@@ -530,9 +530,9 @@ class MTFStructureFilter:
             return False, "Insufficient data for MTF filter"
         
         current_price = df_5m['close'].iloc[-1]
-        highs = df_5m['high'].values
-        lows = df_5m['low'].values
-        closes = df_5m['close'].values
+        highs = df_5m['high'].to_numpy()
+        lows = df_5m['low'].to_numpy()
+        closes = df_5m['close'].to_numpy()
         
         # Calculate indicators
         ema_20 = calculate_ema(closes, 20)[-1]
@@ -795,8 +795,8 @@ class LTFTriggerFilter:
         self.backtest_mode = backtest_mode
         self._last_ltf_info = {}  # Store LTF details for trade tags
     
-    def check(self, df_1m: pd.DataFrame, bias: str, orderbook: dict = None,
-              regime: str = None, regime_confidence: float = 0.0) -> Tuple[bool, str]:
+    def check(self, df_1m: pd.DataFrame, bias: str, orderbook: dict | None = None,
+              regime: str | None = None, regime_confidence: float = 0.0) -> Tuple[bool, str]:
         """
         Check LTF trigger conditions (PRICE-BASED PRIMARY)
         
@@ -813,18 +813,18 @@ class LTFTriggerFilter:
             return False, "Insufficient data for LTF filter"
         
         current_candle = df_1m.iloc[-1]
-        closes = df_1m['close'].values
-        volumes = df_1m['volume'].values
-        highs = df_1m['high'].values
-        lows = df_1m['low'].values
+        closes = df_1m['close'].to_numpy()
+        volumes = df_1m['volume'].to_numpy()
+        highs = df_1m['high'].to_numpy()
+        lows = df_1m['low'].to_numpy()
         
         current_price = closes[-1]
         
         # ===== PRIMARY TRIGGER: PRICE STRUCTURE =====
         
         # 1. BOS LTF (Break of Structure en 1m) - relaxed
-        recent_high = np.max(highs[-5:-1])  # Last 5 candles (excluding current)
-        recent_low = np.min(lows[-5:-1])
+        recent_high = float(np.amax(np.asarray(highs[-5:-1])))  # Last 5 candles (excluding current)
+        recent_low = float(np.amin(np.asarray(lows[-5:-1])))
         
         bos_confirmed = False
         

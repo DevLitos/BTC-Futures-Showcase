@@ -131,7 +131,7 @@ class ManagementRegimeClassifier:
     No lagging indicators - uses volatility relative to baseline.
     """
     
-    def __init__(self, config: RegimeConfig = None):
+    def __init__(self, config: RegimeConfig | None = None):
         self.config = config or RegimeConfig()
         
         # ATR baseline tracking
@@ -244,12 +244,12 @@ class ManagementRegimeClassifier:
     def classify_regime(self,
                         adx: float,
                         current_atr: float,
-                        opens: np.ndarray = None,
-                        highs: np.ndarray = None,
-                        lows: np.ndarray = None,
-                        closes: np.ndarray = None,
-                        volumes: np.ndarray = None,
-                        market_time: datetime = None) -> Tuple[ManagementRegime, Dict[str, Any]]:
+                        opens: np.ndarray | None = None,
+                        highs: np.ndarray | None = None,
+                        lows: np.ndarray | None = None,
+                        closes: np.ndarray | None = None,
+                        volumes: np.ndarray | None = None,
+                        market_time: datetime | None = None) -> Tuple[ManagementRegime, Dict[str, Any]]:
         """
         Classify current market regime.
         
@@ -371,7 +371,7 @@ class ManagementRegimeClassifier:
         # Fallback
         return ManagementRegime.MEAN_REVERSION
     
-    def get_regime_guidance(self, regime: ManagementRegime = None) -> RegimeGuidance:
+    def get_regime_guidance(self, regime: ManagementRegime | None = None) -> RegimeGuidance:
         """Get trading guidance for a regime."""
         regime = regime or self._last_regime or ManagementRegime.MEAN_REVERSION
         return REGIME_GUIDANCE[regime]
@@ -431,7 +431,7 @@ def classify_market_regime(adx: float,
     return classifier.classify_regime(adx, current_atr, **kwargs)
 
 
-def get_regime_risk_multiplier(regime: ManagementRegime = None) -> float:
+def get_regime_risk_multiplier(regime: ManagementRegime | None = None) -> float:
     """Get risk multiplier for current/specified regime."""
     classifier = get_regime_classifier()
     guidance = classifier.get_regime_guidance(regime)

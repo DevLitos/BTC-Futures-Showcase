@@ -168,11 +168,11 @@ def with_retry(
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         async def wrapper(*args, **kwargs) -> T:
-            last_exception = None
+            last_exception: Exception | None = None
             
             for attempt in range(max_retries + 1):
                 try:
-                    return await func(*args, **kwargs)
+                    return await func(*args, **kwargs)  # pyright: ignore[reportReturnType, reportGeneralTypeIssues]
                 except retryable_exceptions as e:
                     last_exception = e
                     
@@ -196,9 +196,10 @@ def with_retry(
             # Should not reach here, but just in case
             if last_exception:
                 raise last_exception
+            raise RuntimeError("Unexpected: no exception but loop finished")  # pyright: ignore[reportUnreachable]
                 
-        return wrapper
-    return decorator
+        return wrapper  # pyright: ignore[reportReturnType]
+    return decorator  # pyright: ignore[reportReturnType]
 
 # =========================================================================
 # SIZE PRECISION CONSTANTS (Kraken Futures BTC/USD:USD)
@@ -252,7 +253,7 @@ class RESTExecutionEngine:
     - Post-only obligatorio
     """
     
-    def __init__(self, exchange: str = 'binance', credentials: dict = None):
+    def __init__(self, exchange: str = 'binance', credentials: dict | None = None):
         self.exchange_name = exchange
         self.credentials = credentials or {}
         self.exchange = None
@@ -326,9 +327,9 @@ class RESTExecutionEngine:
             raise
     
     async def place_limit_order(self, symbol: str, side: str, amount: float, 
-                               price: float, stop_loss: float = None, 
-                               take_profit: float = None,
-                               client_order_id: str = None) -> Optional[Dict]:
+                               price: float, stop_loss: float | None = None, 
+                               take_profit: float | None = None,
+                               client_order_id: str | None = None) -> Optional[Dict]:
         """
         Colocar orden limit post-only con SL/TP ATOMICOS
         
@@ -631,6 +632,8 @@ class RESTExecutionEngine:
                         
                         # Method 2: Check recent trades for this order
                         try:
+                            if self.exchange is None:
+                                raise RuntimeError("Exchange not initialized")
                             trades = await asyncio.wait_for(
                                 self.exchange.fetch_my_trades(symbol, limit=20),
                                 timeout=EXCHANGE_TIMEOUT_SHORT
@@ -820,8 +823,8 @@ class RESTExecutionEngine:
             # En caso de error, asumir que NO hay posición (menos disruptivo)
             return False
     
-    async def set_position_stops(self, symbol: str, stop_loss: float = None, 
-                                  take_profit: float = None) -> bool:
+    async def set_position_stops(self, symbol: str, stop_loss: float | None = None, 
+                                  take_profit: float | None = None) -> bool:
         """
         ⚠️ CRITICAL FIX para Kraken Futures SL/TP placement
         
@@ -1460,7 +1463,7 @@ class RESTExecutionEngine:
             logger.error(f"Error verifying stops on exchange: {e}")
             return {'has_sl': False, 'has_tp': False, 'orders': []}
     
-    async def close_position_market(self, symbol: str = None, side: str = None, amount: float = None, reason: str = "EMERGENCY") -> Optional[Dict]:
+    async def close_position_market(self, symbol: str | None = None, side: str | None = None, amount: float | None = None, reason: str = "EMERGENCY") -> Optional[Dict]:
         """
         Cerrar posición a mercado con timeout y retry
         
@@ -1477,13 +1480,17 @@ class RESTExecutionEngine:
         
         # Use stored symbol if not provided
         if symbol is None:
-            if hasattr(self, 'current_symbol') and self.current_symbol:
-                symbol = self.current_symbol
+            current_sym = getattr(self, 'current_symbol', None)
+            if current_sym:
+                symbol = current_sym
             else:
                 logger.error("Emergency close called without symbol and no current_symbol set")
                 # Use default as last resort but log it clearly
                 symbol = 'BTC/USD:USD'
                 logger.warning(f"Using fallback symbol: {symbol}")
+        
+        # At this point symbol must be a string
+        assert symbol is not None, "Symbol must be set by now"
         
         MAX_RETRIES = 3
         RETRY_DELAY = 2.0
@@ -1989,9 +1996,9 @@ class RESTExecutionEngine:
         }
     
     async def place_market_order(self, symbol: str, side: str, amount: float,
-                                  stop_loss: float = None, 
-                                  take_profit: float = None,
-                                  client_order_id: str = None) -> Optional[Dict]:
+                                  stop_loss: float | None = None, 
+                                  take_profit: float | None = None,
+                                  client_order_id: str | None = None) -> Optional[Dict]:
         """
         Place market order with optional SL/TP.
         

@@ -69,7 +69,7 @@ class Lifecycle(ABC):
         """
         pass
     
-    def _create_task(self, coro, name: str = None) -> asyncio.Task:
+    def _create_task(self, coro, name: str | None = None) -> asyncio.Task:
         """
         Create and track a background task.
         

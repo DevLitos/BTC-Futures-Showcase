@@ -154,7 +154,7 @@ class IntelligentFilter:
         exchange_connected: bool = True,
         
         # Context
-        market_time: datetime = None,
+        market_time: datetime | None = None,
     ) -> IntelligentFilterDecision:
         """
         Evaluate all filters and return intelligent decision.
