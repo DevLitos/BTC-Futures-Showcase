@@ -133,6 +133,7 @@ from src.ml.inference import get_ml_inference_engine
 # NEW ARCHITECTURE: Position Store as Single Source of Truth
 from src.core import RuntimeMode, get_runtime_config
 from src.accounting import get_position_store, TrackedPosition
+from src.core.cost_model import get_cost_model  # 🔥 FIX (Jan 24): Cost validator
 
 logger = logging.getLogger(__name__)
 
@@ -461,18 +462,25 @@ class SignalEngine:
         # PROBLEM: 2 losses triggered 30min cooldown - this is normal variance
         # SOLUTION: Tiered cooldown with higher thresholds:
         #   - 3 consecutive losses → 15 min cooldown (tier 1)
-        #   - 4+ consecutive losses → 45 min cooldown (tier 2)
+        #   - 4 consecutive losses → 60 min cooldown (tier 2)
+        #   - 5 consecutive losses → 180 min cooldown (tier 3)
+        #   - 6 consecutive losses → KILL SWITCH (daily)
         # 
-        # Rationale: With 60% winrate, 3 consecutive losses happens ~6% of time
-        # Normal variance - take a break but don't kill activity
+        # 🔥 FIX (Jan 25, 2026): Enhanced auto kill-switch + dead hours tracking
         # =====================================================================
         self._consecutive_losses = 0  # Tracks consecutive SL hits
         self._cooldown_until = None  # Timestamp when cooldown ends
-        # 🔥 FIX (Jan 22, 2026): Reduced cooldowns - less time blocked = more opportunities
-        # 🔥 FIX v2: Even lighter - 60% winrate means 3 losses = 6% probability (normal)
-        self._cooldown_minutes = 8   # Cooldown duration after 4+ consecutive losses (was 15)
-        self._cooldown_minutes_tier1 = 3  # Shorter cooldown after 3 losses (was 5)
-        self._max_consecutive_losses = 4  # Trigger first cooldown after 4 losses (was 3)
+        self._kill_switch_active = False  # Full daily kill switch
+        self._daily_losses_count = 0  # Count of losses today
+        self._dead_hours_losses = 0   # Losses during dead hours (4am-7am UTC)
+        self._dead_hours_blocked = False  # Block trading in dead hours after 2+ losses
+        
+        # Cooldown configuration from config
+        from src.engine.config import OperatingMode
+        self._pause_after_3 = getattr(OperatingMode, 'PAUSE_AFTER_LOSSES_3', 15)
+        self._pause_after_4 = getattr(OperatingMode, 'PAUSE_AFTER_LOSSES_4', 60)
+        self._pause_after_5 = getattr(OperatingMode, 'PAUSE_AFTER_LOSSES_5', 180)
+        self._kill_switch_losses = getattr(OperatingMode, 'KILL_SWITCH_LOSSES', 6)
         
         # =====================================================================
         # REJECTION COOLDOWN - Prevents rapid reevaluation after filter blocks
@@ -964,10 +972,19 @@ class SignalEngine:
                 
                 logger.info(f"✅ Trade closed by exchange TP/SL - Estimated PnL: ${pnl_estimate:.2f}")
                 
+                # ═══════════════════════════════════════════════════════════════
+                # 🔥 FIX (Jan 25, 2026): Record trade result for KILL-SWITCH tracking
+                # Exchange TP/SL closes MUST be counted for consecutive loss tracking
+                # Without this, kill-switch and tiered cooldowns don't trigger!
+                # ═══════════════════════════════════════════════════════════════
+                from datetime import datetime, UTC
+                market_time = datetime.now(UTC)
+                self._record_trade_result(exit_type, pnl_estimate, market_time)
+                logger.info(f"📊 Exchange TP/SL result recorded for loss tracking: {exit_type} ${pnl_estimate:.2f}")
+                
                 # 🔥 FIX (Jan 14, 2026): Send Telegram notification for exchange TP/SL closes
                 if self.output_manager is not None:
                     try:
-                        from datetime import datetime, UTC
                         _create_safe_task(self.output_manager.send_exit_notification({
                             'symbol': self.symbol,
                             'reason': exit_type,  # Already has EXCHANGE_ prefix
@@ -976,7 +993,7 @@ class SignalEngine:
                             'exit_price': current_price,
                             'entry_price': position.entry_price,
                             'direction': position.direction,
-                            'timestamp': datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+                            'timestamp': market_time.strftime('%Y-%m-%d %H:%M:%S UTC')
                         }), "send_exit_notification_exchange_tpsl")
                         logger.info("📱 Telegram notification sent for exchange TP/SL close")
                     except Exception as e:
@@ -1966,7 +1983,9 @@ class SignalEngine:
             self._htf_cache_reason = htf_reason
             # 🔥 FIX (Jan 23, 2026): Cache HTF regime mode based on ADX
             self._htf_cache_regime_mode = self.htf_filter.last_htf_regime_mode
-            self._htf_cache_adx = self.htf_filter.last_htf_adx
+            # 🔥 FIX (Jan 25, 2026): Ensure ADX cache is always a Python float
+            _raw_adx = self.htf_filter.last_htf_adx
+            self._htf_cache_adx = float(_raw_adx) if hasattr(_raw_adx, '__float__') else float(_raw_adx) if _raw_adx else 0.0
             logger.debug(f"HTF cache updated: ts={last_1h_ts}, passed={htf_passed}, bias={bias}, regime_mode={self._htf_cache_regime_mode}, adx={self._htf_cache_adx:.1f}")
             
             # =================================================================
@@ -2231,8 +2250,9 @@ class SignalEngine:
                 ema_50 = df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
                 ema_200 = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
                 adx_vals, _ = calculate_adx(df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14)
-                adx = adx_vals[-1] if len(adx_vals) > 0 else 0
-                adx_slope = (adx_vals[-1] - adx_vals[-2]) if len(adx_vals) > 1 else 0
+                # 🔥 FIX (Jan 25, 2026): Ensure ADX is Python float
+                adx = float(adx_vals[-1]) if len(adx_vals) > 0 else 0.0
+                adx_slope = float(adx_vals[-1] - adx_vals[-2]) if len(adx_vals) > 1 else 0.0
                 
                 logger.debug(f"   [DATA] Price: ${current_price:.2f} | EMA50: ${ema_50:.2f} | EMA200: ${ema_200:.2f}")
                 logger.debug(f"   [UP] ADX: {adx:.2f} | Slope: {adx_slope:.4f}")
@@ -3552,7 +3572,12 @@ class SignalEngine:
         
         # Detect market regime from current state (RANGE or TREND)
         # Use ADX and ATR expansion to determine regime
-        current_adx_early = self._score_breakdown.get('adx_values', np.array([20.0]))[-1] if hasattr(self, '_score_breakdown') else 20.0
+        # 🔥 FIX (Jan 25, 2026): Handle ADX values safely without numpy import issue
+        _adx_vals_for_threshold = self._score_breakdown.get('adx_values', [20.0]) if hasattr(self, '_score_breakdown') else [20.0]
+        try:
+            current_adx_early = float(_adx_vals_for_threshold[-1]) if len(_adx_vals_for_threshold) > 0 else 20.0
+        except (TypeError, ValueError, IndexError):
+            current_adx_early = 20.0
         is_trend_regime = current_adx_early > 25 or self._current_volatility_regime in [VolatilityRegime.HIGH, VolatilityRegime.SPIKE]
         regime_for_threshold = 'TREND' if is_trend_regime else 'RANGE'
         
@@ -3882,14 +3907,23 @@ class SignalEngine:
         # Anti-chasing behavior changes based on regime
         # =========================================================================
         from src.engine.config import OrderExecution
+        import numpy as np_local  # Local import for numpy
         
         # Detect current regime using ADX, ATR expansion, etc.
-        adx_values = self._score_breakdown.get('adx_values', np.array([20.0]))
-        current_adx = adx_values[-1] if len(adx_values) > 0 else 20.0
+        adx_values = self._score_breakdown.get('adx_values', [20.0])
+        # 🔥 FIX (Jan 25, 2026): Ensure ADX is Python float
+        try:
+            if hasattr(adx_values, '__len__') and len(adx_values) > 0:
+                current_adx = float(adx_values[-1])
+            else:
+                current_adx = float(adx_values) if adx_values else 20.0
+        except (TypeError, IndexError):
+            current_adx = 20.0
         
         # Calculate ATR expansion (current vs average)
         atr_5m = self._calculate_atr_5m(df_5m) if len(df_5m) >= 14 else atr_1m * 2
-        atr_avg = np.mean([c['high'] - c['low'] for c in self.market_data.get_candles('5m')[-20:]]) if len(df_5m) >= 20 else atr_5m
+        candles_5m = self.market_data.get_candles('5m')[-20:]
+        atr_avg = np_local.mean([c['high'] - c['low'] for c in candles_5m]) if len(candles_5m) >= 20 else atr_5m
         
         # Detect regime
         has_bos = self._score_breakdown.get('timing', 0) >= 1  # BOS contributes to timing
@@ -3981,7 +4015,16 @@ class SignalEngine:
         
         # Call Entry Quality Gate
         # Use cached ADX if adx_1h not in local scope
-        htf_adx_for_gate: float = float(locals().get('adx_1h', self._htf_cache_adx))
+        # 🔥 FIX (Jan 25, 2026): Safely handle numpy arrays or scalar values
+        _adx_raw = locals().get('adx_1h', self._htf_cache_adx)
+        try:
+            import numpy as np
+            if isinstance(_adx_raw, np.ndarray):
+                htf_adx_for_gate = float(_adx_raw[-1]) if len(_adx_raw) > 0 else 20.0
+            else:
+                htf_adx_for_gate = float(_adx_raw)
+        except (TypeError, ValueError, IndexError):
+            htf_adx_for_gate = 20.0
         gate_result = self._entry_gate.check(
             regime=self._current_regime.value,
             chase_atr=prelim_chase_atr,
@@ -4403,7 +4446,18 @@ class SignalEngine:
         rr_size_multiplier = EntryGateConfig.get_rr_size_multiplier(worst_case_rr, current_regime_str)
         self._current_trade_tags['rr_size_multiplier'] = rr_size_multiplier
         
-        if rr_size_multiplier == 0.0:
+        # =========================================================================
+        # 🔥 FIX (Jan 25, 2026): HIGH SCORE BYPASS
+        # If score >= 7, don't block on worst-case RR - use probe size instead
+        # Rationale: High score trades have strong edge, slippage model is too conservative
+        # =========================================================================
+        HIGH_SCORE_RR_BYPASS = 7.0
+        if rr_size_multiplier == 0.0 and score >= HIGH_SCORE_RR_BYPASS:
+            logger.warning(f"⚡ HIGH SCORE BYPASS: Score {score:.1f} >= {HIGH_SCORE_RR_BYPASS} | Using PROBE despite worst-case RR {worst_case_rr:.2f}R")
+            rr_size_multiplier = 0.25  # Probe size for high score with marginal RR
+            self._current_trade_tags['high_score_rr_bypass'] = True
+            self._current_trade_tags['rr_size_multiplier'] = rr_size_multiplier
+        elif rr_size_multiplier == 0.0:
             logger.warning(f"🚫 WORST-CASE RR BELOW FLOOR: {worst_case_rr:.2f}R < {effective_floor:.2f}R (ideal was {tp_multiplier:.2f}R) → REJECTED")
             self._current_trade_tags['skip_reason'] = 'worst_case_rr_below_floor'
             self.missed_tracker.log_blocked_signal(
@@ -4640,6 +4694,7 @@ class SignalEngine:
             self._current_trade_tags['funding_bucket'] = funding_info['bucket']
             self._current_trade_tags['funding_direction'] = funding_info['direction']
             self._current_trade_tags['funding_sizing_factor'] = funding_info['sizing_factor']
+            self._current_trade_tags['funding_sizing_boost'] = funding_info.get('sizing_boost', 1.0)
             
             # Log funding status (INFO for normal, WARNING for elevated+)
             # Bucket names from external_data: 'normal', 'elevated', 'high', 'critical', 'extreme'
@@ -4654,6 +4709,14 @@ class SignalEngine:
                 self._entry_score += funding_score_adj
                 direction_note = "receiving" if funding_score_adj > 0 else "paying"
                 logger.info(f"💰 Score adjusted by {funding_score_adj:+.2f} for funding ({direction_note}, new score: {self._entry_score})")
+            
+            # Apply DIRECTIONAL sizing boost when funding strongly favors our direction
+            funding_sizing_boost = funding_info.get('sizing_boost', 1.0)
+            if funding_sizing_boost > 1.0:
+                original_size = position_size
+                position_size = position_size * funding_sizing_boost
+                position_size = round_size_to_exchange(position_size)
+                logger.info(f"💰 FUNDING BOOST: {bias} receives premium → size ×{funding_sizing_boost:.2f} ({original_size:.6f} → {position_size:.6f})")
             
             # ═══════════════════════════════════════════════════════════════
             # TAGS ONLY - Collect data, don't block
@@ -4902,7 +4965,15 @@ class SignalEngine:
                 # SKIP if momentum too extreme IN DEAD MARKET (chasing in range)
                 # Only skip if: velocity > 3.5 ATR AND ADX < 25 (no trend to ride)
                 # Use cached ADX as fallback if not defined in local scope
-                _adx_for_momentum: float = float(locals().get('adx_1h', self._htf_cache_adx))
+                # 🔥 FIX (Jan 25, 2026): Safely handle numpy arrays or scalar values
+                _adx_raw_momentum = locals().get('adx_1h', self._htf_cache_adx)
+                try:
+                    if isinstance(_adx_raw_momentum, np.ndarray):
+                        _adx_for_momentum = float(_adx_raw_momentum[-1]) if len(_adx_raw_momentum) > 0 else 20.0
+                    else:
+                        _adx_for_momentum = float(_adx_raw_momentum)
+                except (TypeError, ValueError, IndexError):
+                    _adx_for_momentum = 20.0
                 is_chasing_in_range = (
                     price_velocity > OrderExecution.MOMENTUM_MAX_VELOCITY and
                     _adx_for_momentum < OrderExecution.MOMENTUM_MAX_VELOCITY_ADX_THRESHOLD
@@ -4931,6 +5002,64 @@ class SignalEngine:
                 else:
                     logger.debug(f"Normal momentum: velocity={price_velocity:.2f}ATR < {OrderExecution.MOMENTUM_VELOCITY_MULTIPLIER}ATR → Using LIMIT order")
         
+
+        # =====================================================================
+        # 🔥 FIX (Jan 24, 2026): COST VALIDATOR - Reject trades where fees eat profit
+        # Only blocks if expected costs are > 50% of expected profit
+        # More permissive than original 30% to allow more trades while protecting
+        # =====================================================================
+        try:
+            cost_model = get_cost_model()
+            notional_usd = position_size * current_price
+            
+            # Estimate roundtrip costs (entry maker + exit taker typical)
+            costs = cost_model.estimate_costs(
+                side=bias,
+                size_usd=notional_usd,
+                entry_price=current_price,
+                is_maker_entry=not use_market_order,  # Limit = maker, Market = taker
+                is_maker_exit=False,  # Assume taker exit (SL/TP hit)
+            )
+            
+            # Calculate expected profit at 1.2R (realistic TP, not minimum 1R)
+            sl_distance = abs(current_price - stop_loss)
+            expected_profit_usd = position_size * sl_distance * 1.2  # 1.2R profit (realistic)
+            
+            # Cost ratio check - adaptive by order type
+            # MARKET orders have higher fees+slippage → stricter threshold
+            # LIMIT/MAKER orders have lower fees → more permissive
+            # FIX (Jan 25, 2026): Raised thresholds - was blocking winners at 70.5%
+            if use_market_order:
+                COST_RATIO_THRESHOLD = 0.50  # 🔥 FIX: was 0.35 (too strict)
+            else:
+                COST_RATIO_THRESHOLD = 0.80  # 🔥 FIX: was 0.50 (blocked winners)
+            
+            cost_ratio = costs.total_usd / expected_profit_usd if expected_profit_usd > 0 else 999
+            
+            self._current_trade_tags['cost_usd'] = round(costs.total_usd, 4)
+            self._current_trade_tags['expected_profit_1_2r'] = round(expected_profit_usd, 4)
+            self._current_trade_tags['cost_ratio'] = round(cost_ratio, 4)
+            
+            if cost_ratio > COST_RATIO_THRESHOLD:
+                logger.warning(f"💸 COST VALIDATOR BLOCK: costs ${costs.total_usd:.4f} = {cost_ratio*100:.1f}% of expected profit ${expected_profit_usd:.4f}")
+                logger.info(f"   Notional: ${notional_usd:.2f}, Fees: ${costs.fee_entry_usd + costs.fee_exit_usd:.4f}, Slip: ${costs.slippage_entry_usd + costs.slippage_exit_usd:.4f}")
+                self._current_trade_tags['skip_reason'] = 'cost_too_high'
+                self.missed_tracker.log_blocked_signal(
+                    direction=bias,
+                    price=current_price,
+                    block_reason=f"Cost ratio {cost_ratio*100:.1f}% > {COST_RATIO_THRESHOLD*100:.0f}% threshold",
+                    block_category='cost_validator',
+                    score=score,
+                    atr=self._last_momentum_atr
+                )
+                return
+            else:
+                logger.info(f"✅ Cost validator PASS: ${costs.total_usd:.4f} = {cost_ratio*100:.1f}% of profit (< {COST_RATIO_THRESHOLD*100:.0f}%)")
+        except Exception as e:
+            logger.warning(f"⚠️ Cost validator error (proceeding anyway): {e}")
+
+
+
         # ===== PLACE ORDER (MARKET or LIMIT based on momentum) =====
         try:
             if use_market_order:
@@ -5909,6 +6038,9 @@ class SignalEngine:
                     self.state_machine.record_trade_close(pnl, pnl > 0, exit_reason='ANTICIPATION_TIMEOUT')
                     self.state_machine.update_daily_pnl(pnl)
                     
+                    # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                    self._record_trade_result('ANTICIPATION_TIMEOUT', pnl, market_time)
+                    
                     logger.info(f"✅ ANTICIPATION TIMEOUT EXIT: PnL={pnl:.2f}")
                     
                     await self.risk_engine.clear_position("ANTICIPATION_TIMEOUT")
@@ -5973,6 +6105,9 @@ class SignalEngine:
                         r_realized = position.calculate_r_realized(current_price)
                         self.state_machine.record_trade_close(pnl_exh, pnl_exh > 0, exit_reason='EXHAUSTION_EXIT')
                         self.state_machine.update_daily_pnl(pnl_exh)
+                        
+                        # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                        self._record_trade_result('EXHAUSTION_EXIT', pnl_exh, market_time)
                         
                         logger.info(f"✅ EXHAUSTION EXIT: PnL={pnl_exh:.2f} | R={r_realized:.2f}")
                         
@@ -6086,6 +6221,9 @@ class SignalEngine:
                 # 🔥 DAILY DRAWDOWN: Track funding exit PnL
                 self.state_machine.update_daily_pnl(pnl_funding)
                 
+                # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                self._record_trade_result('FUNDING_EXIT', pnl_funding, market_time)
+                
                 await self.trade_logger.log_event('trade_closed', {
                     'entry': position.entry_price,
                     'exit': current_price,
@@ -6156,6 +6294,9 @@ class SignalEngine:
                 self.state_machine.record_trade_close(pnl_time, pnl_time > 0, exit_reason='TIME_EXIT')
                 # 🔥 DAILY DRAWDOWN: Track time exit PnL
                 self.state_machine.update_daily_pnl(pnl_time)
+                
+                # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                self._record_trade_result('TIME_EXIT', pnl_time, market_time)
                 
                 await self.trade_logger.log_event('trade_closed', {
                     'entry': position.entry_price,
@@ -6345,6 +6486,9 @@ class SignalEngine:
                         pnl = position.unrealized_pnl
                         self.state_machine.record_trade_close(pnl, pnl > 0, exit_reason='BOS_INVALIDATION')
                         self.state_machine.update_daily_pnl(pnl)
+                        
+                        # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                        self._record_trade_result('BOS_INVALIDATION', pnl, market_time)
                         
                         logger.info(f"✅ BOS INVALIDATION EXIT: PnL={pnl:.2f}")
                         
@@ -7102,25 +7246,44 @@ class SignalEngine:
     
     def _check_loss_cooldown(self, market_time: datetime) -> tuple[bool, str]:
         """
-        LOSS STREAK COOLDOWN: Block trades after consecutive losses
+        LOSS STREAK COOLDOWN + AUTO KILL-SWITCH
         
-        After 3 consecutive SL hits, enter 90-minute cooldown.
-        This protects against chop regimes where stops cluster.
+        🔥 ENHANCED (Jan 25, 2026): Tiered pauses + full kill switch
+        - 3 losses → 15 min pause
+        - 4 losses → 60 min pause  
+        - 5 losses → 180 min pause
+        - 6 losses → KILL SWITCH (daily)
         
-        IMPROVED (Jan 15, 2026): Smart cooldown reset via MicroTrendFilter
-        - Can exit cooldown early if micro trend becomes bullish for N bars
-        - Still respects minimum cooldown (5 min safety)
+        Also tracks dead hours losses and blocks after 2+ losses in 4am-7am UTC.
         
         Returns: (can_enter, reason)
         """
-        # Check if we're still in cooldown
+        from src.engine.config import OperatingMode
+        
+        # Check KILL SWITCH first (highest priority)
+        if self._kill_switch_active:
+            return False, "🔴 KILL SWITCH ACTIVE: Daily loss limit reached - no trading until tomorrow"
+        
+        # Check dead hours block
+        if hasattr(self, '_dead_hours_blocked') and self._dead_hours_blocked:
+            current_hour = market_time.hour
+            dead_start, dead_end = getattr(OperatingMode, 'DEAD_HOURS_UTC', (4, 7))
+            if dead_start <= current_hour < dead_end:
+                return False, f"🌙 DEAD HOURS BLOCKED: {self._dead_hours_losses} losses in dead zone - waiting for next session"
+            else:
+                # Reset dead hours block when exiting dead hours
+                self._dead_hours_blocked = False
+                self._dead_hours_losses = 0
+                logger.info("✅ Exited dead hours zone, block lifted")
+        
+        # Check if we're still in timed cooldown
         if self._cooldown_until is not None:
             if market_time < self._cooldown_until:
                 remaining = (self._cooldown_until - market_time).total_seconds() / 60
                 
                 # SMART COOLDOWN RESET (Jan 15, 2026)
                 # Check if micro trend allows early exit (after minimum 5 min)
-                min_cooldown_passed = remaining < (self._cooldown_minutes - 5)  # At least 5 min in cooldown
+                min_cooldown_passed = remaining < (self._pause_after_3 - 5)  # At least 5 min in cooldown
                 if min_cooldown_passed and self.micro_trend_filter:
                     should_reset, reset_reason = self.micro_trend_filter.should_reset_cooldown(
                         min_bullish_bars=3, min_strength=0.5
@@ -7132,7 +7295,7 @@ class SignalEngine:
                         self._consecutive_losses = 0
                         return True, f"Smart reset: {reset_reason}"
                 
-                return False, f"LOSS COOLDOWN: {remaining:.0f} min remaining ({self._consecutive_losses} consecutive losses)"
+                return False, f"⏸️ LOSS COOLDOWN: {remaining:.0f} min remaining ({self._consecutive_losses} consecutive losses)"
             else:
                 # Cooldown expired, reset
                 logger.info("✅ Loss cooldown expired, trading resumed")
@@ -7153,7 +7316,11 @@ class SignalEngine:
         - TP1_FULL/TP2: Zero weight - wins reset streak
         
         IMPROVED (Jan 22, 2026): Track countertrend losses and short obstinacy
+        
+        🔥 ENHANCED (Jan 25, 2026): Auto kill-switch + dead hours blocking
         """
+        from src.engine.config import OperatingMode
+        
         # 📊 CAPA 5: Record exit in health monitor
         if self.health_monitor:
             exit_type = 'sl' if exit_reason == 'STOP_LOSS' or pnl < 0 else 'tp'
@@ -7173,6 +7340,7 @@ class SignalEngine:
             # Add weighted loss to streak
             old_streak = self._consecutive_losses
             self._consecutive_losses += exit_weight
+            self._daily_losses_count += 1
             
             # Track exit type distribution
             if not hasattr(self, '_loss_exit_types') or not isinstance(self._loss_exit_types, dict):
@@ -7180,6 +7348,21 @@ class SignalEngine:
             self._loss_exit_types[exit_reason] = self._loss_exit_types.get(exit_reason, 0) + 1
             
             logger.info(f"📉 Loss recorded: {exit_reason} (weight={exit_weight:.2f}) → streak: {old_streak:.2f} → {self._consecutive_losses:.2f}")
+            
+            # =========================================================================
+            # 🔥 DEAD HOURS LOSS TRACKING (Jan 25, 2026)
+            # =========================================================================
+            current_hour = market_time.hour
+            dead_start, dead_end = getattr(OperatingMode, 'DEAD_HOURS_UTC', (4, 7))
+            max_dead_hours_losses = getattr(OperatingMode, 'DEAD_HOURS_MAX_LOSSES', 2)
+            
+            if dead_start <= current_hour < dead_end:
+                self._dead_hours_losses = getattr(self, '_dead_hours_losses', 0) + 1
+                logger.warning(f"🌙 DEAD HOURS LOSS #{self._dead_hours_losses}: Loss during {current_hour}:00 UTC")
+                
+                if self._dead_hours_losses >= max_dead_hours_losses:
+                    self._dead_hours_blocked = True
+                    logger.critical(f"🚫 DEAD HOURS BLOCK: {self._dead_hours_losses} losses in dead zone - BLOCKING until next session")
             
             # COUNTERTREND LOSS TRACKING (Jan 22, 2026)
             if is_countertrend:
@@ -7194,19 +7377,31 @@ class SignalEngine:
                 self._short_cooldown_until = market_time + timedelta(minutes=cooldown_mins)
                 logger.warning(f"⚠️ SHORT OBSTINACY COOLDOWN: Lost SHORT with {bullish_signals} bullish signals → {cooldown_mins}min cooldown")
             
-            # TIERED COOLDOWN SYSTEM - now uses weighted threshold
-            effective_losses = int(self._consecutive_losses)  # Round down for threshold comparison
+            # =========================================================================
+            # 🔥 TIERED COOLDOWN + KILL SWITCH (Jan 25, 2026)
+            # =========================================================================
+            effective_losses = int(self._consecutive_losses)
+            kill_switch_threshold = getattr(self, '_kill_switch_losses', 6)
             
-            if effective_losses >= 3:
-                # 3+ weighted losses = longer cooldown (60 min)
-                cooldown_mins = self._cooldown_minutes
+            # KILL SWITCH CHECK - 6+ losses = STOP trading for the day
+            if effective_losses >= kill_switch_threshold:
+                self._kill_switch_active = True
+                logger.critical(f"🔴 KILL SWITCH ACTIVATED: {effective_losses} consecutive losses → NO MORE TRADING TODAY")
+            elif effective_losses >= 5:
+                # 5 losses = 3 hour pause
+                cooldown_mins = getattr(self, '_pause_after_5', 180)
                 self._cooldown_until = market_time + timedelta(minutes=cooldown_mins)
-                logger.warning(f"🚫 TIER 2 COOLDOWN: {self._consecutive_losses:.1f} weighted losses → {cooldown_mins} min pause")
-            elif effective_losses >= self._max_consecutive_losses:
-                # 2 weighted losses = shorter cooldown (30 min)
-                cooldown_mins = self._cooldown_minutes_tier1
+                logger.critical(f"🚨 TIER 3 COOLDOWN: {self._consecutive_losses:.1f} losses → {cooldown_mins} min pause (3 hours)")
+            elif effective_losses >= 4:
+                # 4 losses = 60 min pause
+                cooldown_mins = getattr(self, '_pause_after_4', 60)
                 self._cooldown_until = market_time + timedelta(minutes=cooldown_mins)
-                logger.warning(f"⚠️ TIER 1 COOLDOWN: {self._consecutive_losses:.1f} weighted losses → {cooldown_mins} min pause")
+                logger.warning(f"🚫 TIER 2 COOLDOWN: {self._consecutive_losses:.1f} losses → {cooldown_mins} min pause")
+            elif effective_losses >= 3:
+                # 3 losses = 15 min pause
+                cooldown_mins = getattr(self, '_pause_after_3', 15)
+                self._cooldown_until = market_time + timedelta(minutes=cooldown_mins)
+                logger.warning(f"⚠️ TIER 1 COOLDOWN: {self._consecutive_losses:.1f} losses → {cooldown_mins} min pause")
         else:
             # Win or breakeven resets the streak
             if self._consecutive_losses > 0:
@@ -7335,7 +7530,8 @@ class SignalEngine:
             adx_vals, _ = calculate_adx(
                 df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14
             )
-            adx = adx_vals[-1] if len(adx_vals) > 0 else 20.0
+            # 🔥 FIX (Jan 25, 2026): Ensure ADX is Python float
+            adx = float(adx_vals[-1]) if len(adx_vals) > 0 else 20.0
             
             # EMA separation percentage
             ema_separation = abs(ema_50 - ema_200) / ema_200 * 100 if ema_200 > 0 else 0
@@ -7455,8 +7651,9 @@ class SignalEngine:
             # 4. ADX rising
             adx_vals, _ = calculate_adx(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
             if len(adx_vals) >= 5:
-                adx_current = adx_vals[-1]
-                adx_prev = adx_vals[-5]
+                # 🔥 FIX (Jan 25, 2026): Ensure ADX values are Python floats
+                adx_current = float(adx_vals[-1])
+                adx_prev = float(adx_vals[-5])
                 adx_slope = (adx_current - adx_prev) / 5
                 
                 if adx_current > TrendExpansionConfig.ADX_VALUE_EXPANDING and adx_slope > TrendExpansionConfig.ADX_SLOPE_POSITIVE_THRESHOLD:
@@ -7972,6 +8169,10 @@ class SignalEngine:
                 self.state_machine.record_trade_close(pnl, pnl > 0, exit_reason='EMERGENCY_CLOSE')
                 # 🔒 FIX (Jan 22, 2026): Also update daily PnL for DD tracking
                 self.state_machine.update_daily_pnl(pnl)
+                
+                # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                from datetime import datetime, UTC
+                self._record_trade_result('EMERGENCY_CLOSE', pnl, datetime.now(UTC))
                 
                 # Log to trade logger for backtest results
                 await self.trade_logger.log_event('trade_closed', {

@@ -141,7 +141,7 @@ class LateConfirmationConfig:
     MAX_LATE_PENALTY = 2.0
     
     # Only apply to scores above this (don't penalize already-weak setups)
-    MIN_SCORE_FOR_LATE_PENALTY = 7
+    MIN_SCORE_FOR_LATE_PENALTY = 99  # 🔥 FIX (Jan 24): DISABLED - high confluence = good, not bad
     
     # Candle counting method
     # We count candles since BOS started forming (using df_1m high/low breaks)

@@ -719,7 +719,7 @@ class PositionSizer:
             position_notional = base_margin * leverage
             
             # 🔥 FIX (Jan 22, 2026): Minimum notional of $500 (before multipliers)
-            MIN_BASE_NOTIONAL = 500.0  # Ensures ~$200-300 after worst case multipliers
+            MIN_BASE_NOTIONAL = 750.0  # 🔥 FIX (Jan 24): Subido de 500 para mejor ratio fees/profit  # Ensures ~$200-300 after worst case multipliers
             position_notional = max(position_notional, MIN_BASE_NOTIONAL)
             
             base_size = position_notional / entry_price

@@ -340,8 +340,9 @@ class HTFFilter:
             return False, None, "EMA50 calculation failed (NaN)"
         
         adx_values, adx_slope = calculate_adx(highs, lows, closes, 14)
-        adx = adx_values[-1] if len(adx_values) > 0 else 0.0
-        slope = adx_slope[-1] if len(adx_slope) > 0 else 0.0
+        # 🔥 FIX (Jan 25, 2026): Ensure ADX is a Python float, not numpy array
+        adx = float(adx_values[-1]) if len(adx_values) > 0 else 0.0
+        slope = float(adx_slope[-1]) if len(adx_slope) > 0 else 0.0
         
         # FIX: Handle NaN ADX - use default values instead of blocking
         if np.isnan(adx):
@@ -684,7 +685,7 @@ class MTFStructureFilter:
             
             # WEAK BOS: Valid shift (lower low + higher high in last 5 candles)
             if len(closes) >= 5:
-                recent_ll = np.min(lows[-5:-1])  # Last 5 candles (excluding current)
+                recent_ll = np.min(lows[-8:-1])  # Last 8 candles (excluding current)
                 current_candle_close = closes[-1]
                 
                 # Reclaim of level + close near/above EMA
@@ -717,7 +718,7 @@ class MTFStructureFilter:
             
             # WEAK BOS: Valid shift (higher high + lower low in last 5 candles)
             if len(closes) >= 5:
-                recent_hh = np.max(highs[-5:-1])
+                recent_hh = np.max(highs[-8:-1])
                 current_candle_close = closes[-1]
                 
                 # Reclaim of level + close near/below EMA
@@ -823,8 +824,8 @@ class LTFTriggerFilter:
         # ===== PRIMARY TRIGGER: PRICE STRUCTURE =====
         
         # 1. BOS LTF (Break of Structure en 1m) - relaxed
-        recent_high = float(np.amax(np.asarray(highs[-5:-1])))  # Last 5 candles (excluding current)
-        recent_low = float(np.amin(np.asarray(lows[-5:-1])))
+        recent_high = float(np.amax(np.asarray(highs[-8:-1])))  # Last 8 candles (excluding current)
+        recent_low = float(np.amin(np.asarray(lows[-8:-1])))
         
         bos_confirmed = False
         

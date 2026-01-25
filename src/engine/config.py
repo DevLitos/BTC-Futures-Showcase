@@ -686,14 +686,25 @@ class OperatingMode:
     
     # =========================================================================
     # CONSECUTIVE LOSSES SIZING - Reduce size after losses
-    # Progressive reduction: 1 loss = 80%, 2 losses = 60%, 3 losses = 50%
+    # 🔥 FIX (Jan 25, 2026): Adjusted for micro accounts - faster reduction
+    # Progressive reduction: 1 loss = 70%, 2 losses = 50%, 3 losses = 30%
     # =========================================================================
     LOSS_SIZING_MULTIPLIERS = {
         0: 1.0,    # No losses - full size
-        1: 0.80,   # 1 loss - 80% size
-        2: 0.60,   # 2 losses - 60% size
-        3: 0.50,   # 3+ losses - 50% size (anti-tilt)
+        1: 0.70,   # 1 loss - 70% size
+        2: 0.50,   # 2 losses - 50% size
+        3: 0.30,   # 3+ losses - 30% size (capital preservation for micro accounts)
     }
+    
+    # =========================================================================
+    # AUTO KILL-SWITCH - 🔥 NEW (Jan 25, 2026)
+    # Automatic trading halt after consecutive losses or daily DD
+    # =========================================================================
+    KILL_SWITCH_LOSSES = 6           # Full kill switch after 6 losses
+    KILL_SWITCH_DAILY_DD_PCT = 3.0   # Kill switch if daily DD > 3%
+    PAUSE_AFTER_LOSSES_3 = 15        # 15 min pause after 3 losses
+    PAUSE_AFTER_LOSSES_4 = 60        # 60 min pause after 4 losses
+    PAUSE_AFTER_LOSSES_5 = 180       # 3 hour pause after 5 losses
     
     # =========================================================================
     # CAPA 4: MINIMUM ACTIVITY PER SESSION - Prevent "no trades" failures
@@ -716,10 +727,15 @@ class OperatingMode:
         'LONDON': 0.90,             # Good
         'NY': 0.90,                 # Good
         'ASIA': 0.75,               # Lower quality
-        'DEAD_HOURS': 0.50,         # High risk
+        'DEAD_HOURS': 0.30,         # 🔥 FIX (Jan 25): Reduced to 30% (was 50%)
         'WEEKEND': 0.50,            # Low liquidity
         'OTHER': 0.75,              # Default reduced
     }
+    
+    # 🔥 NEW (Jan 25, 2026): Dead Hours Loss-Based Block
+    # If 2+ losses occur during DEAD_HOURS, block trading until next session
+    DEAD_HOURS_MAX_LOSSES = 2       # Block after 2 losses in dead hours
+    DEAD_HOURS_UTC = (4, 7)         # 4am-7am UTC = dead zone
     
     @classmethod
     def get_min_rr(cls) -> float:
@@ -988,14 +1004,16 @@ class EntryGateConfig:
     
     # RR-BASED SIZING
     # Graduated sizing based on risk:reward quality
-    # FIX (Jan 22, 2026): Lowered floors - with 60%+ winrate, 0.5R is viable
-    RR_BLOCK_FLOOR = 0.5             # Below 0.5 = mathematical roulette (was 0.6)
-    RR_PROBE_MAX = 0.8               # 0.5-0.8 = probe (0.25x) (was 1.0)
-    RR_FULL_MIN = 1.0                # Above 1.0 = full size (was 1.2)
+    # FIX (Jan 25, 2026): CRITICAL - slippage model was blocking ALL trades
+    # The P95 caps were subtracting ~0.65R from ideal RR, making 1.0R → 0.35R
+    # Lowered floors to allow trades to execute
+    RR_BLOCK_FLOOR = 0.30            # 🔥 FIX: was 0.5 → blocked everything
+    RR_PROBE_MAX = 0.50              # 0.3-0.5 = probe (0.25x)
+    RR_FULL_MIN = 0.80               # Above 0.8 = full size (was 1.0)
     
     # RANGE regime has different RR tolerances (high winrate)
-    RR_BLOCK_FLOOR_RANGE = 0.4       # Lower floor for RANGE (was 0.5)
-    RR_PROBE_MAX_RANGE = 0.6         # Lower threshold for probe in RANGE (was 0.8)
+    RR_BLOCK_FLOOR_RANGE = 0.25      # 🔥 FIX: was 0.4 → blocked RANGE trades
+    RR_PROBE_MAX_RANGE = 0.40        # 0.25-0.4 = probe in RANGE
     
     # LTF CONFIRMATIONS
     # Never require all confirmations (anti-paralysis)
@@ -1073,7 +1091,7 @@ class HTFFilters:
     # Legacy (kept for backwards compatibility, but use new thresholds above)
     MIN_ADX = 20                    # 🔥 FIX (Jan 23): ADX must be >= 20 for ANY trend classification
     MIN_ADX_SLOPE = -999            # DEPRECATED: slope never blocks
-    MIN_ATR_VS_MA = 0.70            # Allow contractions
+    MIN_ATR_VS_MA = 0.50  # 🔥 FIX (Jan 24): Relaxed from 0.70 to allow low-vol periods            # Allow contractions
     
     # DEPRECATED: Slope filtering removed
     # ADX slope is now INFO/TAG only, never a veto
@@ -1679,6 +1697,63 @@ class FundingRateControl:
                 return 1.10
         
         return 1.0  # Neutral
+    
+    # =========================================================================
+    # 🔥 NEW (Jan 25, 2026): FUNDING RATE AS DIRECTIONAL BIAS
+    # Use funding rate to suggest trade direction - market imbalance signal
+    # =========================================================================
+    FUNDING_BIAS_THRESHOLD_SHORT = 0.0003   # > 0.03% → market favors SHORT
+    FUNDING_BIAS_THRESHOLD_LONG = -0.0001   # < -0.01% → market favors LONG
+    FUNDING_EXTREME_THRESHOLD = 0.0007      # > 0.07% → EXTREME, increase size
+    FUNDING_BIAS_SCORE_BOOST = 0.5          # Score boost when funding aligns
+    FUNDING_BIAS_SCORE_PENALTY = -0.5       # Score penalty when funding contradicts
+    
+    @classmethod
+    def get_funding_directional_bias(cls, funding_rate: float) -> tuple:
+        """
+        Use funding rate as directional bias signal.
+        
+        Returns: (preferred_direction, confidence, is_extreme)
+        - preferred_direction: 'SHORT', 'LONG', or 'NEUTRAL'
+        - confidence: 0.0-1.0
+        - is_extreme: True if funding is extreme (> 0.07%)
+        """
+        abs_rate = abs(funding_rate)
+        is_extreme = abs_rate >= cls.FUNDING_EXTREME_THRESHOLD
+        
+        if funding_rate >= cls.FUNDING_BIAS_THRESHOLD_SHORT:
+            # High positive funding = longs paying = bearish pressure
+            confidence = min(1.0, funding_rate / cls.FUNDING_EXTREME_THRESHOLD)
+            return ('SHORT', confidence, is_extreme)
+        elif funding_rate <= cls.FUNDING_BIAS_THRESHOLD_LONG:
+            # Negative funding = shorts paying = bullish pressure  
+            confidence = min(1.0, abs(funding_rate) / cls.FUNDING_EXTREME_THRESHOLD)
+            return ('LONG', confidence, is_extreme)
+        
+        return ('NEUTRAL', 0.0, False)
+    
+    @classmethod
+    def get_funding_score_adjustment(cls, funding_rate: float, bias: str) -> float:
+        """
+        Get score adjustment based on funding alignment with trade direction.
+        
+        Returns: Score adjustment (-0.5 to +0.5)
+        """
+        preferred_dir, confidence, is_extreme = cls.get_funding_directional_bias(funding_rate)
+        
+        if preferred_dir == 'NEUTRAL':
+            return 0.0
+        
+        # Funding aligns with our bias → boost score
+        if preferred_dir == bias:
+            adjustment = cls.FUNDING_BIAS_SCORE_BOOST * confidence
+            if is_extreme:  # Extreme funding alignment → double boost
+                adjustment *= 1.5
+            return adjustment
+        
+        # Funding contradicts our bias → penalty
+        adjustment = cls.FUNDING_BIAS_SCORE_PENALTY * confidence
+        return adjustment
 
 
 # ============================================================================

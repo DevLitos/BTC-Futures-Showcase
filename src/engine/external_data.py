@@ -256,55 +256,82 @@ class FundingRateMonitor:
     
     def get_funding_score_penalty(self, bias: str | None = None) -> float:
         """
-        Get score adjustment for funding rate.
-        DIRECTIONAL: funding affects longs and shorts differently.
+        Get score adjustment for funding rate as DIRECTIONAL BIAS.
+        
+        Thresholds (per user feedback for micro accounts):
+          - funding > 0.03% → SHORT bias (longs pay)
+          - funding < -0.01% → LONG bias (shorts pay)
+          - funding extremo (>0.07% or <-0.05%) → stronger adjustment
         
         Positive funding (longs pay, shorts receive):
-          - LONG: penalty
+          - LONG: penalty (paying)
           - SHORT: bonus (collecting funding)
         
         Negative funding (shorts pay, longs receive):
-          - SHORT: penalty  
-          - LONG: bonus
+          - SHORT: penalty (paying)
+          - LONG: bonus (collecting funding)
         
         Args:
             bias: 'LONG' or 'SHORT' - if None, returns generic penalty
             
         Returns:
-            float: Score adjustment (-0.5 to +0.5)
+            float: Score adjustment (-1.0 to +1.0)
         """
         rate = self.current_rate  # Can be positive or negative
-        rate_pct = abs(rate) * 100
+        rate_pct = rate * 100  # Keep sign for directional bias
+        abs_rate_pct = abs(rate_pct)
         
-        # Base penalty based on magnitude (regardless of direction)
-        if rate_pct <= 0.05:
-            base_score = 0.0  # Normal funding, no adjustment
-        elif rate_pct <= 0.10:
-            base_score = -0.25  # Slight penalty
-        elif rate_pct <= 0.15:
-            base_score = -0.50  # Moderate penalty
+        # Thresholds for directional bias
+        BIAS_SHORT_THRESHOLD = 0.03   # funding > 0.03% → SHORT bias
+        BIAS_LONG_THRESHOLD = -0.01   # funding < -0.01% → LONG bias
+        EXTREME_SHORT = 0.07          # funding > 0.07% → strong SHORT bias
+        EXTREME_LONG = -0.05          # funding < -0.05% → strong LONG bias
+        
+        # Calculate base adjustment based on funding direction and magnitude
+        if rate_pct >= EXTREME_SHORT:
+            # Extremely high positive funding - strong SHORT bias
+            base_adjustment = -1.0 if bias == 'LONG' else +1.0 if bias == 'SHORT' else -0.5
+        elif rate_pct >= BIAS_SHORT_THRESHOLD:
+            # Elevated positive funding - moderate SHORT bias
+            base_adjustment = -0.5 if bias == 'LONG' else +0.5 if bias == 'SHORT' else -0.25
+        elif rate_pct <= EXTREME_LONG:
+            # Extremely negative funding - strong LONG bias
+            base_adjustment = +1.0 if bias == 'LONG' else -1.0 if bias == 'SHORT' else -0.5
+        elif rate_pct <= BIAS_LONG_THRESHOLD:
+            # Elevated negative funding - moderate LONG bias
+            base_adjustment = +0.5 if bias == 'LONG' else -0.5 if bias == 'SHORT' else -0.25
         else:
-            base_score = -0.75  # High penalty
+            # Normal funding range - no directional bias
+            base_adjustment = 0.0
         
-        # Directional adjustment: if funding FAVORS our direction, reduce or reverse penalty
-        if bias is not None:
-            is_paying = (
-                (rate > 0.0001 and bias == 'LONG') or   # Longs pay positive funding
-                (rate < -0.0001 and bias == 'SHORT')    # Shorts pay negative funding
-            )
-            is_receiving = (
-                (rate > 0.0001 and bias == 'SHORT') or  # Shorts receive positive funding
-                (rate < -0.0001 and bias == 'LONG')     # Longs receive negative funding
-            )
+        return base_adjustment
+    
+    def get_funding_sizing_boost(self, bias: str | None = None) -> float:
+        """
+        Get sizing BOOST when funding strongly favors our direction.
+        
+        This allows increasing size when:
+          - Going SHORT with funding > 0.07% (collecting premium)
+          - Going LONG with funding < -0.05% (collecting premium)
+        
+        Args:
+            bias: 'LONG' or 'SHORT'
             
-            if is_receiving and rate_pct > 0.05:
-                # Receiving funding = bonus (counteracts base penalty)
-                return min(0.5, base_score + 0.75)  # Can go positive
-            elif is_paying:
-                # Paying = full penalty applies
-                return base_score
+        Returns:
+            float: Sizing multiplier (1.0 = normal, up to 1.25 for favorable funding)
+        """
+        if bias is None:
+            return 1.0
+            
+        rate_pct = self.current_rate * 100
         
-        return base_score
+        # Extreme funding favoring our direction = size boost
+        if bias == 'SHORT' and rate_pct >= 0.07:
+            return 1.20  # 20% boost for shorts in extreme positive funding
+        elif bias == 'LONG' and rate_pct <= -0.05:
+            return 1.20  # 20% boost for longs in extreme negative funding
+        
+        return 1.0
     
     def get_next_funding_time(self) -> datetime:
         """
@@ -370,7 +397,8 @@ class FundingRateMonitor:
             'score_penalty': self.get_funding_score_penalty(bias),
             'direction': 'positive' if self.current_rate > 0 else 'negative',
             'time_to_next_funding_min': time_to_funding,
-            'next_funding_time': self.get_next_funding_time().isoformat()
+            'next_funding_time': self.get_next_funding_time().isoformat(),
+            'sizing_boost': self.get_funding_sizing_boost(bias)
         }
     
     def get_status(self) -> Dict:

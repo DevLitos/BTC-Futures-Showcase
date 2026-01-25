@@ -37,6 +37,8 @@ from src.engine.execution.slippage_model import (
     OrderType,
     get_slippage_model,
     calculate_worst_case_rr,
+    AdaptiveSlippageTracker,
+    get_adaptive_slippage_tracker,
 )
 
 __all__ = [
@@ -66,4 +68,6 @@ __all__ = [
     'OrderType',
     'get_slippage_model',
     'calculate_worst_case_rr',
+    'AdaptiveSlippageTracker',
+    'get_adaptive_slippage_tracker',
 ]

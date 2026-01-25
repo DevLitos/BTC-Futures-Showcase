@@ -12,6 +12,10 @@ CRITICAL: In LIVE mode, this provides real data for:
 - Strategy performance attribution
 - Execution algorithm tuning
 
+ADAPTIVE SLIPPAGE (Jan 23, 2026):
+- Feeds real slippage data to AdaptiveSlippageTracker
+- Model adjusts estimates when real slippage exceeds defaults
+
 USAGE:
     from src.accounting.execution_analytics import get_execution_analytics
     
@@ -46,13 +50,17 @@ USAGE:
 
 from dataclasses import dataclass, field
 from datetime import datetime, UTC, timedelta
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, TYPE_CHECKING
 from collections import deque
 from enum import Enum
 import numpy as np
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Lazy import for AdaptiveSlippageTracker to avoid circular imports
+if TYPE_CHECKING:
+    from src.engine.execution.slippage_model import AdaptiveSlippageTracker
 
 
 # =============================================================================
@@ -177,6 +185,7 @@ class ExecutionAnalytics:
     - Aggregate statistics
     - Cost model calibration data
     - Performance attribution
+    - ADAPTIVE SLIPPAGE FEEDBACK (Jan 23, 2026)
     """
     
     def __init__(self, max_history: int = 1000):
@@ -197,6 +206,9 @@ class ExecutionAnalytics:
         
         # By purpose tracking
         self._by_purpose: Dict[str, Dict] = {}
+        
+        # Adaptive slippage tracker (lazy loaded)
+        self._adaptive_slippage_tracker: Optional['AdaptiveSlippageTracker'] = None
         
         logger.info("ExecutionAnalytics initialized")
     
@@ -343,6 +355,16 @@ class ExecutionAnalytics:
             self._total_timed_out += 1
             logger.warning(f"Execution timeout: {execution_id}")
     
+    def _get_adaptive_tracker(self) -> Optional['AdaptiveSlippageTracker']:
+        """Lazy load adaptive slippage tracker to avoid circular imports."""
+        if self._adaptive_slippage_tracker is None:
+            try:
+                from src.engine.execution.slippage_model import get_adaptive_slippage_tracker
+                self._adaptive_slippage_tracker = get_adaptive_slippage_tracker()
+            except Exception as e:
+                logger.debug(f"Could not load adaptive slippage tracker: {e}")
+        return self._adaptive_slippage_tracker
+    
     def _complete_execution(
         self,
         tracker: ExecutionTracker,
@@ -362,6 +384,40 @@ class ExecutionAnalytics:
             slippage_cost = (tracker.filled_size * tracker.fill_price * 
                            tracker.slippage_bps / 10000)
             self._total_slippage_usd += max(0, slippage_cost)
+            
+            # ═══════════════════════════════════════════════════════════════
+            # ADAPTIVE SLIPPAGE FEEDBACK (Jan 23, 2026)
+            # Feed real slippage data back to the slippage model
+            # ═══════════════════════════════════════════════════════════════
+            try:
+                adaptive_tracker = self._get_adaptive_tracker()
+                if adaptive_tracker and tracker.expected_price > 0 and tracker.fill_price > 0:
+                    # Determine fill type for adaptive tracking
+                    if tracker.purpose in ['entry', 'add']:
+                        if tracker.order_type.lower() == 'limit':
+                            fill_type = 'entry_limit'
+                        else:
+                            fill_type = 'entry_market'
+                    elif tracker.purpose in ['sl', 'stop_loss', 'trailing']:
+                        fill_type = 'exit_sl'
+                    else:  # tp, take_profit, exit
+                        fill_type = 'exit_tp'
+                    
+                    # Determine direction from side
+                    direction = 'LONG' if tracker.side.lower() == 'buy' else 'SHORT'
+                    
+                    recorded_slip = adaptive_tracker.record_fill_slippage(
+                        fill_type=fill_type,
+                        expected_price=tracker.expected_price,
+                        actual_fill_price=tracker.fill_price,
+                        direction=direction
+                    )
+                    
+                    if recorded_slip > 2.0:  # Log notable slippage
+                        logger.info(f"📊 Adaptive slippage recorded: {fill_type} = {recorded_slip:.2f} bps")
+                        
+            except Exception as e:
+                logger.debug(f"Adaptive slippage tracking failed: {e}")
         
         # Track by purpose
         purpose = tracker.purpose

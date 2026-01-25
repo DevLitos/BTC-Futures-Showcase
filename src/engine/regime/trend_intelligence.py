@@ -128,7 +128,7 @@ class TrendIntelligence:
     MIN_DATA_FOR_CONFIDENCE = 20    # Minimum candles for high confidence
     
     # 🔥 NEW (Jan 24): Warmup requirements for reliable state detection
-    MIN_WARMUP_FOR_LOW_CONFIDENCE = 6    # Minimum candles for 40%+ confidence
+    MIN_WARMUP_FOR_LOW_CONFIDENCE = 20  # 🔥 FIX (Jan 24): Increased from 6 for more reliable detection    # Minimum candles for 40%+ confidence
     MIN_WARMUP_FOR_MED_CONFIDENCE = 12   # Minimum candles for 60%+ confidence
     MIN_WARMUP_FOR_HIGH_CONFIDENCE = 24  # Minimum candles for 80%+ confidence
     
@@ -214,14 +214,16 @@ class TrendIntelligence:
         # Now run proper analysis with full history
         self._warmup_candles = len(self._price_history)
         
+        # 🔥 FIX (Jan 25, 2026): Ensure ADX values are Python floats
         # Calculate metrics with historical data
-        self._update_adx_metrics(adx_values[-1] if adx_values else 15.0)
+        _adx_for_warmup = float(adx_values[-1]) if adx_values is not None and len(adx_values) > 0 else 15.0
+        self._update_adx_metrics(_adx_for_warmup)
         self._update_structure_metrics()
-        self._update_volume_metrics(volumes[-1] if volumes else 0.0)
+        self._update_volume_metrics(float(volumes[-1]) if volumes else 0.0)
         
         # Detect current phase
-        current_price = closes[-1]
-        adx = adx_values[-1] if adx_values else 15.0
+        current_price = float(closes[-1])
+        adx = float(adx_values[-1]) if adx_values is not None and len(adx_values) > 0 else 15.0
         atr = self._estimate_atr_from_history()
         
         new_phase, confidence, trigger = self._detect_phase_transition(
@@ -269,44 +271,68 @@ class TrendIntelligence:
         return float(np.mean(tr_list)) if tr_list else 100.0
     
     def _estimate_phase_age(self, adx_values: List[float]) -> int:
-        """Estimate how long we've been in current phase based on ADX pattern"""
+        """
+        Estimate how long we've been in current phase based on ADX pattern.
+        
+        🔥 IMPROVED (Jan 25, 2026): More accurate age estimation
+        - Counts backwards until ADX pattern breaks
+        - Uses phase-specific thresholds
+        - Returns minimum of 1 candle
+        """
         if len(adx_values) < 5:
             return 1
         
         current_phase = self._state.current_phase
-        adx = adx_values[-1]
+        # 🔥 FIX (Jan 25, 2026): Ensure ADX is Python float
+        adx = float(adx_values[-1])
         
         # Count candles that match current phase criteria
         age = 0
-        for i in range(len(adx_values) - 1, max(0, len(adx_values) - 30), -1):
-            adx_val = adx_values[i]
+        lookback_limit = min(50, len(adx_values))  # Look back up to 50 candles
+        
+        for i in range(len(adx_values) - 1, max(0, len(adx_values) - lookback_limit), -1):
+            adx_val = float(adx_values[i])
             
             if current_phase == TrendPhase.RANGE_BOUND:
+                # In range: ADX should be below birth threshold
                 if adx_val < self.ADX_BIRTH_THRESHOLD:
                     age += 1
                 else:
                     break
             elif current_phase in [TrendPhase.TREND_BIRTH, TrendPhase.TREND_ACCELERATION]:
+                # Trending: ADX should be above birth threshold
                 if adx_val > self.ADX_BIRTH_THRESHOLD:
                     age += 1
                 else:
                     break
             elif current_phase == TrendPhase.TREND_MATURE:
+                # Mature trend: ADX should be above mature threshold
                 if adx_val > self.ADX_MATURE_THRESHOLD:
                     age += 1
                 else:
                     break
             elif current_phase in [TrendPhase.TREND_EXHAUSTION, TrendPhase.DISTRIBUTION]:
+                # Exhaustion: ADX declining or below mature
                 if adx_val < self.ADX_MATURE_THRESHOLD:
                     age += 1  
                 else:
                     break
+            elif current_phase == TrendPhase.ACCUMULATION:
+                # Accumulation: ADX very low, building
+                if adx_val < 18:
+                    age += 1
+                else:
+                    break
             else:
                 age += 1
-                if age > 5:
+                if age > 10:
                     break
         
-        return max(1, age)
+        # 🔥 NEW: Ensure minimum age based on warmup data quality
+        # If we have lots of data, the age should reflect it
+        min_age_from_data = min(5, len(adx_values) // 10)  # At least 1 per 10 candles of data
+        
+        return max(1, max(age, min_age_from_data))
     
     def _calculate_confidence(self, base_confidence: float) -> float:
         """
