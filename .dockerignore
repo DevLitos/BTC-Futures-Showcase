@@ -50,11 +50,9 @@ wheels
 logs/
 storage/
 trade_logs/
-# output/ - NO EXCLUIR, contiene código Python
 *.parquet
 *.json
 !config/*.json
-!prometheus.yml
 
 # Documentation (not needed in container)
 *.md

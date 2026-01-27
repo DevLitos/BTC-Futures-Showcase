@@ -43,8 +43,9 @@ dev = [
     "pytest-cov>=5.0.0",
 ]
 
-[tool.setuptools]
-packages = ["src", "src.engine", "src.ingest", "src.storage", "src.monitoring", "src.core", "src.accounting", "src.strategy", "src.validation", "src.modes", "src.output"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
 
 [tool.ruff]
 line-length = 120

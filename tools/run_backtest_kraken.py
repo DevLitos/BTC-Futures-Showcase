@@ -3,6 +3,12 @@
 Backtest usando las clases REALES del sistema (SignalEngine, RiskEngine, etc.)
 Descarga datos históricos de Kraken Futures y simula trading.
 
+ACTUALIZADO (Jan 26, 2026):
+- Capital: 300€ con 10x leverage (como live)
+- Score threshold: 6+ (como config actual)
+- TIME_INVALIDATION: 8 candles, max loss -0.30R
+- Slippage realista por defecto
+
 Uso:
     python run_backtest_kraken.py --days 7
     python run_backtest_kraken.py --days 30 --symbol PF_XBTUSD
@@ -18,14 +24,14 @@ import numpy as np
 import ccxt
 
 # Importar clases REALES del sistema
-from src.engine.signal_engine import SignalEngine
-from src.engine.market_data import SynchronizedMultiTimeframeBuffer
-from src.engine.risk.risk_engine import RiskEngine
-from src.engine.state.state_machine import BotState
+from src.application.live.trading_app import SignalEngine
+from src.application.services.market_data import SynchronizedMultiTimeframeBuffer
+from src.domain.risk.risk_engine import RiskEngine
+from src.domain.trading.state.state_machine import BotState
 
 # Import validation framework (optional slippage simulation)
 try:
-    from src.engine.backtest_validation import (
+    from src.application.backtest.validation_app import (
         SlippageSimulator, SlippageConfig, FeatureFlag, is_feature_enabled
     )
     VALIDATION_AVAILABLE = True
@@ -66,10 +72,71 @@ class MockExecution:
         # Track last direction for slippage calculation
         self._last_direction: str = "LONG"
         
-    def set_price(self, price: float):
-        """Actualiza precio actual (llamado cada tick)"""
+    def set_price(self, price: float) -> Optional[dict]:
+        """Actualiza precio actual (llamado cada tick). Retorna info de SL/TP hit si ocurre."""
         self.current_price = price
         self._check_fills()
+        # CRITICAL: Check SL/TP on every price tick
+        return self._check_sl_tp()
+    
+    def _check_sl_tp(self) -> Optional[dict]:
+        """
+        Verifica si el precio actual cruza los niveles de SL o TP.
+        Retorna dict con info si se ejecuta, None si no.
+        """
+        if self.position is None:
+            return None
+        
+        is_long = self.position.get('side') == 'long' or self.position.get('contracts', 0) > 0
+        entry_price = self.position.get('entry') or self.position.get('entryPrice', 0)
+        
+        exit_reason = None
+        exit_price = self.current_price
+        
+        if is_long:
+            # LONG position: SL below entry, TP above entry
+            if self.pending_sl and self.current_price <= self.pending_sl:
+                exit_reason = 'STOP_LOSS'
+                exit_price = self.pending_sl  # Fill at SL level
+            elif self.pending_tp and self.current_price >= self.pending_tp:
+                exit_reason = 'TAKE_PROFIT'
+                exit_price = self.pending_tp
+        else:
+            # SHORT position: SL above entry, TP below entry
+            if self.pending_sl and self.current_price >= self.pending_sl:
+                exit_reason = 'STOP_LOSS'
+                exit_price = self.pending_sl
+            elif self.pending_tp and self.current_price <= self.pending_tp:
+                exit_reason = 'TAKE_PROFIT'
+                exit_price = self.pending_tp
+        
+        if exit_reason:
+            # Calculate P&L before closing
+            position_size = abs(self.position.get('contracts', 0))
+            if is_long:
+                pnl = (exit_price - entry_price) * position_size
+            else:
+                pnl = (entry_price - exit_price) * position_size
+            
+            # Log the SL/TP hit
+            logger.info(f"[MOCK SL/TP] {exit_reason} HIT: entry={entry_price:.2f}, exit={exit_price:.2f}, pnl={pnl:.4f}")
+            
+            # Close position
+            old_position = self.position.copy()
+            self.position = None
+            self.pending_sl = None
+            self.pending_tp = None
+            
+            return {
+                'exit_reason': exit_reason,
+                'exit_price': exit_price,
+                'entry_price': entry_price,
+                'pnl': pnl,
+                'side': 'long' if is_long else 'short',
+                'position': old_position
+            }
+        
+        return None
     
     def _check_fills(self):
         """Verifica si órdenes limit se llenan"""
@@ -183,11 +250,16 @@ class MockExecution:
             'amount': amount
         }
     
-    async def close_position_market(self, side: str, amount: float) -> bool:
+    async def close_position_market(self, side: str = None, amount: float = 0.0, 
+                                     symbol: str = None, reason: str = None) -> bool:
+        """Cierra posición a mercado - compatible con interfaz real"""
         if self.position:
-            self.position['size'] -= amount
-            if self.position['size'] <= 0:
+            close_amount = amount if amount > 0 else abs(self.position['contracts'])
+            self.position['size'] -= close_amount
+            self.position['contracts'] = self.position['contracts'] - close_amount if self.position['contracts'] > 0 else self.position['contracts'] + close_amount
+            if abs(self.position['contracts']) < 0.0001 or self.position['size'] <= 0:
                 self.position = None
+            logger.info(f"[MOCK] close_position_market: side={side}, amount={close_amount}, reason={reason}")
         return True
     
     async def cancel_order(self, order_id: str) -> bool:
@@ -222,7 +294,13 @@ class MockExecution:
     
     async def set_position_stops(self, symbol: str, stop_loss: float, 
                                   take_profit: float = None) -> bool:
-        return True  # Backtest maneja SL/TP internamente via RiskEngine
+        """Update SL/TP levels - CRITICAL for trailing stop sync"""
+        if stop_loss:
+            self.pending_sl = stop_loss
+        if take_profit:
+            self.pending_tp = take_profit
+        logger.debug(f"[MOCK] set_position_stops: SL={stop_loss}, TP={take_profit}")
+        return True
     
     async def verify_stops_on_exchange(self, symbol: str) -> dict:
         return {'has_sl': True, 'has_tp': True}
@@ -234,11 +312,11 @@ class MockExecution:
     
     async def get_available_capital(self) -> float:
         """Return available capital for position sizing"""
-        return 1000.0  # Fixed capital for backtest (1000 EUR)
+        return 300.0  # 300 EUR como live (actualizado Jan 26, 2026)
     
     async def get_account_balance(self) -> dict:
         """Return mock account balance for backtest"""
-        return {'total': 10000.0, 'free': 10000.0, 'used': 0.0}
+        return {'total': 300.0, 'free': 300.0, 'used': 0.0}
 
 
 class MockExternalData:
@@ -345,23 +423,24 @@ def download_kraken_data(symbol: str = 'BTC/USD:USD', days: int = 7, offset_days
 class BacktestRunner:
     """Ejecuta backtest usando las clases REALES del sistema"""
     
-    def __init__(self, symbol: str = 'BTC/USD:USD', capital: float = 1000.0, 
-                 enable_slippage: bool = False):
+    def __init__(self, symbol: str = 'BTC/USD:USD', capital: float = 300.0, 
+                 enable_slippage: bool = True, leverage: int = 10):
         self.symbol = symbol
         self.capital = capital
+        self.leverage = leverage
         
-        # Check if slippage should be enabled via feature flag
+        # Slippage enabled by default for realistic backtest
         if VALIDATION_AVAILABLE and is_feature_enabled(FeatureFlag.SLIPPAGE_SIM):
             enable_slippage = True
         
         # Componentes REALES
-        self.market_data = SynchronizedMultiTimeframeBuffer(symbol)
+        self.market_data = SynchronizedMultiTimeframeBuffer(symbol, backtest_mode=True)
         self.execution = MockExecution(enable_slippage=enable_slippage)
         self.external_data = MockExternalData()
         self.trade_logger = MockTradeLogger()
         
         if enable_slippage:
-            logger.info("📉 Slippage simulation ENABLED (conservative backtest)")
+            logger.info("📉 Slippage simulation ENABLED (realistic backtest)")
         
         # Signal Engine REAL - with BACKTEST enforcement mode (relaxed thresholds)
         self.engine = SignalEngine(
@@ -377,6 +456,8 @@ class BacktestRunner:
         # Stats
         self.equity_curve: List[float] = [capital]
         self.trades_closed: List[dict] = []
+        
+        logger.info(f"💰 Backtest config: Capital={capital}€, Leverage={leverage}x")
     
     async def run(self, df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_1h: pd.DataFrame):
         """
@@ -389,23 +470,25 @@ class BacktestRunner:
         df_1h_indexed = df_1h.set_index('timestamp')
         
         # Necesitamos warmup de datos
-        # FIX (Jan 3, 2026): Ajustar warmup según datos disponibles
-        # ADX necesita period*2 = 28 velas, EMA200 necesita 200 velas
+        # FIX (Jan 26, 2026): LocationFilter necesita 480 barras 1h (20 días)
+        # EMA200 necesita 200 velas, pero LocationFilter domina
         available_1h = len(df_1h)
         available_5m = len(df_5m)
         available_1m = len(df_1m)
         
-        # Calcular warmup dinámico (dejar al menos 20% para backtest)
-        warmup_1h = min(210, int(available_1h * 0.8))  # Para EMA 200
-        warmup_5m = min(50, int(available_5m * 0.3))
-        warmup_1m = min(50, int(available_1m * 0.1))
+        # Calcular warmup dinámico - LocationFilter necesita 480 barras 1h
+        # IMPORTANTE: Warmup debe dejar datos suficientes para backtest
+        min_warmup_1h = 480  # LocationFilter requirement
+        warmup_1h = min(min_warmup_1h, int(available_1h * 0.8))  # Cap at 80% of data
+        warmup_5m = min(200, int(available_5m * 0.4))  # More 5m for structure detection
+        warmup_1m = min(100, int(available_1m * 0.1))
         
         logger.info(f"  Available data: 1h={available_1h}, 5m={available_5m}, 1m={available_1m}")
         logger.info(f"  Using warmup: 1h={warmup_1h}, 5m={warmup_5m}, 1m={warmup_1m}")
         
-        if warmup_1h < 50:
-            logger.warning(f"⚠️ Insufficient 1h data for reliable backtest (need 210+, have {available_1h})")
-            logger.warning(f"   ADX and EMA200 may return NaN - recommend --days 14 or more")
+        if warmup_1h < 480:
+            logger.warning(f"⚠️ Insufficient 1h data for LocationFilter (need 480+, have {available_1h})")
+            logger.warning(f"   Recommend --days 30+ for proper backtest (need ~21 days warmup + test days)")
         
         # Cargar warmup de 1h
         for i, row in df_1h.head(warmup_1h).iterrows():
@@ -482,11 +565,13 @@ class BacktestRunner:
                 }
                 self.market_data.add_candle(candle_1h)
             
-            # Actualizar precio en mock execution
+            # Actualizar precio en mock execution 
             current_price = float(row['close'])
+            candle_high = float(row['high'])
+            candle_low = float(row['low'])
+            
+            # Set price to close for standard processing
             self.execution.set_price(current_price)
-            # FIX: Update last_price directly (market_data.get_current_price() uses this)
-            # _current_price was wrong - the real code uses last_price
             self.market_data.last_price = current_price
             
             # ⭐ EJECUTAR TICK DEL SISTEMA REAL
@@ -494,6 +579,58 @@ class BacktestRunner:
                 await self.engine._process_tick()
             except Exception as e:
                 logger.debug(f"Tick error at {ts}: {e}")
+            
+            # ===============================================================
+            # BACKTEST SL/TP CHECK: After _process_tick, check if high/low 
+            # crossed SL/TP levels. This is CRITICAL because in live the 
+            # exchange executes stops, but in backtest we must simulate.
+            # ===============================================================
+            pos = self.engine.risk_engine.position
+            if pos and pos.stop_loss:
+                sl_hit = False
+                exit_price = None
+                
+                if pos.direction == 'LONG':
+                    # For LONG: check if LOW touched SL (SL is below entry)
+                    if candle_low <= pos.stop_loss:
+                        sl_hit = True
+                        exit_price = pos.stop_loss
+                else:  # SHORT
+                    # For SHORT: check if HIGH touched SL (SL is above entry)
+                    if candle_high >= pos.stop_loss:
+                        sl_hit = True
+                        exit_price = pos.stop_loss
+                
+                if sl_hit:
+                    # Use RiskEngine's _close_position to ensure proper logging
+                    logger.info(f"[BACKTEST SL] {pos.direction} hit SL: price touched {exit_price:.2f}")
+                    try:
+                        await self.engine.risk_engine._close_position(exit_price, 'STOP_LOSS')
+                    except Exception as e:
+                        logger.error(f"Error closing position on SL: {e}")
+                        # Fallback: clear position manually
+                        self.engine.risk_engine.position = None
+                        self.execution.position = None
+            
+            # Sync MockExecution with RiskEngine state
+            pos = self.engine.risk_engine.position
+            if pos:
+                # Sync trailing stop from RiskEngine to MockExecution
+                self.execution.pending_sl = pos.trailing_stop if hasattr(pos, 'trailing_stop') and pos.trailing_stop else pos.stop_loss
+                # Sync position if needed
+                if self.execution.position is None:
+                    self.execution.position = {
+                        'contracts': pos.size if pos.direction == 'LONG' else -pos.size,
+                        'size': pos.size,
+                        'side': 'long' if pos.direction == 'LONG' else 'short',
+                        'entry': pos.entry_price,
+                        'entryPrice': pos.entry_price
+                    }
+            else:
+                # No position in RiskEngine - clear MockExecution too
+                self.execution.position = None
+                self.execution.pending_sl = None
+                self.execution.pending_tp = None
             
             # Registrar equity
             equity = self._calculate_equity(current_price)
@@ -677,14 +814,33 @@ def print_results(results: dict):
 async def main():
     parser = argparse.ArgumentParser(description='Backtest with Kraken data using REAL strategy classes')
     parser.add_argument('--symbol', default='BTC/USD:USD', help='Kraken Futures symbol')
-    parser.add_argument('--days', type=int, default=7, help='Days of history')
+    parser.add_argument('--days', type=int, default=7, help='Days of history to TEST (excludes warmup)')
     parser.add_argument('--offset', type=int, default=0, help='Offset days from today (0=recent, 7=week ago)')
-    parser.add_argument('--capital', type=float, default=1000, help='Initial capital (EUR)')
-    parser.add_argument('--slippage', action='store_true', help='Enable slippage simulation (conservative)')
+    parser.add_argument('--capital', type=float, default=300, help='Initial capital (EUR) - default 300')
+    parser.add_argument('--leverage', type=int, default=10, help='Leverage - default 10x')
+    parser.add_argument('--no-slippage', action='store_true', help='Disable slippage simulation (optimistic)')
+    parser.add_argument('--no-extra-warmup', action='store_true', help='Disable extra warmup download (faster but LocationFilter may fail)')
     args = parser.parse_args()
     
-    # Descargar datos
-    df_1m, df_5m, df_1h = download_kraken_data(args.symbol, args.days, args.offset)
+    # LocationFilter needs 480 bars of 1h = 20 days
+    # Add extra warmup days to ensure filters work properly
+    WARMUP_DAYS = 21  # 20 days for LocationFilter + 1 buffer
+    total_download_days = args.days + WARMUP_DAYS if not args.no_extra_warmup else args.days
+    
+    print("\n" + "="*70)
+    print("🚀 KRAKEN FUTURES BACKTEST - REAL STRATEGY")
+    print("="*70)
+    print(f"   Symbol: {args.symbol}")
+    print(f"   Test Days: {args.days}")
+    print(f"   Warmup Days: {WARMUP_DAYS if not args.no_extra_warmup else 'AUTO'}")
+    print(f"   Total Download: {total_download_days} days")
+    print(f"   Capital: €{args.capital}")
+    print(f"   Leverage: {args.leverage}x")
+    print(f"   Slippage: {'DISABLED' if args.no_slippage else 'ENABLED'}")
+    print("="*70 + "\n")
+    
+    # Descargar datos (incluye warmup)
+    df_1m, df_5m, df_1h = download_kraken_data(args.symbol, total_download_days, args.offset)
     
     if len(df_1m) < 1000:
         logger.error("Not enough data downloaded. Check symbol or connection.")
@@ -694,7 +850,8 @@ async def main():
     runner = BacktestRunner(
         symbol=args.symbol, 
         capital=args.capital,
-        enable_slippage=args.slippage
+        enable_slippage=not args.no_slippage,
+        leverage=args.leverage
     )
     results = await runner.run(df_1m, df_5m, df_1h)
     

@@ -105,22 +105,31 @@ docker-build:
 
 docker-run:
 	docker run --rm -it \
-		--env-file .env \
+		--env-file .env.secrets \
 		-v $(PWD)/storage:/app/storage \
 		-v $(PWD)/logs:/app/logs \
 		-p 8000:8000 \
 		-p 8001:8001 \
 		daytrader:latest
 
-docker-up:
-	docker-compose up -d trading-bot prometheus
-	@echo "Services started. Logs: docker-compose logs -f trading-bot"
+docker-run-detached:
+	docker run -d \
+		--name btc-trader \
+		--env-file .env.secrets \
+		-v $(PWD)/storage:/app/storage \
+		-v $(PWD)/logs:/app/logs \
+		-p 8000:8000 \
+		-p 8001:8001 \
+		--restart unless-stopped \
+		daytrader:latest
+	@echo "Container started. Logs: docker logs -f btc-trader"
 
-docker-down:
-	docker-compose down
+docker-stop:
+	docker stop btc-trader 2>/dev/null || true
+	docker rm btc-trader 2>/dev/null || true
 
 docker-logs:
-	docker-compose logs -f trading-bot
+	docker logs -f btc-trader
 
 # ============================================================
 # Maintenance

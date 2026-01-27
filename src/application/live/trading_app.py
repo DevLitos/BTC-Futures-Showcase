@@ -1,0 +1,9532 @@
+"""
+Signal Engine for BTC Perpetual Trading System
+Implements complete strategy logic with HTF, MTF, LTF filters
+Integrated with Kraken WebSocket, REST execution, and external data
+
+NOTE: Position sizing now uses centralized PositionSizer from core_utils.
+Edge and state multipliers are coordinated through state_types module.
+"""
+
+import asyncio
+import numpy as np
+import pandas as pd
+from datetime import datetime, UTC, timedelta
+from prometheus_client import Counter
+import logging
+
+from src.domain.trading.state.state_machine import StateMachine, BotState
+from src.domain.market.filters import (
+    KillConditionsFilter, BlackSwanFilter, HTFFilter,
+    LTFTriggerFilter,
+    # MTFStructureFilter removed (FIX #1: Enable earlier entries)
+    # Advanced filters
+    check_funding_rate_safe,
+    should_exit_on_funding,
+    check_session_quality,
+    check_htf_divergence,
+    calculate_vpoc,
+    check_vpoc_validity,
+    check_btc_trend,
+    # Specialized filters
+    LocationFilter, get_location_filter, LocationContext,
+    MicroTrendFilter, get_micro_trend_filter, MicroTrendState,
+    EntryFilterPipeline, get_entry_filter_pipeline,
+    SpreadFilter, get_spread_filter, check_spread_for_entry, SpreadCheckResult,
+)
+from src.domain.risk.risk_engine import RiskEngine
+from src.infrastructure.exchanges.kraken.execution import round_size_to_exchange, KRAKEN_BTC_MIN_SIZE  # 🔒 FIX: Centralized size rounding + min size
+from src.shared.indicators import (
+    calculate_ema, calculate_atr, calculate_adx, calculate_rsi, calculate_bollinger_bands,
+    safe_calculate_atr, safe_calculate_adx, safe_calculate_ema, safe_calculate_rsi,
+    safe_calculate_bollinger_bands, to_ndarray
+)
+from src.config.trading_config import HTFFilters, RiskManagement, OperatingMode  # For logging thresholds + MODE
+from src.config.trading_config import DailyRegimeDetector  # 🔥 FIX (Jan 23): Daily regime classification
+from src.domain.market.regime import EdgeRegimeClassifier, RegimeDetector, EntryRegime, calculate_chase_atr
+from src.domain.market.regime import TrendIntelligence, TrendPhase, get_trend_intelligence  # 🔥 NEW: Trend cycle detection
+from src.domain.trading.edge.edge_enforcement import EdgeEnforcement
+from src.domain.trading.edge.edge_validator import ContextValidity
+from src.shared.utils import PositionSizer, get_position_sizer
+from src.shared.time_provider import get_time_provider, TimeProvider
+from src.infrastructure.monitoring.error_tracker import get_error_tracker, ErrorSeverity
+from src.infrastructure.monitoring.system_health import SystemHealthMonitor
+from src.infrastructure.exchanges.kraken.exchange_reconciler import ExchangeReconciler, ReconcilerState
+from src.infrastructure.monitoring.opportunity_tracker import MissedOpportunityTracker
+from src.domain.market.structure.important_levels import (
+    ImportantLevelsProvider, get_important_levels_provider,
+    initialize_important_levels, LevelContext, LevelType
+)
+from src.domain.trading.strategy.pullback_short import (
+    PullbackShortEngine, get_pullback_short_engine,
+    PullbackShortSignal, TradeType
+)
+from src.config.trading_config import PullbackShortConfig
+
+# NEW: Bias Strength & Trend Expansion configs (Jan 22, 2026)
+from src.config.trading_config import (
+    BiasStrength, BiasStrengthConfig, TrendExpansionConfig, ShortObstinacyConfig
+)
+
+# NEW: Anticipation & Exhaustion engines (Jan 22, 2026)
+from src.domain.trading.anticipation import (
+    AnticipationEngine, get_anticipation_engine, AnticipationSignal, AnticipationState
+)
+from src.domain.trading.strategy.momentum_exhaustion import (
+    MomentumExhaustionDetector, get_exhaustion_detector, ExhaustionLevel, ExhaustionState
+)
+
+from src.infrastructure.monitoring.metrics import (
+    update_pullback_short_signal, update_pullback_short_entry,
+    update_pullback_short_exit, update_pullback_short_status
+)
+
+# NEW IMPORTS: Slippage, Trade Logger, Dynamic Configs (Jan 16, 2026)
+from src.infrastructure.exchanges.kraken.slippage_model import (
+    SlippageModel, get_slippage_model, calculate_worst_case_rr, OrderType
+)
+from src.infrastructure.storage.parquet.trade_logger import TradeLogger, get_trade_logger
+from src.config.trading_config import (
+    DynamicScoreThreshold, SessionTradeLimits, VolatilityRegime, VolatilityRegimeValue,
+    LossStreakConfig, LocationFilterOverride, MicroTrendADXConfig,
+    get_session_name
+)
+from src.domain.trading.scoring import EntryScorer, get_entry_scorer
+
+# Extracted helper modules (Jan 20, 2026 - Phase 4 refactoring)
+from src.domain.trading.execution_logic.filter_checks import (
+    check_trend_filter as _check_trend_pure,
+    check_volatility_expansion as _check_volatility_expansion_pure,
+    check_anti_reversal as _check_anti_reversal_pure,
+    check_volume_delta as _check_volume_delta_pure,
+    check_bos_against_position as _check_bos_pure,
+    check_atr_regime_allows_entry as _check_atr_regime_pure,
+    check_volatility_minimum as _check_vol_min_pure,
+    check_not_post_impulse as _check_post_impulse_pure,
+    check_sweep_occurred as _check_sweep_pure,
+)
+from src.shared.indicator_helpers import (
+    calculate_atr_1m as _calc_atr_1m_pure,
+    calculate_atr_5m as _calc_atr_5m_pure,
+    calculate_atr_generic as _calc_atr_generic_pure,
+    find_tp2_target as _find_tp2_pure,
+    find_support_resistance as _find_sr_pure,
+)
+
+# 🔥 NEW (Jan 22, 2026): Entry Quality Gate - Hard rules before scoring
+from src.domain.trading.execution_logic.entry_quality import (
+    EntryQualityGate, get_entry_quality_gate, GateDecision, GateResult
+)
+
+# 🧠 NEW (Jan 24, 2026): Intelligent Filter - Multi-layer decision system
+from src.domain.trading.execution_logic.intelligent_filter import (
+    IntelligentFilter, get_intelligent_filter, FilterSeverity
+)
+
+# 🔥 NEW (Jan 24, 2026): Adaptive Entry System - Market-aware thresholds
+from src.domain.trading.strategy.adaptive_entry import (
+    AdaptiveEntrySystem, get_adaptive_entry_system, MarketCondition
+)
+
+# 🤖 NEW (Jan 24, 2026): ML Entry Score Refinement - Shadow mode logging
+from src.ml.inference import get_ml_inference_engine
+
+# NEW ARCHITECTURE: Position Store as Single Source of Truth
+from src.bootstrap.runtime import RuntimeMode, get_runtime_config
+from src.infrastructure.storage import get_position_store, TrackedPosition
+from src.domain.trading.cost.cost_model import get_cost_model  # 🔥 FIX (Jan 24): Cost validator
+
+logger = logging.getLogger(__name__)
+
+
+def _ts_to_int(ts) -> int:
+    """Convert any timestamp (pd.Timestamp, int, float) to int (epoch ms)."""
+    if ts is None:
+        return 0
+    if hasattr(ts, 'value'):
+        # pd.Timestamp.value is in nanoseconds, convert to ms
+        return int(ts.value // 1_000_000)
+    if hasattr(ts, 'timestamp'):
+        # datetime object
+        return int(ts.timestamp() * 1000)
+    return int(ts) if ts else 0
+
+
+SIGNALS_GENERATED = Counter(
+    'trading_signals_generated_total',
+    'Total trading signals generated',
+    ['symbol', 'direction']
+)
+
+# Configuration
+ENTRY_TIMEOUT_MINUTES = 3  # 3 candles at 1m = 3 minutes
+POSITION_CHECK_INTERVAL = 5  # Check position every 5 seconds
+
+
+def _create_safe_task(coro, name: str = "anonymous"):
+    """
+    Create an async task with error handling.
+    Prevents fire-and-forget tasks from silently losing errors.
+    """
+    async def wrapped():
+        try:
+            return await coro
+        except asyncio.CancelledError:
+            pass  # Normal shutdown, don't log as error
+        except Exception as e:
+            logger.error(f"Async task '{name}' failed: {e}")
+    
+    return asyncio.create_task(wrapped(), name=name)
+
+
+
+
+
+class SignalEngine:
+    """
+    Main trading engine implementing the complete strategy
+    Orchestrates all filters, state machine, risk management, and execution
+    
+    Integrated components:
+    - market_data: SynchronizedMultiTimeframeBuffer (candle history)
+    - order_book: OrderBookManager (depth, imbalance, spread)
+    - execution: RESTExecutionEngine (CCXT orders)
+    - external_data: ExternalDataManager (funding, macro events)
+    - trade_logger: TradeLogger (persistence)
+    """
+    
+    def __init__(self, market_data, execution, external_data, trade_logger, output_manager=None, order_book=None, enforcement_mode: str = 'forward'):
+        """
+        Initialize SignalEngine.
+        
+        Args:
+            market_data: SynchronizedMultiTimeframeBuffer
+            execution: Execution engine (real or mock)
+            external_data: External data manager
+            trade_logger: Trade logger
+            output_manager: Output manager for notifications (Telegram)
+            order_book: OrderBookManager for spread/depth analysis (optional)
+            enforcement_mode: Edge enforcement mode ('backtest', 'forward', 'live')
+        """
+        self.market_data = market_data
+        self.execution = execution
+        self.external_data = external_data
+        self.trade_logger = trade_logger
+        self.output_manager = output_manager
+        self.order_book = order_book
+        
+        # Store enforcement mode for edge enforcement initialization
+        self._enforcement_mode = enforcement_mode
+        self._is_backtest = enforcement_mode == 'backtest'
+        
+        # =====================================================================
+        # NEW ARCHITECTURE: Position Store Integration
+        # In LIVE mode, position_store is the SINGLE SOURCE OF TRUTH
+        # =====================================================================
+        self._position_store = get_position_store()
+        try:
+            self._runtime_config = get_runtime_config()
+        except RuntimeError:
+            # Runtime not initialized yet (backtest mode)
+            self._runtime_config = None
+        
+        # Core components
+        self.state_machine = StateMachine(backtest_mode=self._is_backtest)
+        self.risk_engine = RiskEngine(capital=0.0)  # Will be updated from exchange
+        
+        # =====================================================================
+        # EXCHANGE RECONCILER - Single Source of Truth (Jan 12, 2026)
+        # The reconciler is the ONLY component that derives state from exchange.
+        # All other subsystems LISTEN to state but never write to it.
+        # =====================================================================
+        self.reconciler = ExchangeReconciler(
+            execution_engine=execution,
+            backtest_mode=self._is_backtest
+        )
+        
+        # Symbol (set during initialization)
+        self.symbol: str | None = None
+        
+        # Filters - ALL use market_time, backtest_mode flag for relaxed validation
+        self.kill_filter = KillConditionsFilter(self.state_machine, capital=0.0, risk_engine=self.risk_engine, backtest_mode=self._is_backtest)
+        self.black_swan_filter = BlackSwanFilter()
+        self.htf_filter = HTFFilter(backtest_mode=self._is_backtest)
+        # self.mtf_filter = MTFStructureFilter()  # REMOVED (FIX #1: Enable earlier entries)
+        self.ltf_filter = LTFTriggerFilter(backtest_mode=self._is_backtest)
+        
+        # Location filter - macro context veto (prevents buying tops in RANGE)
+        self.location_filter = get_location_filter()
+        self._location_context: LocationContext | None = None
+
+        # =====================================================================
+        # MICRO TREND FILTER - Prevents LONGs during micro-bearish trends
+        # Detects when 5m structure is bearish even if 1h is bullish
+        # =====================================================================
+        # 🔥 FIX (Jan 22, 2026): Disable hard_block - only penalize score
+        # Hard blocking on micro structure kills too many good trades
+        # BTC does LL/LH constantly during trends, doesn't mean reversal
+        self.micro_trend_filter = get_micro_trend_filter(hard_block_enabled=False)
+        self._micro_trend_state: MicroTrendState | None = None
+
+        # =====================================================================
+        # ENTRY FILTER PIPELINE (Jan 15, 2026) - Unified filter evaluation
+        # Combines: BB Width, Volatility Shock, Macro Trend, Post-Sweep, Cost, Overtrade
+        # =====================================================================
+        self.filter_pipeline = get_entry_filter_pipeline(
+            bb_width_enabled=True,
+            volatility_shock_enabled=True,
+            macro_trend_enabled=True,
+            post_sweep_enabled=True,
+            cost_filter_enabled=True,
+            overtrade_enabled=True
+        )
+
+        # =====================================================================
+        # PULLBACK SHORT ENGINE - Tactical shorts in bullish markets (Jan 14, 2026)
+        # Captures corrections (e.g., 97k → 92k) within bullish HTF cycles
+        # =====================================================================
+        self.pullback_short_engine = get_pullback_short_engine()
+        self._current_trade_type: TradeType = TradeType.LONG_MAIN  # Default
+        self._current_trade_regime: str = 'RANGE'  # 🔥 FIX (Jan 22): Track regime for trailing stop
+        
+        # =====================================================================
+        # 🔥 DAILY REGIME DETECTOR (Jan 23, 2026) - IMPRESCINDIBLE
+        # Classifies day as TREND_DAY, RANGE_DAY, or TRANSITION_DAY at session start
+        # This OVERRIDES intraday regime decisions for the entire day
+        # =====================================================================
+        self._daily_regime: str = 'RANGE_DAY'  # Default conservative
+        self._daily_regime_config: dict = DailyRegimeDetector.get_daily_config('RANGE_DAY')
+        self._daily_regime_last_update: datetime | None = None
+        
+        # =====================================================================
+        # 🔥 TREND INTELLIGENCE (Jan 23, 2026) - Detección de ciclos
+        # Detecta INICIO y FIN de tendencias, no solo estado actual
+        # Fases: ACCUMULATION → BIRTH → ACCELERATION → MATURE → EXHAUSTION → DEATH
+        # =====================================================================
+        self._trend_intelligence = get_trend_intelligence()
+        self._trend_phase: TrendPhase = TrendPhase.RANGE_BOUND
+        self._trend_last_update: datetime | None = None
+        
+        # Regime classifier for volume-aware filtering
+        self.regime_classifier = EdgeRegimeClassifier()
+        
+        # Edge enforcement - pre-trade validation & degradation monitoring
+        # Uses Activity Regime model (not session-based) for 24/7 crypto markets
+        self.edge_enforcement = EdgeEnforcement(mode=self._enforcement_mode)
+        
+        # =====================================================================
+        # ENTRY SCORER - Extracted to reduce god class complexity (Jan 20, 2026)
+        # Handles score calculation: structure, timing, momentum, context
+        # =====================================================================
+        self._entry_scorer = get_entry_scorer()
+        
+        # =====================================================================
+        # ENTRY QUALITY GATE - Hard rules before scoring (Jan 22, 2026)
+        # Layer 1: Gate (hard rules) → Layer 2: Score → Layer 3: Execution
+        # =====================================================================
+        self._entry_gate = get_entry_quality_gate()
+        
+        # =====================================================================
+        # 🧠 INTELLIGENT FILTER - Multi-layer decision system (Jan 24, 2026)
+        # Accumulates penalties, no "entering anyway" - blocks if accumulated risk is too high
+        # =====================================================================
+        self._intelligent_filter = get_intelligent_filter()
+        
+        # =====================================================================
+        # 🔥 ADAPTIVE ENTRY SYSTEM (Jan 24, 2026)
+        # Market-aware thresholds that adjust based on:
+        # - Volatility (BB width, ADX)
+        # - Activity level (hours since last trade)
+        # - Market condition (dead, low, normal, high, extreme)
+        # =====================================================================
+        self._adaptive_entry = get_adaptive_entry_system()
+        
+        # =====================================================================
+        # 🤖 ML INFERENCE ENGINE (Jan 24, 2026) - Entry Score Refinement
+        # SHADOW MODE: Logs predictions without affecting decisions
+        # Future: HYBRID mode will adjust score ±1 based on ML confidence
+        # =====================================================================
+        self._ml_inference = get_ml_inference_engine()
+        
+        # 🤖 ML STATUS LOG - Show ML state at startup
+        ml_stats = self._ml_inference.get_stats()
+        logger.info(f"🤖 ML ENGINE STATUS:")
+        logger.info(f"   Phase: {ml_stats['phase']}")
+        if ml_stats['model_loaded']:
+            logger.info(f"   Model: LOADED ✅ (AUC: {ml_stats['model_auc']:.3f})")
+            logger.info(f"   Drift Detection: {'ACTIVE ✅' if not ml_stats['drift_detected'] else '⚠️ DRIFT DETECTED'}")
+        else:
+            logger.info(f"   Model: NOT YET TRAINED")
+            logger.info(f"   → ML is collecting data in SHADOW mode")
+            logger.info(f"   → Run training after 100+ trades: uv run python -m src.ml.training.train_entry_model")
+        
+        # Centralized position sizer for consistent sizing calculations
+        self._position_sizer = get_position_sizer(
+            risk_pct=0.01,  # 1% risk per trade
+            max_position_pct=0.10,  # Max 10% of capital
+            leverage=10
+        )
+        
+        # Edge context (updated periodically)
+        self._edge_context: ContextValidity | None = None
+        self._last_context_update = None
+        self._context_update_interval = 300  # Update every 5 minutes
+        
+        # Trade tracking for edge enforcement
+        self._trade_counter = 0
+        self._current_trade_entry_time = None
+        self._current_trade_entry_price = 0.0
+        self._current_trade_mfe = 0.0
+        self._current_trade_mae = 0.0
+        self._reached_tp1 = False
+        self._reached_tp2 = False
+        self._is_be_stop = False
+        
+        # Trade tracking
+        self.current_bias: str | None = None  # 'LONG' or 'SHORT'
+        self.impulse_high: float = 0.0
+        self.impulse_low: float = 0.0
+        self.pending_order_id: str | None = None
+        self.entry_order_time: datetime | None = None
+        
+        # STATE MACHINE para evitar busy loops
+        self.setup_state = None  # IDLE, WAIT_LTF, EXECUTING
+        self.setup_start_time = None  # Cuándo entró en WAIT_LTF
+        self.ltf_wait_timeout = 5 * 60  # 5 minutos (300s) = ~5 candles 1m
+        self.setup_frozen_htf = False  # Freeze HTF evaluation
+        # self.setup_frozen_mtf = False  # REMOVED (no MTF filter)
+        self.last_setup_discard_time = None  # Cuándo se descartó el último setup
+        self.setup_discard_cooldown = 10  # Cooldown reducido: solo 10s para evitar thrashing
+        # Position management flags
+        self._stops_set = False  # Flag para evitar intentar establecer SL/TP múltiples veces
+        self._sync_lock = asyncio.Lock()  # 🔥 AUDIT FIX: Proper async lock for sync operations
+        self._syncing_position = False  # Track if sync is in progress
+        # 🔥 FIX (Jan 23, 2026): Force BOS check after orphan recovery
+        self._force_bos_check_on_orphan = False  # Check BOS immediately after orphan sync
+        
+        # =====================================================================
+        # MISSING ATTRIBUTE INITIALIZATION (🔥 AUDIT FIX)
+        # These were previously initialized via hasattr() checks - now explicit
+        # =====================================================================
+        self._last_entry_data = None  # Entry data for current trade
+        self._last_exchange_sync = None  # Last time we synced with exchange
+        self._consecutive_post_only_rejects = 0  # Track post-only rejections
+        self._recent_trade_prices = []  # Recent trade prices for analysis
+        self._last_log_time = None  # Rate limiting for logs
+        self._last_capital_warning = None  # Rate limiting for capital warnings
+        self._last_exchange_state_check = None  # Last exchange state check
+        self._last_exchange_unavailable_log = None  # Rate limit exchange unavailable logs
+        self._consecutive_no_position_checks = 0  # Track consecutive no-position checks
+        self._last_reconcile_time = None  # Last position reconciliation time
+        self._last_incomplete_log = None  # Rate limit incomplete data logs
+        self._last_defensive_log = None  # Rate limit defensive logs
+        self._last_balance_check = None  # Last balance check time
+        self._last_htf_reject_log_time = None  # Rate limit HTF reject logs
+        self._last_location_state = None  # Last location filter state
+        self._last_micro_state = None  # Last micro trend state
+        self._last_fp_block = None  # Last filter pipeline block
+        self._last_pullback_block_log = None  # Rate limit pullback block logs
+        self._loss_exit_types = {}  # Track loss exit types for analysis (dict not list!)
+        
+        # =====================================================================
+        # 🔥 ANOMALY DETECTION TRACKING (Jan 24, 2026)
+        # Track previous tick data to detect anomalies (gaps, staleness)
+        # =====================================================================
+        self._prev_tick_price: float = 0.0  # Previous tick price for gap detection
+        self._prev_tick_time: datetime | None = None  # Previous tick time for staleness detection
+        
+        # =====================================================================
+        # INDICATOR CACHE - Avoid recalculating heavy indicators every tick
+        # Only recalculate when candle timestamp changes (Jan 20, 2026)
+        # =====================================================================
+        self._indicator_cache = {
+            'last_candle_ts_1m': 0,
+            'last_candle_ts_5m': 0,
+            'last_candle_ts_1h': 0,
+            'df_1m': None,
+            'df_5m': None,
+            'df_1h': None,
+            'adx_1h': None,
+            'atr_1m': None,
+            'atr_ratio': None,
+            'ema20_5m': None,
+            'rsi_1m': None,
+            'bb_width': None,
+            'bb_avg': None,
+            'vpoc': None,
+        }
+        
+        # =====================================================================
+        # LOSS STREAK COOLDOWN - Protection against chop regimes
+        # 
+        # FIX (Jan 22, 2026): Punto 3 - Loss cooldown was too aggressive
+        # PROBLEM: 2 losses triggered 30min cooldown - this is normal variance
+        # SOLUTION: Tiered cooldown with higher thresholds:
+        #   - 3 consecutive losses → 15 min cooldown (tier 1)
+        #   - 4 consecutive losses → 60 min cooldown (tier 2)
+        #   - 5 consecutive losses → 180 min cooldown (tier 3)
+        #   - 6 consecutive losses → KILL SWITCH (daily)
+        # 
+        # 🔥 FIX (Jan 25, 2026): Enhanced auto kill-switch + dead hours tracking
+        # =====================================================================
+        self._consecutive_losses = 0  # Tracks consecutive SL hits
+        self._cooldown_until = None  # Timestamp when cooldown ends
+        self._kill_switch_active = False  # Full daily kill switch
+        self._daily_losses_count = 0  # Count of losses today
+        self._dead_hours_losses = 0   # Losses during dead hours (4am-7am UTC)
+        self._dead_hours_blocked = False  # Block trading in dead hours after 2+ losses
+        
+        # Cooldown configuration from config
+        from src.config.trading_config import OperatingMode
+        self._pause_after_3 = getattr(OperatingMode, 'PAUSE_AFTER_LOSSES_3', 15)
+        self._pause_after_4 = getattr(OperatingMode, 'PAUSE_AFTER_LOSSES_4', 60)
+        self._pause_after_5 = getattr(OperatingMode, 'PAUSE_AFTER_LOSSES_5', 180)
+        self._kill_switch_losses = getattr(OperatingMode, 'KILL_SWITCH_LOSSES', 6)
+        
+        # =====================================================================
+        # REJECTION COOLDOWN - Prevents rapid reevaluation after filter blocks
+        # Only activated for TECHNICAL errors, not filter rejections
+        # =====================================================================
+        self._rejection_cooldown_until: datetime | None = None  # When rejection cooldown ends
+        self._rejection_cooldown_candles = 2  # Number of candles to wait after rejection
+        self._last_rejection_reason: str | None = None  # Why was the setup rejected
+        self._last_evaluated_candle_ts: int = 0  # Timestamp of last evaluated LTF candle
+        
+        # =====================================================================
+        # MOMENTUM QUALITY - For position sizing, not hard veto
+        # =====================================================================
+        self._last_momentum_quality: str = "MODERATE"  # STRONG, MODERATE, WEAK
+        self._last_momentum_atr: float = 100.0  # Last ATR value
+        
+        # =====================================================================
+        # ENTRY SCORE SYSTEM - Score > Gates architecture
+        # 4 blocks × 0-2 points + synergy bonus = max 9
+        # Uses MODE from OperatingMode for thresholds
+        # Only Structure=0 blocks entry (the only real gate)
+        # =====================================================================
+        self._entry_score: int | float = 0
+        self._score_breakdown: dict = {
+            'structure': 0,  # HTF alignment + 5m structure (0-2)
+            'timing': 0,     # BOS at close + reclaim quality (0-2)
+            'momentum': 0,   # ADX + slope (0-2)
+            'context': 0,    # Session + volatility (0-2)
+            'synergy': 0     # HTF clean + BOS confirmed = +1 (non-linear bonus)
+        }
+        # Threshold from OperatingMode - NEVER change based on losses
+        self._entry_threshold: float = float(OperatingMode.get_score_threshold())
+        
+        # =====================================================================
+        # TRADE TAGS - All filters become tags, not blockers
+        # This is where edges are discovered
+        # =====================================================================
+        self._current_trade_tags: dict = {}  # Reset per trade
+        
+        # =====================================================================
+        # DISCOVERY METRICS - Track edge by segment
+        # =====================================================================
+        self._score_distribution: dict = {
+            '5-6': {'trades': 0, 'wins': 0, 'pnl': 0.0},
+            '7-8': {'trades': 0, 'wins': 0, 'pnl': 0.0},
+            '9+': {'trades': 0, 'wins': 0, 'pnl': 0.0}
+        }
+        
+        # Evaluation counter (para debug - verificar que evalúa continuamente)
+        self._idle_eval_count = 0
+        
+        # Control
+        self.is_running = False
+        self._system_halted = False  # CRITICAL: Set to True if close fails with position still open
+        
+        # Log state tracking (para evitar spam)
+        self._last_htf_state = None
+        self._last_ltf_state = None
+        
+        # BOS tracking - edge-triggered (solo loguear UNA vez por nivel)
+        self._last_bos_level: float | None = None  # Nivel donde se detectó BOS
+        self._last_bos_direction: str | None = None  # 'LONG' o 'SHORT'
+        
+        # =====================================================================
+        # HTF CACHE - Solo recalcular cuando cierra nueva vela 1H
+        # =====================================================================
+        self._htf_cache_ts: int = 0  # Timestamp de la última vela 1h evaluada
+        self._htf_cache_passed: bool = False  # Resultado cacheado
+        self._htf_cache_bias: str | None = None  # 'LONG', 'SHORT', None
+        self._htf_cache_reason: str = ""  # Razón del resultado
+        # 🔥 FIX (Jan 23, 2026): Cache HTF regime mode based on ADX
+        self._htf_cache_regime_mode: str = 'UNKNOWN'  # 'RANGE', 'WEAK_TREND', 'TREND', 'LOW_ADX'
+        self._htf_cache_adx: float = 0.0  # ADX value for logging
+        
+        # =====================================================================
+        # SYSTEM HEALTH MONITOR - Independent of PnL
+        # =====================================================================
+        self.health_monitor: SystemHealthMonitor | None = None  # Initialized in initialize()
+        
+        # =====================================================================
+        # MISSED OPPORTUNITY TRACKER - Track blocked signals for edge analysis
+        # =====================================================================
+        self.missed_tracker = MissedOpportunityTracker()
+        
+        # =====================================================================
+        # REGIME DETECTOR - Context-aware market state (Jan 12, 2026)
+        # Anti-chasing becomes relative to regime, not absolute
+        # =====================================================================
+        self.regime_detector = RegimeDetector()
+        self._current_regime: EntryRegime = EntryRegime.NORMAL  # Default: standard trading
+        
+        # =====================================================================
+        # IMPORTANT LEVELS PROVIDER - Anchor levels for S/R (Jan 13, 2026)
+        # Year/Quarter/Month/Week closes act as psychological S/R
+        # Used for: blocking near levels, confluence bonus, TP adjustment
+        # =====================================================================
+        self.important_levels: ImportantLevelsProvider | None = None  # Initialized async in initialize()
+        self._last_level_context: LevelContext | None = None  # Last computed level context
+        self._last_levels_update: datetime | None = None  # Last time levels were refreshed
+        
+        # =====================================================================
+        # NEW: SPREAD FILTER - Real-time spread monitoring (Jan 16, 2026)
+        # =====================================================================
+        self.spread_filter: SpreadFilter = get_spread_filter()
+        
+        # =====================================================================
+        # NEW: SLIPPAGE MODEL - Worst-case RR calculation (Jan 16, 2026)
+        # =====================================================================
+        self.slippage_model: SlippageModel = get_slippage_model()
+        
+        # =====================================================================
+        # 🔥 INDICATOR CACHE BY TIMEFRAME (Jan 20, 2026)
+        # =====================================================================
+        # NEW: TRADE LOGGER - Persistent trade logging with tags (Jan 16, 2026)
+        # =====================================================================
+        self.trade_logger: TradeLogger = get_trade_logger()
+        self._current_trade_id: str | None = None  # Active trade ID for logging
+        
+        # =====================================================================
+        # NEW: SESSION TRADE COUNTER - Limit trades per session (Jan 16, 2026)
+        # =====================================================================
+        self._session_trade_counts: dict = {}  # {session_name: count}
+        self._last_session: str | None = None
+        self._daily_trade_count: int = 0
+        self._last_trade_date: str | None = None
+        self._at_session_limit: bool = False  # Track if at session limit
+        
+        # =====================================================================
+        # NEW: VOLATILITY REGIME TRACKING (Jan 16, 2026)
+        # =====================================================================
+        self._current_volatility_regime: VolatilityRegimeValue | str = VolatilityRegime.NORMAL  # Uses VolatilityRegime class constants
+        self._last_atr_ratio: float = 1.0
+        
+        # =====================================================================
+        # NEW: LAST SENT SL TRACKING for exchange updates (Jan 16, 2026)
+        # =====================================================================
+        self._last_sent_sl: float = 0.0
+        
+        # =====================================================================
+        # NEW: BIAS STRENGTH & TREND EXPANSION SYSTEM (Jan 22, 2026)
+        # =====================================================================
+        self._current_bias_strength: 'BiasStrength | None' = None  # BULL_STRONG, BEAR_STRONG, NEUTRAL
+        self._trend_expansion_active: bool = False
+        self._trend_expansion_start_time: datetime | None = None
+        self._anti_fade_until: datetime | None = None  # No counter-trend until this time
+        self._countertrend_losses_session: int = 0  # CT losses this session
+        self._last_countertrend_loss_time: datetime | None = None
+        self._short_cooldown_until: datetime | None = None  # Short obstinacy cooldown
+        self._last_expansion_check_ts: int = 0  # Cache for expansion check
+        
+        # =========================================================================
+        # 🔥 NEW (Jan 26, 2026): FALSE EXPANSION TRACKING
+        # 
+        # A "false expansion" is when:
+        # - Expansion was detected (4/4 criteria)
+        # - Trade entered
+        # - MFE < 0.3R AND stop hit
+        # 
+        # This tracks detector quality, NOT entry quality.
+        # High false expansion rate = detector needs recalibration.
+        # =========================================================================
+        self._expansion_trades_count: int = 0  # Total trades in expansion mode
+        self._false_expansion_count: int = 0   # Trades where expansion failed (MFE<0.3R + SL hit)
+        self._consecutive_expansion_losses: int = 0  # For cluster protection
+        
+        # =====================================================================
+        # NEW: ANTICIPATION ENGINE - Early entries BEFORE breakouts (Jan 22, 2026)
+        # Detects: BB squeeze, ADX coiling, volume decline, structure building
+        # =====================================================================
+        self.anticipation_engine = get_anticipation_engine()
+        self._last_anticipation_state: AnticipationState | None = None
+        
+        # =====================================================================
+        # NEW: EXHAUSTION DETECTOR - Exit at the "summum" (Jan 22, 2026)
+        # Detects: Volume climax, RSI divergence, candle exhaustion, ATR reversal
+        # =====================================================================
+        self.exhaustion_detector = get_exhaustion_detector()
+        self._last_exhaustion_state: ExhaustionState | None = None
+        
+        logger.info("Signal Engine initialized")
+    
+    # =========================================================================
+    # 🔥 ABSOLUTE LAW: EXCHANGE IS THE ONLY SOURCE OF TRUTH
+    # =========================================================================
+    
+    async def _enforce_exchange_state_truth(self):
+        """
+        THE CARDINAL RULE: System state is DERIVED from exchange, not DECIDED by system.
+        
+        if exchange_position_size > min_size:
+            system_state = MANAGE
+        else:
+            system_state = IDLE
+        
+        This method runs EVERY tick and OVERRIDES any local state that disagrees.
+        No other code path should decide state transitions based on local tracking.
+        """
+        MIN_POSITION_SIZE = 0.00001  # Minimum BTC position to consider "open"
+        
+        # Rate limit: Check exchange every 5 seconds max to avoid API spam
+        now = self.market_data.get_market_time()
+        if self._last_exchange_state_check is None:
+            self._last_exchange_state_check = now
+        
+        time_since_check = (now - self._last_exchange_state_check).total_seconds()
+        if time_since_check < 5:
+            return
+        
+        self._last_exchange_state_check = now
+        
+        # 🔒 FIX (Jan 14, 2026): Skip enforcement during HARD_LOCK (exit in progress)
+        # The reconciler handles state during exits - don't interfere
+        if self.reconciler and self.reconciler.is_hard_locked:
+            logger.debug("Skipping exchange state enforcement: HARD_LOCK active")
+            return
+        
+        try:
+            # 🔥 GET EXCHANGE TRUTH
+            exchange_position = await self.execution.get_position(self.symbol)
+            
+            # CRITICAL: Check if this was a timeout/error (NOT "no position")
+            if exchange_position and exchange_position.get('_error'):
+                # Exchange unavailable - DO NOT CHANGE STATE
+                # Keep current state until exchange is reachable
+                if self._last_exchange_unavailable_log is None or \
+                   (self.market_data.get_market_time() - self._last_exchange_unavailable_log).total_seconds() > 30:
+                    logger.warning(f"⚠️ Exchange unavailable - maintaining current state (not forcing IDLE)")
+                    self._last_exchange_unavailable_log = self.market_data.get_market_time()
+                return  # CRITICAL: Don't change state on timeout!
+            
+            exchange_size = abs(float(exchange_position.get('contracts', 0) or 0)) if exchange_position else 0.0
+            
+            current_state = self.state_machine.state
+            
+            # ===== ENFORCE STATE BASED ON EXCHANGE =====
+            if exchange_size > MIN_POSITION_SIZE:
+                # EXCHANGE HAS POSITION → WE MUST BE IN MANAGE (or WAIT_FILL transitioning)
+                # Reset "no position" counter since we have one
+                self._consecutive_no_position_checks = 0
+                
+                if current_state == BotState.IDLE:
+                    logger.critical(f"🔄 STATE OVERRIDE: IDLE but exchange has {exchange_size:.6f} → forcing MANAGE")
+                    
+                    # Sync local position from exchange if we don't have one
+                    candles_5m = self.market_data.get_candles('5m')
+                    atr_5m = self._calculate_atr_5m(pd.DataFrame(candles_5m)) if candles_5m else None
+                    
+                    if not self.risk_engine.has_open_position():
+                        await self.risk_engine.update_from_exchange_position(exchange_position, atr=atr_5m)
+                    
+                    self.state_machine.transition_to(BotState.MANAGE, "Exchange has position - enforced")
+                    
+                    # =========================================================================
+                    # 🔥 CRITICAL FIX (Jan 17, 2026): Place emergency SL/TP for orphan position
+                    # When we recover a position that has no protection, we MUST place SL/TP
+                    # This prevents catastrophic losses on positions filled after bot went IDLE
+                    # =========================================================================
+                    try:
+                        # Check if position has SL/TP protection
+                        has_protection = await self._check_position_has_stops()
+                        
+                        if not has_protection:
+                            logger.critical("🚨 ORPHAN POSITION HAS NO SL/TP - PLACING EMERGENCY PROTECTION!")
+                            
+                            # Get position details
+                            entry_price = float(exchange_position.get('entryPrice', 0) or exchange_position.get('avgPrice', 0))
+                            if entry_price <= 0:
+                                # Fallback to current price if no entry available
+                                ticker = await self.execution.get_ticker(self.symbol)
+                                entry_price = ticker.get('last', 0) if ticker else 0
+                            
+                            position_side = exchange_position.get('side', '').lower()
+                            if position_side not in ('long', 'short'):
+                                contracts = float(exchange_position.get('contracts', 0))
+                                position_side = 'long' if contracts > 0 else 'short'
+                            
+                            # Calculate emergency SL (2.5x ATR from entry, or 3% if no ATR)
+                            if atr_5m and atr_5m > 0:
+                                emergency_sl_distance = atr_5m * 2.5
+                            else:
+                                emergency_sl_distance = entry_price * 0.03  # 3% emergency SL
+                            
+                            if position_side == 'long':
+                                emergency_sl = entry_price - emergency_sl_distance
+                                emergency_tp = entry_price + (emergency_sl_distance * 2.0)  # 2R TP
+                            else:
+                                emergency_sl = entry_price + emergency_sl_distance
+                                emergency_tp = entry_price - (emergency_sl_distance * 2.0)
+                            
+                            logger.critical(f"🔒 Emergency SL: {emergency_sl:.2f} | TP: {emergency_tp:.2f} | Entry: {entry_price:.2f}")
+                            
+                            # Place the stops
+                            stops_placed = await self.execution.set_position_stops(
+                                symbol=self.symbol,
+                                stop_loss=emergency_sl,
+                                take_profit=emergency_tp
+                            )
+                            
+                            if stops_placed:
+                                logger.info("✅ Emergency SL/TP placed successfully!")
+                                self._stops_set = True
+                                # Store for potential retry
+                                self._last_entry_data = {
+                                    'stop_loss': emergency_sl,
+                                    'take_profit': emergency_tp,
+                                    'emergency_recovery': True
+                                }
+                                if self.risk_engine.position:
+                                    self.risk_engine.position.mark_exchange_sl_active()
+                            else:
+                                logger.critical("❌ FAILED TO PLACE EMERGENCY SL/TP - POSITION AT EXTREME RISK!")
+                                self._stops_set = False
+                                if self.risk_engine.position:
+                                    self.risk_engine.position.mark_exchange_sl_inactive("Emergency placement failed")
+                        else:
+                            logger.info("✅ Orphan position already has SL/TP protection")
+                            self._stops_set = True
+                            
+                    except Exception as emergency_e:
+                        logger.critical(f"❌ Emergency SL/TP placement error: {emergency_e}")
+                    
+                    # 🔥 FIX (Jan 23, 2026): Force BOS evaluation on next cycle for orphan recovery
+                    # An orphan position may already be invalidated by structure break
+                    self._force_bos_check_on_orphan = True
+                    logger.info("📊 Orphan recovered - will check BOS invalidation on next cycle")
+                
+                # Also sync local position size if it differs
+                local_pos = self.risk_engine.position
+                if local_pos and abs(local_pos.size - exchange_size) > MIN_POSITION_SIZE:
+                    logger.warning(f"🔄 Size sync: local={local_pos.size:.6f} → exchange={exchange_size:.6f}")
+                    local_pos.size = exchange_size
+                    
+            else:
+                # EXCHANGE HAS NO POSITION
+                # 🔒 FIX: Require 3 consecutive "no position" checks before forcing IDLE
+                # This prevents race conditions after partial closes
+                if not hasattr(self, '_consecutive_no_position_checks'):
+                    self._consecutive_no_position_checks = 0
+                
+                self._consecutive_no_position_checks += 1
+                
+                if current_state == BotState.MANAGE:
+                    if self._consecutive_no_position_checks < 3:
+                        # Wait for more confirmations before forcing IDLE
+                        logger.warning(f"⚠️ Exchange shows no position ({self._consecutive_no_position_checks}/3) - waiting for confirmation")
+                        return
+                    
+                    # 🔒 FIX (Jan 14, 2026): Force sync position_store before final decision
+                    # This ensures phantom positions are cleared
+                    try:
+                        if self.execution and hasattr(self.execution, 'exchange'):
+                            await self._position_store.sync_from_exchange(self.execution.exchange)
+                        
+                        # NOW check if position_store still has a position (shouldn't after sync)
+                        if self.symbol is None:
+                            logger.error("Cannot check position_store: symbol is None")
+                        else:
+                            ps_pos = self._position_store.get_position(self.symbol)
+                            if ps_pos and not ps_pos.is_flat and ps_pos.size > MIN_POSITION_SIZE:
+                                # This is weird - sync should have cleared it. Log but proceed anyway
+                                logger.error(f"🚨 position_store still has {ps_pos.side} {ps_pos.size:.6f} after sync - forcing clear")
+                                ps_pos.size = 0
+                                ps_pos.side = 'FLAT'
+                    except Exception as ps_e:
+                        logger.debug(f"Position store sync failed: {ps_e}")
+                    
+                    logger.critical(f"🔄 STATE OVERRIDE: MANAGE but exchange has no position (confirmed 3x) → forcing IDLE")
+                    
+                    # Clear local position (thread-safe)
+                    if self.risk_engine.has_open_position():
+                        logger.warning("⚠️ Clearing orphan local position")
+                        await self.risk_engine.clear_position("orphan local position - exchange has none")
+                    
+                    self._reset_trade_state("Exchange has no position - enforced")
+                    self.state_machine.transition_to(BotState.IDLE, "No exchange position - enforced")
+                    self._consecutive_no_position_checks = 0
+                
+                # If in WAIT_FILL too long with no position, also reset
+                elif current_state == BotState.WAIT_FILL:
+                    if hasattr(self, 'entry_order_time') and self.entry_order_time:
+                        wait_time = (now - self.entry_order_time).total_seconds()
+                        if wait_time > 180:  # 3 minutes max
+                            logger.warning(f"🔄 WAIT_FILL timeout ({wait_time:.0f}s) with no exchange position")
+                            
+                            # =========================================================================
+                            # 🔥 CRITICAL FIX (Jan 17, 2026): Cancel order AND VERIFY before going IDLE
+                            # If cancel fails and order still exists, do NOT go IDLE
+                            # This prevents orders from filling later without SL/TP protection
+                            # =========================================================================
+                            order_cancelled = False
+                            order_still_open = False
+                            
+                            if hasattr(self, 'pending_order_id') and self.pending_order_id:
+                                try:
+                                    # STEP 1: Attempt to cancel
+                                    cancel_success = await self.execution.cancel_order(
+                                        self.pending_order_id,
+                                        self.symbol
+                                    )
+                                    
+                                    if cancel_success:
+                                        logger.info(f"✅ Cancelled pending order {self.pending_order_id[:12]}...")
+                                        order_cancelled = True
+                                    else:
+                                        # STEP 2: Cancel failed - verify order status
+                                        logger.warning(f"⚠️ Cancel returned false - verifying order status...")
+                                        await asyncio.sleep(0.5)  # Let exchange update
+                                        
+                                        try:
+                                            order_status = await self.execution.get_order_status(
+                                                self.pending_order_id,
+                                                self.symbol
+                                            )
+                                            
+                                            if order_status:
+                                                status = order_status.get('status', '').lower()
+                                                if status in ('open', 'pending', 'new'):
+                                                    order_still_open = True
+                                                    logger.critical(f"🚨 ORDER STILL OPEN! Status: {status} - NOT going IDLE!")
+                                                elif status in ('canceled', 'cancelled', 'expired', 'rejected'):
+                                                    order_cancelled = True
+                                                    logger.info(f"✅ Order was already cancelled/expired: {status}")
+                                                elif status in ('filled', 'closed'):
+                                                    logger.critical(f"🚨 ORDER FILLED! Status: {status} - checking position...")
+                                                    # Re-fetch position - order filled!
+                                                    await asyncio.sleep(0.5)
+                                                    new_pos = await self.execution.get_position(self.symbol)
+                                                    if new_pos and abs(float(new_pos.get('contracts', 0) or 0)) > MIN_POSITION_SIZE:
+                                                        logger.critical("🔄 Position now exists - transitioning to MANAGE")
+                                                        # STATE OVERRIDE will handle SL/TP placement
+                                                        return  # Exit early, let next cycle handle
+                                        except Exception as status_e:
+                                            logger.error(f"Error checking order status: {status_e}")
+                                            # Assume order may still be open
+                                            order_still_open = True
+                                            
+                                except Exception as cancel_e:
+                                    logger.error(f"Error cancelling order on timeout: {cancel_e}")
+                                    # Assume order may still be open
+                                    order_still_open = True
+                            else:
+                                # No pending order ID - safe to go IDLE
+                                order_cancelled = True
+                            
+                            # STEP 3: Only go IDLE if we're sure order is cancelled/filled
+                            if order_still_open:
+                                logger.critical("🔒 NOT going IDLE - order may still fill! Will check again next cycle.")
+                                # Don't reset trade state - keep trying
+                                return
+                            
+                            self._reset_trade_state("WAIT_FILL timeout - no position")
+                            self.state_machine.transition_to(BotState.IDLE, "WAIT_FILL timeout - enforced")
+                            self._consecutive_no_position_checks = 0
+                    
+        except Exception as e:
+            # On error, don't crash - just log and continue
+            # 🔒 FIX: Include stack trace for debugging
+            logger.error(f"Error in exchange state enforcement: {e}", exc_info=True)
+    
+    def _on_reconciler_state_change(self, public_state, snapshot):
+        """
+        Callback when ExchangeReconciler detects a state change.
+        
+        🔥 FIX (Jan 14, 2026): React immediately to position closes detected by reconciler.
+        This handles TP/SL fills on exchange that the bot didn't initiate.
+        """
+        # 🔥 FIX (Jan 20, 2026): Import PublicState, not ReconcilerState
+        # The callback receives PublicState enum values
+        from src.infrastructure.exchanges.kraken.exchange_reconciler import PublicState
+        
+        # 🔒 CRITICAL FIX (Jan 21, 2026): Don't interfere if we're in HARD_LOCK
+        # HARD_LOCK means we're actively executing an operation and will handle state ourselves
+        if self.reconciler.is_hard_locked:
+            logger.debug(f"Reconciler callback skipped: HARD_LOCK active (state={public_state})")
+            return
+        
+        # If reconciler says IDLE and we're in MANAGE, the position was closed externally
+        if public_state == PublicState.IDLE and self.state_machine.state == BotState.MANAGE:
+            logger.critical("📤 RECONCILER DETECTED: Position closed on exchange (TP/SL hit)")
+            
+            # Record trade close with estimated PnL
+            if self.risk_engine.has_open_position():
+                position = self.risk_engine.position
+                if position is None:  # Type narrowing for Pyright
+                    return
+                
+                # =========================================================================
+                # 🔥 FIX (Jan 27, 2026): Estimate fill price from known TP/SL levels
+                # This is a SYNC callback so we can't call async exchange methods.
+                # Use the TP or SL price that was set on the position as the estimate.
+                # =========================================================================
+                exit_price = None
+                
+                # Get the last candle price as reference
+                candles = self.market_data.get_candles('1m')
+                current_price = candles[-1]['close'] if candles and len(candles) > 0 else position.entry_price
+                
+                # Determine if it was TP or SL hit based on current price vs entry
+                if position.direction == 'SHORT':
+                    # SHORT: TP is below entry, SL is above entry
+                    if current_price < position.entry_price:
+                        # Price is below entry = likely TP hit
+                        exit_price = position.take_profit if hasattr(position, 'take_profit') and position.take_profit else current_price
+                    else:
+                        # Price is above entry = likely SL hit
+                        exit_price = position.stop_loss if hasattr(position, 'stop_loss') else current_price
+                else:  # LONG
+                    # LONG: TP is above entry, SL is below entry
+                    if current_price > position.entry_price:
+                        # Price is above entry = likely TP hit
+                        exit_price = position.take_profit if hasattr(position, 'take_profit') and position.take_profit else current_price
+                    else:
+                        # Price is below entry = likely SL hit
+                        exit_price = position.stop_loss if hasattr(position, 'stop_loss') else current_price
+                
+                # Fallback to current price if we still don't have an exit price
+                if exit_price is None or exit_price <= 0:
+                    exit_price = current_price
+                    logger.warning(f"⚠️ Using current price as exit estimate: {exit_price:.2f}")
+                else:
+                    logger.info(f"📊 Using TP/SL level as exit price: {exit_price:.2f}")
+                
+                # =========================================================================
+                # 🔥 FIX (Jan 27, 2026): Use CORRECT position size for PnL calculation
+                # After partials/ADD TO WINNER, position.size tracks remaining size
+                # =========================================================================
+                actual_closed_size = position.size  # Use current tracked size
+                
+                # Calculate PnL with correct price and size
+                if position.direction == 'LONG':
+                    pnl_estimate = (exit_price - position.entry_price) * actual_closed_size
+                else:
+                    pnl_estimate = (position.entry_price - exit_price) * actual_closed_size
+                
+                # Calculate R realized for notification
+                initial_risk = abs(position.entry_price - position.initial_stop_loss)
+                r_realized = pnl_estimate / (initial_risk * actual_closed_size) if initial_risk > 0 and actual_closed_size > 0 else 0
+                
+                # Determine exit reason (TP or SL)
+                if position.direction == 'LONG':
+                    exit_type = 'EXCHANGE_TAKE_PROFIT' if exit_price > position.entry_price else 'EXCHANGE_STOP_LOSS'
+                else:
+                    exit_type = 'EXCHANGE_TAKE_PROFIT' if exit_price < position.entry_price else 'EXCHANGE_STOP_LOSS'
+                
+                logger.info(f"✅ Trade closed by exchange TP/SL | Entry: {position.entry_price:.2f} → Exit: {exit_price:.2f} | Size: {actual_closed_size:.6f} | PnL: ${pnl_estimate:.2f} ({r_realized:.2f}R)")
+                
+                # Log trade close - 🔥 FIX: Use proper exit_type so losses are counted correctly
+                self.state_machine.record_trade_close(pnl_estimate, pnl_estimate > 0, exit_reason=exit_type)
+                self.state_machine.update_daily_pnl(pnl_estimate)
+                
+                # ═══════════════════════════════════════════════════════════════
+                # 🔥 FIX (Jan 25, 2026): Record trade result for KILL-SWITCH tracking
+                # Exchange TP/SL closes MUST be counted for consecutive loss tracking
+                # Without this, kill-switch and tiered cooldowns don't trigger!
+                # ═══════════════════════════════════════════════════════════════
+                from datetime import datetime, UTC
+                market_time = datetime.now(UTC)
+                self._record_trade_result(exit_type, pnl_estimate, market_time)
+                logger.info(f"📊 Exchange TP/SL result recorded for loss tracking: {exit_type} ${pnl_estimate:.2f}")
+                
+                # =========================================================================
+                # 🔥 FIX (Jan 27, 2026): LOG TRADE TO TRADE_LOGS FOR EXCHANGE TP/SL CLOSES
+                # Previously, trades closed by exchange were NOT logged, causing PnL mismatches
+                # =========================================================================
+                try:
+                    mfe_r = position.max_favorable_excursion_r if hasattr(position, 'max_favorable_excursion_r') else 0
+                    mae_r = abs(r_realized) if r_realized < 0 else 0
+                    
+                    async def _log_exchange_close():
+                        await self.trade_logger.log_event('trade_closed', {
+                            'entry': position.entry_price,
+                            'exit': exit_price,
+                            'size': actual_closed_size,
+                            'pnl': pnl_estimate,
+                            'reason': exit_type,
+                            'r': r_realized,
+                            'mfe_r': mfe_r,
+                            'mae_r': mae_r,
+                            'direction': position.direction,
+                            'regime': self._current_regime.value if self._current_regime else 'UNKNOWN'
+                        })
+                    
+                    _create_safe_task(_log_exchange_close(), "log_exchange_tpsl_close")
+                    logger.info(f"📝 Trade logged: {exit_type} @ {exit_price:.2f} | PnL: ${pnl_estimate:.2f}")
+                except Exception as log_err:
+                    logger.error(f"Failed to log exchange TP/SL trade: {log_err}")
+                
+                # 🔥 FIX (Jan 14, 2026): Send Telegram notification for exchange TP/SL closes
+                if self.output_manager is not None:
+                    try:
+                        _create_safe_task(self.output_manager.send_exit_notification({
+                            'symbol': self.symbol,
+                            'reason': exit_type,  # Already has EXCHANGE_ prefix
+                            'pnl': pnl_estimate,
+                            'r_realized': r_realized,
+                            'exit_price': exit_price,  # 🔥 FIX: Use actual fill price, not current market
+                            'entry_price': position.entry_price,
+                            'direction': position.direction,
+                            'timestamp': market_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+                        }), "send_exit_notification_exchange_tpsl")
+                        logger.info("📱 Telegram notification sent for exchange TP/SL close")
+                    except Exception as e:
+                        logger.error(f"Failed to send Telegram notification for TP/SL: {e}")
+            
+            # Clear local state (sync - we're in a sync callback)
+            self.risk_engine.clear_position_sync("Exchange TP/SL hit - reconciler detected")
+            self._reset_trade_state("Exchange TP/SL hit - reconciler detected")
+            self.state_machine.transition_to(BotState.IDLE, "Exchange TP/SL filled")
+            self._consecutive_no_position_checks = 0
+            
+            # Also clear position_store
+            try:
+                if self.symbol is not None:
+                    ps_pos = self._position_store.get_position(self.symbol)
+                    if ps_pos:
+                        ps_pos.size = 0
+                        ps_pos.side = 'FLAT'
+            except Exception as ps_err:
+                logger.debug(f"Position store cleanup skipped: {ps_err}")
+    
+    @property
+    def _symbol(self) -> str:
+        """Return symbol as non-None str, raising if not set.
+        
+        Use this property in places where Pyright complains about
+        'str | None' not being assignable to 'str'. This property
+        guarantees the return type is str (or raises RuntimeError).
+        """
+        if self.symbol is None:
+            raise RuntimeError("SignalEngine.symbol not initialized")
+        return self.symbol
+
+    def _reset_trade_state(self, reason: str = "State reset"):
+        """Limpia COMPLETAMENTE el estado de trading - CRITICAL para prevenir órdenes múltiples"""
+        logger.info(f"🔄 Resetting trade state: {reason}")
+        
+        # 🔥 FIX (Jan 20, 2026): Clear position_store on state reset
+        # This ensures position tracking is always in sync after exits
+        try:
+            if hasattr(self, '_position_store') and self._position_store and self.symbol is not None:
+                ps_pos = self._position_store.get_position(self.symbol)
+                if ps_pos and ps_pos.size > 0:
+                    ps_pos.size = 0
+                    ps_pos.side = 'FLAT'
+                    logger.debug(f"Position store cleared during reset: {reason}")
+        except Exception as ps_err:
+            logger.debug(f"Position store cleanup skipped: {ps_err}")
+        
+        # Limpia tracking de orden
+        self.pending_order_id = None
+        self.entry_order_time = None
+        
+        # Limpia datos de entrada
+        self._last_entry_data = None
+        
+        # Limpia flags de posición
+        self._stops_set = False
+        
+        # Limpia bias y setup
+        self.current_bias = None
+        self.impulse_high = 0.0
+        self.impulse_low = 0.0
+        
+        # Limpia estado de setup
+        self.setup_state = None
+        self.setup_start_time = None
+        self.setup_frozen_htf = False
+        
+        # Reset log state tracking (para mostrar nuevo setup)
+        self._last_htf_state = None
+        self._last_ltf_state = None
+        
+        # Reset BOS tracking (nueva posición = nuevo contexto de estructura)
+        self._last_bos_level = None
+        self._last_bos_direction = None
+        
+        # 🔥 FIX (Jan 22, 2026): Reset exhaustion detector on trade close
+        # Prevents stale peak_atr/peak_velocity from affecting next trade
+        if hasattr(self, 'exhaustion_detector') and self.exhaustion_detector:
+            self.exhaustion_detector.reset()
+        
+        # Reset exhaustion tightening flag
+        self._exhaustion_tightened = False
+        
+    def _init_health_monitor(self):
+        """Initialize health monitor (called after risk engine capital is set)"""
+        if not hasattr(self, 'health_monitor') or self.health_monitor is None:
+            self.health_monitor = SystemHealthMonitor()
+            logger.info("SystemHealthMonitor initialized")
+    
+    def _set_rejection_cooldown(self, reason: str, candles: int | None = None):
+        """
+        Set a cooldown after a filter rejection (NOT a full reset).
+        This prevents the tight loop of evaluate->reject->reset->evaluate.
+        
+        Args:
+            reason: Why the setup was rejected
+            candles: Number of candles to wait (default: self._rejection_cooldown_candles)
+        """
+        if candles is None:
+            candles = self._rejection_cooldown_candles
+        
+        # Calculate cooldown end time (candles * 60 seconds per 1m candle)
+        cooldown_seconds = candles * 60
+        market_time = self.market_data.get_market_time()
+        cooldown_end = market_time + timedelta(seconds=cooldown_seconds)
+        self._rejection_cooldown_until = cooldown_end
+        self._last_rejection_reason = reason
+        
+        # Log only once (not on every tick)
+        logger.info(f"⏸️ Rejection cooldown: {reason} | Wait {candles} candles until {cooldown_end.strftime('%H:%M:%S')}")
+    
+    def _is_in_rejection_cooldown(self) -> tuple[bool, str]:
+        """Check if we're in a rejection cooldown period."""
+        if self._rejection_cooldown_until is None:
+            return False, ""
+        
+        market_time = self.market_data.get_market_time()
+        if market_time < self._rejection_cooldown_until:
+            remaining = (self._rejection_cooldown_until - market_time).total_seconds()
+            return True, f"Rejection cooldown active ({remaining:.0f}s remaining): {self._last_rejection_reason}"
+        
+        # Cooldown expired
+        self._rejection_cooldown_until = None
+        self._last_rejection_reason = None
+        return False, ""
+    
+    def _get_current_candle_timestamp(self) -> int:
+        """Get the timestamp of the most recent closed 1m candle."""
+        candles_1m = self.market_data.get_candles('1m')
+        if candles_1m and len(candles_1m) > 0:
+            # Get timestamp of last closed candle
+            last_candle = candles_1m[-1]
+            return _ts_to_int(last_candle.get('timestamp', 0))
+        return 0
+    
+    def _is_new_candle(self) -> bool:
+        """Check if a new 1m candle has closed since last evaluation."""
+        current_ts = self._get_current_candle_timestamp()
+        if current_ts > self._last_evaluated_candle_ts:
+            return True
+        return False
+    
+    def _mark_candle_evaluated(self):
+        """Mark the current candle as evaluated."""
+        self._last_evaluated_candle_ts = self._get_current_candle_timestamp()
+    
+    async def _reconcile_orders(self):
+        """
+        Reconciliar órdenes con exchange (elimina órdenes fantasma)
+        Llamar después de reconexiones de WebSocket o timeouts
+        """
+        try:
+            # 🔥 FIX (Jan 20, 2026): Add timeout to prevent hanging
+            try:
+                real_orders = await asyncio.wait_for(
+                    self.execution.get_open_orders(self.symbol),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.error("⏰ TIMEOUT in _reconcile_orders - skipping reconciliation")
+                return
+            
+            # Limpiar tracking local
+            self.execution.open_orders.clear()
+            
+            # Re-sincronizar solo órdenes que existen
+            if real_orders:
+                for order in real_orders:
+                    order_id = order.get('id')
+                    self.execution.open_orders[order_id] = order
+                    logger.debug(f"Reconciled order: {order_id}")
+            else:
+                logger.debug("No open orders on exchange - state clean")
+                
+        except Exception as e:
+            logger.error(f"Error reconciling orders: {e}")
+        
+        # Limpia estado de setup
+        self.setup_state = None
+        self.setup_start_time = None
+        self.setup_frozen_htf = False
+    
+    async def initialize(self, symbol: str = 'BTC/USDT:USDT', leverage: int = 10):
+        """Initialize signal engine - fetch balance and configure leverage"""
+        logger.info("Initializing Signal Engine...")
+        
+        # Store symbol
+        self.symbol = symbol
+        
+        # =====================================================================
+        # 🔒 INITIALIZE RECONCILER with symbol (Jan 12, 2026)
+        # =====================================================================
+        self.reconciler.set_symbol(symbol)
+        
+        # 🔥 FIX (Jan 14, 2026): Register as listener to react to position closes
+        self.reconciler.register_listener(self._on_reconciler_state_change)
+        
+        # 1. Set leverage on exchange
+        leverage_set = await self.execution.set_leverage(leverage, symbol)
+        if leverage_set:
+            logger.info(f"✓ Leverage configured: {leverage}x")
+        else:
+            logger.warning(f"✗ Could not set leverage (exchange may not support it)")
+        
+        # 2. Fetch account balance using dedicated method
+        logger.info("Fetching account balance from exchange...")
+        
+        # Try new method first (preferred)
+        capital = await self.execution.get_available_capital()
+        
+        if capital > 0:
+            self.risk_engine.capital = capital
+            # 🔒 FIX (Jan 22, 2026): Also sync equity values from real exchange balance
+            # Without this, equity stays at default 10k causing incorrect DD calculations
+            if self.risk_engine.initial_equity == 10000.0 or self.risk_engine.equity == 10000.0:
+                logger.info(f"💰 LIVE: Syncing equity from exchange (was default 10k)")
+                self.risk_engine.initial_equity = capital
+                self.risk_engine.equity = capital
+                self.risk_engine.max_equity = capital
+            logger.info(f"✅ Capital loaded via get_available_capital: ${self.risk_engine.capital:.2f}")
+            logger.info(f"✅ Equity synced: initial=${self.risk_engine.initial_equity:.2f}, current=${self.risk_engine.equity:.2f}")
+        else:
+            # Fallback to old method
+            logger.warning("Trying fallback balance fetch...")
+            balance = await self.execution.get_account_balance()
+            if balance:
+                updated = await self.risk_engine.update_capital_from_balance(balance)
+                if updated:
+                    logger.info(f"✓ Capital loaded via update_capital_from_balance: ${self.risk_engine.capital:.2f}")
+                else:
+                    logger.error("✗ Failed to update capital from balance")
+            else:
+                logger.error("✗ Failed to fetch account balance")
+        
+        # 3. Verify minimum capital
+        if self.risk_engine.capital < 10:
+            logger.warning(f"⚠ Insufficient capital: ${self.risk_engine.capital:.2f} (minimum: $10) - Trading might be restricted")
+        
+        # 🔥 DAILY DRAWDOWN: Initialize daily equity at startup
+        self.state_machine.initialize_daily_equity(self.risk_engine.capital)
+        
+        # 4. Initial order reconciliation
+        logger.info("Performing initial order reconciliation...")
+        await self._reconcile_orders()
+        
+        # 5. Initialize system health monitor
+        self._init_health_monitor()
+        
+        # 6. Initialize important levels (anchor levels for S/R)
+        logger.info("Initializing important anchor levels...")
+        try:
+            self.important_levels = get_important_levels_provider(symbol)
+            if await self.important_levels.initialize():
+                self._last_levels_update = datetime.now(UTC)
+                logger.info("✅ Important levels initialized")
+            else:
+                logger.warning("⚠️ Important levels failed to initialize - continuing without")
+        except Exception as e:
+            logger.warning(f"⚠️ Important levels initialization error: {e} - continuing without")
+            self.important_levels = None
+        
+        # =====================================================================
+        # 🔥 TREND INTELLIGENCE WARM START (Jan 24, 2026)
+        # Initialize with historical 1h data for accurate phase/confidence
+        # =====================================================================
+        try:
+            candles_1h = self.market_data.get_candles('1h')
+            if candles_1h and len(candles_1h) >= 20:
+                logger.info(f"🔥 Warming up TrendIntelligence with {len(candles_1h)} 1h candles...")
+                
+                highs = [float(c.get('high', 0)) for c in candles_1h]
+                lows = [float(c.get('low', 0)) for c in candles_1h]
+                closes = [float(c.get('close', 0)) for c in candles_1h]
+                volumes = [float(c.get('volume', 0)) for c in candles_1h]
+                
+                # Calculate ADX values for history
+                from src.shared.indicators import calculate_adx
+                adx_values_arr, _ = calculate_adx(
+                    np.array(highs), np.array(lows), np.array(closes), 14
+                )
+                adx_values = [float(v) if not np.isnan(v) else 15.0 for v in adx_values_arr]
+                
+                # Warm start with historical data
+                self._trend_intelligence.warm_start(
+                    highs=highs,
+                    lows=lows,
+                    closes=closes,
+                    volumes=volumes,
+                    adx_values=adx_values
+                )
+                self._trend_phase = self._trend_intelligence.state.current_phase
+            else:
+                logger.warning(f"⚠️ Not enough 1h candles for TrendIntelligence warm start ({len(candles_1h) if candles_1h else 0} < 20)")
+        except Exception as e:
+            logger.warning(f"⚠️ TrendIntelligence warm start error: {e}")
+        
+        # 7. Log intelligence modules status
+        logger.info("=" * 60)
+        logger.info("🧠 INTELLIGENCE MODULES STATUS")
+        logger.info("=" * 60)
+        logger.info(f"📅 Daily Regime: {self._daily_regime} | Config: {self._daily_regime_config}")
+        logger.info(f"📈 Trend Intelligence: {self._trend_phase.value}")
+        logger.info(f"   Phase Detection: BIRTH → ACCEL → MATURE → EXHAUST → DEATH")
+        logger.info(f"   Current: {self._trend_intelligence.get_phase_description()}")
+        logger.info("=" * 60)
+            
+        logger.info(f"✅ Signal Engine initialized and ready | Capital: ${self.risk_engine.capital:.2f}")
+    
+    async def start(self):
+        """Start the signal engine main loop"""
+        logger.info("Starting Signal Engine...")
+        self.is_running = True
+        
+        # Main loop
+        await self._main_loop()
+        
+        logger.info("Signal Engine stopped")
+    
+    async def stop(self):
+        """Stop the signal engine"""
+        logger.info("Stopping Signal Engine...")
+        self.is_running = False
+        
+        # Cancel pending orders
+        if self.pending_order_id:
+            try:
+                await self.execution.cancel_order(self.pending_order_id, self.symbol)
+            except Exception as e:
+                logger.error(f"Error cancelling pending order: {e}")
+        
+        # Close position if open
+        if self.risk_engine.has_open_position():
+            try:
+                await self.emergency_close_all()
+            except Exception as e:
+                logger.error(f"Error in emergency close: {e}")
+    
+    # ===== MAIN LOOP =====
+    
+    async def _main_loop(self):
+        """Main trading loop - process ticks every second"""
+        logger.info("🔄 _main_loop: Starting main trading loop")
+        last_reconcile_time = datetime.now(UTC)
+        last_position_sync_time = datetime.now(UTC)
+        last_heartbeat_time = datetime.now(UTC)
+        tick_count = 0
+        
+        while self.is_running:
+            # ═══════════════════════════════════════════════════════════════
+            # 🔴 CRITICAL SAFETY CHECK: System halted state
+            # If we failed to close a position, DO NOT continue trading
+            # ═══════════════════════════════════════════════════════════════
+            if self._system_halted:
+                logger.critical("🔴 SYSTEM HALTED - Trading loop suspended")
+                logger.critical("🔴 Manual intervention required to close exchange position")
+                await asyncio.sleep(60)  # Sleep longer when halted
+                continue
+            
+            try:
+                # ═══════════════════════════════════════════════════════════════
+                # 🔒 NEW: Position Store Sync (LIVE mode - every 30s)
+                # This ensures we always have accurate position state from exchange
+                # FIX #4 (Jan 13, 2026): Enhanced with auto-correction
+                # FIX #5 (Jan 21, 2026): Added timeout to prevent blocking
+                # FIX #6 (Jan 22, 2026): Skip if circuit breaker is open
+                # ═══════════════════════════════════════════════════════════════
+                if self._runtime_config and self._runtime_config.mode == RuntimeMode.LIVE:
+                    time_since_sync = (datetime.now(UTC) - last_position_sync_time).total_seconds()
+                    # Skip if circuit breaker active (exchange is down)
+                    cb_open = hasattr(self.execution, 'is_circuit_breaker_open') and self.execution.is_circuit_breaker_open()
+                    if time_since_sync > 30 and not cb_open:
+                        logger.debug(f"🔄 Starting _periodic_reconciliation (last sync {time_since_sync:.0f}s ago)")
+                        try:
+                            await asyncio.wait_for(self._periodic_reconciliation(), timeout=15.0)
+                            logger.debug("✅ _periodic_reconciliation completed")
+                        except asyncio.TimeoutError:
+                            logger.error("⏰ _periodic_reconciliation TIMEOUT (15s) - API may be slow")
+                        except Exception as e:
+                            logger.error(f"Error in periodic reconciliation: {e}")
+                        last_position_sync_time = datetime.now(UTC)
+                
+                # Periodic order reconciliation (every 60s) - skip if circuit breaker open
+                time_since_reconcile = (datetime.now(UTC) - last_reconcile_time).total_seconds()
+                cb_open = hasattr(self.execution, 'is_circuit_breaker_open') and self.execution.is_circuit_breaker_open()
+                if time_since_reconcile > 60 and not cb_open:
+                    # Use enhanced reconciliation
+                    try:
+                        if hasattr(self.execution, 'auto_reconcile_orders'):
+                            await asyncio.wait_for(self.execution.auto_reconcile_orders(self.symbol), timeout=15.0)
+                        else:
+                            await asyncio.wait_for(self._reconcile_orders(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        logger.error("⏰ Order reconciliation TIMEOUT (15s) - API may be slow")
+                    except Exception as e:
+                        logger.error(f"Error in order reconciliation: {e}")
+                    last_reconcile_time = datetime.now(UTC)
+                
+                tick_start = datetime.now(UTC)
+                tick_count += 1
+                
+                # 💓 HEARTBEAT: Log every 60 seconds to confirm system is alive
+                time_since_heartbeat = (tick_start - last_heartbeat_time).total_seconds()
+                if time_since_heartbeat >= 60:
+                    pos = self.risk_engine.position
+                    pos_status = "FLAT" if pos is None else f"{pos.direction} {pos.size:.6f}"
+                    logger.info(f"💓 HEARTBEAT: tick #{tick_count}, state={self.state_machine.state.name}, pos={pos_status}")
+                    
+                    # 🤖 ML STATUS (every 5 minutes = 300s = tick_count % 300 == 0)
+                    if tick_count % 300 == 0:
+                        ml_stats = self._ml_inference.get_stats()
+                        logger.info(f"🤖 ML STATUS: phase={ml_stats['phase']}, predictions={ml_stats['prediction_count']}, "
+                                    f"failures={ml_stats['model_failures']}, avg_latency={ml_stats['avg_latency_ms']:.1f}ms, "
+                                    f"drift={'⚠️ YES' if ml_stats['drift_detected'] else 'NO'}")
+                    
+                    last_heartbeat_time = tick_start
+                
+                # 🔒 FIX (Jan 21, 2026): Add global timeout to _process_tick
+                # Prevents infinite blocking if any async call hangs
+                # 🔒 FIX (Jan 22, 2026): Use shield + wait to properly cancel subtasks
+                tick_task = None
+                try:
+                    tick_task = asyncio.create_task(self._process_tick())
+                    await asyncio.wait_for(asyncio.shield(tick_task), timeout=30.0)
+                except asyncio.TimeoutError:
+                    logger.error("⏰ _process_tick TIMEOUT (30s) - cancelling subtasks...")
+                    if tick_task and not tick_task.done():
+                        tick_task.cancel()
+                        try:
+                            # Give cancelled task time to cleanup (max 2s)
+                            await asyncio.wait_for(tick_task, timeout=2.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            pass  # Expected
+                    # Reset exchange session if hanging (likely stuck CCXT call)
+                    try:
+                        await self.execution._reset_exchange_session()
+                        logger.info("🔄 Exchange session reset after timeout")
+                    except Exception as reset_err:
+                        logger.warning(f"Could not reset exchange session: {reset_err}")
+                    
+                tick_duration = (datetime.now(UTC) - tick_start).total_seconds()
+                # Only warn if tick takes more than 4 seconds (reconciler API calls take ~2s every 5s)
+                if tick_duration > 4.0:
+                    logger.warning(f"⏱️ SLOW TICK: {tick_duration:.2f}s")
+                
+                await asyncio.sleep(1)
+                
+                # Record success to reset error counter
+                error_tracker = get_error_tracker()
+                if error_tracker:
+                    error_tracker.record_success("main_loop")
+                
+                # 📊 CAPA 5: Health-based kill switch (every ~60s)
+                if self.health_monitor and int(datetime.now(UTC).timestamp()) % 60 == 0:
+                    should_stop, reason = self.health_monitor.should_stop_trading()
+                    if should_stop:
+                        logger.critical(f"🚨 HEALTH KILL SWITCH: {reason}")
+                        self.is_running = False
+                        if self.output_manager:
+                            await self.output_manager.send_critical_alert(f"KILL SWITCH: {reason}")
+                        break
+                    
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}", exc_info=True)
+                
+                # Track error for kill switch
+                error_tracker = get_error_tracker()
+                if error_tracker:
+                    should_stop = await error_tracker.record_error(
+                        source="main_loop",
+                        message=str(e),
+                        severity=ErrorSeverity.ERROR
+                    )
+                    if should_stop:
+                        logger.critical("🚨 ERROR KILL SWITCH - Stopping trading")
+                        self.is_running = False
+                        break
+                
+                await asyncio.sleep(1)
+    
+    async def _process_tick(self):
+        """Process one tick - implements strategy logic"""
+        
+        # UPDATE MARKET TIME in state machine (critical for cooldown/observation)
+        market_time = self.market_data.get_market_time()
+        self.state_machine.set_market_time(market_time)
+        
+        # =========================================================================
+        # 📊 MISSED OPPORTUNITY TRACKER: Update pending with current price
+        # =========================================================================
+        current_price_for_tracker = self.market_data.get_current_price()
+        if current_price_for_tracker and hasattr(self, 'missed_tracker'):
+            self.missed_tracker.update_pending(current_price_for_tracker, market_time)
+        
+        # =========================================================================
+        # 🔄 RECONCILER: Poll exchange every 5 seconds (not every tick!)
+        # Rate-limited to avoid API spam that causes 4-second ticks
+        # =========================================================================
+        if not self._is_backtest:
+            now = datetime.now(UTC)
+            # Initialize on first call (can't use hasattr since we init as None)
+            if self._last_reconcile_time is None:
+                self._last_reconcile_time = now
+            time_since_reconcile = (now - self._last_reconcile_time).total_seconds()
+            if time_since_reconcile >= 5:
+                try:
+                    # Add 10s timeout to prevent infinite blocking
+                    await asyncio.wait_for(self.reconciler.reconcile(), timeout=10.0)
+                    self._last_reconcile_time = now
+                except asyncio.TimeoutError:
+                    logger.error("⏰ Reconciler TIMEOUT (10s) - API may be slow or stuck")
+                    self._last_reconcile_time = now  # Reset to avoid spam
+                except Exception as e:
+                    logger.error(f"Reconciler error: {e}")
+        
+        # NOTE: _enforce_exchange_state_truth() removed - reconciler already handles this
+        # and calling both caused redundant API calls (4 second ticks)
+        
+        # Check if we have sufficient data
+        has_data = self.market_data.has_complete_data()
+        
+        if not has_data:
+            # Log state of data buffers (pero no cada iteración para evitar spam)
+            if self._last_incomplete_log is None:
+                self._last_incomplete_log = market_time
+            
+            time_since_log = (market_time - self._last_incomplete_log).total_seconds()
+            if time_since_log > 10:  # Log cada 10 segundos si falta data
+                status = self.market_data.get_candle_completion_status()
+                logger.warning(f"⏳ Waiting for sufficient data: 1m={status['1m']}/20, "
+                             f"5m={status['5m']}/50, 1h={status['1h']}/50")
+                self._last_incomplete_log = market_time
+            return
+        
+        # Get current price (REAL-TIME, not just closed candle)
+        current_price = self.market_data.get_current_price()
+        
+        # Get candles for indicators (ATR, etc)
+        candles_1m = self.market_data.get_candles('1m')
+        if not candles_1m or len(candles_1m) < 14:
+            return
+        
+        # Calculate ATR on CLOSED candles (standard practice)
+        highs = np.array([c['high'] for c in candles_1m])
+        lows = np.array([c['low'] for c in candles_1m])
+        closes = np.array([c['close'] for c in candles_1m])
+        
+        # Calculate ATR 1m
+        atr_1m = calculate_atr(highs, lows, closes, 14)[-1]
+        
+        # ===== BLOQUE 0: KILL CONDITIONS =====
+        should_kill, kill_reason = self.kill_filter.check(current_price, atr_1m, market_time)
+        if should_kill:
+            logger.critical(f"KILL CONDITION MET: {kill_reason}")
+            await self.emergency_close_all()
+            self.is_running = False
+            return
+        
+        # Check black swan (IMPROVED: pass full candle data for wick detection)
+        price_change = abs(closes[-1] - closes[-2]) if len(closes) > 1 else 0
+        last_candle = candles_1m[-1] if candles_1m else {}
+        is_black_swan, bs_reason = self.black_swan_filter.check(
+            price_change=price_change,
+            atr=atr_1m,
+            market_time=market_time,
+            candle_high=float(last_candle.get('high', 0) or 0),
+            candle_low=float(last_candle.get('low', 0) or 0),
+            candle_open=float(last_candle.get('open', 0) or 0),
+            candle_close=float(last_candle.get('close', 0) or 0)
+        )
+        
+        if is_black_swan:
+            logger.warning(f"🦢 BLACK SWAN: {bs_reason}")
+            if self.pending_order_id:
+                try:
+                    await self.execution.cancel_order(self.pending_order_id, self.symbol)
+                except Exception as e:
+                    logger.error(f"Error cancelling pending order during black swan: {e}")
+            
+            # Limpieza completa del estado
+            self._reset_trade_state("Black swan event")
+            self.state_machine.start_cooldown(8)  # Reduced from 30 to 8 min
+            return
+        
+        # Log defensive mode if active (rate-limited to avoid spam)
+        if self.black_swan_filter.is_defensive(market_time):
+            if self._last_defensive_log is None or \
+               (market_time - self._last_defensive_log).total_seconds() >= 60:
+                logger.info(f"⚠️ Defensive mode active - size multiplier: {self.black_swan_filter.get_size_multiplier(market_time)}")
+                self._last_defensive_log = market_time
+        
+        # Update heartbeat with market time
+        self.kill_filter.update_heartbeat(market_time)
+        
+        # ===== EDGE ENFORCEMENT UPDATES =====
+        # Update edge context periodically
+        await self._update_edge_context()
+        # Update regime classifier with market data
+        await self._update_regime_classifier(current_price)
+        
+        # ===== STATE MACHINE LOGIC =====
+        
+        if self.state_machine.state == BotState.IDLE:
+            await self._handle_idle_state(current_price, atr_1m, market_time)
+        
+        elif self.state_machine.state == BotState.WAIT_FILL:
+            await self._handle_wait_fill_state(market_time)
+        
+        elif self.state_machine.state == BotState.MANAGE:
+            await self._handle_manage_state(current_price, atr_1m, market_time)
+        
+        elif self.state_machine.state == BotState.OBSERVATION:
+            await self._handle_observation_state(current_price, atr_1m, market_time)
+    
+    # ===== OBSERVATION STATE - MONITOR ONLY =====
+    
+    async def _handle_observation_state(self, current_price: float, atr_1m: float, market_time: datetime):
+        """
+        OBSERVATION state: Monitor market without trading
+        Intenta recuperarse cuando las métricas mejoran
+        """
+        # Intentar salir de observation mode
+        self.state_machine.try_exit_observation_mode()
+        
+        # Si aún estamos en observation, solo log estado
+        if self.state_machine.state == BotState.OBSERVATION:
+            elapsed = (market_time - self.state_machine.observation_entry_time).total_seconds() / 60 if self.state_machine.observation_entry_time else 0
+            logger.debug(f"👁️ OBSERVATION: {elapsed:.0f}min elapsed | Trades: {self.state_machine.trades_in_observation} | Wins: {self.state_machine.wins_in_observation}")
+        
+    # ===== IDLE STATE - LOOK FOR SETUPS =====
+    
+    async def _handle_idle_state(self, current_price: float, atr_1m: float, market_time: datetime):
+        """IDLE state: look for trade setups with proper state management"""
+        
+        # PROTECCIÓN: Si estamos en OBSERVATION, no entrar en trades nuevas
+        if self.state_machine.state == BotState.OBSERVATION:
+            logger.debug("In OBSERVATION state, skipping entry evaluation")
+            return
+        
+        # =====================================================================
+        # 🔒 REJECTION COOLDOWN CHECK - Prevents tight loop after filter blocks
+        # =====================================================================
+        in_cooldown, cooldown_reason = self._is_in_rejection_cooldown()
+        if in_cooldown:
+            # Log only every 30 ticks to avoid spam
+            self._idle_eval_count += 1
+            if self._idle_eval_count % 30 == 0:
+                logger.debug(f"⏸️ {cooldown_reason}")
+            return
+        
+        # =====================================================================
+        # 🕐 CANDLE GATE - Only evaluate on NEW closed candle (not every tick)
+        # =====================================================================
+        # EXCEPTION: If in WAIT_LTF state, check on every tick for faster trigger
+        if self.setup_state != "WAIT_LTF":
+            if not self._is_new_candle():
+                # Same candle, no need to re-evaluate the full setup
+                # Just update tick counter silently
+                self._idle_eval_count += 1
+                if self._idle_eval_count % 60 == 0:  # Log every minute (60 ticks)
+                    logger.debug(f"📊 IDLE: Waiting for new candle | Tick #{self._idle_eval_count} | Price: ${current_price:.2f}")
+                return
+            # New candle - mark as evaluated and proceed
+            self._mark_candle_evaluated()
+        
+        # Contador de evaluaciones (log cada 30 iteraciones para verificar actividad)
+        self._idle_eval_count += 1
+        if self._idle_eval_count % 30 == 0:
+            logger.info(f"📊 IDLE: Evaluated {self._idle_eval_count} ticks | Price: ${current_price:.2f} | ATR: {atr_1m:.2f}")
+        
+        # Reset trade tags for new evaluation (Jan 22, 2026)
+        self._current_trade_tags = {}
+        
+        # 🔒 CRITICAL: Verificar que NO hay orden pendiente o posición abierta
+        if self.pending_order_id:
+            logger.critical(f"⛔ IDLE STATE ABORT: Pending order {self.pending_order_id} exists - transitioning to WAIT_FILL")
+            self.state_machine.transition_to(BotState.WAIT_FILL, "Recovered from IDLE with pending order")
+            return
+        
+        if self.risk_engine.has_open_position():
+            logger.critical(f"⛔ IDLE STATE ABORT: Open position exists - transitioning to MANAGE")
+            self.state_machine.transition_to(BotState.MANAGE, "Recovered from IDLE with open position")
+            return
+        
+        # 🔥 PERIODIC EXCHANGE SYNC: Verificar cada 30 segundos si hay posición en exchange
+        if self._last_exchange_sync is None:
+            self._last_exchange_sync = market_time
+        
+        time_since_sync = (market_time - self._last_exchange_sync).total_seconds()
+        if time_since_sync > 30:  # Sync cada 30s
+            # 🔥 AUDIT FIX: Use proper async lock with timeout to prevent deadlock
+            try:
+                async with asyncio.timeout(10):  # 10 second timeout on lock
+                    async with self._sync_lock:
+                        try:
+                            self._syncing_position = True
+                            
+                            exchange_has_position = await self.execution.has_open_position(self.symbol)
+                            if exchange_has_position:
+                                logger.critical("🔄 IDLE but exchange has position - syncing state...")
+                                
+                                # Get ATR for proper SL calculation
+                                candles_5m = self.market_data.get_candles('5m')
+                                atr_5m = self._calculate_atr_5m(pd.DataFrame(candles_5m)) if candles_5m else None
+                                
+                                # Intentar recuperar y sincronizar posición
+                                exchange_position = await self.execution.get_position(self.symbol)
+                                if exchange_position:
+                                    await self.risk_engine.update_from_exchange_position(exchange_position, atr=atr_5m)
+                                
+                                # 🔒 FIX: Don't set flag here - let finally handle it
+                                self.state_machine.transition_to(BotState.MANAGE, "Synced with exchange position")
+                                return
+                                
+                            self._last_exchange_sync = market_time
+                            
+                        except Exception as e:
+                            logger.error(f"Error during exchange sync in IDLE: {e}")
+                        finally:
+                            self._syncing_position = False
+            except asyncio.TimeoutError:
+                logger.warning("Exchange sync lock acquisition timeout - will retry next cycle")
+        
+        # ===== CHECK IF IN WAIT_LTF STATE =====
+        if self.setup_state == "WAIT_LTF":
+            if self.setup_start_time is None:
+                logger.error("WAIT_LTF state with no setup_start_time - resetting to IDLE")
+                self.setup_state = "IDLE"
+                return
+            elapsed = (market_time - self.setup_start_time).total_seconds()
+            
+            # 1. Check timeout
+            if elapsed > self.ltf_wait_timeout:
+                logger.warning(f"WAIT_LTF timeout after {elapsed:.0f}s - Discarding setup")
+                self.setup_state = "IDLE"
+                self.setup_frozen_htf = False
+                self.current_bias = None
+                # NO establecer cooldown - permitir re-evaluación inmediata
+                return
+            
+            # 2. Check invalidation conditions
+            # EMA50 break = setup invalid
+            candles_5m = self.market_data.get_candles('5m')
+            if candles_5m and len(candles_5m) >= 20:
+                df_5m = pd.DataFrame(candles_5m)
+                closes_5m = df_5m['close'].to_numpy()
+                ema_50 = calculate_ema(closes_5m, 50)[-1]
+                
+                if self.current_bias == "LONG" and current_price < ema_50:
+                    logger.warning(f"Setup invalidated: Price broke EMA50 down during WAIT_LTF")
+                    self.setup_state = "IDLE"
+                    self.setup_frozen_htf = False
+                    self.current_bias = None
+                    # NO cooldown - permitir detección inmediata si precio vuelve a subir
+                    return
+                
+                if self.current_bias == "SHORT" and current_price > ema_50:
+                    logger.warning(f"Setup invalidated: Price broke EMA50 up during WAIT_LTF")
+                    self.setup_state = "IDLE"
+                    self.setup_frozen_htf = False
+                    self.current_bias = None
+                    # NO cooldown - permitir detección inmediata si precio vuelve a bajar
+                    return
+            
+            # 3. Try LTF trigger
+            logger.debug(f"WAIT_LTF state: Checking LTF trigger ({elapsed:.0f}s/{self.ltf_wait_timeout}s)")
+            candles_1m = self.market_data.get_candles('1m')
+            if candles_1m and len(candles_1m) >= 20:
+                df_1m = pd.DataFrame(candles_1m)
+                
+                # Get regime info for volume-aware filtering
+                regime_value = self.regime_classifier.current_regime.value if self.regime_classifier.current_regime else None
+                regime_conf = self.regime_classifier.regime_confidence
+                
+                # Ensure bias is set (should be when in WAIT_LTF)
+                if self.current_bias is None:
+                    logger.warning("WAIT_LTF without bias - resetting to IDLE")
+                    self.setup_state = "IDLE"
+                    return
+                
+                ltf_passed, ltf_reason = self.ltf_filter.check(
+                    df_1m,
+                    self.current_bias,
+                    {},
+                    regime=regime_value,
+                    regime_confidence=regime_conf
+                )
+                
+                if ltf_passed:
+                    logger.info(f"✅ LTF TRIGGER FIRED - Executing {self.current_bias}")
+                    self.setup_state = "EXECUTING"
+                    # Proceed to entry execution
+                    await self._execute_entry(current_price, atr_1m, market_time)
+                    return
+                else:
+                    logger.debug(f"LTF not ready yet: {ltf_reason}")
+                    return  # Stay in WAIT_LTF
+            
+            return  # Stay in WAIT_LTF, waiting for LTF trigger
+        
+        # ===== IDLE STATE - FULL EVALUATION =====
+        # NO cooldown - los filtros ya previenen thrashing
+        # Si las condiciones vuelven a ser válidas, el bot debe detectarlo inmediatamente
+        
+        # ===== 🔥 DAILY DRAWDOWN CHECK - BEFORE ANYTHING ELSE =====
+        is_halted, halt_reason = self.state_machine.check_daily_halt()
+        if is_halted:
+            if self._idle_eval_count % 1000 == 0:  # Log sparingly
+                logger.critical(f"🛑 DAILY HALT ACTIVE: {halt_reason}")
+            return
+        
+        # ===== EXCHANGE AVAILABILITY CHECK =====
+        if hasattr(self.execution, 'is_exchange_available') and not self.execution.is_exchange_available:
+            if self._idle_eval_count % 100 == 0:
+                logger.warning("⚠️ Exchange unavailable - skipping signal evaluation")
+            return
+        
+        # ===== IDLE STATE - FULL EVALUATION =====
+        # Check if can trade
+        can_trade, reason = self.state_machine.can_trade()
+        if not can_trade:
+            # Log at INFO level occasionally (every 100 evals) for diagnosis
+            if self._idle_eval_count % 100 == 0:
+                logger.info(f"⚠️ Cannot trade: {reason}")
+            return
+        
+        # Refresh balance before looking for trade (every ~5 minutes in IDLE)
+        if self._last_balance_check is None:
+            self._last_balance_check = market_time
+        
+        if (market_time - self._last_balance_check).total_seconds() > 300:  # 5 min
+            try:
+                balance = await self.execution.get_account_balance()
+                if balance:
+                    await self.risk_engine.update_capital_from_balance(balance)
+                self._last_balance_check = market_time
+            except Exception as e:
+                logger.warning(f"Balance check error: {e}")
+        
+        # Check external data (funding, macro)
+        ext_can_trade, ext_reason = self.external_data.can_trade()
+        if not ext_can_trade:
+            logger.debug(f"External data blocks trading: {ext_reason}")
+            return
+        
+        # =====================================================================
+        # 🔮 ANTICIPATION ENGINE - Check for early entry BEFORE filters
+        # Detects pre-breakout conditions for earlier entries with better RR
+        # =====================================================================
+        try:
+            candles_5m_antic = self.market_data.get_candles('5m')
+            if candles_5m_antic and len(candles_5m_antic) >= 50:
+                df_5m_antic = pd.DataFrame(candles_5m_antic)
+                atr_5m_antic = calculate_atr(
+                    df_5m_antic['high'].to_numpy(), 
+                    df_5m_antic['low'].to_numpy(), 
+                    df_5m_antic['close'].to_numpy(), 14
+                )
+                # 🔥 FIX (Jan 22, 2026): Safe ATR extraction with NaN guard
+                atr_5m_val = current_price * 0.005  # Default fallback
+                if len(atr_5m_antic) > 0 and not np.isnan(atr_5m_antic[-1]):
+                    atr_5m_val = atr_5m_antic[-1]
+                
+                # Get HTF bias hint (if available from cache)
+                htf_bias_hint = self._htf_cache_bias if hasattr(self, '_htf_cache_bias') else None
+                
+                # Get current regime for anticipation gating
+                current_regime = self.regime_classifier.current_regime.value if self.regime_classifier.current_regime else None
+                
+                anticipation = self.anticipation_engine.evaluate(
+                    df_5m=df_5m_antic,
+                    current_price=current_price,
+                    atr=atr_5m_val,
+                    market_time=market_time,
+                    htf_bias=htf_bias_hint,
+                    regime=current_regime  # Pass regime for gating
+                )
+                
+                self._last_anticipation_state = anticipation
+                
+                # Check for valid anticipation signal (confidence > 60%)
+                if anticipation.signal != AnticipationSignal.NONE and anticipation.confidence >= 0.6:
+                    # Store anticipation tags
+                    self._current_trade_tags['anticipation_signal'] = anticipation.signal.value
+                    self._current_trade_tags['anticipation_confidence'] = anticipation.confidence
+                    self._current_trade_tags['anticipation_direction'] = anticipation.direction
+                    
+                    logger.info(f"🔮 ANTICIPATION DETECTED: {anticipation.signal.value} {anticipation.direction} "
+                               f"(conf={anticipation.confidence:.0%})")
+                    if anticipation.reasons:
+                        for reason in anticipation.reasons[:3]:  # Show top 3 reasons
+                            logger.info(f"   → {reason}")
+                    
+                    # If high confidence (>75%), consider early entry with probe size
+                    if anticipation.confidence >= 0.75 and anticipation.direction:
+                        self._current_trade_tags['anticipation_entry'] = True
+                        # 🔥 FIX (Jan 22, 2026): Store validity timestamp for timeout check
+                        if anticipation.time_valid_until:
+                            self._current_trade_tags['anticipation_valid_until'] = anticipation.time_valid_until.timestamp()
+                        # 🔥 FIX (Jan 22, 2026): Apply probe sizing for anticipation (25-35%)
+                        self._current_trade_tags['anticipation_probe_size'] = 0.30  # 30% size
+                        logger.info(f"🔬 ANTICIPATION PROBE: Will use 30% position size")
+        except Exception as e:
+            logger.warning(f"⚠️ Anticipation engine error (non-fatal): {e}")
+            # Continue without anticipation - it's optional enhancement
+        
+        # ===== BLOQUE 0.5: DAILY REGIME DETECTOR (Jan 23, 2026) =====
+        # Update daily regime every 4 hours OR on first tick
+        # This changes ENTIRE bot behavior for the day
+        candles_1h = self.market_data.get_candles('1h')
+        if candles_1h and len(candles_1h) >= 50:
+            # 🔥 IMPROVED (Jan 24, 2026): Update daily regime every 1 hour instead of 4
+            # Also detect SIGNIFICANT changes that warrant immediate transition
+            should_update_daily_regime = (
+                self._daily_regime_last_update is None or
+                (market_time - self._daily_regime_last_update).total_seconds() > 3600  # 1 hour (was 4h)
+            )
+            
+            if should_update_daily_regime:
+                # Calculate daily indicators from 1h candles
+                highs_1h = np.array([c['high'] for c in candles_1h])
+                lows_1h = np.array([c['low'] for c in candles_1h])
+                closes_1h = np.array([c['close'] for c in candles_1h])
+                
+                # Daily range (last 24 1h candles)
+                daily_high = np.max(highs_1h[-24:]) if len(highs_1h) >= 24 else np.max(highs_1h)
+                daily_low = np.min(lows_1h[-24:]) if len(lows_1h) >= 24 else np.min(lows_1h)
+                daily_range = daily_high - daily_low
+                
+                # Daily ATR (from 1h data averaged)
+                atr_1h = calculate_atr(highs_1h, lows_1h, closes_1h, 14)
+                daily_atr = float(atr_1h[-1] * 24) if len(atr_1h) > 0 else daily_range  # Approx daily ATR
+                
+                # Daily ADX - FIXED: calculate_adx returns (adx_values, adx_slope) tuple
+                adx_1h_values, _ = calculate_adx(highs_1h, lows_1h, closes_1h, 14)
+                daily_adx = float(adx_1h_values[-1]) if len(adx_1h_values) > 0 and not np.isnan(adx_1h_values[-1]) else 15.0
+                
+                # Classify daily regime
+                new_daily_regime = DailyRegimeDetector.classify_daily_regime(
+                    daily_range=daily_range,
+                    daily_atr=daily_atr,
+                    daily_adx=daily_adx
+                )
+                
+                # Update state if changed
+                if new_daily_regime != self._daily_regime:
+                    old_regime = self._daily_regime
+                    logger.info(
+                        f"🔄 DAILY REGIME TRANSITION: {old_regime} → {new_daily_regime}"
+                    )
+                    logger.info(
+                        DailyRegimeDetector.log_daily_regime(
+                            new_daily_regime, daily_range, daily_atr, daily_adx
+                        )
+                    )
+                    self._daily_regime = new_daily_regime
+                    self._daily_regime_config = DailyRegimeDetector.get_daily_config(new_daily_regime)
+                    
+                    # 🔥 Also update trade tags for tracking
+                    self._current_trade_tags['daily_regime'] = new_daily_regime
+                    self._current_trade_tags['daily_regime_changed_at'] = market_time.isoformat()
+                
+                self._daily_regime_last_update = market_time
+        
+        # ===== BLOQUE 1: HTF FILTER (1h) - CON CACHÉ INTRA-BAR =====
+        # candles_1h already fetched above
+        if not candles_1h or len(candles_1h) < 50:
+            return
+        
+        # Convert to DataFrame for filters
+        df_1h = pd.DataFrame(candles_1h)
+        
+        # HTF Cache: Solo recalcular cuando cierra vela nueva 1h
+        last_1h_ts = _ts_to_int(candles_1h[-1].get('timestamp', 0))
+        if last_1h_ts != self._htf_cache_ts:
+            # Nueva vela 1h cerrada → recalcular
+            htf_passed, bias, htf_reason = self.htf_filter.check(
+                df_1h,
+                current_price,
+                correlation_data=None
+            )
+            # Guardar en caché
+            self._htf_cache_ts = last_1h_ts
+            self._htf_cache_passed = htf_passed
+            self._htf_cache_bias = bias
+            self._htf_cache_reason = htf_reason
+            # 🔥 FIX (Jan 23, 2026): Cache HTF regime mode based on ADX
+            self._htf_cache_regime_mode = self.htf_filter.last_htf_regime_mode
+            # 🔥 FIX (Jan 25, 2026): Ensure ADX cache is always a Python float
+            _raw_adx = self.htf_filter.last_htf_adx
+            self._htf_cache_adx = float(_raw_adx) if hasattr(_raw_adx, '__float__') else float(_raw_adx) if _raw_adx else 0.0
+            logger.debug(f"HTF cache updated: ts={last_1h_ts}, passed={htf_passed}, bias={bias}, regime_mode={self._htf_cache_regime_mode}, adx={self._htf_cache_adx:.1f}")
+            
+            # =================================================================
+            # 🔥 TREND INTELLIGENCE UPDATE (Jan 23, 2026)
+            # Update trend phase detection on each new 1h candle
+            # This detects trend BIRTH, ACCELERATION, EXHAUSTION, DEATH
+            # =================================================================
+            try:
+                last_candle = candles_1h[-1]
+                atr_1h_arr = calculate_atr(
+                    df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14
+                )
+                atr_1h = float(atr_1h_arr[-1]) if len(atr_1h_arr) > 0 else 100.0
+                
+                trend_state = self._trend_intelligence.update(
+                    current_price=current_price,
+                    high=float(last_candle.get('high', current_price)),
+                    low=float(last_candle.get('low', current_price)),
+                    close=float(last_candle.get('close', current_price)),
+                    adx=self._htf_cache_adx,
+                    volume=float(last_candle.get('volume', 0)),
+                    atr=atr_1h,
+                    timestamp=market_time
+                )
+                
+                # Update phase tracking
+                old_phase = self._trend_phase
+                self._trend_phase = trend_state.current_phase
+                
+                if old_phase != self._trend_phase:
+                    logger.info(
+                        f"📈 TREND PHASE: {self._trend_intelligence.get_phase_description()}"
+                    )
+                    
+                # Store for trade tags
+                self._current_trade_tags['trend_phase'] = self._trend_phase.value
+                self._current_trade_tags['trend_direction'] = trend_state.direction.value
+                self._current_trade_tags['trend_entry_mode'] = trend_state.entry_mode
+                self._current_trade_tags['trend_bias'] = trend_state.trade_bias
+                
+            except Exception as e:
+                logger.debug(f"TrendIntelligence update error: {e}")
+        else:
+            # Usar caché
+            htf_passed = self._htf_cache_passed
+            bias = self._htf_cache_bias
+            htf_reason = self._htf_cache_reason
+        
+        # =====================================================================
+        # 🔥 FIX (Jan 23, 2026): RANGE MODE - NOT BLOCK, USE DIFFERENT RULES
+        # When ADX < 18, we are in RANGE/CHOP - NOT trending
+        # 
+        # CORRECCIÓN CRÍTICA: No bloquear, usar MODO RANGE con reglas:
+        #   - Trades SÍ permitidos en EXTREMOS (VAH/VAL/VWAP bands)
+        #   - Size reducido (50%)
+        #   - Stop más tight (2x ATR vs 3x)
+        #   - TP corto + salida rápida
+        #   - Score threshold más alto (7.0 vs 6.0)
+        # 
+        # El rango es donde BTC pasa el 60-70% del tiempo - no podemos
+        # ignorarlo, hay que explotarlo correctamente.
+        # =====================================================================
+        htf_regime_mode = self._htf_cache_regime_mode
+        htf_adx = self._htf_cache_adx
+        
+        # =====================================================================
+        # 🔥 FIX (Jan 23, 2026): FAST REGIME DETECTION using 5m ADX
+        # Problem: Using only 1h ADX meant we could be 1 HOUR late detecting
+        # regime changes. An intraday bot needs faster detection.
+        # 
+        # Solution: Use 5m ADX for FAST detection, 1h ADX for CONFIRMATION
+        #   - If 5m ADX drops < 15 → IMMEDIATE RANGE MODE (don't wait for 1h)
+        #   - If 5m ADX > 25 AND 1h ADX > 18 → STRONG TREND
+        #   - Otherwise, use 1h ADX as primary
+        # =====================================================================
+        fast_adx = htf_adx  # Default to 1h
+        candles_5m = self.market_data.get_candles('5m')
+        if candles_5m and len(candles_5m) >= 30:
+            try:
+                df_5m_temp = pd.DataFrame(candles_5m[-30:])  # Last 30 candles = 2.5 hours
+                adx_5m_vals, _ = calculate_adx(
+                    df_5m_temp['high'].to_numpy(), 
+                    df_5m_temp['low'].to_numpy(), 
+                    df_5m_temp['close'].to_numpy(), 
+                    14
+                )
+                if len(adx_5m_vals) > 0 and not np.isnan(adx_5m_vals[-1]):
+                    fast_adx = float(adx_5m_vals[-1])
+                    self._current_trade_tags['adx_5m_fast'] = fast_adx
+            except Exception as e:
+                logger.debug(f"Fast ADX calc error: {e}")
+        
+        # COMBINED REGIME DETECTION: Fast (5m) + Confirmation (1h)
+        # If 5m shows STRONG RANGE (ADX < 15), believe it immediately
+        # If 5m shows STRONG TREND (ADX > 25) AND 1h confirms (ADX > 18), it's TREND
+        # Otherwise, use 1h as primary
+        if fast_adx < 15:
+            # 5m says STRONG RANGE - don't wait for 1h
+            effective_adx = min(fast_adx, htf_adx)  # Use the more conservative (lower)
+        elif fast_adx > 25 and htf_adx > 18:
+            # 5m says STRONG TREND and 1h confirms - use the stronger signal
+            effective_adx = htf_adx  # Trust 1h for trend confirmation
+        else:
+            # Mixed signals - use weighted average favoring 1h for stability
+            effective_adx = htf_adx * 0.7 + fast_adx * 0.3
+        
+        # Store regime for downstream use
+        self._current_trade_tags['htf_regime_mode'] = htf_regime_mode
+        self._current_trade_tags['htf_adx'] = htf_adx
+        self._current_trade_tags['effective_adx'] = effective_adx
+        
+        # Determine trading mode based on EFFECTIVE ADX (not just 1h)
+        if effective_adx < 18:
+            trading_mode = 'RANGE'
+        elif effective_adx < 20:
+            trading_mode = 'TRANSITION'  # Less size, higher score threshold
+        else:
+            trading_mode = 'TREND'
+        
+        self._current_trade_tags['trading_mode'] = trading_mode
+        
+        # Log mode changes (rate limited)
+        if self._idle_eval_count % 60 == 1:
+            logger.info(
+                f"🎯 TRADING MODE: {trading_mode} | ADX_1h={htf_adx:.1f} | ADX_5m={fast_adx:.1f} | "
+                f"Effective={effective_adx:.1f} | Bias={bias}"
+            )
+        
+        # ===================================================================
+        # RANGE MODE RULES (ADX < 18)
+        # Not a block - different entry rules for ranging markets
+        # 🔥 FIX (Jan 23): MUST have location_context, otherwise NO TRADE
+        # 🔥 FIX (Jan 24): Calculate location_context EARLY if in RANGE mode
+        # ===================================================================
+        if trading_mode == 'RANGE':
+            # EARLY location_context calculation if missing
+            # This fixes timing bug where we check before calculating
+            if not self._location_context:
+                try:
+                    closes_1h_early = np.asarray(df_1h['close'].to_numpy())
+                    highs_1h_early = np.asarray(df_1h['high'].to_numpy())
+                    lows_1h_early = np.asarray(df_1h['low'].to_numpy())
+                    volumes_1h_early = np.asarray(df_1h['volume'].to_numpy()) if 'volume' in df_1h.columns else np.ones(len(closes_1h_early))
+                    
+                    atr_1h_vals_early = calculate_atr(highs_1h_early, lows_1h_early, closes_1h_early, 14)
+                    atr_1h_early = atr_1h_vals_early[-1] if len(atr_1h_vals_early) > 0 else current_price * 0.01
+                    
+                    adx_1h_vals_early, _ = calculate_adx(highs_1h_early, lows_1h_early, closes_1h_early, 14)
+                    adx_1h_early = adx_1h_vals_early[-1] if len(adx_1h_vals_early) > 0 else 20.0
+                    
+                    location_cache_key_early = _ts_to_int(df_1h.iloc[-1].get('timestamp', 0))
+                    _, _, self._location_context = self.location_filter.check(
+                        closes_1h=closes_1h_early,
+                        highs_1h=highs_1h_early,
+                        lows_1h=lows_1h_early,
+                        volumes_1h=volumes_1h_early,
+                        current_price=current_price,
+                        atr_1h=atr_1h_early,
+                        adx_1h=adx_1h_early,
+                        bias=bias,
+                        regime='RANGE',
+                        cache_key=location_cache_key_early
+                    )
+                    logger.debug(f"📍 RANGE MODE: Calculated early location_context")
+                except Exception as e:
+                    logger.warning(f"⚠️ RANGE MODE: Failed to calculate early location_context: {e}")
+            
+            # In RANGE: Only trade at EXTREMES (VAH/VAL/VWAP deviation)
+            # Check if we're at an extreme using location context
+            at_extreme = False
+            extreme_type = None
+            
+            # 🔥 FIX: If no location_context, we can't determine if at extreme
+            # In RANGE mode without context = NO TRADE (conservative)
+            if not self._location_context:
+                if self._idle_eval_count % 120 == 1:
+                    logger.info(
+                        f"⏸️ RANGE MODE: No location context available | "
+                        f"Cannot determine if at extreme - SKIPPING"
+                    )
+                return
+            
+            pct_60d = self._location_context.percentile_60d
+            self._current_trade_tags['percentile_60d'] = pct_60d
+            
+            # Extreme = top 10% or bottom 10% of 60-day range
+            if pct_60d >= 90:
+                at_extreme = True
+                extreme_type = 'HIGH'  # Only SHORT allowed here
+                if bias == 'LONG':
+                    logger.debug(f"⛔ RANGE MODE: At 90th percentile - LONG blocked, only SHORT")
+                    return  # Can't long at the top in range
+            elif pct_60d <= 10:
+                at_extreme = True
+                extreme_type = 'LOW'  # Only LONG allowed here
+                if bias == 'SHORT':
+                    logger.debug(f"⛔ RANGE MODE: At 10th percentile - SHORT blocked, only LONG")
+                    return  # Can't short at the bottom in range
+            
+            if not at_extreme:
+                # =========================================================================
+                # 🔥 FIX (Jan 26, 2026): PROBING MODE instead of early exit
+                # 
+                # OLD BEHAVIOR: Not at extreme → early exit, no trade
+                # NEW BEHAVIOR: Not at extreme → check if PROBING criteria met
+                #               If yes → continue with 0.25x size (diagnostic probe)
+                #               If no → early exit (pure observation)
+                # =========================================================================
+                
+                # Prepare dataframes for PROBING check
+                # df_1h already available from HTF filter block above
+                # df_5m needs to be built from candles_5m
+                df_5m_probing = None
+                if candles_5m and len(candles_5m) >= 20:
+                    df_5m_probing = pd.DataFrame(candles_5m[-60:])  # Last 60 candles = 5 hours
+                
+                # Calculate ATR 5m for PROBING criteria
+                atr_5m_probing = current_price * 0.01  # Default 1%
+                if df_5m_probing is not None and len(df_5m_probing) >= 14:
+                    try:
+                        atr_vals = calculate_atr(
+                            df_5m_probing['high'].to_numpy(),
+                            df_5m_probing['low'].to_numpy(),
+                            df_5m_probing['close'].to_numpy(),
+                            14
+                        )
+                        if len(atr_vals) > 0 and not np.isnan(atr_vals[-1]):
+                            atr_5m_probing = float(atr_vals[-1])
+                    except Exception:
+                        pass
+                
+                # Check PROBING criteria (near VWAP/VPOC, good structure)
+                # Returns: (size_multiplier, reason, conviction_score) where 0.0 = blocked
+                probing_size_mult, probing_reason, probing_conviction = self._check_probing_criteria(
+                    current_price=current_price,
+                    atr_5m=atr_5m_probing,
+                    bias=bias,
+                    df_1h=df_1h,
+                    df_5m=df_5m_probing
+                )
+                
+                if probing_size_mult > 0:
+                    # PROBING MODE: Continue with graduated risk
+                    # Determine level name FIRST for tag storage
+                    if probing_size_mult >= 0.65:
+                        level_name = "PROBE_MAX"
+                    elif probing_size_mult >= 0.50:
+                        level_name = "PROBE_MED"
+                    else:
+                        level_name = "PROBE_MIN"
+                    
+                    self._current_trade_tags['probing_mode'] = level_name  # 🔥 FIX: Store level name, not True
+                    self._current_trade_tags['range_mode_extreme'] = 'PROBING'  # Not at extreme but probing
+                    self._current_trade_tags['range_size_mult'] = probing_size_mult  # Graduated size
+                    self._current_trade_tags['conviction_score'] = probing_conviction  # 🔥 Store for observability
+                    
+                    logger.info(
+                        f"🔍 {level_name}: Not at extreme (pct={pct_60d:.0f}%) | "
+                        f"{probing_reason} | Size={probing_size_mult*100:.0f}%"
+                    )
+                    # DON'T RETURN - continue to evaluation
+                else:
+                    # NO PROBING - pure observation mode
+                    if self._idle_eval_count % 120 == 1:  # Log every 2 min
+                        logger.info(
+                            f"👁️ NO_EDGE MODE: Not at extreme (pct={pct_60d:.0f}%) | "
+                            f"PROBING blocked: {probing_reason}"
+                        )
+                    return  # Early exit - no edge detected
+            
+            # At extreme in RANGE - apply RANGE rules
+            self._current_trade_tags['range_mode_extreme'] = extreme_type
+            self._current_trade_tags['range_size_mult'] = 0.50  # 50% size
+            logger.info(
+                f"🎯 RANGE TRADE: {bias} at {extreme_type} extreme (pct={pct_60d:.0f}%) | "
+                f"Size=50% | Stop=2xATR"
+            )
+        
+        # ===================================================================
+        # TRANSITION MODE RULES (ADX 18-20)
+        # Cautious - reduced size, higher score threshold
+        # ===================================================================
+        elif trading_mode == 'TRANSITION':
+            self._current_trade_tags['transition_mode'] = True
+            self._current_trade_tags['transition_size_mult'] = 0.70  # 70% size
+            self._current_trade_tags['transition_score_add'] = 0.5  # +0.5 to threshold
+            logger.debug(f"⚠️ TRANSITION MODE: Size=70%, Score+0.5")
+        
+        # IMPROVED: Allow counter-trend trading in defensive mode
+        # When market is volatile, both directions can present opportunities
+        allow_countertrend = False
+        if not htf_passed and HTFFilters.ALLOW_COUNTERTREND_DEFENSIVE:
+            if self.black_swan_filter.is_defensive(market_time):
+                # In defensive mode, allow trading against HTF with reduced size
+                # Derive counter-trend bias from EMA relationship
+                ema_50 = df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+                ema_200 = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
+                
+                if ema_50 > ema_200:
+                    counter_bias = 'SHORT'  # Counter to bullish HTF
+                else:
+                    counter_bias = 'LONG'   # Counter to bearish HTF
+                
+                logger.info(f"⚠️ HTF rejected but DEFENSIVE MODE active - allowing counter-trend {counter_bias}")
+                allow_countertrend = True
+                bias = counter_bias
+                htf_passed = True  # Override for this trade
+        
+        if not htf_passed:
+            # HTF filter rechazado - loguear cada 5 minutos (cada vela 5m cerrada)
+            if self._last_htf_reject_log_time is None:
+                self._last_htf_reject_log_time = market_time
+            
+            seconds_since_log = (market_time - self._last_htf_reject_log_time).total_seconds()
+            
+            # Log cada 5 minutos (300 segundos) o si cambió de razón
+            should_log = (seconds_since_log >= 300) or (self._last_htf_state != 'rejected')
+            
+            if should_log:
+                logger.info(f"[BLOCK] HTF filter: {htf_reason}")
+                
+                # Show detailed HTF values
+                ema_50 = df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+                ema_200 = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
+                adx_vals, _ = calculate_adx(df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14)
+                # 🔥 FIX (Jan 25, 2026): Ensure ADX is Python float
+                adx = float(adx_vals[-1]) if len(adx_vals) > 0 else 0.0
+                adx_slope = float(adx_vals[-1] - adx_vals[-2]) if len(adx_vals) > 1 else 0.0
+                
+                logger.debug(f"   [DATA] Price: ${current_price:.2f} | EMA50: ${ema_50:.2f} | EMA200: ${ema_200:.2f}")
+                logger.debug(f"   [UP] ADX: {adx:.2f} | Slope: {adx_slope:.4f}")
+                
+                self._last_htf_reject_log_time = market_time
+                self._last_htf_state = 'rejected'
+            return
+        
+        self.current_bias = bias
+        bias_label = f'{bias} (counter-trend)' if allow_countertrend else bias
+        if self._last_htf_state != f'passed_{bias}':
+            logger.debug(f"[OK] HTF filter passed - Bias: {bias_label}")
+            self._last_htf_state = f'passed_{bias}'
+        
+        # ===== BLOQUE 1.5: LOCATION FILTER (MACRO VETO) =====
+        # Check if location in market structure allows this trade direction
+        # This is a HARD VETO that prevents buying tops in RANGE regime
+        
+        closes_1h = np.asarray(df_1h['close'].to_numpy())
+        highs_1h = np.asarray(df_1h['high'].to_numpy())
+        lows_1h = np.asarray(df_1h['low'].to_numpy())
+        volumes_1h = np.asarray(df_1h['volume'].to_numpy()) if 'volume' in df_1h.columns else np.ones(len(closes_1h))
+        
+        # Get ATR and ADX for location context
+        atr_1h_vals = calculate_atr(highs_1h, lows_1h, closes_1h, 14)
+        atr_1h = atr_1h_vals[-1] if len(atr_1h_vals) > 0 else current_price * 0.01
+        
+        adx_1h_vals, _ = calculate_adx(highs_1h, lows_1h, closes_1h, 14)
+        adx_1h = adx_1h_vals[-1] if len(adx_1h_vals) > 0 else 20.0
+        
+        # Get current regime for location filter
+        regime_for_location = self.regime_classifier.current_regime.value if self.regime_classifier.current_regime else "RANGE"
+        
+        # 🔥 FIX (Jan 23, 2026): HTF ADX classification can OVERRIDE regime to RANGE
+        # If HTF ADX says RANGE/WEAK_TREND but EdgeRegimeClassifier says TREND, trust ADX
+        # This fixes the bug where ADX 15.3 was treated as TREND (wrong stops, wrong logic)
+        htf_regime_mode = self._htf_cache_regime_mode
+        if htf_regime_mode in ('RANGE', 'WEAK_TREND', 'LOW_ADX'):
+            if regime_for_location in ('REGIME_A', 'TREND', 'BREAKOUT'):
+                logger.info(f"⚠️ HTF ADX override: classifier={regime_for_location} but ADX={self._htf_cache_adx:.1f} → forcing RANGE logic")
+                regime_for_location = 'RANGE'
+        
+        # 🔥 FIX (Jan 22, 2026): Store regime for trailing stop to use SAME regime
+        self._current_trade_regime = regime_for_location
+        
+        # 🔥 FIX (Jan 23, 2026): Store HTF regime mode in trade tags for analysis
+        self._current_trade_tags['htf_regime_mode'] = htf_regime_mode
+        self._current_trade_tags['htf_adx'] = self._htf_cache_adx
+        
+        # Calculate location context (cached by 1h bar close)
+        # Ensure bias is set before location check
+        if bias is None:
+            logger.warning("HTF passed but no bias set - skipping")
+            return
+        
+        location_cache_key = _ts_to_int(df_1h.iloc[-1].get('timestamp', 0))
+        location_allowed, location_reason, self._location_context = self.location_filter.check(
+            closes_1h=closes_1h,
+            highs_1h=highs_1h,
+            lows_1h=lows_1h,
+            volumes_1h=volumes_1h,
+            current_price=current_price,
+            atr_1h=atr_1h,
+            adx_1h=adx_1h,
+            bias=bias,
+            regime=regime_for_location,
+            cache_key=location_cache_key
+        )
+        
+        # Store location context in trade tags
+        if self._location_context:
+            self._current_trade_tags['location_pct_60d'] = self._location_context.percentile_60d
+            self._current_trade_tags['location_headroom_atr'] = (
+                self._location_context.headroom_to_high_atr if bias == 'LONG' 
+                else self._location_context.headroom_to_low_atr
+            )
+            self._current_trade_tags['location_in_extreme'] = (
+                self._location_context.in_extreme_high or self._location_context.in_extreme_low
+            )
+            self._current_trade_tags['location_is_breakout'] = (
+                self._location_context.is_breakout_up or self._location_context.is_breakout_down
+            )
+            # 🔥 FIX (Jan 22, 2026): Store location penalties for scoring
+            self._current_trade_tags['location_penalty_long'] = self._location_context.location_penalty_long
+            self._current_trade_tags['location_penalty_short'] = self._location_context.location_penalty_short
+            self._current_trade_tags['location_size_cap_long'] = self._location_context.size_cap_long
+            self._current_trade_tags['location_size_cap_short'] = self._location_context.size_cap_short
+        
+        # 🔥 FIX (Jan 22, 2026): In TREND regime, convert hard veto to penalty + continue
+        # Only hard block in RANGE regime
+        is_range_regime = regime_for_location in ['RANGE', 'CHOPPY_DEAD', 'MEAN_REVERSION']
+        
+        if not location_allowed:
+            # =====================================================================
+            # LOCATION FILTER BREAKOUT OVERRIDE (Jan 16, 2026)
+            # Allow entry if HTF ADX is strong AND we have a valid BOS (breakout)
+            # This prevents blocking genuine breakouts that look like "extreme" locations
+            # =====================================================================
+            breakout_override = False
+            
+            if self._location_context:
+                is_breakout = self._location_context.is_breakout_up or self._location_context.is_breakout_down
+                htf_adx_strong = adx_1h >= LocationFilterOverride.MIN_HTF_ADX
+                
+                # Check for BOS (Break of Structure) if required
+                has_bos = True  # Default
+                if LocationFilterOverride.REQUIRE_BOS:
+                    # BOS = price breaking recent swing high/low
+                    if bias == 'LONG' and self._location_context.is_breakout_up:
+                        # Breaking above recent highs
+                        has_bos = current_price > np.max(highs_1h[-5:]) if len(highs_1h) >= 5 else False
+                    elif bias == 'SHORT' and self._location_context.is_breakout_down:
+                        # Breaking below recent lows
+                        has_bos = current_price < np.min(lows_1h[-5:]) if len(lows_1h) >= 5 else False
+                
+                if is_breakout and htf_adx_strong and has_bos:
+                    breakout_override = True
+                    self._current_trade_tags['location_breakout_override'] = True
+                    self._current_trade_tags['breakout_adx'] = adx_1h
+                    logger.info(f"🚀 LOCATION OVERRIDE: Breakout with ADX={adx_1h:.1f} (threshold={LocationFilterOverride.MIN_HTF_ADX})")
+            
+            if not breakout_override:
+                # 🔥 FIX (Jan 22, 2026): In TREND regime, DON'T hard block - use penalty and continue
+                if not is_range_regime:
+                    # TREND/TRANSITION: Apply penalty and continue (don't return)
+                    location_penalty = (
+                        self._location_context.location_penalty_long if bias == 'LONG' 
+                        else self._location_context.location_penalty_short
+                    ) if self._location_context else -1.0
+                    self._current_trade_tags['location_penalty_applied'] = location_penalty
+                    logger.info(f"📍 LOCATION PENALTY (TREND): {location_reason} → penalty {location_penalty:.1f} (continuing)")
+                    # Don't return - continue with penalty applied in scoring
+                else:
+                    # RANGE regime: Hard block only for extreme cases
+                    # Log location veto (once per bias change)
+                    if self._last_location_state is None or self._last_location_state != f'vetoed_{bias}':
+                        logger.warning(f"📍 LOCATION VETO (RANGE): {location_reason}")
+                        if self._location_context:
+                            logger.info(self.location_filter.get_location_summary(self._location_context))
+                        self._last_location_state = f'vetoed_{bias}'
+                    
+                    # =====================================================================
+                    # PULLBACK SHORT ENGINE EVALUATION (Jan 14, 2026)
+                    # When LONG is blocked by location (price at extreme high), check if
+                    # pullback short conditions are met for tactical correction capture
+                    # =====================================================================
+                    if bias == 'LONG' and PullbackShortConfig.ENABLED:
+                        await self._evaluate_pullback_short(
+                            current_price=current_price,
+                            df_1h=df_1h,
+                            candles_5m=self.market_data.get_candles('5m'),
+                            htf_bias=bias,
+                            regime=regime_for_location,
+                            market_time=market_time,
+                            veto_reason=location_reason
+                        )
+                    
+                    return
+        else:
+            self._last_location_state = f'allowed_{bias}'
+            # Log location context on first pass or regime change
+            if self._location_context and self._idle_eval_count % 60 == 0:
+                logger.debug(self.location_filter.get_location_summary(self._location_context))
+            
+            # 🔥 FIX (Jan 22, 2026): Apply location penalty even when allowed
+            # In RANGE regime with extreme positions, penalty is set but no hard block
+            if self._location_context:
+                location_penalty = (
+                    self._location_context.location_penalty_long if bias == 'LONG' 
+                    else self._location_context.location_penalty_short
+                )
+                if location_penalty < 0:
+                    self._current_trade_tags['location_penalty_applied'] = location_penalty
+                    logger.debug(f"📍 Location penalty (allowed): {location_penalty:.1f}")
+        
+        # =========================================================================
+        # NEW: BIAS STRENGTH & TREND EXPANSION DETECTION (Jan 22, 2026)
+        # Detect market state for asymmetric direction rules
+        # =========================================================================
+        
+        # Get 5m data for expansion detection
+        candles_5m_pre = self.market_data.get_candles('5m')
+        df_5m_pre = pd.DataFrame(candles_5m_pre) if candles_5m_pre and len(candles_5m_pre) >= 30 else None
+        candles_1m_pre = self.market_data.get_candles('1m')
+        df_1m_pre = pd.DataFrame(candles_1m_pre) if candles_1m_pre and len(candles_1m_pre) >= 20 else None
+        
+        # 1. Detect Bias Strength
+        if df_5m_pre is not None and len(df_5m_pre) >= 20:
+            self._current_bias_strength = self._detect_bias_strength(df_1h, df_5m_pre, current_price)
+        else:
+            self._current_bias_strength = BiasStrength.NEUTRAL
+        
+        self._current_trade_tags['bias_strength'] = self._current_bias_strength.value
+        
+        # 2. Get countertrend rules
+        ct_rules = BiasStrengthConfig.get_countertrend_rules(self._current_bias_strength, bias)
+        is_countertrend = ct_rules['is_countertrend']
+        
+        self._current_trade_tags['is_countertrend'] = is_countertrend
+        self._current_trade_tags['ct_size_mult'] = ct_rules['size_mult']
+        self._current_trade_tags['ct_max_rr'] = ct_rules['max_rr']
+        
+        if is_countertrend:
+            logger.info(f"⚠️ COUNTERTREND TRADE: {bias} against {self._current_bias_strength.value} → size={ct_rules['size_mult']:.0%}, max_rr={ct_rules['max_rr']:.1f}")
+            
+            # Check countertrend limits
+            if self._countertrend_losses_session >= BiasStrengthConfig.COUNTERTREND_MAX_PER_SESSION:
+                logger.warning(f"⛔ CT SESSION LIMIT: {self._countertrend_losses_session} CT losses this session")
+                self._current_trade_tags['skip_reason'] = 'ct_session_limit'
+                return
+            
+            # Check cooldown after CT loss
+            if self._last_countertrend_loss_time is not None:
+                cooldown_end = self._last_countertrend_loss_time + timedelta(minutes=ct_rules['cooldown_on_loss'] * 5)
+                if market_time < cooldown_end:
+                    remaining = (cooldown_end - market_time).total_seconds() / 60
+                    logger.info(f"⏳ CT COOLDOWN: {remaining:.0f}min remaining after CT loss")
+                    self._current_trade_tags['skip_reason'] = 'ct_cooldown'
+                    return
+        
+        # 3. Detect Trend Expansion
+        if df_5m_pre is not None and df_1m_pre is not None:
+            atr_5m_pre = calculate_atr(df_5m_pre['high'].to_numpy(), df_5m_pre['low'].to_numpy(), df_5m_pre['close'].to_numpy(), 14)
+            atr_5m_val = atr_5m_pre[-1] if len(atr_5m_pre) > 0 else current_price * 0.005
+            
+            expansion_detected, expansion_criteria = self._detect_trend_expansion(
+                df_5m_pre, df_1m_pre, current_price, atr_5m_val
+            )
+            
+            if expansion_detected and not self._trend_expansion_active:
+                self._trend_expansion_active = True
+                self._trend_expansion_start_time = market_time
+                # Set anti-fade period
+                anti_fade_minutes = TrendExpansionConfig.ANTI_FADE_CANDLES * 5
+                self._anti_fade_until = market_time + timedelta(minutes=anti_fade_minutes)
+                logger.info(f"🚀 TREND EXPANSION MODE ACTIVATED - anti-fade for {anti_fade_minutes}min")
+            elif not expansion_detected and self._trend_expansion_active:
+                # Check if expansion ended
+                if self._trend_expansion_start_time and (market_time - self._trend_expansion_start_time).total_seconds() > 1800:  # 30min min duration
+                    self._trend_expansion_active = False
+                    self._trend_expansion_start_time = None
+                    logger.info("📉 TREND EXPANSION MODE ENDED")
+            
+            self._current_trade_tags['trend_expansion'] = self._trend_expansion_active
+            self._current_trade_tags['expansion_criteria'] = expansion_criteria
+        
+        # 4. Apply anti-fade rule (no counter-trend in expansion)
+        if self._anti_fade_until and market_time < self._anti_fade_until:
+            if is_countertrend:
+                remaining = (self._anti_fade_until - market_time).total_seconds() / 60
+                logger.info(f"⛔ ANTI-FADE: No countertrend during expansion ({remaining:.0f}min remaining)")
+                self._current_trade_tags['skip_reason'] = 'anti_fade_expansion'
+                return
+        
+        # 5. Short Obstinacy Check (for shorts only)
+        short_obstinacy_penalty = 0.0
+        if bias == 'SHORT' and df_5m_pre is not None:
+            atr_5m_pre = calculate_atr(df_5m_pre['high'].to_numpy(), df_5m_pre['low'].to_numpy(), df_5m_pre['close'].to_numpy(), 14)
+            atr_5m_val = atr_5m_pre[-1] if len(atr_5m_pre) > 0 else current_price * 0.005
+            
+            short_obstinacy_penalty, bullish_signals, obstinacy_reason = self._calculate_short_obstinacy_penalty(
+                df_5m_pre, current_price, atr_5m_val
+            )
+            
+            self._current_trade_tags['short_obstinacy_penalty'] = short_obstinacy_penalty
+            self._current_trade_tags['bullish_signals'] = bullish_signals
+            self._current_trade_tags['obstinacy_reason'] = obstinacy_reason
+            
+            # Check short cooldown
+            if self._short_cooldown_until and market_time < self._short_cooldown_until:
+                remaining = (self._short_cooldown_until - market_time).total_seconds() / 60
+                logger.info(f"⏳ SHORT OBSTINACY COOLDOWN: {remaining:.0f}min remaining")
+                self._current_trade_tags['skip_reason'] = 'short_obstinacy_cooldown'
+                return
+        
+        # ===== BLOQUE 2: SKIPPED - MTF FILTER REMOVED =====
+        # OPTIMIZATION FIX #1 (Jan 3, 2026):
+        # Removed MTF (5m) Structure filter to enable EARLIER ENTRIES
+        # Benefits:
+        #   - Eliminates 10-15 minute delay
+        #   - Increases R from 0.6R → 1.0-1.2R naturally
+        #   - Adds 15-25% more trades
+        # Trade-off: +5-10% more false entries (mitigated by tighter LTF filter)
+        # 
+        # BEFORE: HTF (1h) → MTF (5m) → LTF (1m) = 3 filters, slow entry
+        # NOW:    HTF (1h) → LTF (1m) = 2 filters, fast entry
+        
+        # Find impulse high/low from last 10 1m candles (for reference only)
+        candles_1m_for_impulse = self.market_data.get_candles('1m')
+        if candles_1m_for_impulse and len(candles_1m_for_impulse) >= 10:
+            self.impulse_high = max([c['high'] for c in candles_1m_for_impulse[-10:]])
+            self.impulse_low = min([c['low'] for c in candles_1m_for_impulse[-10:]])
+        else:
+            self.impulse_high = current_price
+            self.impulse_low = current_price
+        
+        # Log impulse only on state changes (not every evaluation)
+        logger.debug(f"⚡ BLOQUE 2 SKIPPED (MTF removed) | Impulse High: ${self.impulse_high:.2f} | Low: ${self.impulse_low:.2f}")
+        
+        # ===== BLOQUE 2.5: MICRO TREND FILTER (5m) - NEW (Jan 15, 2026) =====
+        # PROBLEM: Bot enters LONGs during micro-bearish trends within macro-bullish,
+        # leading to consecutive SL hits that erode gains.
+        # SOLUTION: Detect micro-trend (5m structure) and block/penalize opposing entries.
+        #
+        # Workflow:
+        # 1. Check if micro-trend opposes HTF bias
+        # 2. If HARD BLOCK: veto entry completely
+        # 3. If SOFT BLOCK: apply score penalty (tracked in _micro_trend_state)
+        # 4. Score penalty applied in _calculate_entry_score via score_adjustment
+        
+        candles_5m_list = self.market_data.get_candles('5m')
+        candles_1m_list = self.market_data.get_candles('1m')
+        
+        # Initialize to None for type safety
+        df_5m_micro: pd.DataFrame | None = None
+        df_1m_micro: pd.DataFrame | None = None
+        
+        if candles_5m_list and len(candles_5m_list) >= 60:
+            df_5m_micro = pd.DataFrame(candles_5m_list)
+            df_1m_micro = pd.DataFrame(candles_1m_list) if candles_1m_list and len(candles_1m_list) >= 30 else None
+            
+            micro_allowed, micro_reason, self._micro_trend_state = self.micro_trend_filter.check(
+                df_5m=df_5m_micro,
+                df_1m=df_1m_micro,
+                current_price=current_price,
+                htf_bias=bias,
+                market_time=market_time
+            )
+            
+            # Store micro trend state in trade tags for analysis
+            if self._micro_trend_state:
+                self._current_trade_tags['micro_trend'] = self._micro_trend_state.micro_trend
+                self._current_trade_tags['micro_trend_strength'] = self._micro_trend_state.strength
+                self._current_trade_tags['micro_ema20_5m'] = self._micro_trend_state.ema20_5m
+                self._current_trade_tags['micro_ema50_5m'] = self._micro_trend_state.ema50_5m
+                self._current_trade_tags['micro_rsi_5m'] = self._micro_trend_state.rsi_5m
+                self._current_trade_tags['micro_score_adj'] = self._micro_trend_state.score_adjustment
+                self._current_trade_tags['micro_has_ll'] = self._micro_trend_state.has_lower_low
+                
+                # =========================================================================
+                # 🔥 FIX (Jan 22, 2026): REGIME-AWARE MICRO TREND ADJUSTMENT
+                # In RANGE regime: micro trends are ephemeral, reduce their weight
+                # This prevents over-shorting/longing in the middle of ranges
+                # =========================================================================
+                regime_for_micro = self._current_trade_regime
+                is_range_for_micro = regime_for_micro in ['RANGE', 'CHOPPY_DEAD', 'MEAN_REVERSION', 'TREND_EXHAUSTION']
+                
+                if is_range_for_micro and self._micro_trend_state.score_adjustment != 0:
+                    original_adj = self._micro_trend_state.score_adjustment
+                    # In RANGE: cap bonus at 0.5, cap penalty at -0.3
+                    if original_adj > 0:
+                        self._micro_trend_state.score_adjustment = min(0.5, original_adj)
+                    else:
+                        self._micro_trend_state.score_adjustment = max(-0.3, original_adj)
+                    
+                    if original_adj != self._micro_trend_state.score_adjustment:
+                        logger.info(
+                            f"📊 MICRO ADJ CAPPED (RANGE regime): {original_adj:+.1f} → "
+                            f"{self._micro_trend_state.score_adjustment:+.1f}"
+                        )
+                        self._current_trade_tags['micro_score_adj'] = self._micro_trend_state.score_adjustment
+                        self._current_trade_tags['micro_regime_capped'] = True
+            
+            if not micro_allowed:
+                # =====================================================================
+                # MICRO TREND ADX CONDITIONING (Jan 16, 2026)
+                # Only apply hard block if HTF trend is WEAK (low ADX)
+                # In STRONG trends (ADX >= 30), micro-corrections are normal - allow entry
+                # In WEAK trends (ADX < 20), micro-trend signals are more meaningful - block
+                #
+                # 🔥 FIX (Jan 22, 2026): Penalty caps based on ADX
+                # ADX > 30: penalty = 0 (strong trend, pullbacks are opportunities)
+                # ADX 15-25: penalty max = -0.5 (transitional, be cautious but allow)
+                # ADX < 15: keep current penalty (weak/ranging, micro trend is significant)
+                # =====================================================================
+                adx_override = False
+                
+                if adx_1h >= MicroTrendADXConfig.STRONG_TREND_ADX:
+                    # Strong HTF trend - override micro block, NO penalty
+                    adx_override = True
+                    self._current_trade_tags['micro_adx_override'] = True
+                    self._current_trade_tags['micro_htf_adx'] = adx_1h
+                    logger.info(f"⚡ MICRO TREND override: HTF ADX={adx_1h:.1f} >= {MicroTrendADXConfig.STRONG_TREND_ADX} (strong trend - NO penalty)")
+                    # Zero penalty in strong trends
+                    if self._micro_trend_state:
+                        self._micro_trend_state.score_adjustment = 0.0
+                elif adx_1h >= 15:  # 15-30 range
+                    # Mid-range ADX: Apply capped penalty
+                    adx_override = True
+                    self._current_trade_tags['micro_adx_override'] = True
+                    self._current_trade_tags['micro_htf_adx'] = adx_1h
+                    
+                    # Progressive penalty: 15 ADX = -0.5, 25 ADX = -0.25, 30 ADX = 0
+                    penalty_factor = (30 - adx_1h) / 30  # 0 at ADX=30, 0.5 at ADX=15
+                    capped_penalty = max(-0.5, -penalty_factor)
+                    
+                    if self._micro_trend_state:
+                        self._micro_trend_state.score_adjustment = capped_penalty
+                    
+                    logger.info(f"⚠️ MICRO TREND: HTF ADX={adx_1h:.1f} (mid-range) → capped penalty {capped_penalty:.2f}")
+                else:
+                    # Weak HTF trend (ADX < 15) - micro signals are very significant
+                    logger.info(f"⛔ MICRO TREND: HTF ADX={adx_1h:.1f} < 15 (weak trend, full block)")
+                
+                if not adx_override:
+                    # Log micro trend veto (once per state change)
+                    if self._last_micro_state is None or self._last_micro_state != f'vetoed_{bias}':
+                        logger.warning(f"⛔ MICRO TREND VETO: {micro_reason}")
+                        logger.info(f"   📊 5m Structure: EMA20={self._micro_trend_state.ema20_5m:.0f} | EMA50={self._micro_trend_state.ema50_5m:.0f} | RSI={self._micro_trend_state.rsi_5m:.1f}")
+                        logger.info(f"   📉 Signals: LL={self._micro_trend_state.has_lower_low} | LH={self._micro_trend_state.has_lower_high} | BelowEMA20={self._micro_trend_state.is_below_ema20}")
+                        self._last_micro_state = f'vetoed_{bias}'
+                    return
+            else:
+                self._last_micro_state = f'allowed_{bias}'
+                if self._micro_trend_state and self._micro_trend_state.score_adjustment != 0:
+                    logger.debug(f"📊 MICRO TREND: {self._micro_trend_state.micro_trend} (strength={self._micro_trend_state.strength:.0%}, score_adj={self._micro_trend_state.score_adjustment:+.1f})")
+        else:
+            # Not enough data - allow but log
+            self._micro_trend_state = None
+            logger.debug("⚠️ MICRO TREND: Insufficient 5m data - skipping filter")
+        
+        # =========================================================================
+        # 🔥 BIAS INVERSION (Jan 27, 2026)
+        # PROBLEM: HTF bias (EMA50_1h) is slow to react to intraday trend changes.
+        # When price drops $1000, EMA50 barely moves, so system keeps trying LONG.
+        # SOLUTION: If micro-trend is STRONG and OPPOSES HTF bias, INVERT the bias.
+        # 
+        # This allows the system to trade the actual trend, not a lagging indicator.
+        # =========================================================================
+        MICRO_STRENGTH_FOR_INVERSION = 0.65  # Need 65%+ micro-trend strength to invert
+        original_bias = bias
+        bias_inverted = False
+        
+        if self._micro_trend_state and self._micro_trend_state.strength >= MICRO_STRENGTH_FOR_INVERSION:
+            micro_trend = self._micro_trend_state.micro_trend
+            
+            # HTF says LONG but micro is BEARISH → invert to SHORT
+            if bias == 'LONG' and micro_trend == 'BEARISH':
+                bias = 'SHORT'
+                bias_inverted = True
+                logger.info(
+                    f"🔄 BIAS INVERTED: HTF={original_bias} but micro={micro_trend} "
+                    f"(strength={self._micro_trend_state.strength:.0%}) → trading {bias}"
+                )
+                self._current_trade_tags['bias_inverted'] = True
+                self._current_trade_tags['bias_inversion_reason'] = f'micro_{micro_trend.lower()}'
+                self._current_trade_tags['original_htf_bias'] = original_bias
+                # Reset micro-trend penalty since we're now aligned
+                self._micro_trend_state.score_adjustment = 0.0
+            
+            # HTF says SHORT but micro is BULLISH → invert to LONG
+            elif bias == 'SHORT' and micro_trend == 'BULLISH':
+                bias = 'LONG'
+                bias_inverted = True
+                logger.info(
+                    f"🔄 BIAS INVERTED: HTF={original_bias} but micro={micro_trend} "
+                    f"(strength={self._micro_trend_state.strength:.0%}) → trading {bias}"
+                )
+                self._current_trade_tags['bias_inverted'] = True
+                self._current_trade_tags['bias_inversion_reason'] = f'micro_{micro_trend.lower()}'
+                self._current_trade_tags['original_htf_bias'] = original_bias
+                # Reset micro-trend penalty since we're now aligned
+                self._micro_trend_state.score_adjustment = 0.0
+        
+        # Update current_bias if inverted
+        if bias_inverted:
+            self.current_bias = bias
+        
+        # ===== BLOQUE 2.6: EMA DISTANCE GUARD (Jan 15, 2026) =====
+        # PROBLEM: Bot enters LONGs when price is significantly below EMA20/EMA50 on 5m,
+        # which indicates strong bearish micro-structure. MicroTrendFilter hysteresis 
+        # may not catch fast moves.
+        # SOLUTION: Hard block if price is >1% below EMA20 for LONG (or >1% above for SHORT)
+        # This is a FAIL-SAFE to prevent entries against obvious micro-structure.
+        #
+        # Why 1%? On BTC at 95000, 1% = $950. If we're $950+ below EMA20 (5m),
+        # we're clearly in a pullback/correction - not a good LONG entry point.
+        
+        EMA_DISTANCE_BLOCK_PCT = 0.01  # 1% threshold
+        EMA_DISTANCE_WARNING_PCT = 0.005  # 0.5% warning (apply score penalty)
+        
+        if df_5m_micro is not None and len(df_5m_micro) >= 50:
+            closes_5m = df_5m_micro['close'].to_numpy()
+            ema20_5m_val = calculate_ema(closes_5m, 20)[-1]
+            ema50_5m_val = calculate_ema(closes_5m, 50)[-1]
+            
+            if not np.isnan(ema20_5m_val) and not np.isnan(ema50_5m_val) and ema20_5m_val > 0:
+                if bias == 'LONG':
+                    # For LONG: Block if price is significantly BELOW EMAs
+                    distance_to_ema20 = (current_price - ema20_5m_val) / ema20_5m_val
+                    distance_to_ema50 = (current_price - ema50_5m_val) / ema50_5m_val
+                    
+                    # HARD BLOCK: Price >1% below EMA20 AND below EMA50
+                    if distance_to_ema20 < -EMA_DISTANCE_BLOCK_PCT and distance_to_ema50 < 0:
+                        logger.warning(
+                            f"⛔ EMA DISTANCE VETO: LONG blocked - price {current_price:.0f} is "
+                            f"{abs(distance_to_ema20)*100:.1f}% below EMA20({ema20_5m_val:.0f}) "
+                            f"and {abs(distance_to_ema50)*100:.1f}% below EMA50({ema50_5m_val:.0f})"
+                        )
+                        self._current_trade_tags['ema_distance_veto'] = True
+                        self._current_trade_tags['ema20_distance_pct'] = distance_to_ema20 * 100
+                        self._current_trade_tags['ema50_distance_pct'] = distance_to_ema50 * 100
+                        self._set_rejection_cooldown("EMA distance veto - price too far below EMAs", candles=5)
+                        return
+                    
+                    # WARNING: Price 0.5-1% below EMA20 - apply extra penalty (handled in micro_trend)
+                    elif distance_to_ema20 < -EMA_DISTANCE_WARNING_PCT:
+                        logger.debug(
+                            f"[WARN] EMA DISTANCE: LONG {abs(distance_to_ema20)*100:.1f}% below EMA20"
+                        )
+                        self._current_trade_tags['ema_distance_warning'] = True
+                        self._current_trade_tags['ema20_distance_pct'] = distance_to_ema20 * 100
+                
+                elif bias == 'SHORT':
+                    # For SHORT: Block if price is significantly ABOVE EMAs
+                    distance_to_ema20 = (current_price - ema20_5m_val) / ema20_5m_val
+                    distance_to_ema50 = (current_price - ema50_5m_val) / ema50_5m_val
+                    
+                    # HARD BLOCK: Price >1% above EMA20 AND above EMA50
+                    if distance_to_ema20 > EMA_DISTANCE_BLOCK_PCT and distance_to_ema50 > 0:
+                        logger.warning(
+                            f"⛔ EMA DISTANCE VETO: SHORT blocked - price {current_price:.0f} is "
+                            f"{distance_to_ema20*100:.1f}% above EMA20({ema20_5m_val:.0f}) "
+                            f"and {distance_to_ema50*100:.1f}% above EMA50({ema50_5m_val:.0f})"
+                        )
+                        self._current_trade_tags['ema_distance_veto'] = True
+                        self._current_trade_tags['ema20_distance_pct'] = distance_to_ema20 * 100
+                        self._current_trade_tags['ema50_distance_pct'] = distance_to_ema50 * 100
+                        self._set_rejection_cooldown("EMA distance veto - price too far above EMAs", candles=5)
+                        return
+        
+        # ===== BLOQUE 2.7: UNIFIED FILTER PIPELINE (Jan 15, 2026) =====
+        # Runs all new filters: BB Width, Volatility Shock, Macro Trend, 
+        # Post-Sweep, Cost, Overtrade
+        # NOTE: System doesn't have 15m candles, using 5m as proxy for intermediate TF
+        df_15m_proxy = df_5m_micro
+        
+        # Calculate spread from order book if available
+        spread = None
+        if hasattr(self, 'order_book') and self.order_book:
+            bid_price, ask_price, spread_pct = self.order_book.get_spread()
+            if bid_price and ask_price:
+                # Update spread filter with bid/ask for rolling window analysis
+                self.spread_filter.update_spread(bid_price, ask_price, current_price)
+                spread = spread_pct  # Use the percentage for other calculations
+        
+        filter_decision = self.filter_pipeline.evaluate(
+            df_1m=df_1m_micro,  # pyright: ignore[reportArgumentType]
+            df_5m=df_5m_micro,  # pyright: ignore[reportArgumentType]
+            df_15m=df_15m_proxy,  # pyright: ignore[reportArgumentType]
+            df_1h=df_1h,
+            current_price=current_price,
+            bias=bias,
+            atr=atr_1m,
+            spread=spread,
+            market_time=market_time
+        )
+        
+        # Store filter pipeline tags
+        if filter_decision.tags:
+            for key, value in filter_decision.tags.items():
+                self._current_trade_tags[f'fp_{key}'] = value
+        
+        if not filter_decision.allow:
+            # Log which filter blocked
+            blocker = filter_decision.tags.get('blocked_by', 'unknown')
+            if self._last_fp_block is None or self._last_fp_block != f'{blocker}_{bias}':
+                logger.warning(f"[BLOCK] FILTER [{blocker}]: {filter_decision.reasons[0] if filter_decision.reasons else 'veto'}")
+                self._last_fp_block = f'{blocker}_{bias}'
+            return
+        else:
+            self._last_fp_block = None
+            if filter_decision.score_adjust != 0:
+                logger.debug(f"📊 FILTER PIPELINE: score_adj={filter_decision.score_adjust:+.1f}")
+        
+        # ===== BLOQUE 3: LTF TRIGGER (1m) =====
+        logger.debug("Evaluating LTF trigger (1m)...")
+        candles_1m = self.market_data.get_candles('1m')
+        df_1m = pd.DataFrame(candles_1m)
+        
+        # Get regime info for volume-aware filtering
+        regime_value = self.regime_classifier.current_regime.value if self.regime_classifier.current_regime else None
+        regime_conf = self.regime_classifier.regime_confidence
+        
+        ltf_passed, ltf_reason = self.ltf_filter.check(
+            df_1m,
+            bias,
+            {},  # Order book would go here but we'll use execution for real book
+            regime=regime_value,
+            regime_confidence=regime_conf
+        )
+        
+        # ===== STORE LTF INFO AS TAGS (regardless of pass/fail) =====
+        ltf_info = self.ltf_filter.get_last_ltf_info()
+        if ltf_info:
+            self._current_trade_tags['ltf_bos'] = ltf_info.get('bos_confirmed', False)
+            self._current_trade_tags['ltf_ema_reclaim'] = ltf_info.get('ema_reclaim', False)
+            self._current_trade_tags['ltf_slope_positive'] = ltf_info.get('slope_positive', False)
+            self._current_trade_tags['ltf_confirmations'] = ltf_info.get('confirmations', 0)
+            self._current_trade_tags['ltf_ema_slope'] = ltf_info.get('ema_slope', 0.0)
+            # Volume tags (never blocks, only info)
+            self._current_trade_tags['rel_vol'] = ltf_info.get('rel_vol', 1.0)
+            self._current_trade_tags['volume_bucket'] = ltf_info.get('volume_bucket', 'unknown')
+        
+        if not ltf_passed:
+            if self._last_ltf_state != f'rejected_{ltf_reason}':
+                logger.info(f"⛔ LTF filter rejected: {ltf_reason}")
+                
+                # Show detailed LTF values
+                ema_9_ltf = df_1m['close'].ewm(span=9, adjust=False).mean().iloc[-1]
+                ema_20_ltf = df_1m['close'].ewm(span=20, adjust=False).mean().iloc[-1]
+                
+                logger.info(f"   📊 Price: ${current_price:.2f} | EMA9: ${ema_9_ltf:.2f} | EMA20: ${ema_20_ltf:.2f}")
+                logger.info(f"   🎯 Bias: {bias} | Impulse High: ${self.impulse_high:.2f} | Low: ${self.impulse_low:.2f}")
+                
+                self._last_ltf_state = f'rejected_{ltf_reason}'
+            return
+        
+        if self._last_ltf_state != 'passed':
+            logger.info(f"✅ LTF filter passed")
+            self._last_ltf_state = 'passed'
+        
+        # =====================================================================
+        # PUNTO 12: DELTA VOLUME CONFIRMATION (Jan 22, 2026)
+        # Check if buy/sell volume delta confirms the bias direction
+        # LONG: require positive delta (more buying than selling)
+        # SHORT: require negative delta (more selling than buying)
+        # This is a SCORE BONUS, not a hard gate
+        # =====================================================================
+        delta_score_bonus = 0
+        try:
+            if 'volume' in df_1m.columns and len(df_1m) >= 5:
+                # Calculate volume delta using candle direction
+                # Green candle = buy volume, Red candle = sell volume
+                df_1m_recent = df_1m.tail(5).copy()
+                df_1m_recent['is_green'] = df_1m_recent['close'] >= df_1m_recent['open']
+                df_1m_recent['signed_vol'] = np.where(
+                    df_1m_recent['is_green'],
+                    df_1m_recent['volume'],
+                    -df_1m_recent['volume']
+                )
+                delta = df_1m_recent['signed_vol'].sum()
+                avg_vol = df_1m['volume'].tail(20).mean()
+                
+                # Calculate delta as multiple of average volume
+                delta_ratio = delta / avg_vol if avg_vol > 0 else 0
+                
+                self._current_trade_tags['volume_delta'] = delta
+                self._current_trade_tags['volume_delta_ratio'] = delta_ratio
+                
+                # Score bonus for aligned delta
+                if bias == 'LONG' and delta_ratio > 0.5:
+                    # Positive delta = buying pressure confirms LONG
+                    delta_score_bonus = 0.5 if delta_ratio > 1.0 else 0.25
+                    logger.debug(f"📊 DELTA ALIGNED: +{delta_ratio:.2f}x avg vol supports LONG (+{delta_score_bonus} score)")
+                elif bias == 'SHORT' and delta_ratio < -0.5:
+                    # Negative delta = selling pressure confirms SHORT
+                    delta_score_bonus = 0.5 if delta_ratio < -1.0 else 0.25
+                    logger.debug(f"📊 DELTA ALIGNED: {delta_ratio:.2f}x avg vol supports SHORT (+{delta_score_bonus} score)")
+                elif bias == 'LONG' and delta_ratio < -0.5:
+                    # Negative delta contradicts LONG - warning but not block
+                    self._current_trade_tags['delta_contradicts'] = True
+                    logger.info(f"⚠️ DELTA CONTRADICT: {delta_ratio:.2f}x avg vol AGAINST LONG bias")
+                elif bias == 'SHORT' and delta_ratio > 0.5:
+                    # Positive delta contradicts SHORT - warning but not block
+                    self._current_trade_tags['delta_contradicts'] = True
+                    logger.info(f"⚠️ DELTA CONTRADICT: +{delta_ratio:.2f}x avg vol AGAINST SHORT bias")
+        except Exception as e:
+            logger.debug(f"Delta volume calculation error: {e}")
+        
+        self._current_trade_tags['delta_score_bonus'] = delta_score_bonus
+        
+        # ===== ALL FILTERS PASSED - PRE-CHECK EDGE CONTEXT =====
+        # Note: LTF is "score-based" not "gate-based" so we show actual confirmations
+        ltf_confs = self._current_trade_tags.get('ltf_confirmations', '?')
+        
+        # Quick edge context check BEFORE showing "SETUP COMPLETE"
+        # This prevents confusing logs where setup appears complete but is then blocked
+        if self._edge_context and not self._edge_context.is_valid():
+            logger.info(f"🎯 FILTERS PASSED - {bias} | HTF✓ MTF✓ LTF({ltf_confs}/3) | ⚠️ Edge context pending validation")
+        else:
+            logger.info(f"🎯 SETUP COMPLETE - {bias} | HTF✓ MTF✓ LTF({ltf_confs}/3)")
+        self._current_trade_type = TradeType.LONG_MAIN if bias == 'LONG' else TradeType.SHORT_STRUCTURAL
+        try:
+            await self._execute_entry(current_price, atr_1m, market_time)
+        except Exception as e:
+            logger.error(f"⛔ _execute_entry EXCEPTION: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    async def _evaluate_pullback_short(
+        self,
+        current_price: float,
+        df_1h: pd.DataFrame,
+        candles_5m: list,
+        htf_bias: str,
+        regime: str,
+        market_time: datetime,
+        veto_reason: str = ""
+    ):
+        """
+        Evaluate and potentially execute a pullback short signal.
+        
+        This is called when LONG is blocked by location filter (at extreme high).
+        The pullback short engine checks if correction capture conditions are met.
+        
+        Args:
+            current_price: Current market price
+            df_1h: 1H candle DataFrame
+            candles_5m: 5M candle list
+            htf_bias: Current HTF bias ('LONG')
+            regime: Current market regime
+            market_time: Current market time
+            veto_reason: Why the main signal was vetoed
+        """
+        # Check if pullback shorts are enabled (both config and settings)
+        try:
+            from src.config.settings import get_settings
+            settings = get_settings()
+            if not settings.enable_short_pullback:
+                logger.debug("[PULLBACK] Disabled in settings")
+                return
+            
+            if settings.is_live_mode and not settings.short_pullback_live_allowed:
+                logger.debug("[PULLBACK] Not allowed in LIVE mode")
+                return
+        except Exception as e:
+            logger.debug(f"[PULLBACK] Could not check settings: {e}")
+            if not PullbackShortConfig.ENABLED:
+                return
+        
+        # Prepare 5m DataFrame
+        if not candles_5m or len(candles_5m) < 20:
+            logger.debug("[PULLBACK] Insufficient 5m data")
+            return
+        
+        df_5m = pd.DataFrame(candles_5m)
+        
+        # Get 1m data (optional for fine triggers)
+        candles_1m = self.market_data.get_candles('1m')
+        df_1m = pd.DataFrame(candles_1m) if candles_1m and len(candles_1m) >= 20 else None
+        
+        # Check for integrity errors
+        has_integrity_errors = False
+        position = self.risk_engine.position if hasattr(self.risk_engine, 'position') else None
+        if self.risk_engine.has_open_position() and position is not None and hasattr(position, 'integrity_errors'):
+            has_integrity_errors = len(position.integrity_errors) > 0
+        
+        # Check for macro events
+        has_macro_event = self.external_data.has_high_impact_event() if hasattr(self.external_data, 'has_high_impact_event') else False
+        
+        # Evaluate pullback short signal
+        signal = self.pullback_short_engine.evaluate(
+            current_price=current_price,
+            df_1h=df_1h,
+            df_5m=df_5m,
+            df_1m=df_1m,
+            htf_bias=htf_bias,
+            regime=regime,
+            market_time=market_time,
+            has_integrity_errors=has_integrity_errors,
+            has_macro_event=has_macro_event
+        )
+        
+        if not signal.valid:
+            # Log block reason (throttled to avoid spam)
+            if self._last_pullback_block_log is None or \
+               (market_time - self._last_pullback_block_log).total_seconds() > 60:
+                logger.info(f"[PULLBACK] Signal blocked: {signal.block_reason}")
+                self._last_pullback_block_log = market_time
+            
+            # 📊 METRICS: Track blocked pullback signals
+            update_pullback_short_signal(self.symbol, blocked=True, reason=signal.block_reason or "unknown")
+            return
+        
+        # 📊 METRICS: Track valid pullback signal
+        update_pullback_short_signal(self.symbol, blocked=False)
+        
+        # =====================================================================
+        # VALID PULLBACK SHORT SIGNAL - EXECUTE
+        # =====================================================================
+        logger.info(
+            f"🎯 PULLBACK SHORT SIGNAL VALID | "
+            f"Entry={signal.entry_price:.2f} | SL={signal.stop_loss:.2f} | TP1={signal.tp1_price:.2f}"
+        )
+        
+        # Set trade type
+        self._current_trade_type = TradeType.SHORT_PULLBACK
+        self.current_bias = 'SHORT'
+        
+        # Store signal in tags
+        self._current_trade_tags['trade_type'] = 'SHORT_PULLBACK'
+        self._current_trade_tags['pullback_ext_z'] = signal.extension_z
+        self._current_trade_tags['pullback_trigger'] = signal.trigger_type
+        self._current_trade_tags['pullback_swing_high'] = signal.swing_high
+        self._current_trade_tags['pullback_activity_score'] = signal.activity_score
+        self._current_trade_tags['pullback_size_factor'] = signal.size_factor
+        self._current_trade_tags['veto_reason_original'] = veto_reason
+        
+        # Copy signal tags
+        for key, value in signal.tags.items():
+            self._current_trade_tags[f'pullback_{key}'] = value
+        
+        # Calculate ATR for entry
+        atr_1m = self._calculate_atr_1m(df_1m) if df_1m is not None else 100.0
+        
+        # Execute entry with pullback-specific parameters
+        await self._execute_pullback_short_entry(
+            signal=signal,
+            atr_1m=atr_1m,
+            market_time=market_time
+        )
+    
+    async def _execute_pullback_short_entry(
+        self,
+        signal: PullbackShortSignal,
+        atr_1m: float,
+        market_time: datetime
+    ):
+        """
+        Execute a pullback short entry with specific risk parameters.
+        
+        This is separate from _execute_entry to maintain distinct risk management.
+        """
+        # ==================================================================
+        # 🔒 SAME SAFETY CHECKS AS MAIN ENTRY
+        # ==================================================================
+        
+        if self.pending_order_id:
+            logger.critical(f"⛔ PULLBACK ABORTED: Pending order exists")
+            return
+        
+        if self.risk_engine.has_open_position():
+            logger.critical("⛔ PULLBACK ABORTED: Position already open")
+            return
+        
+        if self.state_machine.state != BotState.IDLE:
+            logger.critical(f"⛔ PULLBACK ABORTED: State is {self.state_machine.state.name}")
+            return
+        
+        # ==================================================================
+        # POSITION SIZING - Reduced for pullback shorts
+        # ==================================================================
+        
+        capital = self.risk_engine.capital
+        if capital <= 0:
+            logger.error("⛔ PULLBACK ABORTED: No capital available")
+            return
+        
+        # Calculate base risk
+        stop_distance = abs(signal.stop_loss - signal.entry_price)
+        if stop_distance <= 0:
+            logger.error("⛔ PULLBACK ABORTED: Invalid stop distance")
+            return
+        
+        # Risk amount (reduced for pullback shorts)
+        risk_pct = OperatingMode.get_risk_pct() / 100.0
+        risk_pct_adjusted = risk_pct * signal.size_factor  # Apply pullback reduction
+        risk_amount = capital * risk_pct_adjusted
+        
+        # Position size
+        qty = risk_amount / stop_distance
+        
+        # Apply notional cap
+        max_notional = min(PullbackShortConfig.MAX_NOTIONAL_USD, self.risk_engine.capital * 0.3)
+        max_qty = max_notional / signal.entry_price
+        qty = min(qty, max_qty)
+        
+        # Round to exchange precision
+        qty = round_size_to_exchange(qty)
+        
+        if qty < KRAKEN_BTC_MIN_SIZE:
+            logger.warning(f"⛔ PULLBACK ABORTED: Size {qty} below minimum {KRAKEN_BTC_MIN_SIZE}")
+            return
+        
+        # ==================================================================
+        # PLACE ORDER - RETEST (LIMIT) or MARKET mode
+        # ==================================================================
+        
+        entry_mode = signal.entry_mode
+        order_type = 'limit' if entry_mode == 'RETEST' else 'market'
+        order_price = signal.retest_level if entry_mode == 'RETEST' else None
+        
+        logger.info(
+            f"📉 PULLBACK SHORT ENTRY | Mode={entry_mode} | "
+            f"Size={qty:.6f} BTC @ ${signal.entry_price:.2f} | "
+            f"SL=${signal.stop_loss:.2f} | TP1=${signal.tp1_price:.2f} | "
+            f"Risk=${risk_amount:.2f} ({risk_pct_adjusted*100:.2f}%)"
+        )
+        
+        # Transition to wait_fill
+        self.state_machine.transition_to(BotState.WAIT_FILL, f"Pullback short entry ({entry_mode})")
+        
+        try:
+            # Use correct method based on order type
+            if order_type == 'limit':
+                order = await self.execution.place_limit_order(
+                    symbol=self.symbol,
+                    side='sell',
+                    amount=qty,
+                    price=order_price,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.tp1_price
+                )
+            else:
+                order = await self.execution.place_market_order(
+                    symbol=self.symbol,
+                    side='sell',
+                    amount=qty,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.tp1_price
+                )
+            
+            if order and order.get('id'):
+                self.pending_order_id = order['id']
+                self.entry_order_time = market_time
+                
+                # Store entry data with all pullback-specific fields
+                self._last_entry_data = {
+                    'bias': 'SHORT',
+                    'trade_type': TradeType.SHORT_PULLBACK,
+                    'entry_price': signal.entry_price,
+                    'position_size': qty,
+                    'stop_loss': signal.stop_loss,
+                    'tp1_price': signal.tp1_price,
+                    'tp2_price': signal.tp2_price,
+                    'size': qty,
+                    'swing_high': signal.swing_high,
+                    'confirm_level': signal.confirm_level,
+                    'extension_z': signal.extension_z,
+                    'trigger_type': signal.trigger_type,
+                    'entry_mode': entry_mode,
+                    'retest_level': signal.retest_level,
+                    'order_type': order_type.upper(),
+                    'atr_1m': atr_1m,  # Needed for position creation
+                    'activity_score': signal.activity_score
+                }
+                
+                # 📊 METRICS: Track pullback short entry
+                update_pullback_short_entry(self.symbol, extension_z=signal.extension_z)
+                
+                logger.info(f"✅ PULLBACK SHORT ORDER PLACED ({order_type.upper()}): {order['id']}")
+            else:
+                logger.error("⛔ PULLBACK ORDER FAILED: No order ID returned")
+                self.state_machine.transition_to(BotState.IDLE, "Pullback order failed")
+                
+        except Exception as e:
+            logger.error(f"⛔ PULLBACK ORDER EXCEPTION: {e}")
+            self.state_machine.transition_to(BotState.IDLE, f"Pullback order exception: {e}")
+    
+    def _calculate_atr_1m(self, df_1m: pd.DataFrame) -> float:
+        """Calculate ATR from 1m data - delegates to indicator_helpers"""
+        result = _calc_atr_1m_pure(df_1m)
+        return result if result > 0 else 100.0
+
+    async def _execute_entry(self, current_price: float, atr_1m: float, market_time: datetime):
+        """Execute entry with strict safety checks"""
+        # ==================================================================
+        # 🔒 FINAL GATEKEEPER - STRICT CONCURRENCY CHECK
+        # ==================================================================
+        
+        # 1. Check internal pending order
+        if self.pending_order_id:
+            logger.critical(f"⛔ EXECUTION ABORTED: Pending order {self.pending_order_id} already exists")
+            self.state_machine.transition_to(BotState.WAIT_FILL, "Recovered pending order state")
+            return
+
+        # 2. Check risk engine position
+        if self.risk_engine.has_open_position():
+            logger.critical("⛔ EXECUTION ABORTED: Risk Engine reports open position")
+            self.state_machine.transition_to(BotState.MANAGE, "Recovered open position state")
+            return
+
+        # 3. Check execution engine open orders (Double Check)
+        # NOTE: Exclude SL/TP orders (protective orders on existing positions)
+        if hasattr(self.execution, 'open_orders') and self.execution.open_orders:
+            # Filter out protective orders (stop-loss, take-profit types)
+            non_protective_orders = {
+                oid: order for oid, order in self.execution.open_orders.items()
+                if order.get('type') not in ['stop', 'stop-loss', 'take-profit', 'stop_loss']
+            }
+            
+            if non_protective_orders:
+                logger.critical(f"⛔ EXECUTION ABORTED: Execution Engine reports {len(non_protective_orders)} open entry orders")
+                logger.info("🔄 Attempting order reconciliation...")
+                
+                # Intentar reconciliar automáticamente
+                await self._reconcile_orders()
+                
+                # Verificar nuevamente después de reconciliación (re-filter)
+                non_protective_orders_after = {
+                    oid: order for oid, order in self.execution.open_orders.items()
+                    if order.get('type') not in ['stop', 'stop-loss', 'take-profit', 'stop_loss']
+                }
+                
+                if non_protective_orders_after:
+                    logger.critical(f"⛔ Still {len(non_protective_orders_after)} entry orders after reconciliation - aborting")
+                    return
+                else:
+                    logger.info("✅ Orders cleaned - proceeding with entry")
+            else:
+                logger.debug(f"ℹ️ {len(self.execution.open_orders)} protective orders (SL/TP) detected - OK to proceed")
+            
+        # 4. Check State Machine (Must be IDLE to enter)
+        if self.state_machine.state != BotState.IDLE:
+             logger.critical(f"⛔ EXECUTION ABORTED: State is {self.state_machine.state.name}, not IDLE")
+             return
+
+        # 5. STRICT EXCHANGE CHECK (Network call - ONLY FOR LIVE)
+        # In backtest mode, skip this check entirely - MockExchange handles it
+        # 🔥 FIX (Jan 20, 2026): SKIP this check - it causes hangs and is redundant
+        # The exchange will reject duplicate orders anyway, and we check position
+        # at startup. Trust the local state.
+        if not self._is_backtest:
+            logger.info("🔒 Skipping exchange check (local state trusted, exchange validates)")
+            # REMOVED: get_open_orders and get_position calls that were hanging
+            # If there's a real conflict, the exchange will reject the order
+        else:
+            logger.debug("📋 [BACKTEST] Skipping STRICT exchange check")
+
+        # ==================================================================
+        # 🛡️ EDGE ENFORCEMENT - PRE-TRADE VALIDATION
+        # ==================================================================
+        
+        # Update edge context if needed
+        await self._update_edge_context()
+        
+        if self._edge_context is not None:
+            # Calculate current drawdown from RiskEngine (source of truth for equity/drawdown)
+            current_drawdown = self.risk_engine.get_drawdown_pct() / 100.0 if hasattr(self.risk_engine, 'get_drawdown_pct') else 0.0
+            
+            # Validate pre-trade with edge enforcement (simplified method)
+            can_trade, blockers = self.edge_enforcement.validate_pre_trade_simple(
+                context=self._edge_context,
+                current_drawdown=current_drawdown
+            )
+            
+            if not can_trade:
+                logger.warning(f"⛔ EDGE ENFORCEMENT BLOCKED TRADE: {blockers}")
+                # Track missed opportunity
+                current_price = self.market_data.get_current_price() or 0.0
+                atr = self._last_momentum_atr if hasattr(self, '_last_momentum_atr') else 100.0
+                self.missed_tracker.log_blocked_signal(
+                    direction=self.current_bias or 'UNKNOWN',
+                    price=current_price,
+                    block_reason=f"Edge enforcement: {', '.join(blockers)}",
+                    block_category='edge_enforcement',
+                    score=self._entry_score,
+                    atr=atr
+                )
+                return
+            
+            # Apply position size multiplier from edge enforcement
+            edge_size_multiplier = self.edge_enforcement.get_position_size_multiplier()
+            if edge_size_multiplier < 1.0:
+                logger.info(f"📉 Edge enforcement reducing position size to {edge_size_multiplier*100:.0f}%")
+        else:
+            edge_size_multiplier = 1.0
+            logger.debug("Edge context not available - using full size")
+        
+        # ==================================================================
+        
+        bias = self.current_bias
+        
+        # Get market time for cooldown checks
+        market_time = self.market_data.get_market_time()
+        
+        # Get 5m data for support/resistance
+        candles_5m = self.market_data.get_candles('5m')
+        if not candles_5m or len(candles_5m) < 20:
+            logger.warning("Not enough 5m data for entry execution")
+            return
+        df_5m = pd.DataFrame(candles_5m)
+        
+        # Get 1m data for volatility check
+        candles_1m = self.market_data.get_candles('1m')
+        if not candles_1m or len(candles_1m) < 200:
+            logger.debug("Not enough 1m data for volatility filter")
+            df_1m = pd.DataFrame(candles_1m) if candles_1m else None
+        else:
+            df_1m = pd.DataFrame(candles_1m)
+        
+        # ==================================================================
+        # 🚫 GLOBAL GUARDS - REJECT BEFORE WASTING COMPUTE ON SCORING
+        # ==================================================================
+        
+        # ==================================================================
+        # 🔥 GUARD 0: EARLY LOCATION FILTER (Jan 14, 2026)
+        # "Location decides if you play. Scoring decides quality."
+        # 
+        # Rule: If REGIME = RANGE and headroom < 0.75 ATR → INVALIDATE SETUP
+        # This is BEFORE scoring to avoid wasting CPU on doomed setups.
+        # A human trader doesn't even evaluate a long at the ceiling.
+        # ==================================================================
+        
+        # Get ATR for headroom calculations
+        atr_for_headroom = self._last_momentum_atr or 235.0  # Default fallback
+        
+        # Check 1: Anchor levels (YTD high/low) - most important constraint
+        # These are the real ceilings/floors that collapse RR
+        if hasattr(self, 'important_levels') and self.important_levels is not None:
+            try:
+                # FIX Jan 27, 2026: Use get_all_levels() instead of non-existent get_relevant_levels()
+                anchor_levels = self.important_levels.get_all_levels()
+                
+                if anchor_levels:
+                    if bias == 'LONG':
+                        # For LONG, check distance to nearest resistance above
+                        nearest_resistance = None
+                        for level in anchor_levels:
+                            if level.price > current_price:
+                                if nearest_resistance is None or level.price < nearest_resistance:
+                                    nearest_resistance = level.price
+                        
+                        if nearest_resistance is not None:
+                            headroom_to_resistance = nearest_resistance - current_price
+                            headroom_atr = headroom_to_resistance / atr_for_headroom if atr_for_headroom > 0 else 0
+                            
+                            # FIX: In RANGE, if < 0.75 ATR to major resistance, skip
+                            regime_check = self._location_context.regime.upper() if hasattr(self, '_location_context') and self._location_context else "RANGE"
+                            if regime_check in ['RANGE', 'CHOPPY_DEAD', 'MEAN_REVERSION']:
+                                if headroom_atr < 0.75:
+                                    logger.warning(
+                                        f"🚫 EARLY ANCHOR VETO: LONG with only {headroom_atr:.2f} ATR "
+                                        f"to resistance @ ${nearest_resistance:.0f} in {regime_check} → SETUP INVALIDATED"
+                                    )
+                                    self._set_rejection_cooldown("Anchor veto - too close to resistance", candles=5)
+                                    return
+                                    
+                    elif bias == 'SHORT':
+                        # For SHORT, check distance to nearest support below
+                        nearest_support = None
+                        for level in anchor_levels:
+                            if level.price < current_price:
+                                if nearest_support is None or level.price > nearest_support:
+                                    nearest_support = level.price
+                        
+                        if nearest_support is not None:
+                            headroom_to_support = current_price - nearest_support
+                            headroom_atr = headroom_to_support / atr_for_headroom if atr_for_headroom > 0 else 0
+                            
+                            regime_check = self._location_context.regime.upper() if hasattr(self, '_location_context') and self._location_context else "RANGE"
+                            if regime_check in ['RANGE', 'CHOPPY_DEAD', 'MEAN_REVERSION']:
+                                if headroom_atr < 0.75:
+                                    logger.warning(
+                                        f"🚫 EARLY ANCHOR VETO: SHORT with only {headroom_atr:.2f} ATR "
+                                        f"to support @ ${nearest_support:.0f} in {regime_check} → SETUP INVALIDATED"
+                                    )
+                                    self._set_rejection_cooldown("Anchor veto - too close to support", candles=5)
+                                    return
+            except Exception as e:
+                logger.debug(f"Anchor level check skipped: {e}")
+        
+        # Check 2: 60d range location context (secondary check)
+        if hasattr(self, '_location_context') and self._location_context is not None:
+            location_ctx = self._location_context
+            regime_for_early_filter = location_ctx.regime.upper() if hasattr(location_ctx, 'regime') else "RANGE"
+            
+            # Only apply in RANGE regime (trend regimes can trade at extremes)
+            if regime_for_early_filter in ['RANGE', 'CHOPPY_DEAD', 'MEAN_REVERSION']:
+                # Check headroom for the intended direction
+                if bias == 'LONG':
+                    headroom_atr = location_ctx.headroom_to_high_atr
+                    headroom_ok = headroom_atr >= 0.75
+                    
+                    if not headroom_ok:
+                        logger.warning(
+                            f"🚫 EARLY LOCATION VETO: LONG in {regime_for_early_filter} with only "
+                            f"{headroom_atr:.2f} ATR headroom (need ≥0.75) → SETUP INVALIDATED"
+                        )
+                        # Track as early veto (not a scoring miss)
+                        self.missed_tracker.log_blocked_signal(
+                            direction=bias,
+                            price=current_price,
+                            block_reason=f"Early location veto: {headroom_atr:.2f} ATR headroom in RANGE",
+                            block_category='location',
+                            score=0,  # Not scored
+                            atr=self._last_momentum_atr
+                        )
+                        self._set_rejection_cooldown("Location veto - ceiling in RANGE", candles=3)
+                        return
+                        
+                elif bias == 'SHORT':
+                    headroom_atr = location_ctx.headroom_to_low_atr
+                    headroom_ok = headroom_atr >= 0.75
+                    
+                    if not headroom_ok:
+                        logger.warning(
+                            f"🚫 EARLY LOCATION VETO: SHORT in {regime_for_early_filter} with only "
+                            f"{headroom_atr:.2f} ATR headroom (need ≥0.75) → SETUP INVALIDATED"
+                        )
+                        self.missed_tracker.log_blocked_signal(
+                            direction=bias,
+                            price=current_price,
+                            block_reason=f"Early location veto: {headroom_atr:.2f} ATR headroom in RANGE",
+                            block_category='location',
+                            score=0,
+                            atr=self._last_momentum_atr
+                        )
+                        self._set_rejection_cooldown("Location veto - floor in RANGE", candles=3)
+                        return
+        
+        # GUARD 1: ADX coherence - HTF trending but LTF dead = false signal
+        candles_1h = self.market_data.get_candles('1h')
+        if candles_1h and len(candles_1h) >= 20:
+            df_1h_temp = pd.DataFrame(candles_1h)
+            adx_1h, _ = calculate_adx(df_1h_temp['high'].to_numpy(), df_1h_temp['low'].to_numpy(), df_1h_temp['close'].to_numpy(), 14)
+            adx_5m, _ = calculate_adx(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
+            
+            if len(adx_1h) > 0 and len(adx_5m) > 0:
+                htf_adx = adx_1h[-1]
+                ltf_adx = adx_5m[-1]
+                
+                # HTF shows trend but LTF is dead → wait for LTF to catch up
+                if htf_adx > 20 and ltf_adx < 12:
+                    logger.warning(f"🚫 ADX DIVERGENCE: HTF ADX={htf_adx:.1f} trending but LTF ADX={ltf_adx:.1f} dead → skip")
+                    return
+        
+        # GUARD 2: Consecutive POST_ONLY rejections → market too fast for limit orders
+        if hasattr(self, '_consecutive_post_only_rejects'):
+            if self._consecutive_post_only_rejects >= 3:
+                logger.warning(f"🚫 MARKET TOO FAST: {self._consecutive_post_only_rejects} consecutive POST_ONLY rejections → cooldown")
+                self._consecutive_post_only_rejects = 0
+                self.state_machine.start_cooldown(5)  # 5 min cooldown
+                return
+        
+        # GUARD 3: Check TP multiplier is valid (sanity check)
+        if RiskManagement.TP1_RISK_MULTIPLE < OperatingMode.RR_HARD_FLOOR:
+            logger.error(f"🚫 CONFIG ERROR: TP1_RISK_MULTIPLE ({RiskManagement.TP1_RISK_MULTIPLE}) < RR_HARD_FLOOR ({OperatingMode.RR_HARD_FLOOR})")
+            return
+        
+        # GUARD 4: Funding rate check (CRITICAL - prevents instant exit after entry)
+        # FIX: check_funding_rate_safe was imported but NEVER USED - causing immediate exits
+        if not self._is_backtest:
+            try:
+                funding_ok, funding_reason = await check_funding_rate_safe(
+                    self.external_data,
+                    self.symbol,
+                    bias
+                )
+                if not funding_ok:
+                    logger.warning(f"🚫 FUNDING UNSAFE: {funding_reason} → skip entry")
+                    return
+            except Exception as e:
+                logger.warning(f"Could not check funding rate: {e} - proceeding with caution")
+        
+        # ==================================================================
+        # GUARD 5: Spread Filter (blocks excessive spread, penalizes elevated)
+        # ==================================================================
+        session_name = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
+        spread_result = self.spread_filter.check_entry_allowed(session_name)
+        
+        if not spread_result.allowed:
+            logger.warning(f"🚫 SPREAD BLOCK: {spread_result.reason} → skip entry")
+            self._current_trade_tags['skip_reason'] = 'spread_too_wide'
+            self._current_trade_tags['spread_block_reason'] = spread_result.reason
+            self.missed_tracker.log_blocked_signal(
+                direction=bias,
+                price=current_price,
+                block_reason=f"Spread filter: {spread_result.reason}",
+                block_category='spread',
+                score=0,  # Not yet calculated
+                atr=self._last_momentum_atr
+            )
+            self._set_rejection_cooldown("Spread too wide", candles=1)
+            return
+        
+        # Store spread penalty for score adjustment later
+        _spread_score_penalty = spread_result.score_penalty
+        _spread_size_factor = spread_result.size_factor
+        if spread_result.score_penalty > 0:
+            self._current_trade_tags['spread_penalty'] = spread_result.score_penalty
+            logger.info(f"⚠️ SPREAD ELEVATED: penalty={spread_result.score_penalty}pts, size_mult={spread_result.size_factor:.2f}")
+        
+        # ==================================================================
+        # GUARD 6: Session Trade Limits (prevents overtrading)
+        # ==================================================================
+        # Update session if changed
+        if session_name != self._last_session:
+            self._last_session = session_name
+            # Don't reset counts - they persist per named session
+            # BUT reset countertrend losses per session (Jan 22, 2026)
+            self._countertrend_losses_session = 0
+            logger.debug(f"📊 Session changed to {session_name} - CT loss counter reset")
+        
+        current_session_trades = self._session_trade_counts.get(session_name, 0)
+        session_limit = SessionTradeLimits.MAX_TRADES_PER_SESSION.get(session_name, 5)
+        
+        # Check if at limit (override check happens after score calculation)
+        self._at_session_limit = current_session_trades >= session_limit
+        if self._at_session_limit:
+            logger.debug(f"📊 Session {session_name}: {current_session_trades}/{session_limit} trades (at limit)")
+        
+        # ==================================================================
+        # GUARD 7: Volatility Regime Classification
+        # ==================================================================
+        # Calculate ATR ratio for regime detection
+        atr_1m_local = self._calculate_atr_1m(df_1m) if df_1m is not None and len(df_1m) >= 14 else None
+        atr_1h_data = self.market_data.get_candles('1h')
+        if atr_1h_data and len(atr_1h_data) >= 14:
+            df_1h_atr = pd.DataFrame(atr_1h_data)
+            atr_1h = self._calculate_atr_generic(df_1h_atr, 14)
+        else:
+            atr_1h = atr_1m_local * 10 if atr_1m_local else None
+        
+        if atr_1m_local and atr_1h:
+            atr_ratio = atr_1m_local / (atr_1h / 60)  # Normalize 1H to per-minute
+            self._last_atr_ratio = atr_ratio
+            self._current_volatility_regime = VolatilityRegime.from_atr_ratio(atr_ratio)
+            vol_name = self._current_volatility_regime.name if hasattr(self._current_volatility_regime, 'name') else str(self._current_volatility_regime)
+            logger.debug(f"📊 Volatility regime: {vol_name} (ATR ratio={atr_ratio:.2f})")
+        else:
+            self._current_volatility_regime = VolatilityRegime.NORMAL
+        
+        # ==================================================================
+        # 🔥 ADAPTIVE MARKET CLASSIFICATION (Jan 24, 2026)
+        # Classify market condition based on BB width and ADX
+        # This adjusts ALL thresholds dynamically
+        # ==================================================================
+        try:
+            # Get BB width as percentage
+            candles_1m_for_cache = self.market_data.get_candles('1m') or []
+            candles_5m_for_cache = self.market_data.get_candles('5m') or []
+            candles_1h_for_cache = self.market_data.get_candles('1h') or []
+            cached_data = self._get_cached_indicators(candles_1m_for_cache, candles_5m_for_cache, candles_1h_for_cache)
+            bb_width = cached_data.get('bb_width', 0)
+            bb_avg = cached_data.get('bb_avg', 1)
+            adx_for_adaptive = cached_data.get('adx_1h', 20)
+            
+            # Convert BB width to percentage
+            if bb_avg and bb_avg > 0 and current_price > 0:
+                bb_width_pct = (bb_width / current_price) * 100
+            else:
+                bb_width_pct = 0.5  # Default to normal
+            
+            # Classify market condition
+            market_condition = self._adaptive_entry.classify_market_condition(
+                bb_width_pct=bb_width_pct,
+                adx=adx_for_adaptive or 20
+            )
+            
+            self._current_trade_tags['market_condition'] = market_condition.value
+            self._current_trade_tags['bb_width_pct'] = round(bb_width_pct, 3)
+            
+            # Get adaptive thresholds
+            adaptive_thresholds = self._adaptive_entry.get_effective_thresholds(market_time)
+            self._current_trade_tags['adaptive_min_score'] = adaptive_thresholds.min_score
+            self._current_trade_tags['adaptive_chase_tol'] = adaptive_thresholds.chase_tolerance_atr
+            
+        except Exception as e:
+            logger.debug(f"Adaptive classification failed: {e}")
+        
+        # ==================================================================
+        # 🎯 SCORE-BASED ENTRY SYSTEM (Score > Gates)
+        # 4 blocks × 0-2 points + synergy = max 9
+        # Dynamic threshold based on regime, session, and mode
+        # Only Structure=0 blocks entry (the only real gate)
+        # ==================================================================
+        
+        # Get dynamic threshold based on regime, session, and mode
+        # Uses DynamicScoreThreshold config for regime-aware thresholds
+        is_discovery = OperatingMode.is_discovery()
+        
+        # Detect market regime from current state (RANGE or TREND)
+        # Use ADX and ATR expansion to determine regime
+        # 🔥 FIX (Jan 25, 2026): Handle ADX values safely without numpy import issue
+        _adx_vals_for_threshold = self._score_breakdown.get('adx_values', [20.0]) if hasattr(self, '_score_breakdown') else [20.0]
+        try:
+            current_adx_early = float(_adx_vals_for_threshold[-1]) if len(_adx_vals_for_threshold) > 0 else 20.0
+        except (TypeError, ValueError, IndexError):
+            current_adx_early = 20.0
+        is_trend_regime = current_adx_early > 25 or self._current_volatility_regime in [VolatilityRegime.HIGH, VolatilityRegime.SPIKE]
+        regime_for_threshold = 'TREND' if is_trend_regime else 'RANGE'
+        
+        # Get base threshold from dynamic config
+        base_threshold = DynamicScoreThreshold.get_threshold(
+            regime=regime_for_threshold,
+            session=session_name,
+            is_discovery=is_discovery
+        )
+        
+        # =====================================================================
+        # 🔥 TREND INTELLIGENCE THRESHOLD ADJUSTMENT (Jan 23, 2026)
+        # Adjust threshold based on trend PHASE (cycle position)
+        # BIRTH = easiest entry, EXHAUSTION = hardest entry
+        # =====================================================================
+        trend_phase = self._trend_phase
+        trend_threshold_adj = 0
+        
+        if trend_phase == TrendPhase.TREND_BIRTH:
+            trend_threshold_adj = -1  # Easiest - catch the start
+            self._current_trade_tags['trend_phase_adj'] = 'BIRTH_BONUS'
+        elif trend_phase == TrendPhase.TREND_ACCELERATION:
+            trend_threshold_adj = -0.5  # Still good momentum
+            self._current_trade_tags['trend_phase_adj'] = 'ACCEL_BONUS'
+        elif trend_phase == TrendPhase.TREND_EXHAUSTION:
+            trend_threshold_adj = +1.5  # Much harder - trend dying
+            self._current_trade_tags['trend_phase_adj'] = 'EXHAUST_PENALTY'
+        elif trend_phase == TrendPhase.DISTRIBUTION:
+            trend_threshold_adj = +2  # Hardest - no new entries
+            self._current_trade_tags['trend_phase_adj'] = 'DISTRIB_PENALTY'
+        elif trend_phase == TrendPhase.TREND_DEATH:
+            # Reversal opportunity - but only for opposite direction
+            trend_state = self._trend_intelligence.state
+            if (trend_state.direction.value == 'BULLISH' and bias == 'SHORT') or \
+               (trend_state.direction.value == 'BEARISH' and bias == 'LONG'):
+                trend_threshold_adj = -0.5  # Reversal opportunity
+                self._current_trade_tags['trend_phase_adj'] = 'REVERSAL_BONUS'
+            else:
+                trend_threshold_adj = +2  # Wrong direction
+                self._current_trade_tags['trend_phase_adj'] = 'WRONG_DIR_PENALTY'
+        
+        base_threshold += trend_threshold_adj
+        if trend_threshold_adj != 0:
+            logger.info(f"📈 Trend phase {trend_phase.value}: threshold adjusted by {trend_threshold_adj:+.1f}")
+        
+        # =====================================================================
+        # 🔥 ANTI-PARALYSIS GUARD (Jan 24, 2026) - Intelligent threshold relaxation
+        # Problem: Bot had 0 trades in 9h due to accumulated filter penalties
+        # Solution: Progressive relaxation based on inactivity duration
+        #
+        # LEVELS:
+        # - 4+ hours without trade: -0.5 threshold (was -1.0 only after deficit)
+        # - 6+ hours without trade: -1.0 threshold + reduce filter penalties
+        # - 8+ hours without trade: -1.5 threshold + bypass soft filters
+        #
+        # This NEVER bypasses hard safety (chaos, extreme spread, HTF veto)
+        # Only relaxes quality gates (score threshold, chase penalty, etc.)
+        # =====================================================================
+        daily_trades = self.state_machine.daily_trades if hasattr(self.state_machine, 'daily_trades') else 0
+        hours_elapsed = (market_time - market_time.replace(hour=0, minute=0, second=0)).total_seconds() / 3600
+        
+        # Track time since last trade for progressive relaxation
+        last_trade_time = getattr(self, '_last_trade_time', None)
+        if last_trade_time is None:
+            hours_since_trade = hours_elapsed
+        else:
+            hours_since_trade = (market_time - last_trade_time).total_seconds() / 3600
+        
+        # Calculate expected vs actual trades
+        expected_trades = max(1, int(hours_elapsed / 8) * OperatingMode.MIN_TRADES_PER_SESSION)
+        activity_deficit = expected_trades - daily_trades
+        
+        # 🔥 NEW: Progressive anti-paralysis based on hours since last trade
+        anti_paralysis_reduction = 0.0
+        anti_paralysis_level = 0
+        
+        if hours_since_trade >= 8:
+            # LEVEL 3: Severe inactivity - maximum relaxation
+            anti_paralysis_reduction = 1.5
+            anti_paralysis_level = 3
+            self._current_trade_tags['anti_paralysis_level'] = 'SEVERE'
+            logger.warning(f"⚠️ ANTI-PARALYSIS L3: {hours_since_trade:.1f}h without trade → threshold -{anti_paralysis_reduction}")
+        elif hours_since_trade >= 6:
+            # LEVEL 2: Significant inactivity
+            anti_paralysis_reduction = 1.0
+            anti_paralysis_level = 2
+            self._current_trade_tags['anti_paralysis_level'] = 'SIGNIFICANT'
+            logger.info(f"📊 ANTI-PARALYSIS L2: {hours_since_trade:.1f}h without trade → threshold -{anti_paralysis_reduction}")
+        elif hours_since_trade >= 4:
+            # LEVEL 1: Mild inactivity
+            anti_paralysis_reduction = 0.5
+            anti_paralysis_level = 1
+            self._current_trade_tags['anti_paralysis_level'] = 'MILD'
+            logger.info(f"📊 ANTI-PARALYSIS L1: {hours_since_trade:.1f}h without trade → threshold -{anti_paralysis_reduction}")
+        
+        # Also add legacy activity deficit logic
+        if activity_deficit >= 2 and hours_elapsed >= 4:
+            legacy_reduction = min(OperatingMode.LOW_ACTIVITY_SCORE_REDUCTION, activity_deficit)
+            anti_paralysis_reduction = max(anti_paralysis_reduction, legacy_reduction)
+            self._current_trade_tags['low_activity_relaxed'] = True
+        
+        # Apply anti-paralysis reduction (never below floor of 3.0)
+        if anti_paralysis_reduction > 0:
+            final_threshold = max(3.0, base_threshold - anti_paralysis_reduction)
+            if final_threshold < base_threshold:
+                logger.info(f"📊 Anti-paralysis: {daily_trades} trades in {hours_elapsed:.1f}h → threshold {base_threshold:.1f} → {final_threshold:.1f}")
+            self._entry_threshold = final_threshold
+        else:
+            self._entry_threshold = base_threshold
+        
+        # Store anti-paralysis level for use by other filters
+        self._anti_paralysis_level = anti_paralysis_level
+        self._current_trade_tags['hours_since_trade'] = round(hours_since_trade, 2)
+        
+        # Log the regime-aware threshold
+        logger.debug(f"📊 Dynamic threshold: {self._entry_threshold} (regime={regime_for_threshold}, session={session_name}, phase={trend_phase.value}, ap_level={anti_paralysis_level})")
+        
+        # Get 1h data for structure scoring
+        candles_1h = self.market_data.get_candles('1h')
+        if not candles_1h or len(candles_1h) < 50:
+            logger.warning("Not enough 1h data for entry scoring")
+            return
+        df_1h = pd.DataFrame(candles_1h)
+        
+        # Calculate entry score (also populates self._current_trade_tags)
+        score, breakdown, structure_blocks = self._calculate_entry_score(
+            df_1h, df_5m, df_1m, bias, current_price, market_time
+        )
+        
+        # Apply spread penalty to score (from GUARD 5)
+        if _spread_score_penalty > 0:
+            original_score = score
+            score = max(0, score - _spread_score_penalty)
+            logger.info(f"📊 Score adjusted for spread: {original_score} → {score} (penalty={_spread_score_penalty})")
+            self._current_trade_tags['spread_adjusted_score'] = score
+        
+        # Apply delta volume bonus (from PUNTO 12 - Jan 22, 2026)
+        delta_bonus = self._current_trade_tags.get('delta_score_bonus', 0)
+        if delta_bonus > 0:
+            original_score = score
+            score = min(9, score + delta_bonus)  # Cap at 9
+            logger.info(f"📊 Score +{delta_bonus} for volume delta alignment: {original_score} → {score}")
+            self._current_trade_tags['delta_adjusted_score'] = score
+        
+        # Apply short obstinacy penalty (from Jan 22, 2026)
+        short_obstinacy_penalty = self._current_trade_tags.get('short_obstinacy_penalty', 0)
+        if short_obstinacy_penalty < 0:
+            original_score = score
+            score = max(0, score + short_obstinacy_penalty)  # penalty is negative
+            logger.info(f"📊 Score {short_obstinacy_penalty:+.1f} for short obstinacy: {original_score:.1f} → {score:.1f}")
+            self._current_trade_tags['obstinacy_adjusted_score'] = score
+        
+        # 🔥 FIX (Jan 22, 2026): Apply location penalty to score
+        # In RANGE regime, extreme positions incur score penalty instead of hard block
+        location_penalty = self._current_trade_tags.get('location_penalty_applied', 0)
+        if location_penalty < 0:
+            original_score = score
+            score = max(0, score + location_penalty)  # penalty is negative
+            logger.info(f"📍 Score {location_penalty:+.1f} for location penalty: {original_score:.1f} → {score:.1f}")
+            self._current_trade_tags['location_adjusted_score'] = score
+        
+        # 🔮 FIX (Jan 22, 2026): Apply anticipation bonus when aligned with entry direction
+        # Anticipation signal detection gives early entry signals - reward alignment
+        anticipation_entry = self._current_trade_tags.get('anticipation_entry', False)
+        anticipation_direction = self._current_trade_tags.get('anticipation_direction', None)
+        anticipation_confidence = self._current_trade_tags.get('anticipation_confidence', 0)
+        
+        if anticipation_entry and anticipation_direction == bias and anticipation_confidence >= 0.6:
+            # Bonus based on confidence: 60% conf = +0.5, 100% conf = +1.0
+            anticipation_bonus = 0.5 + (anticipation_confidence - 0.6) * 1.25  # 0.5 to 1.0
+            anticipation_bonus = min(1.0, anticipation_bonus)  # Cap at 1.0
+            original_score = score
+            score = min(9, score + anticipation_bonus)  # Cap at 9
+            logger.info(f"🔮 Score +{anticipation_bonus:.1f} for anticipation alignment: {original_score:.1f} → {score:.1f}")
+            self._current_trade_tags['anticipation_bonus'] = anticipation_bonus
+            self._current_trade_tags['anticipation_adjusted_score'] = score
+        
+        # Apply countertrend score relaxation if with-trend (from Jan 22, 2026)
+        is_countertrend = self._current_trade_tags.get('is_countertrend', False)
+        if not is_countertrend and self._current_bias_strength is not None and self._current_bias_strength in [BiasStrength.BULL_STRONG, BiasStrength.BEAR_STRONG]:
+            # With-trend in strong bias - relax score requirement
+            score += BiasStrengthConfig.WITHTREND_SCORE_RELAXATION
+            self._current_trade_tags['withtrend_bonus'] = BiasStrengthConfig.WITHTREND_SCORE_RELAXATION
+            logger.debug(f"📊 With-trend bonus: +{BiasStrengthConfig.WITHTREND_SCORE_RELAXATION} (bias={self._current_bias_strength.value})")
+        
+        # Store for later use
+        self._entry_score = score
+        self._score_breakdown = breakdown
+        
+        # 🤖 ML: Copy score components to trade tags for feature extraction
+        self._current_trade_tags['score_structure'] = breakdown.get('structure', 0)
+        self._current_trade_tags['score_timing'] = breakdown.get('timing', 0)
+        self._current_trade_tags['score_momentum'] = breakdown.get('momentum', 0)
+        self._current_trade_tags['score_context'] = breakdown.get('context', 0)
+        self._current_trade_tags['score_synergy'] = breakdown.get('synergy', 0)
+        
+        # Log score breakdown (includes synergy)
+        synergy = breakdown.get('synergy', 0)
+        logger.info(f"📊 ENTRY SCORE: {score}/9 [MODE={OperatingMode.MODE}] | Str:{breakdown['structure']} Tim:{breakdown['timing']} Mom:{breakdown['momentum']} Ctx:{breakdown['context']} Syn:{synergy}")
+        
+        # THE ONLY GATE: Structure = 0 (corrupt data, systemic risk, invalid regime)
+        if structure_blocks:
+            logger.warning(f"⛔ STRUCTURE GATE: Score blocked by structure ({breakdown['structure']}/2)")
+            # Track missed opportunity
+            self.missed_tracker.log_blocked_signal(
+                direction=bias,
+                price=current_price,
+                block_reason=f"Structure gate ({breakdown['structure']}/2)",
+                block_category='filter',
+                score=score,
+                atr=self._last_momentum_atr
+            )
+            # Wait 2 candles for structure to potentially change
+            self._set_rejection_cooldown("Structure against entry", candles=2)
+            return
+        
+        # =====================================================================
+        # GRADUATED ENTRY SYSTEM (Jan 20, 2026) - PHASE 1: Floor check only
+        # Entry type decision DEFERRED until after chase penalty applied
+        # - score < 4.5: Block (floor breach) - checked here
+        # - Entry type (probe/reduced/full) decided AFTER chase penalty
+        # =====================================================================
+        from src.config.trading_config import EntryGateConfig
+        
+        # PRELIMINARY score-based multiplier (will be recalculated after chase)
+        _preliminary_score_multiplier = EntryGateConfig.get_score_size_multiplier(score)
+        
+        # Check if score is below absolute floor (even before chase penalty)
+        if _preliminary_score_multiplier == 0.0:
+            logger.info(f"📉 Score {score:.1f} < floor {EntryGateConfig.SCORE_BLOCK_FLOOR} - waiting for better setup")
+            # Log tags for analysis even on rejected entries
+            if OperatingMode.is_discovery():
+                logger.debug(f"🏷️ Rejected trade tags: {self._current_trade_tags}")
+            return
+        
+        # NOTE: Entry type log (PROBE/REDUCED/FULL) moved to after chase penalty
+        # to avoid contradictory logs like "PROBE ENTRY" then "skipping by chase"
+        
+        # =========================================================================
+        # SESSION TRADE LIMIT CHECK (after score pass, allows override for high scores)
+        # =========================================================================
+        if self._at_session_limit:
+            # Check if score qualifies for override
+            if score >= SessionTradeLimits.OVERRIDE_IF_SCORE_GTE:
+                logger.info(f"📊 Session limit override: score {score} >= {SessionTradeLimits.OVERRIDE_IF_SCORE_GTE} (trades in {session_name}: {current_session_trades}/{session_limit})")
+                self._current_trade_tags['session_limit_override'] = True
+            else:
+                logger.warning(f"🚫 SESSION LIMIT: {current_session_trades}/{session_limit} trades in {session_name}, score {score} < override threshold {SessionTradeLimits.OVERRIDE_IF_SCORE_GTE}")
+                self._current_trade_tags['skip_reason'] = 'session_limit'
+                self.missed_tracker.log_blocked_signal(
+                    direction=bias,
+                    price=current_price,
+                    block_reason=f"Session limit {current_session_trades}/{session_limit} in {session_name}",
+                    block_category='session_limit',
+                    score=score,
+                    atr=self._last_momentum_atr
+                )
+                # No cooldown - limits reset per session
+                return
+        
+        # =========================================================================
+        # IMPORTANT LEVELS CHECK (Jan 13, 2026) - Anchor level proximity
+        # Check if entry is blocked by nearby psychological S/R levels
+        # Also provides confluence bonus and TP adjustment suggestions
+        # =========================================================================
+        level_context = None
+        if self.important_levels and self.important_levels.is_initialized:
+            try:
+                # Refresh levels if needed (once per hour max)
+                await self.important_levels.update_if_needed()
+                
+                # Get level context for current price and direction
+                level_context = self.important_levels.get_level_context(
+                    current_price=current_price,
+                    direction=bias,
+                    atr_5m=self._calculate_atr_5m(df_5m) if len(df_5m) >= 14 else atr_1m * 2
+                )
+                self._last_level_context = level_context
+                
+                # Store level info in tags
+                if level_context.nearest_above:
+                    self._current_trade_tags['level_above'] = level_context.nearest_above.price
+                    self._current_trade_tags['level_above_type'] = level_context.nearest_above.level_type.value
+                    self._current_trade_tags['level_above_atr'] = level_context.distance_above_atr
+                if level_context.nearest_below:
+                    self._current_trade_tags['level_below'] = level_context.nearest_below.price
+                    self._current_trade_tags['level_below_type'] = level_context.nearest_below.level_type.value
+                    self._current_trade_tags['level_below_atr'] = level_context.distance_below_atr
+                
+                # Log level context
+                if level_context.nearest_above or level_context.nearest_below:
+                    above_info = f"↑ ${level_context.nearest_above.price:,.0f} ({level_context.distance_above_atr:.2f} ATR)" if level_context.nearest_above else "↑ None"
+                    below_info = f"↓ ${level_context.nearest_below.price:,.0f} ({level_context.distance_below_atr:.2f} ATR)" if level_context.nearest_below else "↓ None"
+                    logger.info(f"📊 ANCHOR LEVELS: {above_info} | {below_info}")
+                
+                # Check if blocked by proximity to level in our direction
+                if level_context.blocked:
+                    logger.warning(f"⛔ ANCHOR LEVEL BLOCK: {level_context.block_reason}")
+                    self._current_trade_tags['skip_reason'] = 'anchor_level_too_close'
+                    self._current_trade_tags['level_block_reason'] = level_context.block_reason
+                    
+                    # Track as missed opportunity
+                    self.missed_tracker.log_blocked_signal(
+                        direction=bias,
+                        price=current_price,
+                        block_reason=f"Anchor level: {level_context.block_reason}",
+                        block_category='anchor_level',
+                        score=score,
+                        atr=self._last_momentum_atr
+                    )
+                    # Short cooldown - levels don't change, but price might
+                    self._set_rejection_cooldown("Anchor level proximity", candles=3)
+                    return
+                
+                # Apply confluence bonus if applicable
+                if level_context.confluence_bonus > 0:
+                    score += level_context.confluence_bonus
+                    self._current_trade_tags['level_confluence'] = True
+                    self._current_trade_tags['level_confluence_bonus'] = level_context.confluence_bonus
+                    logger.info(f"📈 LEVEL CONFLUENCE: +{level_context.confluence_bonus} pts | {level_context.confluence_reason}")
+                    
+            except Exception as e:
+                logger.warning(f"Error checking important levels: {e} - continuing without")
+        
+        # =========================================================================
+        # REGIME DETECTION (Jan 12, 2026) - Context-aware market state
+        # Anti-chasing behavior changes based on regime
+        # =========================================================================
+        from src.config.trading_config import OrderExecution
+        import numpy as np_local  # Local import for numpy
+        
+        # Detect current regime using ADX, ATR expansion, etc.
+        adx_values = self._score_breakdown.get('adx_values', [20.0])
+        # 🔥 FIX (Jan 25, 2026): Ensure ADX is Python float
+        try:
+            if hasattr(adx_values, '__len__') and len(adx_values) > 0:
+                current_adx = float(adx_values[-1])
+            else:
+                current_adx = float(adx_values) if adx_values else 20.0
+        except (TypeError, IndexError):
+            current_adx = 20.0
+        
+        # Calculate ATR expansion (current vs average)
+        atr_5m = self._calculate_atr_5m(df_5m) if len(df_5m) >= 14 else atr_1m * 2
+        candles_5m = self.market_data.get_candles('5m')[-20:]
+        atr_avg = np_local.mean([c['high'] - c['low'] for c in candles_5m]) if len(candles_5m) >= 20 else atr_5m
+        
+        # Detect regime
+        has_bos = self._score_breakdown.get('timing', 0) >= 1  # BOS contributes to timing
+        
+        # Get actual spread from order book if available
+        spread_pct = 0.0
+        if hasattr(self, 'order_book') and self.order_book:
+            bid_price, ask_price, spread_val = self.order_book.get_spread()
+            if bid_price and ask_price and bid_price > 0:
+                mid_price = (bid_price + ask_price) / 2
+                spread_pct = ((ask_price - bid_price) / mid_price) * 100 if mid_price > 0 else 0.0
+        
+        self._current_regime = self.regime_detector.detect(
+            adx=current_adx,
+            adx_values=adx_values,
+            atr_current=atr_5m,
+            atr_avg=float(atr_avg),
+            has_bos=has_bos,
+            spread_pct=spread_pct,
+            volume_spike=False
+        )
+        
+        # =========================================================================
+        # 🔥 THREE-STATE REGIME SYSTEM (Jan 26, 2026)
+        # 
+        # Instead of binary ON/OFF, we have:
+        # - TREND_EXPANSION (1.2x) - Exploit confirmed edge
+        # - PROBING (0.25x-0.65x) - Validate location with micro-risk  
+        # - RANGE/NO_EDGE (0.0x) - Pure observation
+        #
+        # NOTE: PROBING determination is done EARLIER in the flow (line ~2245)
+        # when we check for RANGE mode. Here we just read the tag and set the regime.
+        # This avoids duplicate calculations.
+        # =========================================================================
+        
+        # STATE 1: TREND_EXPANSION - expansion detector overrides RANGE/PROBING/NORMAL
+        if self._trend_expansion_active and self._current_regime in (EntryRegime.RANGE, EntryRegime.PROBING, EntryRegime.NORMAL):
+            self._current_regime = EntryRegime.TREND_EXPANSION
+            logger.info(f"🚀 REGIME: TREND_EXPANSION (expansion detector active)")
+        
+        # STATE 2: PROBING - check if already determined in RANGE mode early exit
+        elif self._current_regime == EntryRegime.RANGE and not self._trend_expansion_active:
+            # Check if PROBING was already determined in the early RANGE mode check
+            probing_mode = self._current_trade_tags.get('probing_mode', False)
+            if probing_mode:
+                self._current_regime = EntryRegime.PROBING
+                probing_size = self._current_trade_tags.get('range_size_mult', 0.25)
+                if probing_size >= 0.65:
+                    level = "PROBE_MAX"
+                elif probing_size >= 0.50:
+                    level = "PROBE_MED"
+                else:
+                    level = "PROBE_MIN"
+                logger.info(f"🔍 REGIME: PROBING ({level} @ {probing_size:.0%})")
+            else:
+                # STATE 3: NO_EDGE - pure observation
+                logger.debug(f"👁️ REGIME: NO_EDGE (PROBING not activated)")
+        
+        regime_config = self.regime_detector.get_config(self._current_regime)
+        self._current_trade_tags['regime'] = self._current_regime.value
+        logger.info(f"[DATA] REGIME: {self._current_regime.value} | {regime_config.description}")
+        
+        # =========================================================================
+        # 🔥 ENTRY QUALITY GATE (Jan 22, 2026) - Hard rules BEFORE chase calculation
+        # 
+        # Three Layer System:
+        # 1. GATE (this) - Hard rules that block/restrict trades
+        # 2. SCORE - Soft ranking to decide probe/reduced/full
+        # 3. EXECUTION - Market vs limit, timing
+        #
+        # Gate checks:
+        # - Microtrend contradiction >= 85% → BLOCK
+        # - RANGE + chase > 1.3 ATR → PROBE only
+        # - RANGE + chase > 1.0 ATR → Limit only
+        # - Poor session + ADX < 15 → Reduce size
+        # =========================================================================
+        
+        # Prepare gate inputs
+        micro_trend_str = 'NEUTRAL'
+        micro_strength = 0.0
+        if self._micro_trend_state:
+            micro_trend_str = self._micro_trend_state.micro_trend or 'NEUTRAL'
+            micro_strength = self._micro_trend_state.strength or 0.0
+        
+        # Calculate chase early for gate check (will be refined later)
+        from src.config.trading_config import OrderExecution
+        prelim_chase_atr = self._calculate_chase_atr(df_1m, atr_1m, bias) if OrderExecution.ANTI_CHASING_ENABLED else 0.0
+        
+        # Check for RSI divergence (extra confirmation for blocked trades)
+        has_rsi_divergence = False
+        if len(df_5m) >= 14:
+            rsi_values = calculate_rsi(df_5m['close'].to_numpy(), 14)
+            if len(rsi_values) >= 5:
+                # Bullish divergence: price makes lower low, RSI makes higher low
+                # Bearish divergence: price makes higher high, RSI makes lower high
+                closes = df_5m['close'].to_numpy()
+                if bias == 'SHORT':
+                    # Looking for bearish divergence
+                    price_hh = closes[-1] > closes[-3]
+                    rsi_lh = rsi_values[-1] < rsi_values[-3]
+                    has_rsi_divergence = price_hh and rsi_lh
+                else:  # LONG
+                    # Looking for bullish divergence
+                    price_ll = closes[-1] < closes[-3]
+                    rsi_hl = rsi_values[-1] > rsi_values[-3]
+                    has_rsi_divergence = price_ll and rsi_hl
+        
+        # Check VPOC proximity
+        near_vpoc = False
+        vpoc_price = self._current_trade_tags.get('vpoc_price', 0)
+        if vpoc_price and vpoc_price > 0:
+            vpoc_distance_atr = abs(current_price - vpoc_price) / atr_5m if atr_5m > 0 else 999
+            near_vpoc = vpoc_distance_atr < 0.5
+        
+        # Check anchor level proximity
+        near_anchor = False
+        if level_context:
+            # Consider near anchor if < 1.0 ATR away
+            near_anchor = (level_context.distance_above_atr < 1.0 or level_context.distance_below_atr < 1.0)
+        
+        # Get session quality from trade tags (set earlier in scoring) or default
+        session_quality_str = self._current_trade_tags.get('session_quality', 'moderate')
+        if not session_quality_str:
+            session_quality_str = 'moderate'
+        
+        # Call Entry Quality Gate
+        # Use cached ADX if adx_1h not in local scope
+        # 🔥 FIX (Jan 25, 2026): Safely handle numpy arrays or scalar values
+        _adx_raw = locals().get('adx_1h', self._htf_cache_adx)
+        try:
+            import numpy as np
+            if isinstance(_adx_raw, np.ndarray):
+                htf_adx_for_gate = float(_adx_raw[-1]) if len(_adx_raw) > 0 else 20.0
+            else:
+                htf_adx_for_gate = float(_adx_raw)
+        except (TypeError, ValueError, IndexError):
+            htf_adx_for_gate = 20.0
+        gate_result = self._entry_gate.check(
+            regime=self._current_regime.value,
+            chase_atr=prelim_chase_atr,
+            micro_trend=micro_trend_str,
+            micro_strength=micro_strength,
+            entry_direction=bias or 'LONG',
+            session_quality=session_quality_str,
+            htf_adx=htf_adx_for_gate,
+            has_rsi_divergence=has_rsi_divergence,
+            near_vpoc=near_vpoc,
+            near_anchor_level=near_anchor,
+        )
+        
+        # Store gate result in tags
+        self._current_trade_tags['gate_decision'] = gate_result.decision.value
+        self._current_trade_tags['gate_reason'] = gate_result.reason
+        
+        # Handle gate decisions
+        if gate_result.decision == GateDecision.BLOCK:
+            logger.warning(f"⛔ ENTRY GATE BLOCK: {gate_result.reason}")
+            self.missed_tracker.log_blocked_signal(
+                direction=bias,
+                price=current_price,
+                block_reason=f"Quality Gate: {gate_result.reason}",
+                block_category='quality_gate',
+                score=score,
+                atr=self._last_momentum_atr
+            )
+            self._current_trade_tags['skip_reason'] = 'quality_gate_block'
+            # Cooldown based on gate type
+            if gate_result.microtrend_blocked:
+                self._set_rejection_cooldown("Microtrend contradiction", candles=5)
+            elif gate_result.chase_blocked:
+                self._set_rejection_cooldown("Chase in RANGE blocked", candles=3)
+            return
+        
+        # Apply gate modifiers
+        gate_size_cap = gate_result.max_size_multiplier
+        gate_require_limit = gate_result.require_limit
+        gate_sl_modifier = gate_result.sl_multiplier
+        
+        if gate_result.decision == GateDecision.PROBE_ONLY:
+            logger.info(f"📊 GATE: Probe only - {gate_result.reason}")
+            self._current_trade_tags['gate_forced_probe'] = True
+        elif gate_result.decision == GateDecision.LIMIT_ONLY:
+            logger.info(f"📊 GATE: Limit only - {gate_result.reason}")
+            self._current_trade_tags['gate_forced_limit'] = True
+        elif gate_result.decision == GateDecision.REDUCE_SIZE:
+            logger.info(f"📊 GATE: Size reduced to {gate_size_cap:.0%} - {gate_result.reason}")
+            self._current_trade_tags['gate_size_reduced'] = True
+        
+        # =========================================================================
+        # ANTI-CHASING AS SCORE PENALTY (Jan 12, 2026)
+        # ❌ Old: gate that blocks trades
+        # ✅ New: score penalty relative to regime
+        # "Chasing is not wrong, it's more expensive"
+        # =========================================================================
+        chase_atr = 0.0
+        chase_penalty = 0.0
+        
+        if OrderExecution.ANTI_CHASING_ENABLED:
+            # Calculate chase distance (how many ATRs have we moved since signal)
+            chase_atr = self._calculate_chase_atr(df_1m, atr_1m, bias)
+            
+            # Check if regime says to block entirely (only CHAOS or extreme chase)
+            should_block, block_reason = self.regime_detector.should_block_trade(chase_atr, self._current_regime)
+            
+            if should_block:
+                logger.warning(f"⛔ REGIME BLOCK: {block_reason}")
+                self.missed_tracker.log_blocked_signal(
+                    direction=bias,
+                    price=current_price,
+                    block_reason=f"Regime block: {block_reason}",
+                    block_category='regime',
+                    score=score,
+                    atr=self._last_momentum_atr
+                )
+                self._current_trade_tags['skip_reason'] = 'regime_block'
+                return
+            
+            # Calculate regime-aware chase penalty
+            chase_penalty = self.regime_detector.get_chase_penalty(chase_atr, self._current_regime)
+            
+            # Check momentum context (if positive, reduce penalty)
+            adx_rising = len(adx_values) >= 3 and adx_values[-1] > adx_values[-3]
+            candle_expansion = bool(atr_5m > atr_avg * 1.1)
+            
+            # Check VWAP reclaim: was below N candles ago, now above
+            vwap_reclaim = False
+            try:
+                if len(df_5m) >= 5:
+                    from src.shared.indicators import calculate_vwap
+                    vwap_series = calculate_vwap(df_5m)
+                    if len(vwap_series) >= 5:
+                        closes_5m = df_5m['close'].to_numpy()
+                        # For LONG: was below VWAP in last 5 candles, now above
+                        # For SHORT: was above VWAP in last 5 candles, now below
+                        if bias == 'LONG':
+                            was_below = any(closes_5m[i] < vwap_series.iloc[i] for i in range(-5, -1))
+                            now_above = closes_5m[-1] > vwap_series.iloc[-1]
+                            vwap_reclaim = was_below and now_above
+                        else:  # SHORT
+                            was_above = any(closes_5m[i] > vwap_series.iloc[i] for i in range(-5, -1))
+                            now_below = closes_5m[-1] < vwap_series.iloc[-1]
+                            vwap_reclaim = was_above and now_below
+            except Exception as e:
+                logger.debug(f"VWAP reclaim check failed: {e}")
+            
+            momentum_context = self.regime_detector.get_momentum_context(
+                has_bos=has_bos,
+                adx_rising=adx_rising,
+                candle_expansion=candle_expansion,
+                vwap_reclaim=vwap_reclaim
+            )
+            
+            # =========================================================================
+            # 🔥 FIX (Jan 22, 2026): Chase penalty halving is REGIME-DEPENDENT
+            # In RANGE: momentum is often fake, so DON'T reduce chase penalty
+            # In TREND: momentum is meaningful, reduce penalty by half
+            # =========================================================================
+            is_trend_regime = self._current_trade_regime in ['TREND', 'TREND_EXPANSION', 'BREAKOUT']
+            
+            if momentum_context and chase_penalty > 0 and is_trend_regime:
+                # Momentum context reduces penalty by half ONLY in trend
+                chase_penalty *= 0.5
+                logger.info(f"📊 Momentum context positive + TREND regime → chase penalty halved")
+            elif momentum_context and chase_penalty > 0:
+                # In RANGE: log but DON'T reduce
+                logger.info(f"📊 Momentum context positive but RANGE regime → chase penalty NOT reduced (momentum often fake in range)")
+                self._current_trade_tags['momentum_context_ignored'] = True
+            
+            # TREND EXPANSION: Further reduce chase penalty (Jan 22, 2026)
+            # In expansion mode, chasing is acceptable - don't penalize as much
+            if self._trend_expansion_active and chase_penalty > 0:
+                chase_penalty *= TrendExpansionConfig.CHASE_PENALTY_MULT
+                logger.info(f"🚀 Trend expansion → chase penalty reduced to {TrendExpansionConfig.CHASE_PENALTY_MULT:.0%}")
+                self._current_trade_tags['expansion_chase_reduction'] = True
+            
+            # =========================================================================
+            # 🔥 ANTI-PARALYSIS: Reduce chase penalty based on inactivity level
+            # If we haven't traded in hours, being picky about chase is counterproductive
+            # =========================================================================
+            anti_paralysis = getattr(self, '_anti_paralysis_level', 0)
+            if anti_paralysis > 0 and chase_penalty > 0:
+                # Reduce chase penalty by 25% per level (up to 75% reduction at L3)
+                reduction_factor = 1.0 - (0.25 * anti_paralysis)
+                original_penalty = chase_penalty
+                chase_penalty *= reduction_factor
+                logger.info(f"📊 Anti-paralysis L{anti_paralysis}: chase penalty {original_penalty:.2f} → {chase_penalty:.2f} (×{reduction_factor:.0%})")
+                self._current_trade_tags['ap_chase_reduction'] = reduction_factor
+            
+            # Apply penalty to score
+            if chase_penalty > 0:
+                adjusted_score = score - chase_penalty
+                logger.info(f"📊 Chase penalty: {chase_atr:.2f} ATR → -{chase_penalty:.1f} pts → adjusted score {adjusted_score:.1f}")
+                self._current_trade_tags['chase_atr'] = chase_atr
+                self._current_trade_tags['chase_penalty'] = chase_penalty
+                
+                # Re-check threshold after penalty
+                if adjusted_score < self._entry_threshold:
+                    logger.warning(f"⚠️ Score after chase penalty ({adjusted_score:.1f}) < threshold ({self._entry_threshold}) - skipping")
+                    self.missed_tracker.log_blocked_signal(
+                        direction=bias,
+                        price=current_price,
+                        block_reason=f"Chase penalty: {chase_atr:.1f} ATR, score {score:.1f}→{adjusted_score:.1f}",
+                        block_category='chase_penalty',
+                        score=score,
+                        atr=self._last_momentum_atr
+                    )
+                    self._current_trade_tags['near_miss'] = True
+                    self._current_trade_tags['near_miss_reason'] = 'chase_penalty'
+                    return
+                
+                # Update score with penalty applied
+                score = adjusted_score
+        
+        # =========================================================================
+        # GRADUATED ENTRY SYSTEM - PHASE 2: Final entry type decision
+        # Now that chase penalty is applied, decide entry type
+        # =========================================================================
+        score_size_multiplier = EntryGateConfig.get_score_size_multiplier(score)
+        self._current_trade_tags['score_size_multiplier'] = score_size_multiplier
+        
+        # Final check after chase penalty
+        if score_size_multiplier == 0.0:
+            logger.info(f"📉 Score after penalties {score:.1f} < floor - waiting for better setup")
+            return
+        
+        # Determine and LOG entry type (now with final score)
+        is_probe_entry = score_size_multiplier <= 0.3
+        is_reduced_entry = 0.3 < score_size_multiplier < 1.0
+        
+        # =========================================================================
+        # 🔥 FIX (Jan 27, 2026): BLOCK FULL entry when chase > 1.5 ATR
+        # Even if score is high, extended chase = higher reversion probability
+        # Force reduced sizing for high chase scenarios
+        # =========================================================================
+        prelim_chase_atr = self._current_trade_tags.get('chase_atr', 0)
+        if not is_probe_entry and not is_reduced_entry and prelim_chase_atr > 1.5:
+            logger.warning(f"⚠️ FULL → REDUCED: Chase {prelim_chase_atr:.2f} ATR > 1.5 ATR threshold")
+            score_size_multiplier = min(score_size_multiplier, 0.5)  # Cap at 50%
+            is_reduced_entry = True
+            self._current_trade_tags['chase_forced_reduction'] = True
+        
+        if is_probe_entry:
+            # =========================================================================
+            # 🔥 FIX (Jan 27, 2026): BLOCK probe entries in poor conditions
+            # Probe entries in poor session + loss streak = accumulating small losses
+            # =========================================================================
+            session_quality = self._current_trade_tags.get('session_quality', 'good')
+            loss_streak = self._current_trade_tags.get('loss_streak_size_factor', 1.0)
+            
+            if session_quality == 'poor' and loss_streak < 0.8:
+                logger.warning(f"⛔ PROBE BLOCKED: Poor session + loss streak ({loss_streak:.0%}) - skipping low quality probe")
+                self._current_trade_tags['skip_reason'] = 'probe_poor_session'
+                return
+            
+            logger.info(f"🔬 PROBE ENTRY: Final score {score:.1f} in probe zone - entering with {score_size_multiplier:.0%} size")
+            self._current_trade_tags['entry_type'] = 'probe'
+        elif is_reduced_entry:
+            logger.info(f"📊 REDUCED ENTRY: Final score {score:.1f} in reduced zone - entering with {score_size_multiplier:.0%} size")
+            self._current_trade_tags['entry_type'] = 'reduced'
+        else:
+            logger.info(f"✅ FULL ENTRY: Final score {score:.1f} >= 6.5 - entering with full size")
+            self._current_trade_tags['entry_type'] = 'full'
+        
+        # =========================================================================
+        # REGIME-BASED SIZING (replaces simple score sizing)
+        # =========================================================================
+        if OperatingMode.is_discovery():
+            # Fixed 0.8x sizing in discovery - no momentum adjustments
+            score_size_multiplier = 0.8
+            logger.info(f"📊 DISCOVERY mode: fixed sizing 0.8x")
+        else:
+            # Get score-based size multiplier (score 5→0.8x, 6→1.0x, 7+→1.2x)
+            base_size = self._entry_scorer.get_score_size_multiplier(int(score))
+            # Apply regime multiplier
+            score_size_multiplier = base_size * regime_config.size_multiplier
+            logger.info(f"📊 Regime sizing: {base_size:.1f}x × {regime_config.size_multiplier:.1f}x = {score_size_multiplier:.2f}x")
+        
+        # DUPLICATE ZONE - Still check this (it's about avoiding revenge trading)
+        # This is TECHNICAL protection, not quality filtering
+        dup_ok, dup_reason = self._check_not_duplicate_zone(current_price)
+        if not dup_ok:
+            logger.warning(f"⛔ DUPLICATE BLOCKED: {dup_reason}")
+            self._set_rejection_cooldown(dup_reason, candles=3)
+            return
+        
+        # LOSS COOLDOWN - Still check this (it's about protecting from tilt)
+        cooldown_ok, cooldown_reason = self._check_loss_cooldown(market_time)
+        if not cooldown_ok:
+            logger.warning(f"⛔ {cooldown_reason}")
+            self._reset_trade_state("Loss cooldown active")
+            return
+        
+        # FIX: Use ATR from 5m timeframe for SL (more stable, survives noise)
+        atr_5m = self._calculate_atr_5m(df_5m)
+        if atr_5m > 0:
+            atr_for_sl = atr_5m
+            logger.info(f"📊 Using ATR 5m for SL: ${atr_for_sl:.2f}")
+        else:
+            atr_for_sl = atr_1m * 2.5
+            logger.warning(f"⚠️ ATR 5m not available, using scaled 1m: ${atr_for_sl:.2f}")
+        
+        # 🔥 REGIME-BASED SL ATR MULTIPLIER
+        # RANGE = 1.5x (tighter, quick scalps)
+        # TREND = 2.5x (wider, let winners run)
+        regime_sl_atr_mult = regime_config.sl_atr_multiplier
+        logger.info(f"📊 Regime SL: {regime_sl_atr_mult}x ATR ({self._current_regime.value})")
+        
+        # Calculate ATR ratio for dynamic SL sizing (volatility adjustment)
+        atr_ratio_for_sl = None
+        if len(df_5m) >= 14:
+            # Calculate ATR using existing function
+            atr_values = calculate_atr(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
+            if len(atr_values) >= 10:
+                current_atr = atr_values[-1]
+                avg_atr = sum(atr_values[-10:]) / 10
+                if avg_atr > 0:
+                    atr_ratio_for_sl = current_atr / avg_atr
+                    logger.debug(f"ATR ratio for SL: {atr_ratio_for_sl:.2f} (current: {current_atr:.2f}, avg: {avg_atr:.2f})")
+        
+        support_resistance = self._find_support_resistance(bias, df_5m)
+        stop_loss = self.risk_engine.calculate_stop_loss(
+            current_price,
+            bias,
+            support_resistance,
+            atr_for_sl,
+            atr_ratio=atr_ratio_for_sl,
+            regime_atr_mult=regime_sl_atr_mult  # Pass regime-based multiplier
+        )
+        
+        # Calculate take profit
+        risk = abs(current_price - stop_loss)
+        
+        # 🔥 FIX (Jan 24, 2026): Use DAILY REGIME TP target from AsymmetryConfig
+        # This makes TP adaptive: shorter in RANGE_DAY (scalps), longer in TREND_DAY
+        from src.config.trading_config import AsymmetryConfig
+        daily_regime_tp = self._daily_regime_config.get('tp_r_target', AsymmetryConfig.BASE_TP_R)
+        tp_multiplier = daily_regime_tp
+        
+        # Log if different from base
+        if daily_regime_tp != AsymmetryConfig.BASE_TP_R:
+            logger.debug(f"📅 TP adjusted for {self._daily_regime}: {AsymmetryConfig.BASE_TP_R}R → {daily_regime_tp}R")
+            self._current_trade_tags['tp_regime_adjusted'] = True
+            self._current_trade_tags['tp_regime_target'] = daily_regime_tp
+        
+        if bias == 'LONG':
+            take_profit = current_price + (risk * tp_multiplier)
+        else:
+            take_profit = current_price - (risk * tp_multiplier)
+        
+        # =========================================================================
+        # COUNTERTREND TP CAP (Jan 22, 2026)
+        # Limit max RR for counter-trend trades to quick scalps
+        # =========================================================================
+        ct_max_rr = self._current_trade_tags.get('ct_max_rr', 5.0)
+        if ct_max_rr < tp_multiplier:
+            logger.info(f"📊 CT TP CAP: RR {tp_multiplier:.1f}R → {ct_max_rr:.1f}R (countertrend limit)")
+            tp_multiplier = ct_max_rr
+            if bias == 'LONG':
+                take_profit = current_price + (risk * tp_multiplier)
+            else:
+                take_profit = current_price - (risk * tp_multiplier)
+            self._current_trade_tags['ct_tp_capped'] = True
+        
+        # =========================================================================
+        # TP ADJUSTMENT FOR ANCHOR LEVELS (Jan 13, 2026)
+        # If an important level is between entry and TP, adjust TP to just before it
+        # This avoids rejections at psychological levels
+        # =========================================================================
+        original_tp = take_profit
+        if level_context and self.important_levels:
+            # Get updated level context with planned TP
+            adjusted_context = self.important_levels.get_level_context(
+                current_price=current_price,
+                direction=bias,
+                atr_5m=atr_for_sl,
+                planned_tp=take_profit
+            )
+            
+            if adjusted_context.suggested_tp is not None:
+                take_profit = adjusted_context.suggested_tp
+                self._current_trade_tags['tp_adjusted_for_level'] = True
+                self._current_trade_tags['tp_original'] = original_tp
+                self._current_trade_tags['tp_adjustment_reason'] = adjusted_context.tp_adjustment_reason
+                logger.info(f"📊 TP ADJUSTED: {adjusted_context.tp_adjustment_reason}")
+                
+                # Recalculate effective RR after adjustment
+                new_risk_reward = abs(take_profit - current_price) / risk if risk > 0 else 0
+                tp_multiplier = new_risk_reward
+                logger.info(f"📊 Effective RR after adjustment: {new_risk_reward:.2f}R")
+        
+        logger.info(f"Levels: Entry={current_price:.2f} | SL={stop_loss:.2f} | TP={take_profit:.2f} | Risk={risk:.2f} | RR={tp_multiplier:.2f}R")
+        
+        # =========================================================================
+        # RR SCORE ADJUSTMENT - Apply RR penalty/bonus to score (Jan 9, 2026)
+        # This happens AFTER SL/TP calculation when we know actual RR
+        # =========================================================================
+        original_score = score
+        score, rr_adjustment_reason = self._entry_scorer.apply_rr_score_adjustment(
+            int(score), tp_multiplier, current_regime=getattr(self, '_current_regime', None)
+        )
+        
+        if rr_adjustment_reason:
+            logger.info(f"📊 Score adjusted: {original_score} → {score} ({rr_adjustment_reason})")
+            self._current_trade_tags['rr_adjustment'] = rr_adjustment_reason
+        
+        # Re-check if score still passes threshold after RR adjustment
+        if score < self._entry_threshold:
+            logger.warning(f"⛔ Score {score:.1f} < threshold {self._entry_threshold} AFTER RR adjustment - SKIP ENTRY")
+            self._current_trade_tags['skip_reason'] = 'score_below_threshold_after_rr_adjustment'
+            return
+        
+        # ===== RR HARD FLOOR CHECK - REGIME AWARE (Jan 14, 2026) =====
+        # Different regimes have different mathematical minimums:
+        # - RANGE: High winrate mean-reversion can work with 0.5R+
+        # - TREND: Need 0.9R+ because momentum premium
+        # Use regime_config.min_rr as PRIMARY floor
+        current_regime_config = self.regime_detector.get_config(self._current_regime)
+        regime_min_rr = current_regime_config.min_rr
+        
+        # Absolute floor (applies to ALL regimes)
+        absolute_floor = getattr(OperatingMode, 'RR_HARD_FLOOR', 0.4)
+        
+        # Use the higher of: regime-specific floor or absolute floor
+        effective_floor = max(regime_min_rr, absolute_floor)
+        
+        self._current_trade_tags['rr_regime_floor'] = regime_min_rr
+        self._current_trade_tags['rr_effective_floor'] = effective_floor
+        
+        if tp_multiplier < effective_floor:
+            logger.warning(f"🚫 RR BELOW FLOOR: {tp_multiplier:.2f}R < {effective_floor:.2f}R ({self._current_regime.value}) → REJECTED")
+            self._current_trade_tags['skip_reason'] = 'rr_below_floor'
+            return
+        
+        # Log acceptance for transparency
+        if tp_multiplier < 1.0:
+            logger.info(f"✅ RR {tp_multiplier:.2f}R ACCEPTED for {self._current_regime.value} (floor={effective_floor:.2f}R)")
+        
+        # =========================================================================
+        # WORST-CASE RR VALIDATION (using slippage model)
+        # Calculate realistic RR accounting for:
+        # - Entry slippage (LIMIT order - actual bot behavior)
+        # - SL slippage (market order in adverse conditions)
+        # - TP slippage (taker if aggressive exit)
+        # If worst-case RR < regime floor, reject the trade
+        #
+        # UPDATE Jan 20, 2026:
+        # Changed from MARKET to LIMIT because bot uses post-only limit orders.
+        # This gives a realistic estimate rather than overly pessimistic worst-case.
+        # =========================================================================
+        from src.infrastructure.exchanges.kraken.slippage_model import OrderType
+        
+        # Get volatility ratio for slippage calculation
+        volatility_ratio = self._last_atr_ratio if hasattr(self, '_last_atr_ratio') else 1.0
+        
+        worst_case_rr = self.slippage_model.calculate_worst_case_rr(
+            entry_price=current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            direction=bias,
+            order_type=OrderType.LIMIT,  # Bot uses limit orders for entry
+            volatility_ratio=volatility_ratio
+        )
+        
+        self._current_trade_tags['rr_ideal'] = tp_multiplier
+        self._current_trade_tags['rr_worst_case'] = worst_case_rr
+        self._current_trade_tags['rr_slippage_impact'] = tp_multiplier - worst_case_rr
+        
+        logger.info(f"📊 RR Analysis: Ideal={tp_multiplier:.2f}R → Worst-case={worst_case_rr:.2f}R (slippage={tp_multiplier - worst_case_rr:.2f}R)")
+        
+        # =========================================================================
+        # RR-BASED SIZING (Jan 20, 2026 Update)
+        # Replaces binary floor with graduated sizing:
+        # - rr_net < 0.6: Block (mathematical roulette)
+        # - 0.6 <= rr_net < 1.0: Probe entry (0.25x size)
+        # - 1.0 <= rr_net < 1.2: Reduced entry (0.5x size)
+        # - rr_net >= 1.2: Full entry (1.0x size)
+        # Note: RANGE regime uses lower thresholds due to higher winrate
+        # =========================================================================
+        current_regime_str = self._current_regime.value if self._current_regime else "NORMAL"
+        rr_size_multiplier = EntryGateConfig.get_rr_size_multiplier(worst_case_rr, current_regime_str)
+        self._current_trade_tags['rr_size_multiplier'] = rr_size_multiplier
+        
+        # =========================================================================
+        # 🔥 FIX (Jan 25, 2026): HIGH SCORE BYPASS
+        # If score >= 7, don't block on worst-case RR - use probe size instead
+        # Rationale: High score trades have strong edge, slippage model is too conservative
+        # =========================================================================
+        HIGH_SCORE_RR_BYPASS = 7.0
+        if rr_size_multiplier == 0.0 and score >= HIGH_SCORE_RR_BYPASS:
+            logger.warning(f"⚡ HIGH SCORE BYPASS: Score {score:.1f} >= {HIGH_SCORE_RR_BYPASS} | Using PROBE despite worst-case RR {worst_case_rr:.2f}R")
+            rr_size_multiplier = 0.25  # Probe size for high score with marginal RR
+            self._current_trade_tags['high_score_rr_bypass'] = True
+            self._current_trade_tags['rr_size_multiplier'] = rr_size_multiplier
+        elif rr_size_multiplier == 0.0:
+            logger.warning(f"🚫 WORST-CASE RR BELOW FLOOR: {worst_case_rr:.2f}R < {effective_floor:.2f}R (ideal was {tp_multiplier:.2f}R) → REJECTED")
+            self._current_trade_tags['skip_reason'] = 'worst_case_rr_below_floor'
+            self.missed_tracker.log_blocked_signal(
+                direction=bias,
+                price=current_price,
+                block_reason=f"Worst-case RR {worst_case_rr:.2f}R < floor {effective_floor:.2f}R",
+                block_category='slippage',
+                score=score,
+                atr=self._last_momentum_atr
+            )
+            return
+        
+        # Log RR sizing decision
+        if rr_size_multiplier < 1.0:
+            rr_zone = 'probe' if rr_size_multiplier <= 0.3 else 'reduced'
+            logger.info(f"📊 RR SIZING: Worst-case {worst_case_rr:.2f}R → {rr_zone} ({rr_size_multiplier:.0%})")
+            self._current_trade_tags['rr_zone'] = rr_zone
+        
+        # Tag the configured values for analysis
+        self._current_trade_tags['rr_configured'] = tp_multiplier
+        
+        # 🔥 REFRESH CAPITAL BEFORE POSITION SIZING
+        # This ensures we use ACTUAL free margin, not stale capital value
+        try:
+            fresh_capital = await asyncio.wait_for(
+                self.execution.get_available_capital(),
+                timeout=10.0
+            )
+            if fresh_capital > 0:
+                self.risk_engine.capital = fresh_capital
+                logger.debug(f"Refreshed capital: ${fresh_capital:.2f} free")
+            else:
+                logger.warning("⚠️ Failed to refresh capital - using cached value")
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ Capital refresh timeout - using cached value")
+        except Exception as e:
+            logger.warning(f"⚠️ Capital refresh error: {e} - using cached value")
+        
+        # ==================================================================
+        # CENTRALIZED POSITION SIZING (Using PositionSizer + Score + Funding)
+        # Enhanced with: Loss streak, Session quality, Day of week, Funding direction
+        # ==================================================================
+        
+        # Get state multiplier from operational state machine
+        state_multiplier = self.state_machine.get_size_multiplier()
+        
+        # Get black swan defensive multiplier
+        black_swan_multiplier = self.black_swan_filter.get_size_multiplier(market_time)
+        
+        # Initialize funding_sizing_factor (will be updated in TIER 2 section if not backtest)
+        funding_sizing_factor = 1.0
+        
+        # SCORE-BASED SIZING: Now using graduated sizing from EntryGateConfig
+        # score_size_multiplier already calculated above
+        combined_defensive = black_swan_multiplier * score_size_multiplier
+        
+        # =========================================================================
+        # RR-BASED SIZING (Jan 20, 2026) - Apply RR-based size reduction
+        # rr_size_multiplier already calculated above after worst-case RR check
+        # =========================================================================
+        combined_defensive *= rr_size_multiplier
+        if rr_size_multiplier < 1.0:
+            logger.debug(f"📊 RR sizing applied: {rr_size_multiplier:.0%}")
+        
+        # =========================================================================
+        # LTF CONFIRMATION SIZING (Jan 20, 2026) - Size based on LTF confirmations
+        # Never require 3/3 confirmations (anti-paralysis)
+        # 2/3+ = full, 1/3 = 0.5x, 0/3 = 0.25x
+        # =========================================================================
+        ltf_confirmations = self._current_trade_tags.get('ltf_confirmations', 2)
+        ltf_size_multiplier = EntryGateConfig.get_ltf_size_multiplier(ltf_confirmations, total=3)
+        combined_defensive *= ltf_size_multiplier
+        self._current_trade_tags['ltf_size_multiplier'] = ltf_size_multiplier
+        if ltf_size_multiplier < 1.0:
+            logger.info(f"📊 LTF sizing: {ltf_confirmations}/3 confirmations → {ltf_size_multiplier:.0%}")
+        
+        # =========================================================================
+        # LOSS STREAK SIZING (Jan 9, 2026) - Reduce size after consecutive losses
+        # Progressive: 0 losses=100%, 1=80%, 2=60%, 3+=50%
+        # =========================================================================
+        loss_streak_multiplier = OperatingMode.get_loss_sizing_multiplier(int(self._consecutive_losses))
+        if self._consecutive_losses > 0:
+            logger.info(f"📉 Loss streak sizing: {self._consecutive_losses} losses → {loss_streak_multiplier:.0%}")
+            self._current_trade_tags['loss_streak_size_factor'] = loss_streak_multiplier
+        combined_defensive *= loss_streak_multiplier
+        
+        # =========================================================================
+        # SESSION QUALITY SIZING (Jan 9, 2026) - Reduce in low-quality sessions
+        # =========================================================================
+        session_name = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
+        session_multiplier = OperatingMode.get_session_multiplier(session_name)
+        if session_multiplier < 1.0:
+            logger.info(f"📊 Session sizing: {session_name} → {session_multiplier:.0%}")
+        self._current_trade_tags['session_quality'] = session_name
+        self._current_trade_tags['session_size_factor'] = session_multiplier
+        combined_defensive *= session_multiplier
+        
+        # =========================================================================
+        # DAY OF WEEK SIZING (Jan 13, 2026) - Reduce on Friday/Weekend
+        # =========================================================================
+        day_multiplier = OperatingMode.get_day_multiplier(market_time.weekday())
+        if day_multiplier < 1.0:
+            day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+            logger.info(f"📊 Day sizing: {day_names[market_time.weekday()]} → {day_multiplier:.0%}")
+        self._current_trade_tags['day_of_week'] = market_time.weekday()
+        self._current_trade_tags['day_size_factor'] = day_multiplier
+        combined_defensive *= day_multiplier
+        
+        # =========================================================================
+        # SPREAD SIZE REDUCTION (Jan 16, 2026) - Reduce size when spread is elevated
+        # =========================================================================
+        if _spread_size_factor < 1.0:
+            logger.info(f"📊 Spread sizing: elevated spread → {_spread_size_factor:.0%}")
+            self._current_trade_tags['spread_size_factor'] = _spread_size_factor
+            combined_defensive *= _spread_size_factor
+        
+        # =========================================================================
+        # COUNTERTREND SIZE REDUCTION (Jan 22, 2026) - Reduce size for CT trades
+        # =========================================================================
+        ct_size_mult = self._current_trade_tags.get('ct_size_mult', 1.0)
+        if ct_size_mult < 1.0:
+            bias_str = self._current_bias_strength.value if self._current_bias_strength else 'UNKNOWN'
+            logger.info(f"📊 Countertrend sizing: {bias_str} → {ct_size_mult:.0%}")
+            self._current_trade_tags['ct_size_applied'] = ct_size_mult
+            combined_defensive *= ct_size_mult
+        
+        # =========================================================================
+        # 🔥 FIX (Jan 22, 2026): LOCATION SIZE CAP - Reduce size at extremes
+        # When trading near range boundaries, cap position size
+        # =========================================================================
+        location_size_cap = self._current_trade_tags.get(
+            'location_size_cap_long' if bias == 'LONG' else 'location_size_cap_short', 1.0
+        )
+        if location_size_cap < 1.0:
+            logger.info(f"📍 Location size cap: {location_size_cap:.0%} (trading near extreme)")
+            self._current_trade_tags['location_size_cap_applied'] = location_size_cap
+            combined_defensive *= location_size_cap
+        
+        # =========================================================================
+        # 🔥 FIX (Jan 22, 2026): ANTICIPATION PROBE SIZING
+        # Anticipation trades use reduced size (30%) because we're entering BEFORE confirmation
+        # =========================================================================
+        anticipation_probe_size = self._current_trade_tags.get('anticipation_probe_size', 1.0)
+        if anticipation_probe_size < 1.0:
+            logger.info(f"🔬 Anticipation probe sizing: {anticipation_probe_size:.0%}")
+            self._current_trade_tags['anticipation_size_applied'] = anticipation_probe_size
+            combined_defensive *= anticipation_probe_size
+        
+        # =========================================================================
+        # 🔥 FIX (Jan 22, 2026): ENTRY QUALITY GATE SIZE CAP
+        # Apply size cap from Entry Quality Gate (microtrend contradiction, chase in range, etc.)
+        # =========================================================================
+        if gate_size_cap < 1.0:
+            logger.info(f"🚧 Gate size cap: {gate_size_cap:.0%} ({gate_result.reason})")
+            self._current_trade_tags['gate_size_cap'] = gate_size_cap
+            combined_defensive *= gate_size_cap
+        
+        # =========================================================================
+        # FUNDING SIZING - Moved to TIER 2 section (lines ~1980) to avoid duplication
+        # The funding_sizing_factor is retrieved from external_data.funding.get_funding_info()
+        # which provides comprehensive funding data including directional scoring
+        # =========================================================================
+        # NOTE: funding_sizing_factor will be set later in the TIER 2 section
+        # and applied via combined_defensive there
+        
+        # =========================================================================
+        # 🔥 FIX (Jan 26, 2026): PROBING / RANGE SIZE MODIFIER
+        # Apply range_size_mult which includes PROBING levels:
+        # - PROBE_MIN: 0.25x
+        # - PROBE_MED: 0.50x  
+        # - PROBE_MAX: 0.65x
+        # - RANGE_EXTREME: 0.50x
+        # =========================================================================
+        range_size_mult = self._current_trade_tags.get('range_size_mult', 1.0)
+        if range_size_mult < 1.0:
+            probing_mode = self._current_trade_tags.get('probing_mode', False)
+            if probing_mode:
+                # Determine PROBING level for logging
+                if range_size_mult >= 0.65:
+                    level = "PROBE_MAX"
+                elif range_size_mult >= 0.50:
+                    level = "PROBE_MED"
+                else:
+                    level = "PROBE_MIN"
+                logger.info(f"🔍 {level} sizing: {range_size_mult:.0%} (diagnostic probe)")
+            else:
+                logger.info(f"📊 RANGE sizing: {range_size_mult:.0%} (at extreme)")
+            self._current_trade_tags['range_size_mult_applied'] = range_size_mult
+            combined_defensive *= range_size_mult
+        
+        # =========================================================================
+        # 🔥 FIX (Jan 23, 2026): DAILY REGIME SIZE MODIFIER
+        # Apply daily regime-based position size adjustment
+        # TREND_DAY = 100%, RANGE_DAY = 50%, TRANSITION_DAY = 70%
+        # =========================================================================
+        daily_regime_size_mult = self._daily_regime_config.get('size_mult', 1.0)
+        if daily_regime_size_mult < 1.0:
+            logger.info(f"📅 Daily regime sizing: {self._daily_regime} → {daily_regime_size_mult:.0%}")
+            self._current_trade_tags['daily_regime'] = self._daily_regime
+            self._current_trade_tags['daily_regime_size_mult'] = daily_regime_size_mult
+            combined_defensive *= daily_regime_size_mult
+        
+        # Calculate position size using centralized sizer
+        position_size, size_breakdown = self._position_sizer.calculate_position_size(
+            capital=self.risk_engine.capital,
+            entry_price=current_price,
+            stop_loss=stop_loss,
+            state_multiplier=state_multiplier,
+            edge_multiplier=edge_size_multiplier,
+            defensive_multiplier=combined_defensive,
+            leverage=10
+        )
+        
+        # =====================================================================
+        # 🔒 FIX (Jan 13, 2026): PRE-ROUND SIZE TO EXCHANGE PRECISION
+        # This ensures local state uses the SAME size that will be submitted.
+        # Prevents desync between intended_size and submitted_size.
+        # =====================================================================
+        intended_size = position_size  # Store original for logging
+        position_size = round_size_to_exchange(position_size)
+        
+        if position_size != intended_size:
+            logger.info(f"📊 Size pre-rounded for local tracking: {intended_size:.8f} → {position_size:.8f}")
+        
+        # Log sizing breakdown with ALL factors
+        logger.info(f"📊 Position sizing: base={size_breakdown['base']:.6f} × state={size_breakdown['state']:.2f} × edge={size_breakdown['edge']:.2f} × score={score_size_multiplier:.2f} × rr={rr_size_multiplier:.2f} × ltf={ltf_size_multiplier:.2f} × losses={loss_streak_multiplier:.2f} × session={session_multiplier:.2f} × day={day_multiplier:.2f} = {position_size:.6f}")
+        
+        if size_breakdown.get('blocked_by'):
+            logger.warning(f"⛔ Sizing blocked by: {size_breakdown['blocked_by']}")
+        
+        if position_size <= 0:
+            logger.warning("Position size is zero - skipping entry")
+            return
+
+        # ==================================================================
+        # TIER 2 VALIDATION - Score > Gates Architecture
+        # 
+        # PHILOSOPHY: After score >= threshold, only TRUE SYSTEMIC RISK blocks.
+        # Funding rate is NOT a blocker - it's a tag + sizing factor.
+        #
+        # NOTHING BLOCKS after score passes (except corrupt data)
+        # Everything becomes a TAG for edge discovery.
+        # ==================================================================
+
+        # Get 1H data for metrics
+        candles_1h = self.market_data.get_candles('1h')
+        df_1h = pd.DataFrame(candles_1h) if candles_1h else None
+
+        if not self._is_backtest:
+            # ═══════════════════════════════════════════════════════════════
+            # FUNDING RATE - TAG + SIZING + DIRECTIONAL SCORE (NOT A BLOCKER)
+            # Funding affects sizing in PRODUCTION, but NEVER blocks entry
+            # DIRECTIONAL: shorts can BENEFIT from high positive funding
+            # ═══════════════════════════════════════════════════════════════
+            funding_info = self.external_data.funding.get_funding_info(bias=bias)
+            
+            # Store as tags for analysis
+            self._current_trade_tags['funding_rate'] = funding_info['rate_pct']
+            self._current_trade_tags['funding_bucket'] = funding_info['bucket']
+            self._current_trade_tags['funding_direction'] = funding_info['direction']
+            self._current_trade_tags['funding_sizing_factor'] = funding_info['sizing_factor']
+            self._current_trade_tags['funding_sizing_boost'] = funding_info.get('sizing_boost', 1.0)
+            
+            # Log funding status (INFO for normal, WARNING for elevated+)
+            # Bucket names from external_data: 'normal', 'elevated', 'high', 'critical', 'extreme'
+            if funding_info['bucket'] in ['high', 'critical', 'extreme']:
+                logger.warning(f"⚠️ Funding {funding_info['bucket'].upper()}: {funding_info['rate_pct']:.4f}% | sizing ×{funding_info['sizing_factor']:.2f}")
+            elif funding_info['bucket'] == 'elevated':
+                logger.info(f"📊 Funding elevated: {funding_info['rate_pct']:.4f}% | sizing ×{funding_info['sizing_factor']:.2f}")
+            
+            # Apply DIRECTIONAL score adjustment (can be positive for favorable funding!)
+            funding_score_adj = funding_info['score_penalty']
+            if funding_score_adj != 0:
+                self._entry_score += funding_score_adj
+                direction_note = "receiving" if funding_score_adj > 0 else "paying"
+                logger.info(f"💰 Score adjusted by {funding_score_adj:+.2f} for funding ({direction_note}, new score: {self._entry_score})")
+            
+            # Apply DIRECTIONAL sizing boost when funding strongly favors our direction
+            funding_sizing_boost = funding_info.get('sizing_boost', 1.0)
+            if funding_sizing_boost > 1.0:
+                original_size = position_size
+                position_size = position_size * funding_sizing_boost
+                position_size = round_size_to_exchange(position_size)
+                logger.info(f"💰 FUNDING BOOST: {bias} receives premium → size ×{funding_sizing_boost:.2f} ({original_size:.6f} → {position_size:.6f})")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # TAGS ONLY - Collect data, don't block
+            # In DISCOVERY mode, we ENTER regardless and track outcomes
+            # ═══════════════════════════════════════════════════════════════
+            
+            # TAG: Session quality (ADX + volatility)
+            adx_1h = 0.0
+            volatility_bps = 0.0
+            if df_1h is not None and len(df_1h) >= 20:
+                try:
+                    adx_vals, _ = calculate_adx(df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14)
+                    adx_1h = float(adx_vals[-1]) if len(adx_vals) > 0 else 0.0
+                    
+                    last = df_1h.iloc[-1]
+                    close = float(last.get('close', 0) or 0)
+                    high = float(last.get('high', 0) or 0)
+                    low = float(last.get('low', 0) or 0)
+                    volatility_bps = ((high - low) / close * 10000.0) if close > 0 else 0.0
+                except Exception as e:
+                    logger.debug(f"Session metrics calc failed: {e}")
+            
+            # 🔒 FIX: Store ADX 1h in tags for consistency with HTF filter
+            self._current_trade_tags['adx_1h'] = float(adx_1h)
+            
+            session_ok, session_reason = check_session_quality(adx_1h, volatility_bps)
+            self._current_trade_tags['session_quality'] = 'good' if session_ok else 'poor'
+            self._current_trade_tags['session_reason'] = session_reason
+            if not session_ok:
+                logger.info(f"🏷️ TAG: Session quality poor: {session_reason} (entering anyway)")
+            
+            # TAG: HTF divergence
+            if df_1h is not None:
+                divergence_detected, divergence_reason = check_htf_divergence(df_1h, bias)
+                self._current_trade_tags['htf_divergence'] = divergence_detected
+                if divergence_detected:
+                    logger.info(f"🏷️ TAG: HTF divergence detected: {divergence_reason} (entering anyway)")
+            
+            # TAG: VPOC validity
+            if df_1h is not None:
+                vpoc = calculate_vpoc(df_1h)
+                vpoc_ok, vpoc_reason = check_vpoc_validity(current_price, vpoc, bias)
+                self._current_trade_tags['vpoc_valid'] = vpoc_ok
+                self._current_trade_tags['vpoc_price'] = vpoc
+                if not vpoc_ok:
+                    logger.info(f"🏷️ TAG: VPOC invalid: {vpoc_reason} (entering anyway)")
+            
+            # TAG: BTC trend correlation
+            try:
+                btc_ok, btc_reason = await asyncio.wait_for(
+                    check_btc_trend(self.external_data, bias),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⏰ BTC trend check TIMEOUT (5s) - skipping")
+                btc_ok, btc_reason = True, "timeout"
+            self._current_trade_tags['btc_aligned'] = btc_ok
+            if not btc_ok:
+                logger.info(f"🏷️ TAG: BTC trend misaligned: {btc_reason} (entering anyway)")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # CAPA 3: AGGRESSIVE TAGGING FOR EDGE DISCOVERY
+            # These tags NEVER block - they enable post-trade analysis
+            # ═══════════════════════════════════════════════════════════════
+            
+            # TAG: VWAP distance (in ATRs)
+            try:
+                vwap = self.market_data.indicators.get('5m', {}).get('vwap', 0.0)
+                if vwap and atr_1m > 0:
+                    vwap_distance = abs(current_price - vwap)
+                    vwap_distance_atr = vwap_distance / atr_1m
+                    self._current_trade_tags['vwap_distance_atr'] = round(vwap_distance_atr, 2)
+                    self._current_trade_tags['vwap_side'] = 'above' if current_price > vwap else 'below'
+            except Exception as e:
+                logger.debug(f"VWAP tag failed: {e}")
+            
+            # TAG: Funding z-score (relative to historical, not absolute)
+            try:
+                funding_rate = funding_info.get('rate_pct', 0.0)
+                # Historical median funding ~0.01% (10 bps)
+                # Historical std ~0.05% (50 bps)
+                funding_median = 0.01
+                funding_std = 0.05
+                funding_zscore = (abs(funding_rate) - funding_median) / funding_std if funding_std > 0 else 0.0
+                self._current_trade_tags['funding_zscore'] = round(funding_zscore, 2)
+            except Exception as e:
+                logger.debug(f"Funding z-score tag failed: {e}")
+            
+            # TAG: Entry timestamp for latency tracking (order->fill)
+            self._current_trade_tags['entry_timestamp_ms'] = int(market_time.timestamp() * 1000)
+            
+            # =================================================================
+            # 🧠 INTELLIGENT FILTER - Final Decision Before Execution
+            # Accumulates ALL penalties and makes nuanced decision
+            # NO "entering anyway" - if risk is too high, BLOCK
+            # =================================================================
+            session_quality_str = self._current_trade_tags.get('session_quality', 'moderate')
+            is_weekend = market_time.weekday() >= 5 if market_time else False
+            
+            # 🔧 FIX (Jan 25, 2026): Use REAL feed staleness from market_data
+            # Previous implementation used time between tick processing (buggy)
+            # New implementation uses time since last websocket data received
+            tick_age = self.market_data.get_feed_age_sec()
+            
+            # 🔥 FIX (Jan 27, 2026): Get RSI for intelligent filter
+            # This allows blocking SHORTs when RSI is oversold (< 35)
+            rsi_for_filter = self._current_trade_tags.get('rsi', None)
+            rsi_slope_for_filter = None
+            if df_1m is not None and len(df_1m) >= 20:
+                # NOTE: calculate_rsi is already imported from src.shared.indicators at top of file
+                rsi_arr = calculate_rsi(df_1m['close'].to_numpy(), 14)
+                if len(rsi_arr) >= 5:
+                    rsi_slope_for_filter = float(rsi_arr[-1] - rsi_arr[-5])
+            
+            intelligent_decision = self._intelligent_filter.evaluate(
+                # Market Quality
+                spread_bps=None,  # TODO: Get from order book
+                spread_normal_bps=3.0,
+                feed_age_sec=tick_age,  # Now uses actual feed timestamp
+                atr_ratio=self._current_trade_tags.get('volatility_ratio'),
+                
+                # Session Quality
+                htf_adx=adx_1h,
+                session_name=self._current_trade_tags.get('session', 'unknown'),
+                day_of_week=market_time.weekday() if market_time else 0,
+                is_weekend=is_weekend,
+                
+                # Signal Quality
+                regime=self._current_regime.value if self._current_regime else "UNKNOWN",
+                chase_atr=self._current_trade_tags.get('chase_atr', 0.0),
+                micro_trend=micro_trend_str if 'micro_trend_str' in dir() else "NEUTRAL",
+                micro_strength=micro_strength if 'micro_strength' in dir() else 0.0,
+                entry_direction=bias or "UNKNOWN",
+                has_bos=self._current_trade_tags.get('bos_confirmed', False),
+                near_level=(level_context.distance_below_atr < 1.0 if level_context else False),
+                
+                # 🔥 RSI for directional confirmation (Jan 27, 2026)
+                rsi_value=rsi_for_filter,
+                rsi_slope=rsi_slope_for_filter,
+                
+                # Execution Quality (from recent trades)
+                recent_slippage_bps=0.0,  # TODO: Get from execution analytics
+                order_latency_ms=0.0,
+                recent_rejects=0,
+                
+                # System Health
+                consecutive_timeouts=0,  # TODO: Track
+                tick_latency_ms=0.0,
+                exchange_connected=True,
+                
+                market_time=market_time,
+            )
+            
+            # Store decision in tags
+            self._current_trade_tags['intelligent_filter_decision'] = intelligent_decision.decision_reason
+            self._current_trade_tags['intelligent_filter_penalty'] = intelligent_decision.accumulated_penalty
+            self._current_trade_tags['intelligent_filter_size_mult'] = intelligent_decision.final_size_multiplier
+            
+            # 🧠 INTELLIGENT FILTER DECISION
+            if not intelligent_decision.allow_entry:
+                logger.warning(f"🧠 INTELLIGENT FILTER BLOCK: {intelligent_decision.decision_reason}")
+                for f in intelligent_decision.active_filters:
+                    logger.info(f"   {f}")
+                self._current_trade_tags['skip_reason'] = 'intelligent_filter_block'
+                self.missed_tracker.log_blocked_signal(
+                    direction=bias,
+                    price=current_price,
+                    block_reason=f"Intelligent Filter: {intelligent_decision.decision_reason}",
+                    block_category='intelligent_filter',
+                    score=score,
+                    atr=self._last_momentum_atr
+                )
+                self._set_rejection_cooldown("Intelligent filter block", candles=3)
+                return
+            
+            # Apply intelligent filter modifiers
+            if intelligent_decision.accumulated_penalty > 0:
+                logger.info(f"🧠 INTELLIGENT FILTER: {intelligent_decision}")
+                # Apply size reduction from intelligent filter
+                position_size = position_size * intelligent_decision.final_size_multiplier
+                # Apply SL tightening
+                if intelligent_decision.sl_tightening_factor < 1.0:
+                    sl_distance = abs(stop_loss - current_price)
+                    tightened_distance = sl_distance * intelligent_decision.sl_tightening_factor
+                    if bias == 'LONG':
+                        stop_loss = current_price - tightened_distance
+                    else:
+                        stop_loss = current_price + tightened_distance
+                    logger.info(f"   SL tightened by {(1-intelligent_decision.sl_tightening_factor)*100:.0f}% → {stop_loss:.2f}")
+            
+            # Re-enforce minimum size
+            if position_size < KRAKEN_BTC_MIN_SIZE:
+                logger.warning(f"⚠️ Position size {position_size:.6f} below minimum after intelligent filter - blocking")
+                self._current_trade_tags['skip_reason'] = 'size_below_minimum_after_filter'
+                return
+        else:
+            logger.debug("📋 [BACKTEST] Skipping TIER2 validation")
+        
+        # =====================================================================
+        # 🤖 ML SHADOW MODE - Log prediction without affecting decision
+        # Collects data for future ML model training
+        # In SHADOW phase: just logs, doesn't modify score
+        # In HYBRID phase: would adjust score ±1 based on ML confidence
+        # =====================================================================
+        try:
+            feature_snapshot = self._build_ml_feature_snapshot()
+            ml_adjusted_score, ml_prob, ml_reason = self._ml_inference.get_entry_adjustment(
+                rule_score=int(score),
+                feature_snapshot=feature_snapshot
+            )
+            
+            # Store ML prediction in trade tags for analysis
+            self._current_trade_tags['ml_win_prob'] = round(ml_prob, 4)
+            self._current_trade_tags['ml_adjusted_score'] = ml_adjusted_score
+            self._current_trade_tags['ml_reason'] = ml_reason
+            self._current_trade_tags['ml_phase'] = self._ml_inference.phase.name
+            
+            # In SHADOW mode: log only, don't modify score
+            # In HYBRID/PRIMARY mode: this would update score
+            # score = ml_adjusted_score  # Uncomment when ready for HYBRID
+            
+        except Exception as e:
+            logger.warning(f"⚠️ ML inference error (non-blocking): {e}")
+            self._current_trade_tags['ml_error'] = str(e)
+        
+        # ===== FIX #2: DETERMINE ORDER TYPE BASED ON MOMENTUM =====
+        # Calculate price velocity from last 2 candles (1m)
+        candles_1m = self.market_data.get_candles('1m')
+        use_market_order = False
+        price_velocity = 0.0
+        
+        if candles_1m and len(candles_1m) >= 2:
+            # Last 2 candles (1m)
+            last_close = candles_1m[-1]['close']
+            prev_close = candles_1m[-2]['close']
+            
+            # Price change
+            price_change = abs(last_close - prev_close)
+            
+            # ATR(1m)
+            closes_1m = [c['close'] for c in candles_1m[-14:]]
+            highs_1m = [c['high'] for c in candles_1m[-14:]]
+            lows_1m = [c['low'] for c in candles_1m[-14:]]
+            
+            if len(closes_1m) >= 14:
+                atr_1m_vals = calculate_atr(
+                    np.array(highs_1m, dtype=float),
+                    np.array(lows_1m, dtype=float),
+                    np.array(closes_1m, dtype=float),
+                    14
+                )
+                atr_1m_current = atr_1m_vals[-1] if len(atr_1m_vals) > 0 else atr_1m
+                
+                # Velocity = price change / ATR
+                price_velocity = price_change / atr_1m_current if atr_1m_current > 0 else 0
+                
+                # Use market if velocity > 2x ATR
+                from src.config.trading_config import OrderExecution
+                
+                # SKIP if momentum too extreme IN DEAD MARKET (chasing in range)
+                # Only skip if: velocity > 3.5 ATR AND ADX < 25 (no trend to ride)
+                # Use cached ADX as fallback if not defined in local scope
+                # 🔥 FIX (Jan 25, 2026): Safely handle numpy arrays or scalar values
+                _adx_raw_momentum = locals().get('adx_1h', self._htf_cache_adx)
+                try:
+                    if isinstance(_adx_raw_momentum, np.ndarray):
+                        _adx_for_momentum = float(_adx_raw_momentum[-1]) if len(_adx_raw_momentum) > 0 else 20.0
+                    else:
+                        _adx_for_momentum = float(_adx_raw_momentum)
+                except (TypeError, ValueError, IndexError):
+                    _adx_for_momentum = 20.0
+                is_chasing_in_range = (
+                    price_velocity > OrderExecution.MOMENTUM_MAX_VELOCITY and
+                    _adx_for_momentum < OrderExecution.MOMENTUM_MAX_VELOCITY_ADX_THRESHOLD
+                )
+                if is_chasing_in_range:
+                    logger.warning(f"🚫 CHASING IN DEAD MARKET: velocity={price_velocity:.2f}ATR > {OrderExecution.MOMENTUM_MAX_VELOCITY}ATR + ADX={_adx_for_momentum:.1f} < {OrderExecution.MOMENTUM_MAX_VELOCITY_ADX_THRESHOLD} → SKIP")
+                    self._current_trade_tags['skip_reason'] = 'chasing_in_range'
+                    self._current_trade_tags['velocity_at_skip'] = price_velocity
+                    self._current_trade_tags['adx_at_skip'] = _adx_for_momentum
+                    return  # Do not enter - wait for trend or pullback
+                
+                use_market_order = (
+                    OrderExecution.USE_MARKET_ON_MOMENTUM and 
+                    price_velocity > OrderExecution.MOMENTUM_VELOCITY_MULTIPLIER
+                )
+                
+                # 🔥 FIX (Jan 22, 2026): Entry Quality Gate can FORCE limit order
+                # e.g., chase_atr > 1.0 in RANGE → no market, require limit
+                if gate_require_limit and use_market_order:
+                    logger.info(f"🚧 GATE OVERRIDE: Market order blocked → using LIMIT ({gate_result.reason})")
+                    use_market_order = False
+                    self._current_trade_tags['gate_forced_limit_override'] = True
+                
+                if use_market_order:
+                    logger.info(f"⚡ HIGH MOMENTUM: velocity={price_velocity:.2f}ATR > {OrderExecution.MOMENTUM_VELOCITY_MULTIPLIER}ATR → Using MARKET order")
+                else:
+                    logger.debug(f"Normal momentum: velocity={price_velocity:.2f}ATR < {OrderExecution.MOMENTUM_VELOCITY_MULTIPLIER}ATR → Using LIMIT order")
+        
+
+        # =====================================================================
+        # 🔥 FIX (Jan 24, 2026): COST VALIDATOR - Reject trades where fees eat profit
+        # Only blocks if expected costs are > X% of expected profit
+        # 
+        # ⚠️ CAREFUL (Jan 25, 2026): This filter exists to prevent bleed in chop/range
+        # NOT to maximize entries. High cost ratio trades often cluster in adverse conditions.
+        # Relajar sin validación cruzada por régimen = optimización reactiva peligrosa.
+        # =====================================================================
+        try:
+            cost_model = get_cost_model()
+            notional_usd = position_size * current_price
+            
+            # Estimate roundtrip costs (entry maker + exit taker typical)
+            costs = cost_model.estimate_costs(
+                side=bias,
+                size_usd=notional_usd,
+                entry_price=current_price,
+                is_maker_entry=not use_market_order,  # Limit = maker, Market = taker
+                is_maker_exit=False,  # Assume taker exit (SL/TP hit)
+            )
+            
+            # Calculate expected profit at 1.2R (realistic TP, not minimum 1R)
+            sl_distance = abs(current_price - stop_loss)
+            expected_profit_usd = position_size * sl_distance * 1.2  # 1.2R profit (realistic)
+            
+            # Cost ratio check - adaptive by order type
+            # MARKET orders have higher fees+slippage → stricter threshold
+            # LIMIT/MAKER orders have lower fees → more permissive
+            # ⚠️ These thresholds are CONSERVATIVE for micro accounts - DO NOT relax without
+            # full backtest validation across RANGE, TREND, and CHOP regimes
+            if use_market_order:
+                COST_RATIO_THRESHOLD = 0.50  # 50% max for market orders (higher cost)
+            else:
+                COST_RATIO_THRESHOLD = 0.80  # 80% max for limit orders (lower cost)
+            
+            cost_ratio = costs.total_usd / expected_profit_usd if expected_profit_usd > 0 else 999
+            
+            self._current_trade_tags['cost_usd'] = round(costs.total_usd, 4)
+            self._current_trade_tags['expected_profit_1_2r'] = round(expected_profit_usd, 4)
+            self._current_trade_tags['cost_ratio'] = round(cost_ratio, 4)
+            
+            if cost_ratio > COST_RATIO_THRESHOLD:
+                logger.warning(f"💸 COST VALIDATOR BLOCK: costs ${costs.total_usd:.4f} = {cost_ratio*100:.1f}% of expected profit ${expected_profit_usd:.4f}")
+                logger.info(f"   Notional: ${notional_usd:.2f}, Fees: ${costs.fee_entry_usd + costs.fee_exit_usd:.4f}, Slip: ${costs.slippage_entry_usd + costs.slippage_exit_usd:.4f}")
+                self._current_trade_tags['skip_reason'] = 'cost_too_high'
+                self.missed_tracker.log_blocked_signal(
+                    direction=bias,
+                    price=current_price,
+                    block_reason=f"Cost ratio {cost_ratio*100:.1f}% > {COST_RATIO_THRESHOLD*100:.0f}% threshold",
+                    block_category='cost_validator',
+                    score=score,
+                    atr=self._last_momentum_atr
+                )
+                return
+            else:
+                logger.info(f"✅ Cost validator PASS: ${costs.total_usd:.4f} = {cost_ratio*100:.1f}% of profit (< {COST_RATIO_THRESHOLD*100:.0f}%)")
+        except Exception as e:
+            logger.warning(f"⚠️ Cost validator error (proceeding anyway): {e}")
+
+
+
+        # ===== PLACE ORDER (MARKET or LIMIT based on momentum) =====
+        try:
+            if use_market_order:
+                # Market order for momentum
+                logger.info(f"🚀 Placing MARKET order | {bias} {position_size} @ market | Velocity: {price_velocity:.2f}ATR")
+                order_result = await self.execution.place_market_order(
+                    symbol=self.symbol,
+                    side='buy' if bias == 'LONG' else 'sell',
+                    amount=position_size,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+            else:
+                # Limit post-only order (default)
+                logger.info(f"📊 Placing LIMIT post-only | {bias} {position_size} @ {current_price:.2f} | Velocity: {price_velocity:.2f}ATR")
+                order_result = await self.execution.place_limit_order(
+                    symbol=self.symbol,
+                    side='buy' if bias == 'LONG' else 'sell',
+                    amount=position_size,
+                    price=current_price,
+                    stop_loss=stop_loss,      # Stored for later placement
+                    take_profit=take_profit   # Stored for later placement
+                )
+            
+            if order_result:
+                self.pending_order_id = order_result.get('id')
+                self.entry_order_time = market_time  # Use market_time, not datetime.now()
+                
+                # =====================================================================
+                # 🔒 NOTIFY RECONCILER - Enter HARD_LOCK to prevent premature reactions
+                # During HARD_LOCK: funding/penalty/exits are DISABLED
+                # =====================================================================
+                if self.pending_order_id:
+                    self.reconciler.notify_order_placed(self.pending_order_id)
+                
+                # Send Telegram notification with account value
+                if self.output_manager:
+                    try:
+                        rec = {
+                            'symbol': self.symbol,
+                            'direction': bias,
+                            'status': 'OPENING',
+                            'entry_price': current_price,
+                            'stop_loss_price': stop_loss,
+                            'signal_timestamp': market_time.isoformat(),
+                            'account_value': self.risk_engine.capital,
+                            'score': score
+                        }
+                        _create_safe_task(self.output_manager.send_recommendation(rec), "send_recommendation")
+                    except Exception as e:
+                        logger.error(f"Failed to send Telegram notification: {e}")
+                
+                # Store entry data for position creation upon fill
+                # Include trade tags for DISCOVERY analysis
+                order_type_str = 'MARKET' if use_market_order else 'LIMIT'
+                self._last_entry_data = {
+                    'bias': bias,
+                    'entry_price': current_price,
+                    'position_size': position_size,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,  # Guardar TP para establecer después
+                    'atr_1m': atr_1m,
+                    'order_type': order_type_str,
+                    'original_order_type': order_type_str,  # 🔥 FIX (Jan 23, 2026): Track original type for latency
+                    # Trade type for position tracking
+                    'trade_type': self._current_trade_type or (TradeType.LONG_MAIN if bias == 'LONG' else TradeType.SHORT_STRUCTURAL),
+                    # DISCOVERY: Trade tags for segmented analysis
+                    'tags': self._current_trade_tags.copy(),
+                    'score': score,
+                    'score_breakdown': breakdown.copy()
+                }
+                
+                # Log tags for discovery tracking
+                if OperatingMode.is_discovery():
+                    logger.info(f"🏷️ Trade tags: score={score} | {self._current_trade_tags}")
+                
+                # =====================================================================
+                # 🔒 FIX (Jan 13, 2026): INSTANT FILL ONLY IN BACKTEST
+                # In LIVE, we MUST wait for fill confirmation via WAIT_FILL state.
+                # Market orders may return status='closed' immediately from exchange API,
+                # but this is NOT the same as a confirmed fill with correct size/price.
+                # 
+                # CRITICAL: In LIVE, always go to WAIT_FILL to:
+                # 1. Verify position exists on exchange
+                # 2. Get actual fill price (may differ from limit price)
+                # 3. Get actual fill size (may be partial or rounded)
+                # =====================================================================
+                order_status = order_result.get('status', '')
+                is_instant_fill = order_status in ('filled', 'closed') or order_result.get('filled', 0) > 0
+                
+                if self._is_backtest and is_instant_fill:
+                    # BACKTEST ONLY: Skip WAIT_FILL since mock execution fills instantly
+                    logger.info(f"✅ INSTANT FILL (backtest): {self.pending_order_id} - skipping WAIT_FILL")
+                    
+                    # Create position directly - same logic as _handle_wait_fill_state
+                    fill_price = order_result.get('average') or order_result.get('price') or current_price
+                    fill_size = order_result.get('filled', position_size)  # Use actual filled size
+                    
+                    # =========================================================================
+                    # 🔥 FIX (Jan 21, 2026): Update position_store in backtest instant fill
+                    # Keeps position_store in sync with risk_engine
+                    # =========================================================================
+                    try:
+                        fill_side = 'buy' if bias == 'LONG' else 'sell'
+                        await self._position_store.record_fill(
+                            order_id=self.pending_order_id or 'bt_order',
+                            symbol=self.symbol,
+                            side=fill_side,
+                            size=fill_size,
+                            price=fill_price,
+                            fee=0.0,
+                            fill_type='MAKER',
+                            fill_id=f"{self.pending_order_id}_fill",
+                        )
+                    except Exception as ps_err:
+                        logger.warning(f"⚠️ Could not update position_store on backtest fill: {ps_err}")
+                    
+                    self.risk_engine.create_position(
+                        symbol=self.symbol,
+                        direction=bias,
+                        entry_price=fill_price,
+                        position_size=fill_size,
+                        stop_loss=stop_loss,
+                        atr_1m=atr_1m,
+                        market_time=market_time,
+                        trade_type=self._current_trade_type or (TradeType.LONG_MAIN if bias == 'LONG' else TradeType.SHORT_STRUCTURAL),
+                        regime_mode=self._current_trade_regime  # 🔥 FIX (Jan 22): Pass regime to trailing
+                    )
+                    
+                    # 🔥 NEW: Start exhaustion tracking for this trade
+                    self.exhaustion_detector.start_tracking(market_time)
+                    self._exhaustion_tightened = False
+                    
+                    self.state_machine.record_trade_open(self.pending_order_id or "UNKNOWN")
+                    
+                    # =========================================================================
+                    # UPDATE SESSION TRADE COUNT & INITIALIZE TRADE LOGGER
+                    # =========================================================================
+                    session_for_count = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
+                    self._session_trade_counts[session_for_count] = self._session_trade_counts.get(session_for_count, 0) + 1
+                    logger.debug(f"📊 Session {session_for_count}: trade count → {self._session_trade_counts[session_for_count]}")
+                    
+                    # Start trade logging (generates trade_id for this trade)
+                    # Wrapped in try/except to prevent logging errors from blocking state transition
+                    try:
+                        # Determine trade type for logging
+                        trade_type_for_log = TradeType.SHORT_STRUCTURAL if bias == 'SHORT' else TradeType.LONG_MAIN
+                        if hasattr(self, '_current_trade_type') and self._current_trade_type:
+                            trade_type_for_log = self._current_trade_type
+                        trade_type_name = trade_type_for_log.value if hasattr(trade_type_for_log, 'value') else str(trade_type_for_log)
+                        
+                        self._current_trade_id = self.trade_logger.start_trade(
+                            symbol=self.symbol,
+                            direction=bias,
+                            entry_price=fill_price,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                            position_size=fill_size,
+                            entry_score=score,
+                            entry_tags=list(self._current_trade_tags.keys()) if isinstance(self._current_trade_tags, dict) else [],
+                            regime=str(self._current_volatility_regime),
+                            volatility_regime=str(self._current_volatility_regime),
+                            session=session_for_count,
+                            trade_type=trade_type_name,
+                            score_breakdown=breakdown.copy(),
+                            metadata={'worst_case_rr': worst_case_rr if 'worst_case_rr' in dir() else None},
+                            # 🔥 ML Data Collection (Jan 24, 2026)
+                            feature_snapshot=self._build_ml_feature_snapshot(),
+                            entry_trading_mode=self._current_trade_tags.get('trading_mode', ''),
+                            entry_daily_regime=self._daily_regime
+                        )
+                    except Exception as log_err:
+                        logger.error(f"TradeLogger.start_trade() failed (backtest): {log_err} - continuing without trade logging")
+                        self._current_trade_id = None
+                    
+                    # Clear pending state
+                    self.pending_order_id = None
+                    self.entry_order_time = None
+                    self._last_entry_data = None
+                    
+                    # Record trade price for duplicate zone filter
+                    self._record_trade_price(fill_price)
+                    
+                    # Go directly to MANAGE
+                    self.state_machine.transition_to(BotState.MANAGE, "Instant fill (backtest)")
+                    
+                    # 🔥 ANTI-PARALYSIS: Update last trade time
+                    self._last_trade_time = market_time
+                    
+                    SIGNALS_GENERATED.labels(symbol=self.symbol, direction=bias).inc()
+                    logger.info(f"🎯 Position opened: {bias} {fill_size} @ {fill_price:.2f}")
+                else:
+                    # NON-BACKTEST MODE: Always go through WAIT_FILL to verify position on exchange
+                    # Even if exchange API returns 'filled', we must verify:
+                    # - Position actually exists
+                    # - Actual fill price (may differ from order price)
+                    # - Actual fill size (may be partial or rounded)
+                    if is_instant_fill and not self._is_backtest:
+                        mode_name = self._runtime_config.mode.value if self._runtime_config else "UNKNOWN"
+                        logger.info(f"⏳ Order returned filled status, but {mode_name} mode (instant_fill=False) requires verification via WAIT_FILL")
+                    
+                    self.state_machine.start_entry_timer()
+                    self.state_machine.transition_to(BotState.WAIT_FILL, "Order placed")
+                    
+                    SIGNALS_GENERATED.labels(symbol=self.symbol, direction=bias).inc()
+                    logger.info(f"Entry order placed: {self.pending_order_id}")
+            else:
+                # FIX (Jan 3, 2026): Reduced cooldown from 60 to 5 minutes
+                logger.warning("⚠️ EXECUTION FAILED - Cooldown 5m (was 60m before fix)")
+                self._reset_trade_state("Order placement failed")
+                self.state_machine.start_cooldown(5)  # 5 minutes cooldown (reduced from 60)
+        
+        except Exception as e:
+            # FIX (Jan 3, 2026): Reduced cooldown from 60 to 5 minutes
+            logger.error(f"Error placing order: {e}", exc_info=True)
+            logger.warning("⚠️ Order exception - Cooldown 5m (was 60m before fix)")
+            self._reset_trade_state("Order exception")
+            self.state_machine.start_cooldown(5)  # 5 minutes cooldown (reduced from 60)
+    
+    # ===== WAIT_FILL STATE - MONITOR ORDER =====
+    
+    async def _handle_wait_fill_state(self, market_time: datetime):
+        """WAIT_FILL state: monitor pending order"""
+        
+        if not self.pending_order_id:
+            # 🔒 LIMPIEZA si no hay orden pendiente
+            self._reset_trade_state("WAIT_FILL with no pending order")
+            self.state_machine.transition_to(BotState.IDLE, "No pending order")
+            return
+        
+        # =====================================================================
+        # 🔒 FIX (Jan 13, 2026): BACKTEST-ONLY instant fill from fills list
+        # This path should ONLY be used in backtest mode.
+        # In LIVE, we verify fills through the proper poll_fill_status flow below.
+        # =====================================================================
+        if self._is_backtest and hasattr(self.execution, 'fills'):
+            for fill in self.execution.fills:
+                if fill.get('order_id') == self.pending_order_id:
+                    logger.info(f"✅ Order {self.pending_order_id} already filled (backtest) - processing immediately")
+                    
+                    if hasattr(self, '_last_entry_data') and self._last_entry_data:
+                        entry_data = self._last_entry_data
+                        fill_size = fill.get('amount', entry_data['position_size'])
+                        fill_price = fill.get('price', entry_data['entry_price'])
+                        
+                        # 🔥 FIX (Jan 21, 2026): Update position_store in backtest WAIT_FILL
+                        try:
+                            fill_side = 'buy' if entry_data['bias'].upper() == 'LONG' else 'sell'
+                            await self._position_store.record_fill(
+                                order_id=self.pending_order_id or 'bt_order',
+                                symbol=self.symbol,
+                                side=fill_side,
+                                size=fill_size,
+                                price=fill_price,
+                                fee=0.0,
+                                fill_type='MAKER',
+                                fill_id=f"{self.pending_order_id}_fill",
+                            )
+                        except Exception as ps_err:
+                            logger.warning(f"⚠️ Could not update position_store (backtest WAIT_FILL): {ps_err}")
+                        
+                        self.risk_engine.create_position(
+                            symbol=self.symbol,
+                            direction=entry_data['bias'],
+                            entry_price=fill_price,
+                            position_size=fill_size,
+                            stop_loss=entry_data['stop_loss'],
+                            atr_1m=entry_data['atr_1m'],
+                            market_time=market_time,
+                            trade_type=entry_data.get('trade_type', TradeType.LONG_MAIN if entry_data['bias'] == 'LONG' else TradeType.SHORT_STRUCTURAL),
+                            regime_mode=self._current_trade_regime  # 🔥 FIX (Jan 22): Pass regime to trailing
+                        )
+                        
+                        # 🔥 NEW: Start exhaustion tracking for this trade
+                        self.exhaustion_detector.start_tracking(market_time)
+                        self._exhaustion_tightened = False
+                        
+                        # Record trade price for duplicate zone filter
+                        self._record_trade_price(fill_price)
+                        
+                        self.state_machine.record_trade_open(self.pending_order_id)
+                        self._reset_trade_state("Instant fill processed")
+                        self.state_machine.transition_to(BotState.MANAGE, "Fill detected (backtest)")
+                        logger.info(f"🎯 Position opened from WAIT_FILL: {entry_data['bias']} {fill_size} @ {fill_price:.2f}")
+                        return
+        
+        # Check order timeout (3 minutes = 3 candles) - USE MARKET TIME
+        if self.entry_order_time:
+            elapsed = (market_time - self.entry_order_time).total_seconds()
+            
+            # ================================================================
+            # 🚀 LIMIT → MARKET FALLBACK (FIX Jan 12, 2026)
+            # If price escapes before fill, cancel LIMIT and send MARKET
+            # This prevents missing momentum moves when using limit orders
+            # 
+            # VELOCITY CHECK ADDED: Only convert if candle shows momentum
+            # (body_size > 0.25 ATR) to avoid converting in choppy ranges
+            # ================================================================
+            if elapsed > 2.0 and hasattr(self, '_last_entry_data') and self._last_entry_data:
+                entry_data = self._last_entry_data
+                order_type = entry_data.get('order_type', 'LIMIT')
+                
+                # Only apply to LIMIT orders
+                if order_type == 'LIMIT':
+                    entry_price = entry_data.get('entry_price', 0)
+                    bias = entry_data.get('bias', '')
+                    atr = entry_data.get('atr_1m', 100)  # Default ATR if not available
+                    
+                    # Get current price
+                    current_price = self.market_data.last_price
+                    
+                    if current_price and entry_price and atr:
+                        # Calculate how far price has moved away from limit
+                        if bias == 'LONG':
+                            price_escape = current_price - entry_price  # Positive = price moved up (escaped)
+                        else:  # SHORT
+                            price_escape = entry_price - current_price  # Positive = price moved down (escaped)
+                        
+                        escape_atr = price_escape / atr if atr > 0 else 0
+                        
+                        # ============================================================
+                        # VELOCITY CHECK: Only convert if candle shows real momentum
+                        # This prevents paying taker fees in choppy/ranging markets
+                        # ============================================================
+                        has_velocity = False
+                        VELOCITY_THRESHOLD_ATR = 0.25  # Candle body must be > 0.25 ATR
+                        
+                        candles_1m = self.market_data.get_candles('1m')
+                        if candles_1m and len(candles_1m) > 0:
+                            last_candle = candles_1m[-1]
+                            candle_open = float(last_candle.get('open', 0))
+                            candle_close = float(last_candle.get('close', 0))
+                            candle_body = abs(candle_close - candle_open)
+                            body_atr_ratio = candle_body / atr if atr > 0 else 0
+                            
+                            # Check if candle body shows momentum
+                            if body_atr_ratio > VELOCITY_THRESHOLD_ATR:
+                                has_velocity = True
+                                logger.debug(f"📊 Velocity check PASSED: body={candle_body:.0f} ({body_atr_ratio:.2f} ATR)")
+                            else:
+                                logger.debug(f"📊 Velocity check FAILED: body={candle_body:.0f} ({body_atr_ratio:.2f} ATR) < {VELOCITY_THRESHOLD_ATR}")
+                        
+                        # If price escaped > 0.15 ATR in favorable direction AND has velocity
+                        ESCAPE_THRESHOLD_ATR = 0.15
+                        if escape_atr > ESCAPE_THRESHOLD_ATR and has_velocity:
+                            logger.warning(f"🚀 LIMIT→MARKET FALLBACK: Price escaped {escape_atr:.2f} ATR | {bias} @ {entry_price:.0f} → Current: {current_price:.0f}")
+                            
+                            # Cancel the limit order
+                            try:
+                                cancel_success = await self.execution.cancel_order(self.pending_order_id, self.symbol)
+                                if cancel_success:
+                                    logger.info(f"✅ Limit order {self.pending_order_id} cancelled for market conversion")
+                                    
+                                    # Clean up
+                                    if self.pending_order_id in self.execution.open_orders:
+                                        self.execution.open_orders.pop(self.pending_order_id, None)
+                                    
+                                    # Place MARKET order instead
+                                    position_size = entry_data.get('position_size', 0)
+                                    stop_loss = entry_data.get('stop_loss', 0)
+                                    take_profit = entry_data.get('take_profit', 0)
+                                    
+                                    logger.info(f"📈 Placing MARKET order: {bias} {position_size:.6f} @ market (~{current_price:.0f})")
+                                    
+                                    market_result = await self.execution.place_market_order(
+                                        symbol=self.symbol,
+                                        side='buy' if bias == 'LONG' else 'sell',
+                                        amount=position_size,
+                                        stop_loss=stop_loss,
+                                        take_profit=take_profit
+                                    )
+                                    
+                                    if market_result and market_result.get('id'):
+                                        self.pending_order_id = market_result['id']
+                                        entry_data['order_type'] = 'MARKET'  # Update for tracking
+                                        entry_data['entry_price'] = current_price  # Update expected price
+                                        self.entry_order_time = market_time  # Reset timer
+                                        logger.info(f"✅ Market order placed: {self.pending_order_id}")
+                                        return  # Will process fill on next tick
+                                    else:
+                                        logger.error("❌ Failed to place market order after limit cancel")
+                                        self._reset_trade_state("Market order failed after limit cancel")
+                                        self.state_machine.transition_to(BotState.IDLE, "Market order failed")
+                                        return
+                                else:
+                                    logger.warning("⚠️ Could not cancel limit order for market conversion")
+                            except Exception as e:
+                                logger.error(f"Error during LIMIT→MARKET conversion: {e}")
+            
+            if elapsed > ENTRY_TIMEOUT_MINUTES * 60:
+                logger.warning(f"Entry timeout after {elapsed:.0f}s - attempting cancel")
+                
+                # ================================================================
+                # FIX #3 (Jan 13, 2026): Enhanced timeout cleanup with late fill detection
+                # ================================================================
+                
+                # Step 1: Check if order was ALREADY filled before we cancel
+                pre_cancel_filled = False
+                try:
+                    fill_status = await self.execution.poll_fill_status(
+                        self.pending_order_id, self.symbol
+                    )
+                    if fill_status.get('filled'):
+                        logger.warning("⚠️ Order appears FILLED during timeout check - processing fill instead")
+                        pre_cancel_filled = True
+                        # Don't return - let the normal fill flow handle it below
+                except Exception as e:
+                    logger.debug(f"Pre-cancel fill check error: {e}")
+                
+                if not pre_cancel_filled:
+                    # Step 2: Cancel the order
+                    cancel_success = False
+                    try:
+                        cancel_success = await self.execution.cancel_order(
+                            self.pending_order_id,
+                            self.symbol
+                        )
+                        # 📊 CAPA 5: Record cancel in health monitor
+                        if self.health_monitor:
+                            self.health_monitor.record_order_canceled()  # No reason param
+                    except Exception as e:
+                        logger.error(f"Error cancelling order: {e}")
+                    
+                    # Step 3: Wait briefly and check for LATE FILL (race condition)
+                    await asyncio.sleep(0.5)
+                    
+                    try:
+                        exchange_has_position = await self.execution.has_open_position(self.symbol)
+                        if exchange_has_position:
+                            logger.critical("🚨 LATE FILL DETECTED: Order filled after timeout!")
+                            logger.critical("🔄 Closing orphan position created by late fill...")
+                            
+                            # Get position details
+                            exchange_pos = await self.execution.get_position(self.symbol)
+                            if exchange_pos:
+                                size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                                side = exchange_pos.get('side', '').lower()
+                                
+                                if size >= KRAKEN_BTC_MIN_SIZE:
+                                    close_side = 'sell' if side == 'long' else 'buy'
+                                    await self.execution.close_position_market(
+                                        symbol=self.symbol,
+                                        side=close_side,
+                                        amount=size,
+                                        reason="LATE_FILL"
+                                    )
+                                    logger.info(f"✅ Late fill position closed: {size:.6f} {side}")
+                                    
+                                    # Notify
+                                    if self.output_manager:
+                                        await self.output_manager.send_critical_alert(
+                                            f"🚨 LATE FILL: Closed orphan {side} {size:.6f} (order filled after timeout)"
+                                        )
+                                elif size > 0:
+                                    logger.warning(f"⚠️ Late fill size {size:.6f} < min - considered closed")
+                    except Exception as e:
+                        logger.error(f"Error checking late fill: {e}")
+                    
+                    # Step 4: Clean up local state
+                    if self.pending_order_id in self.execution.open_orders:
+                        self.execution.open_orders.pop(self.pending_order_id, None)
+                        logger.debug(f"Cleaned order {self.pending_order_id} from local tracking")
+                    
+                    # Step 5: Reconcile to ensure clean state
+                    await self._reconcile_orders()
+                    
+                    # Step 6: Complete cleanup
+                    self._reset_trade_state("Order timeout (enhanced)")
+                    self.state_machine.transition_to(BotState.IDLE, "Entry timeout")
+                    return
+        
+        # Check if order was filled
+        try:
+            fill_status = await self.execution.poll_fill_status(
+                self.pending_order_id,
+                self.symbol
+            )
+            
+            # Handle rejected order (POST_ONLY that crossed book)
+            if fill_status.get('rejected'):
+                logger.warning(f"🚫 Order {self.pending_order_id} was REJECTED by exchange (likely POST_ONLY crossed book)")
+                
+                # 📊 CAPA 5: Record rejection in health monitor
+                if self.health_monitor:
+                    self.health_monitor.record_order_rejected()  # No reason param
+                
+                # Track consecutive POST_ONLY rejections for guard
+                if not hasattr(self, '_consecutive_post_only_rejects'):
+                    self._consecutive_post_only_rejects = 0
+                self._consecutive_post_only_rejects += 1
+                logger.debug(f"POST_ONLY rejection count: {self._consecutive_post_only_rejects}")
+                
+                self._reset_trade_state("Order rejected by exchange")
+                self.state_machine.transition_to(BotState.IDLE, "Order rejected")
+                return
+            
+            # Reset rejection counter on successful fill
+            self._consecutive_post_only_rejects = 0
+            
+            if fill_status.get('filled'):
+                # Order filled - VERIFICAR POSICIÓN REAL antes de crear
+                logger.info(f"✅ Entry order FILLED - verifying position on exchange...")
+                
+                # 📊 CAPA 3: Capture order→fill latency for tags
+                fill_latency_ms = 0
+                order_type = 'market'  # default
+                was_converted = False
+                
+                if hasattr(self, '_last_entry_data') and self._last_entry_data:
+                    entry_ts = self._last_entry_data.get('tags', {}).get('entry_timestamp_ms', 0)
+                    order_type = self._last_entry_data.get('order_type', 'LIMIT').lower()
+                    # Check if this was a LIMIT→MARKET conversion (originally LIMIT but now MARKET)
+                    original_order_type = self._last_entry_data.get('original_order_type', order_type)
+                    was_converted = (original_order_type.lower() == 'limit' and order_type == 'market')
+                    
+                    if entry_ts:
+                        fill_ts = int(market_time.timestamp() * 1000)
+                        fill_latency_ms = fill_ts - entry_ts
+                        self._last_entry_data['tags']['order_fill_latency_ms'] = fill_latency_ms
+                        if fill_latency_ms > 5000:  # > 5 seconds
+                            logger.info(f"🏷️ TAG: Order→fill latency: {fill_latency_ms}ms ({order_type}, converted={was_converted})")
+                
+                # =====================================================================
+                # 🔥 FIX (Jan 23, 2026): Setup TTL - si fill_latency > 20s el contexto LTF
+                # ya no es fiable. Cancelar y esperar otro setup.
+                # Aplica SOLO a market orders puros, no a conversiones (damage control)
+                # =====================================================================
+                SETUP_TTL_MS = 20000  # 20 segundos máximo para un setup válido
+                
+                if order_type == 'market' and not was_converted and fill_latency_ms > SETUP_TTL_MS:
+                    logger.warning(f"⚠️ SETUP TTL EXPIRED: {fill_latency_ms}ms > {SETUP_TTL_MS}ms - LTF context stale")
+                    logger.warning("📉 Closing stale entry - waiting for fresh setup")
+                    
+                    # Close the position immediately
+                    try:
+                        await self.execution.close_position(self.symbol)
+                        self._reset_trade_state("Setup TTL expired")
+                        self.state_machine.transition_to(BotState.IDLE, "Setup TTL expired")
+                        
+                        # Record as health event (optional, informational)
+                        if self.health_monitor:
+                            self.health_monitor.record_order_filled(
+                                latency_ms=fill_latency_ms, order_type=order_type, was_converted=False
+                            )
+                        return  # Exit without creating position
+                    except Exception as close_err:
+                        logger.error(f"❌ Could not close stale entry: {close_err}")
+                        # Continue anyway - better to have tracking than phantom position
+                
+                # 📊 CAPA 5: Record fill in health monitor
+                # 🔥 FIX (Jan 23, 2026): Pass order type to distinguish LIMIT wait time vs MARKET latency
+                if self.health_monitor:
+                    self.health_monitor.record_order_filled(
+                        latency_ms=fill_latency_ms, 
+                        order_type=order_type,
+                        was_converted=was_converted
+                    )
+                
+                # CRITICAL: Verificar que hay contracts en exchange
+                await asyncio.sleep(0.5)  # Dar tiempo a que exchange actualice
+                exchange_has_position = await self.execution.has_open_position(self.symbol)
+                
+                if not exchange_has_position:
+                    logger.error("⚠️ Order filled but NO position on exchange - possible partial fill or error")
+                    self._reset_trade_state("Fill reported but no position")
+                    self.state_machine.transition_to(BotState.IDLE, "No position after fill")
+                    return
+                
+                logger.info("✅ Position confirmed on exchange - creating local tracking")
+                
+                # Get position data for validation and later use
+                position_data: dict | None = None
+                
+                # 🔒 CRITICAL: Validate side consistency before proceeding
+                # This prevents SL/TP placement with wrong side (wouldNotReducePosition error)
+                if hasattr(self, '_last_entry_data') and self._last_entry_data:
+                    expected_side = self._last_entry_data.get('bias', '').lower()  # 'long' or 'short'
+                    position_data = await self.execution.get_position(self.symbol)
+                    if position_data:
+                        exchange_side = position_data.get('side', '').lower()
+                        if exchange_side and expected_side and exchange_side != expected_side:
+                            logger.critical(f"🚨 SIDE MISMATCH: System={expected_side.upper()} vs Exchange={exchange_side.upper()}")
+                            logger.critical("⚠️ Correcting system side to match exchange reality")
+                            self._last_entry_data['bias'] = exchange_side.upper()
+                        elif exchange_side:
+                            logger.info(f"✅ Side validated: System={expected_side.upper()} == Exchange={exchange_side.upper()}")
+                
+                # Limpiar de open_orders
+                if self.pending_order_id in self.execution.open_orders:
+                    self.execution.open_orders.pop(self.pending_order_id, None)
+                
+                # Create Position object for risk management
+                # 🔥 FIX #4: Use ACTUAL fill price/size from exchange, not intended values
+                if hasattr(self, '_last_entry_data') and self._last_entry_data:
+                    entry_data = self._last_entry_data
+                    
+                    # Get actual fill data from exchange position
+                    actual_price = entry_data['entry_price']  # Fallback
+                    actual_size = entry_data['position_size']  # Fallback
+                    
+                    if position_data:
+                        # Use exchange-reported values if available
+                        exchange_price = float(position_data.get('entryPrice', 0) or 0)
+                        exchange_qty = abs(float(position_data.get('contracts', 0) or 0))
+                        
+                        if exchange_price > 0:
+                            if abs(exchange_price - actual_price) > 0.01:
+                                logger.info(f"🔄 Using actual fill price: {actual_price:.2f} → {exchange_price:.2f}")
+                            actual_price = exchange_price
+                        
+                        if exchange_qty > 0:
+                            if abs(exchange_qty - actual_size) > 0.00001:
+                                logger.info(f"🔄 Using actual fill size: {actual_size:.6f} → {exchange_qty:.6f}")
+                            actual_size = exchange_qty
+                    
+                    # =========================================================================
+                    # 🔥 FIX (Jan 21, 2026): Update position_store when limit order fills
+                    # This was missing, causing position_store vs risk_engine desync
+                    # leading to phantom positions and "Position flipped" errors
+                    # 
+                    # 🔥 FIX (Jan 22, 2026): SKIP if market order already recorded fill!
+                    # When LIMIT→MARKET conversion happens, execution.py already calls
+                    # record_fill, so we must NOT call it again here.
+                    # Check if position_store already has this position to avoid double-count.
+                    # =========================================================================
+                    try:
+                        fill_side = 'buy' if entry_data['bias'].upper() == 'LONG' else 'sell'
+                        
+                        # Check if position already exists (market order already recorded)
+                        existing_pos = self._position_store.get_position(self.symbol or '')
+                        if existing_pos and abs(existing_pos.size - actual_size) < 0.00001:
+                            logger.info(f"✅ position_store already updated (market order path): {fill_side.upper()} {actual_size:.6f} @ {existing_pos.entry_price:.2f}")
+                        else:
+                            await self._position_store.record_fill(
+                                order_id=self.pending_order_id or 'unknown',
+                                symbol=self.symbol,
+                                side=fill_side,
+                                size=actual_size,
+                                price=actual_price,
+                                fee=0.0,
+                                fill_type='MAKER',  # Limit orders are maker
+                                fill_id=f"{self.pending_order_id}_fill",
+                            )
+                            logger.info(f"✅ position_store updated: {fill_side.upper()} {actual_size:.6f} @ {actual_price:.2f}")
+                    except Exception as ps_err:
+                        logger.warning(f"⚠️ Could not update position_store on fill: {ps_err}")
+                    
+                    self.risk_engine.create_position(
+                        symbol=self.symbol,
+                        direction=entry_data['bias'],
+                        entry_price=actual_price,
+                        position_size=actual_size,
+                        stop_loss=entry_data['stop_loss'],
+                        atr_1m=entry_data['atr_1m'],
+                        market_time=market_time,  # Use market time, not datetime.now()
+                        trade_type=entry_data.get('trade_type', TradeType.LONG_MAIN if entry_data['bias'] == 'LONG' else TradeType.SHORT_STRUCTURAL),
+                        regime_mode=self._current_trade_regime  # 🔥 FIX (Jan 22): Pass regime to trailing
+                    )
+                    
+                    # 🔥 NEW: Start exhaustion tracking for this trade
+                    self.exhaustion_detector.start_tracking(market_time)
+                    self._exhaustion_tightened = False
+                    
+                    trade_type_str = entry_data.get('trade_type', TradeType.LONG_MAIN)
+                    trade_type_name = trade_type_str.value if hasattr(trade_type_str, 'value') else str(trade_type_str)
+                    logger.info(f"Position created: {entry_data['bias']} {actual_size:.6f} @ {actual_price:.2f} [{trade_type_name}]")
+                    
+                    # =========================================================================
+                    # UPDATE SESSION TRADE COUNT & INITIALIZE TRADE LOGGER (WAIT_FILL path)
+                    # =========================================================================
+                    session_for_count = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
+                    self._session_trade_counts[session_for_count] = self._session_trade_counts.get(session_for_count, 0) + 1
+                    logger.debug(f"📊 Session {session_for_count}: trade count → {self._session_trade_counts[session_for_count]}")
+                    
+                    # Start trade logging (generates trade_id for this trade)
+                    # Wrapped in try/except to prevent logging errors from blocking state transition
+                    trade_tags = entry_data.get('tags', {})
+                    trade_score_breakdown = entry_data.get('score_breakdown', {})
+                    try:
+                        # Determine trade type for logging
+                        trade_type_for_log = entry_data.get('trade_type', TradeType.LONG_MAIN if entry_data['bias'] == 'LONG' else TradeType.SHORT_STRUCTURAL)
+                        trade_type_name = trade_type_for_log.value if hasattr(trade_type_for_log, 'value') else str(trade_type_for_log)
+                        
+                        self._current_trade_id = self.trade_logger.start_trade(
+                            symbol=self.symbol,
+                            direction=entry_data['bias'],
+                            entry_price=actual_price,
+                            stop_loss=entry_data['stop_loss'],
+                            take_profit=float(entry_data.get('take_profit', 0) or 0),
+                            position_size=actual_size,
+                            entry_score=entry_data.get('score', 0),
+                            entry_tags=list(trade_tags.keys()) if isinstance(trade_tags, dict) else [],
+                            regime=trade_tags.get('regime', 'UNKNOWN'),
+                            volatility_regime=trade_tags.get('volatility_regime', 'NORMAL'),
+                            session=session_for_count,
+                            trade_type=trade_type_name,
+                            score_breakdown=trade_score_breakdown,
+                            metadata={'worst_case_rr': trade_tags.get('rr_worst_case')},
+                            # 🔥 ML Data Collection (Jan 24, 2026)
+                            feature_snapshot=self._build_ml_feature_snapshot(),
+                            entry_trading_mode=trade_tags.get('trading_mode', ''),
+                            entry_daily_regime=self._daily_regime
+                        )
+                        # 🔥 ANTI-PARALYSIS: Update last trade time for activity tracking
+                        self._last_trade_time = market_time
+                    except Exception as log_err:
+                        logger.error(f"TradeLogger.start_trade() failed: {log_err} - continuing without trade logging")
+                        self._current_trade_id = None
+                    
+                    # 📊 CAPA 5: Record trade entry in health monitor
+                    if self.health_monitor:
+                        self.health_monitor.record_trade_entry(
+                            side=entry_data['bias'],
+                            size=entry_data['position_size'],
+                            score=int(self._entry_score)
+                        )
+                    # 🔒 CAPA 1: Validate position integrity against exchange
+                    if position_data and self.risk_engine.position:
+                        exchange_side = position_data.get('side', '').lower()
+                        exchange_qty = abs(float(position_data.get('contracts', 0)))
+                        
+                        integrity_ok = self.risk_engine.position.validate_integrity(
+                            exchange_side=exchange_side,
+                            exchange_qty=exchange_qty,
+                            qty_tolerance=0.02  # 2% tolerance for partial fills
+                        )
+                        
+                        if not integrity_ok:
+                            # Check what kind of error it was
+                            pos = self.risk_engine.position
+                            has_side_mismatch = any('SIDE MISMATCH' in e for e in pos.integrity_errors)
+                            has_qty_mismatch = any('QTY MISMATCH' in e for e in pos.integrity_errors)
+                            
+                            if has_side_mismatch:
+                                # Real side mismatch - critical, block SL/TP
+                                logger.critical("🚨 SIDE MISMATCH - SL/TP placement BLOCKED")
+                                if self.health_monitor:
+                                    self.health_monitor.record_integrity_error(
+                                        f"side_mismatch: system={entry_data['bias']} vs exchange={exchange_side}"
+                                    )
+                                self._stops_set = True  # Prevent stop placement
+                            elif has_qty_mismatch:
+                                # Partial fill - size already adjusted, safe to place SL/TP
+                                logger.warning("⚠️ Partial fill detected - size adjusted, proceeding with SL/TP")
+                                if self.health_monitor:
+                                    self.health_monitor.record_integrity_error(
+                                        f"qty_mismatch: expected={pos.expected_qty:.6f} vs exchange={exchange_qty:.6f}",
+                                        is_critical=False
+                                    )
+                    
+                    # 🔥 ESTABLECER SL/TP EN LA POSICIÓN ABIERTA (UNA SOLA VEZ)
+                    if not self._stops_set:
+                        logger.info("📍 Setting SL/TP on open position...")
+                        
+                        # 🔥 FIX #3: Retry SL placement with EXPONENTIAL BACKOFF
+                        max_sl_retries = 3
+                        stops_set = False
+                        base_delay = 0.5  # Start at 500ms
+                        
+                        for attempt in range(max_sl_retries):
+                            stops_set = await self.execution.set_position_stops(
+                                symbol=self.symbol,
+                                stop_loss=entry_data['stop_loss'],
+                                take_profit=entry_data.get('take_profit')  # TP si existe
+                            )
+                            
+                            if stops_set:
+                                logger.info(f"✅ SL/TP successfully set on position (attempt {attempt + 1})")
+                                self._stops_set = True
+                                # Mark reduce-only validated in position
+                                if self.risk_engine.position:
+                                    self.risk_engine.position.mark_reduce_only_validated()
+                                    # 🔥 CRITICAL FIX: Mark that exchange has the SL
+                                    # This prevents local SL checks from triggering double close
+                                    self.risk_engine.position.mark_exchange_sl_active()
+                                break
+                            else:
+                                logger.warning(f"⚠️ SL/TP placement attempt {attempt + 1}/{max_sl_retries} failed")
+                                if attempt < max_sl_retries - 1:
+                                    # Exponential backoff: 0.5s, 1s, 2s
+                                    delay = base_delay * (2 ** attempt)
+                                    logger.info(f"⏳ Waiting {delay:.1f}s before retry...")
+                                    await asyncio.sleep(delay)
+                        
+                        if not stops_set:
+                            # 🔥 CRITICAL: All retries failed - Mark SL as inactive
+                            logger.critical("🚨 CRITICAL: SL/TP placement FAILED after 3 retries - FORCE CLOSING position!")
+                            if self.risk_engine.position:
+                                self.risk_engine.position.mark_exchange_sl_inactive("All placement attempts failed")
+                            if self.health_monitor:
+                                self.health_monitor.record_integrity_error(
+                                    "SL_PLACEMENT_FAILED: Force closing unprotected position",
+                                    is_critical=True
+                                )
+                            await self.emergency_close_all()
+                            return
+                    
+                else:
+                    # 🔥 AUDIT FIX: entry_data does not exist here - this is an error path
+                    logger.error("No entry data available - Fill without entry tracking")
+                    # No entry data - error en tracking
+                    self.pending_order_id = None
+                    self.state_machine.transition_to(BotState.IDLE, "Fill without entry data")
+                    return
+                
+                # Limpia pending_order_id PERO mantiene _last_entry_data para tracking
+                self.pending_order_id = None
+                self.state_machine.transition_to(BotState.MANAGE, "Order filled")
+            else:
+                # Still pending - stay in WAIT_FILL
+                pass
+        
+        except Exception as e:
+            logger.error(f"Error checking fill status: {e}")
+    
+    # ===== MANAGE STATE - RUN POSITION =====
+    
+    async def _handle_manage_state(self, current_price: float, atr_1m: float, market_time: datetime):
+        """MANAGE state: run open position"""
+        
+        # =====================================================================
+        # 🔒 HARD_LOCK CHECK - No subsystem can act during transition periods
+        # The reconciler enforces this to prevent premature reactions
+        # =====================================================================
+        can_act, block_reason = self.reconciler.can_subsystems_act()
+        if not can_act:
+            logger.debug(f"🔒 Subsystems BLOCKED: {block_reason}")
+            return
+        
+        # 🔥 FIX #2: Skip if sync operation is in progress
+        if getattr(self, '_syncing_position', False):
+            logger.debug("Position sync in progress - skipping MANAGE operations")
+            return
+        
+        # 🔥 OPTIMIZATION (Jan 20, 2026): Use reconciler snapshot instead of API call
+        # This was calling has_open_position() EVERY tick = 1+ second per tick!
+        # The reconciler already has the position state from its last poll.
+        snapshot = self.reconciler.get_snapshot()
+        exchange_has_position = snapshot.has_position if snapshot else True  # Assume has position if no snapshot
+        
+        if not exchange_has_position:
+            logger.warning("⚠️ MANAGE state but NO position on exchange (reconciler snapshot)")
+            
+            # Verificar si tenemos posición local
+            if self.risk_engine.position:
+                logger.critical("🔄 Position closed on exchange but exists locally - syncing...")
+                
+                # Calcular PnL aproximado (no sabemos precio exacto de cierre)
+                position = self.risk_engine.position
+                estimated_pnl = 0  # No podemos calcular exacto
+                
+                # Registrar cierre (SYNC event, NOT a real loss)
+                self.state_machine.record_trade_close(estimated_pnl, False, exit_reason='RECONCILE_CLOSE')
+                self.state_machine.update_daily_pnl(estimated_pnl)  # 🔥 FIX: Update daily PnL (even if 0)
+                
+                # Limpiar posición local (thread-safe)
+                await self.risk_engine.clear_position("reconcile close - no position on exchange")
+            else:
+                logger.warning("No local position either - likely only pending orders exist")
+            
+            # Cancelar todas las órdenes pendientes (SL/TP sin posición)
+            logger.info("Cancelling all pending orders (no position to protect)")
+            cancelled = await self.execution.cancel_all_orders(self.symbol)
+            if cancelled > 0:
+                logger.info(f"Cancelled {cancelled} pending orders")
+            
+            # Limpieza completa y volver a IDLE
+            self._reset_trade_state("No position on exchange")
+            self.state_machine.transition_to(BotState.IDLE, "No position")
+            return
+        
+        # 🔥 RETRY: Intentar establecer SL/TP si no se estableció en fill
+        if not self._stops_set and hasattr(self, '_last_entry_data') and self._last_entry_data:
+            logger.warning("🔄 RETRY: Attempting to set SL/TP (not set during fill)")
+            try:
+                stops_set = await self.execution.set_position_stops(
+                    symbol=self.symbol,
+                    stop_loss=self._last_entry_data['stop_loss'],
+                    take_profit=self._last_entry_data.get('take_profit')
+                )
+                
+                if stops_set:
+                    # VERIFICAR que realmente se colocaron en exchange
+                    await asyncio.sleep(0.5)
+                    verification = await self.execution.verify_stops_on_exchange(self.symbol)
+                    
+                    if verification['has_sl']:
+                        logger.info("✅ SL/TP successfully set AND verified on exchange")
+                        self._stops_set = True
+                        # 🔥 CRITICAL: Mark exchange SL as active
+                        if self.risk_engine.position:
+                            self.risk_engine.position.mark_exchange_sl_active()
+                    else:
+                        logger.critical("❌ SL/TP claimed success but NOT found on exchange - UNPROTECTED!")
+                        # Mark SL as inactive - local check will handle closure
+                        if self.risk_engine.position:
+                            self.risk_engine.position.mark_exchange_sl_inactive("Not found on exchange after placement")
+                        # Intentar nuevamente con parámetros ajustados
+                        logger.info("Retrying with different parameters...")
+                        await asyncio.sleep(1)
+                        retry2 = await self.execution.set_position_stops(
+                            symbol=self.symbol,
+                            stop_loss=self._last_entry_data['stop_loss'],
+                            take_profit=self._last_entry_data.get('take_profit')
+                        )
+                        if retry2:
+                            self._stops_set = True
+                            if self.risk_engine.position:
+                                self.risk_engine.position.mark_exchange_sl_active()
+                else:
+                    logger.error("❌ Failed to set SL/TP on retry - position still at risk!")
+                    if self.risk_engine.position:
+                        self.risk_engine.position.mark_exchange_sl_inactive("All retry attempts failed")
+            except Exception as e:
+                logger.error(f"Error setting stops on retry: {e}")
+        
+        # Verificar que tenemos posición local
+        position = self.risk_engine.position
+        if not position:
+            # 🔒 LIMPIEZA COMPLETA si no hay posición local
+            logger.warning("MANAGE state but no local position - transitioning to IDLE")
+            self._reset_trade_state("MANAGE state with no position")
+            self.state_machine.transition_to(BotState.IDLE, "No position")
+            return
+
+        # Track MFE/MAE for edge enforcement
+        if position.entry_price > 0:
+            if position.direction == 'LONG':
+                excursion = (current_price - position.entry_price) / position.entry_price
+            else:  # SHORT
+                excursion = (position.entry_price - current_price) / position.entry_price
+            
+            # Update MFE (Max Favorable Excursion)
+            if excursion > self._current_trade_mfe:
+                self._current_trade_mfe = excursion
+            # Update MAE (Max Adverse Excursion) - negative excursion
+            if excursion < 0 and abs(excursion) > self._current_trade_mae:
+                self._current_trade_mae = abs(excursion)
+
+        # ==================================================================
+        # 🔥 PROBING MODE EXIT RULES (Jan 26, 2026)
+        # 
+        # PROBING trades have special exit rules:
+        # 1. If MAE > 0.5R AND time > 60s → ABORT (thesis failed, gave time to work)
+        # 2. If +0.2R reached in <90s → Validation passed (can continue)
+        # 3. If +0.2R NOT reached after 5min → Abort (no edge shown)
+        #
+        # NOTE: MAE threshold raised from 0.3R to 0.5R after backtest analysis
+        # showed many winners had drawdowns >0.3R before reversing.
+        # Added time requirement (60s) to avoid panic exits on noise.
+        #
+        # This is the "diagnostic probe" - we're testing, not exploiting
+        # ==================================================================
+        is_probing_trade = self._current_trade_tags.get('probing_mode', False)
+        
+        if is_probing_trade and position:
+            mae_r = position.calculate_mae_r() if hasattr(position, 'calculate_mae_r') else 0
+            mfe_r_probe = position.calculate_mfe_r() if position else 0
+            
+            # Calculate time in trade
+            entry_ts = self._current_trade_tags.get('entry_timestamp_ms', 0)
+            time_in_trade_sec = (market_time.timestamp() * 1000 - entry_ts) / 1000 if entry_ts > 0 else 0
+            
+            # Rule 1: MAE > 0.5R AND time > 60s → ABORT (thesis failed)
+            # Don't abort in first 60s - give trade time to work through noise
+            if mae_r > 0.5 and time_in_trade_sec > 60:
+                logger.warning(f"🔴 PROBING ABORT: MAE={mae_r:.2f}R > 0.5R after {time_in_trade_sec:.0f}s - thesis failed")
+                
+                self.reconciler.notify_exit_started("PROBING_ABORT_MAE")
+                
+                close_size = position.size
+                try:
+                    exchange_pos = await self.execution.get_position(self.symbol)
+                    if exchange_pos:
+                        close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                except Exception as e:
+                    logger.debug(f"Could not get exchange position for PROBING_ABORT: {e}")
+                
+                if close_size >= KRAKEN_BTC_MIN_SIZE:
+                    await self.execution.close_position_market(
+                        symbol=self.symbol,
+                        side='sell' if position.direction == 'LONG' else 'buy',
+                        amount=close_size,
+                        reason="PROBING_ABORT_MAE"
+                    )
+                    
+                    pnl = position.unrealized_pnl
+                    self.state_machine.record_trade_close(pnl, pnl > 0, exit_reason='PROBING_ABORT_MAE')
+                    self.state_machine.update_daily_pnl(pnl)
+                    
+                    self._record_trade_result('PROBING_ABORT_MAE', pnl, market_time)
+                    
+                    logger.info(f"✅ PROBING ABORT (MAE): PnL={pnl:.2f}")
+                    
+                    await self.risk_engine.clear_position("PROBING_ABORT_MAE")
+                    self._reset_trade_state("Trade closed: PROBING_ABORT_MAE")
+                    self.state_machine.start_cooldown(2)  # Slightly longer cooldown
+                    self.state_machine.transition_to(BotState.IDLE, "Trade closed: PROBING_ABORT_MAE")
+                    return
+            
+            # Rule 2: +0.2R reached fast → Validation passed (log only, continue normal mgmt)
+            time_to_02r = self._current_trade_tags.get('time_to_02r_sec', -1)
+            if time_to_02r > 0 and time_to_02r < 90 and not self._current_trade_tags.get('probing_validated', False):
+                self._current_trade_tags['probing_validated'] = True
+                self._current_trade_tags['probing_validated_at'] = market_time.isoformat()
+                logger.info(f"🟢 PROBING VALIDATED: +0.2R in {time_to_02r:.0f}s - edge confirmed")
+            
+            # =====================================================================
+            # 📊 PROBE_MAX OBSERVABILITY (Jan 26, 2026)
+            # Track sequence: +0.2R reached → then MAE > 0.5R
+            # 
+            # This tells us:
+            # - If edge is CLEAN MOMENTUM (rare to see MAE > 0.5R after +0.2R)
+            # - Or HIGH NOISE MEAN-REVERT (common to see retrace after +0.2R)
+            # =====================================================================
+            probing_level = self._current_trade_tags.get('range_size_mult', 0.25)
+            is_probe_max = probing_level >= 0.65
+            was_validated = self._current_trade_tags.get('probing_validated', False)
+            
+            if is_probe_max and was_validated and mae_r > 0.5:
+                # Track this event (validated + then deep MAE)
+                if not self._current_trade_tags.get('probe_max_sequence_logged', False):
+                    self._current_trade_tags['probe_max_sequence_logged'] = True
+                    self._current_trade_tags['probe_max_validated_then_mae'] = True
+                    self._current_trade_tags['probe_max_mae_after_validation'] = mae_r
+                    logger.info(
+                        f"📊 PROBE_MAX SEQUENCE: Validated (+0.2R) → then MAE={mae_r:.2f}R | "
+                        f"This suggests HIGH NOISE / MEAN-REVERT behavior"
+                    )
+            
+            # Also track if PROBE_MAX reached +0.2R without deep MAE
+            if is_probe_max and was_validated and not self._current_trade_tags.get('probe_max_clean_momentum_logged', False):
+                if mae_r < 0.3:  # Clean move, minimal retrace
+                    self._current_trade_tags['probe_max_clean_momentum_logged'] = True
+                    self._current_trade_tags['probe_max_clean_momentum'] = True
+                    logger.debug(f"📊 PROBE_MAX CLEAN: Validated (+0.2R) with MAE={mae_r:.2f}R (clean momentum)")
+            
+            # Rule 3: No +0.2R after 5 minutes → Abort (no edge shown)
+            # Increased from 3min to 5min after backtest analysis
+            if time_in_trade_sec > 300 and mfe_r_probe < 0.2:
+                logger.warning(f"🔴 PROBING TIMEOUT: {time_in_trade_sec:.0f}s without +0.2R (MFE={mfe_r_probe:.2f}R)")
+                
+                self.reconciler.notify_exit_started("PROBING_TIMEOUT")
+                
+                close_size = position.size
+                try:
+                    exchange_pos = await self.execution.get_position(self.symbol)
+                    if exchange_pos:
+                        close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                except Exception as e:
+                    logger.debug(f"Could not get exchange position for PROBING_TIMEOUT: {e}")
+                
+                if close_size >= KRAKEN_BTC_MIN_SIZE:
+                    await self.execution.close_position_market(
+                        symbol=self.symbol,
+                        side='sell' if position.direction == 'LONG' else 'buy',
+                        amount=close_size,
+                        reason="PROBING_TIMEOUT"
+                    )
+                    
+                    pnl = position.unrealized_pnl
+                    self.state_machine.record_trade_close(pnl, pnl > 0, exit_reason='PROBING_TIMEOUT')
+                    self.state_machine.update_daily_pnl(pnl)
+                    
+                    self._record_trade_result('PROBING_TIMEOUT', pnl, market_time)
+                    
+                    logger.info(f"✅ PROBING TIMEOUT EXIT: PnL={pnl:.2f}")
+                    
+                    await self.risk_engine.clear_position("PROBING_TIMEOUT")
+                    self._reset_trade_state("Trade closed: PROBING_TIMEOUT")
+                    self.state_machine.start_cooldown(3)  # Longer cooldown - edge not shown
+                    self.state_machine.transition_to(BotState.IDLE, "Trade closed: PROBING_TIMEOUT")
+                    return
+
+        # ==================================================================
+        # 🔥 ANTICIPATION TRADE TIMEOUT CHECK (Jan 22, 2026)
+        # If this is an anticipation trade and hasn't shown MFE > 0.3R within 10min,
+        # close it to free capital for better setups
+        # ==================================================================
+        anticipation_valid_until = self._current_trade_tags.get('anticipation_valid_until', None)
+        is_anticipation_trade = self._current_trade_tags.get('anticipation_entry', False)
+        
+        if is_anticipation_trade and anticipation_valid_until:
+            current_ts = market_time.timestamp()
+            mfe_r = position.calculate_mfe_r() if position else 0
+            
+            # Check timeout: if past valid_until AND MFE < 0.3R → exit
+            if current_ts > anticipation_valid_until and mfe_r < 0.3:
+                logger.warning(f"⏰ ANTICIPATION TIMEOUT: Trade expired without expansion (MFE={mfe_r:.2f}R < 0.3R)")
+                
+                # Close position - anticipation thesis failed
+                self.reconciler.notify_exit_started("ANTICIPATION_TIMEOUT")
+                
+                close_size = position.size
+                try:
+                    exchange_pos = await self.execution.get_position(self.symbol)
+                    if exchange_pos:
+                        close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                except Exception as e:
+                    logger.debug(f"Could not get exchange position for ANTICIPATION_TIMEOUT: {e}")
+                
+                if close_size >= KRAKEN_BTC_MIN_SIZE:
+                    await self.execution.close_position_market(
+                        symbol=self.symbol,
+                        side='sell' if position.direction == 'LONG' else 'buy',
+                        amount=close_size,
+                        reason="ANTICIPATION_TIMEOUT"
+                    )
+                    
+                    pnl = position.unrealized_pnl
+                    self.state_machine.record_trade_close(pnl, pnl > 0, exit_reason='ANTICIPATION_TIMEOUT')
+                    self.state_machine.update_daily_pnl(pnl)
+                    
+                    # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                    self._record_trade_result('ANTICIPATION_TIMEOUT', pnl, market_time)
+                    
+                    logger.info(f"✅ ANTICIPATION TIMEOUT EXIT: PnL={pnl:.2f}")
+                    
+                    await self.risk_engine.clear_position("ANTICIPATION_TIMEOUT")
+                    self._reset_trade_state("Trade closed: ANTICIPATION_TIMEOUT")
+                    self.state_machine.start_cooldown(1)  # Short cooldown
+                    self.state_machine.transition_to(BotState.IDLE, "Trade closed: ANTICIPATION_TIMEOUT")
+                    return
+
+        # ==================================================================
+        # ⚡ MOMENTUM EXHAUSTION DETECTOR - Exit at the "summum" (Jan 22, 2026)
+        # Detects when momentum is dying BEFORE price reverses
+        # ==================================================================
+        mfe_r = position.calculate_mfe_r() if position else 0
+        
+        # Only run exhaustion check if profitable (MFE > 0.5R)
+        if mfe_r >= 0.5:
+            try:
+                candles_1m_exh = self.market_data.get_candles('1m')
+                candles_5m_exh = self.market_data.get_candles('5m')
+                exhaustion = None  # Initialize to avoid UnboundLocalError
+                
+                if candles_1m_exh and len(candles_1m_exh) >= 30 and candles_5m_exh and len(candles_5m_exh) >= 30:
+                    df_1m_exh = pd.DataFrame(candles_1m_exh)
+                    df_5m_exh = pd.DataFrame(candles_5m_exh)
+                    
+                    exhaustion = self.exhaustion_detector.evaluate(
+                        df_1m=df_1m_exh,
+                        df_5m=df_5m_exh,
+                        direction=position.direction,
+                        market_time=market_time,
+                        mfe_r=mfe_r
+                    )
+                    
+                    self._last_exhaustion_state = exhaustion
+                
+                if exhaustion and exhaustion.level == ExhaustionLevel.SEVERE:
+                    # SEVERE exhaustion (4+ signals) → Exit now
+                    logger.critical(f"⚡ EXHAUSTION EXIT: {exhaustion.signal_count} signals detected!")
+                    for sig in exhaustion.signals_detected[:3]:
+                        logger.info(f"   {sig}")
+                    
+                    # Market exit
+                    self.reconciler.notify_exit_started("EXHAUSTION_EXIT")
+                    
+                    close_size = position.size
+                    try:
+                        exchange_pos = await self.execution.get_position(self.symbol)
+                        if exchange_pos:
+                            close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                    except Exception as e:
+                        logger.debug(f"Could not get exchange position for EXHAUSTION_EXIT: {e}")
+                    
+                    if close_size >= KRAKEN_BTC_MIN_SIZE:
+                        await self.execution.close_position_market(
+                            symbol=self.symbol,
+                            side='sell' if position.direction == 'LONG' else 'buy',
+                            amount=close_size,
+                            reason="EXHAUSTION_EXIT"
+                        )
+                        
+                        pnl_exh = position.unrealized_pnl
+                        r_realized = position.calculate_r_realized(current_price)
+                        self.state_machine.record_trade_close(pnl_exh, pnl_exh > 0, exit_reason='EXHAUSTION_EXIT')
+                        self.state_machine.update_daily_pnl(pnl_exh)
+                        
+                        # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                        self._record_trade_result('EXHAUSTION_EXIT', pnl_exh, market_time)
+                        
+                        logger.info(f"✅ EXHAUSTION EXIT: PnL={pnl_exh:.2f} | R={r_realized:.2f}")
+                        
+                        await self.risk_engine.clear_position("EXHAUSTION_EXIT")
+                        self._reset_trade_state("Trade closed: EXHAUSTION_EXIT")
+                        self.state_machine.start_cooldown(2)  # Short cooldown - good exit
+                        self.state_machine.transition_to(BotState.IDLE, "Trade closed: EXHAUSTION_EXIT")
+                        return
+                
+                elif exhaustion and exhaustion.level == ExhaustionLevel.MODERATE:
+                    # MODERATE exhaustion (3 signals) → Tighten trailing stop 50%
+                    if not getattr(self, '_exhaustion_tightened', False):
+                        logger.warning(f"⚠️ EXHAUSTION WARNING: {exhaustion.signal_count} signals - tightening stop")
+                        
+                        # 🔥 FIX (Jan 22, 2026): Robust trailing stop tightening
+                        # Use ATR-based calculation instead of simple distance math
+                        current_stop = position.trailing_stop
+                        entry = position.entry_price
+                        
+                        # Get current ATR for smart tightening
+                        candles_5m_trail = self.market_data.get_candles('5m')
+                        trail_atr = None
+                        if candles_5m_trail and len(candles_5m_trail) >= 14:
+                            df_trail = pd.DataFrame(candles_5m_trail)
+                            trail_atr_vals = calculate_atr(
+                                df_trail['high'].to_numpy(), 
+                                df_trail['low'].to_numpy(), 
+                                df_trail['close'].to_numpy(), 14
+                            )
+                            trail_atr = trail_atr_vals[-1] if len(trail_atr_vals) > 0 else None
+                        
+                        if position.direction == 'LONG':
+                            if trail_atr and trail_atr > 0:
+                                # ATR-based: tighten to 0.6 * ATR from current price
+                                new_stop = max(current_stop, current_price - (trail_atr * 0.6))
+                            else:
+                                # Fallback: Move stop closer to current price by 50%
+                                new_stop = current_stop + (current_price - current_stop) * 0.5
+                            
+                            if new_stop > current_stop:
+                                position.trailing_stop = new_stop
+                                logger.info(f"🎯 Trailing tightened (LONG): {current_stop:.2f} → {new_stop:.2f} (ATR-based)")
+                                self._exhaustion_tightened = True
+                        else:
+                            if trail_atr and trail_atr > 0:
+                                # ATR-based: tighten to 0.6 * ATR from current price
+                                new_stop = min(current_stop, current_price + (trail_atr * 0.6))
+                            else:
+                                # Fallback: Move stop closer to current price by 50%
+                                new_stop = current_stop - (current_stop - current_price) * 0.5
+                            
+                            if new_stop < current_stop:
+                                position.trailing_stop = new_stop
+                                logger.info(f"🎯 Trailing tightened (SHORT): {current_stop:.2f} → {new_stop:.2f} (ATR-based)")
+                                self._exhaustion_tightened = True
+            except Exception as e:
+                logger.warning(f"⚠️ Exhaustion detector error (non-fatal): {e}")
+                # Continue without exhaustion check - position management continues
+        else:
+            # Reset exhaustion tightening flag when not profitable
+            self._exhaustion_tightened = False
+
+        # ==================================================================
+        # TIER 2 INTEGRATION (FIX #6): Funding-based forced exit
+        # TIER 2 INTEGRATION (FIX #13): Time-based forced exit
+        # ==================================================================
+
+        try:
+            # FIX #6: exit on extreme funding (LONG only)
+            # IMPROVED (Jan 12): Use REAL time until next funding settlement
+            time_to_funding_min = None
+            try:
+                if hasattr(self.external_data, 'funding'):
+                    time_to_funding_min = self.external_data.funding.get_time_to_next_funding_minutes()
+            except Exception as e:
+                logger.debug(f"Could not get time to funding: {e}")
+            
+            exit_funding, funding_exit_reason = await should_exit_on_funding(
+                self.external_data,
+                self.symbol,
+                position.direction,
+                unrealized_pnl=position.unrealized_pnl,
+                time_to_funding_min=time_to_funding_min
+            )
+            if exit_funding:
+                logger.critical(f"🚨 FORCED EXIT (Funding): {funding_exit_reason}")
+                # 🔐 FIX #2: Hard-lock during exit to prevent state corruption
+                self.reconciler.notify_exit_started("FUNDING_EXIT")
+                
+                # 🔒 FIX (Jan 14, 2026): Get real size from exchange
+                close_size = position.size
+                try:
+                    exchange_pos = await self.execution.get_position(self.symbol)
+                    if exchange_pos:
+                        close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                except Exception as e:
+                    logger.debug(f"Could not get exchange position for FUNDING_EXIT (using local size): {e}")
+                
+                if close_size < KRAKEN_BTC_MIN_SIZE:
+                    logger.warning(f"⚠️ FUNDING_EXIT skipped: size {close_size:.6f} < min")
+                    return
+                
+                await self.execution.close_position_market(
+                    symbol=self.symbol,
+                    side='sell' if position.direction == 'LONG' else 'buy',
+                    amount=close_size,
+                    reason="FUNDING_EXIT"
+                )
+                pnl_funding = position.unrealized_pnl
+                self.state_machine.record_trade_close(pnl_funding, pnl_funding > 0, exit_reason='FUNDING_EXIT')
+                # 🔥 DAILY DRAWDOWN: Track funding exit PnL
+                self.state_machine.update_daily_pnl(pnl_funding)
+                
+                # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                self._record_trade_result('FUNDING_EXIT', pnl_funding, market_time)
+                
+                await self.trade_logger.log_event('trade_closed', {
+                    'entry': position.entry_price,
+                    'exit': current_price,
+                    'size': position.size,
+                    'pnl': position.unrealized_pnl,
+                    'reason': 'FUNDING_EXIT',
+                    'r': position.calculate_r_realized(current_price),
+                    'mfe_r': position.calculate_mfe_r(),
+                    'mae_r': position.calculate_mae_r(),
+                    'direction': position.direction,
+                    'regime': position.regime
+                })
+                
+                if self.output_manager:
+                    # Get fresh capital for notification
+                    try:
+                        fresh_capital = await self.execution.get_available_capital()
+                        if fresh_capital > 0:
+                            self.risk_engine.capital = fresh_capital
+                    except Exception as e:
+                        logger.debug(f"Could not refresh capital for funding exit notification: {e}")
+                    
+                    _create_safe_task(self.output_manager.send_exit_notification({
+                        'symbol': self.symbol,
+                        'reason': 'FUNDING_EXIT',
+                        'pnl': position.unrealized_pnl,
+                        'r_realized': position.calculate_r_realized(current_price),
+                        'exit_price': current_price,
+                        'timestamp': market_time.isoformat(),
+                        'account_value': self.risk_engine.capital
+                    }), "funding_exit_notification")
+                
+                await self.risk_engine.clear_position("FUNDING_EXIT")
+                self._reset_trade_state(f"Trade closed: FUNDING_EXIT")
+                self.state_machine.start_cooldown()
+                self.state_machine.transition_to(BotState.IDLE, "Trade closed: FUNDING_EXIT")
+                return
+
+            # FIX #13: time-based exit (stagnation-based, not clock-based)
+            # REDESIGNED (Jan 4, 2026): Pass current ATR for stagnation check
+            current_atr = position.atr_1m  # Use stored ATR, can be updated
+            exit_time, time_exit_reason = position.should_force_exit_by_time(market_time, current_atr)
+            if exit_time:
+                logger.critical(f"🚨 FORCED EXIT (Time): {time_exit_reason}")
+                # 🔐 FIX #2: Hard-lock during exit to prevent state corruption
+                self.reconciler.notify_exit_started("TIME_EXIT")
+                
+                # 🔒 FIX (Jan 14, 2026): Get real size from exchange
+                close_size = position.size
+                try:
+                    exchange_pos = await self.execution.get_position(self.symbol)
+                    if exchange_pos:
+                        close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                except Exception as e:
+                    logger.debug(f"Could not get exchange position for TIME_EXIT (using local size): {e}")
+                
+                if close_size < KRAKEN_BTC_MIN_SIZE:
+                    logger.warning(f"⚠️ TIME_EXIT skipped: size {close_size:.6f} < min")
+                    return
+                
+                await self.execution.close_position_market(
+                    symbol=self.symbol,
+                    side='sell' if position.direction == 'LONG' else 'buy',
+                    amount=close_size,
+                    reason="TIME_EXIT"
+                )
+                pnl_time = position.unrealized_pnl
+                self.state_machine.record_trade_close(pnl_time, pnl_time > 0, exit_reason='TIME_EXIT')
+                # 🔥 DAILY DRAWDOWN: Track time exit PnL
+                self.state_machine.update_daily_pnl(pnl_time)
+                
+                # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                self._record_trade_result('TIME_EXIT', pnl_time, market_time)
+                
+                await self.trade_logger.log_event('trade_closed', {
+                    'entry': position.entry_price,
+                    'exit': current_price,
+                    'size': position.size,
+                    'pnl': position.unrealized_pnl,
+                    'reason': 'TIME_BASED_EXIT',
+                    'r': position.calculate_r_realized(current_price),
+                    'mfe_r': position.calculate_mfe_r(),
+                    'mae_r': position.calculate_mae_r(),
+                    'direction': position.direction,
+                    'regime': position.regime
+                })
+                
+                if self.output_manager:
+                    # Get fresh capital for notification
+                    try:
+                        fresh_capital = await self.execution.get_available_capital()
+                        if fresh_capital > 0:
+                            self.risk_engine.capital = fresh_capital
+                    except Exception as e:
+                        logger.debug(f"Could not refresh capital for time exit notification: {e}")
+                    
+                    _create_safe_task(self.output_manager.send_exit_notification({
+                        'symbol': self.symbol,
+                        'reason': f'TIME_EXIT ({time_exit_reason})',
+                        'pnl': position.unrealized_pnl,
+                        'r_realized': position.calculate_r_realized(current_price),
+                        'exit_price': current_price,
+                        'timestamp': market_time.isoformat(),
+                        'account_value': self.risk_engine.capital
+                    }), "time_exit_notification")
+                
+                await self.risk_engine.clear_position("TIME_BASED_EXIT")
+                self._reset_trade_state(f"Trade closed: TIME_BASED_EXIT")
+                self.state_machine.start_cooldown()
+                self.state_machine.transition_to(BotState.IDLE, "Trade closed: TIME_BASED_EXIT")
+                return
+
+        except Exception as e:
+            logger.error(f"Error during forced-exit checks: {e}")
+        
+        # =====================================================================
+        # OPTIMIZED (Jan 20, 2026): Use cached indicators system
+        # Only recalculate when new candle arrives, not every tick
+        # This dramatically reduces CPU usage in MANAGE state
+        # =====================================================================
+        candles_1m = self.market_data.get_candles('1m')
+        candles_5m = self.market_data.get_candles('5m')
+        candles_1h = self.market_data.get_candles('1h')
+        
+        # Get cached indicators (will recalculate only if candle changed)
+        cached = self._get_cached_indicators(candles_1m, candles_5m, candles_1h)
+        
+        # Extract cached values
+        current_adx = cached.get('adx_1h')
+        atr_ratio = cached.get('atr_ratio')
+        ema20_5m = cached.get('ema20_5m')
+        rsi_1m = cached.get('rsi_1m')
+        bb_width = cached.get('bb_width')
+        bb_avg = cached.get('bb_avg')
+        vpoc_price = cached.get('vpoc')
+        df_1m = cached.get('df_1m')
+        
+        # Get volume from cached DataFrame (fast - no new DataFrame creation)
+        if df_1m is not None and len(df_1m) > 0:
+            current_volume = df_1m['volume'].iloc[-1]
+            avg_volume = df_1m['volume'].mean()
+        else:
+            current_volume = 0
+            avg_volume = 0
+        
+        # =====================================================================
+        # PUNTO 11: MOMENTUM PERSISTENCE CHECK (Jan 22, 2026)
+        # After 5 minutes in trade, check if momentum is persisting
+        # If ADX drops significantly or RSI diverges, tighten stop
+        # =====================================================================
+        if position and hasattr(position, 'open_time') and current_adx is not None:
+            time_in_trade_min = (market_time - position.open_time).total_seconds() / 60 if position.open_time else 0
+            
+            # Only check after 5 minutes in trade
+            if time_in_trade_min >= 5:
+                # Store entry ADX if not yet stored
+                if not hasattr(position, '_entry_adx') or position._entry_adx is None:
+                    position._entry_adx = current_adx
+                
+                # Check ADX drop (momentum dying)
+                if position._entry_adx and position._entry_adx > 0:
+                    adx_drop = position._entry_adx - current_adx
+                    
+                    # If ADX dropped >5 points, momentum is dying - tighten stop
+                    if adx_drop >= 5:
+                        # Calculate current R
+                        initial_risk = abs(position.entry_price - position.initial_stop_loss)
+                        if initial_risk > 0 and position.direction == 'LONG':
+                            current_r = (current_price - position.entry_price) / initial_risk
+                        elif initial_risk > 0:  # SHORT
+                            current_r = (position.entry_price - current_price) / initial_risk
+                        else:
+                            current_r = 0
+                        
+                        # Only tighten if in profit and not already at BE
+                        if current_r > 0.3 and not position.be_moved:
+                            # Tighten to lock at least 0.15R
+                            lock_r = max(0.15, current_r * 0.5)  # Lock half of current profit
+                            
+                            if position.direction == 'LONG':
+                                new_stop = position.entry_price + (initial_risk * lock_r)
+                                if new_stop > position.trailing_stop:
+                                    logger.info(f"📉 MOMENTUM DECAY: ADX dropped {adx_drop:.1f}pts | Tightening SL to +{lock_r:.2f}R")
+                                    position.trailing_stop = new_stop
+                            else:  # SHORT
+                                new_stop = position.entry_price - (initial_risk * lock_r)
+                                if new_stop < position.trailing_stop:
+                                    logger.info(f"📉 MOMENTUM DECAY: ADX dropped {adx_drop:.1f}pts | Tightening SL to +{lock_r:.2f}R")
+                                    position.trailing_stop = new_stop
+        
+        # Find TP2 target
+        tp2_target = self._find_tp2_target()
+        
+        # Check for BOS against position
+        has_bos_against = self._check_bos_against_position(position.direction, candles_5m)
+        
+        # 🔥 FIX (Jan 23, 2026): Log if this is an orphan recovery BOS check
+        if getattr(self, '_force_bos_check_on_orphan', False):
+            logger.info(f"📊 ORPHAN BOS CHECK: {position.direction} | has_bos_against={has_bos_against}")
+            self._force_bos_check_on_orphan = False  # Reset flag
+        
+        # =====================================================================
+        # 🔥 FIX (Jan 27, 2026): BOS GRACE PERIOD - Don't check BOS in first 5 minutes
+        # The trade needs time to develop. Immediate BOS checks cause churning.
+        # =====================================================================
+        if has_bos_against and position:
+            trade_age_minutes = (market_time - position.entry_time).total_seconds() / 60.0 if position.entry_time else 999
+            BOS_GRACE_PERIOD_MINUTES = 5.0
+            
+            if trade_age_minutes < BOS_GRACE_PERIOD_MINUTES:
+                logger.info(f"🛡️ BOS GRACE PERIOD: Trade age {trade_age_minutes:.1f}m < {BOS_GRACE_PERIOD_MINUTES}m → IGNORING BOS")
+                has_bos_against = False  # Ignore BOS during grace period
+        
+        # =====================================================================
+        # 🔥 FIX (Jan 22, 2026): BOS INVALIDATION - Structure broke against us
+        # If SHORT and price makes Higher High, or LONG and price makes Lower Low,
+        # the structural thesis is invalidated. Actions:
+        # - Close if near BE or small loss
+        # - Tighten stop by 50% if in profit
+        # =====================================================================
+        if has_bos_against and position:
+            # Calculate current R
+            initial_risk = abs(position.entry_price - position.initial_stop_loss)
+            if initial_risk > 0:
+                if position.direction == 'LONG':
+                    current_r = (current_price - position.entry_price) / initial_risk
+                else:  # SHORT
+                    current_r = (position.entry_price - current_price) / initial_risk
+            else:
+                current_r = 0
+            
+            # Get the BOS level for logging
+            df_5m = pd.DataFrame(candles_5m) if candles_5m else None
+            bos_level = 0
+            if df_5m is not None and len(df_5m) > 0:
+                if position.direction == 'SHORT':
+                    bos_level = df_5m['high'].iloc[-1]  # HH against short
+                else:
+                    bos_level = df_5m['low'].iloc[-1]   # LL against long
+            
+            # Determine action based on current profit
+            if current_r < 0.3 and current_r > -0.3:
+                # Near breakeven or small loss - close immediately
+                logger.warning(
+                    f"⛔ BOS INVALIDATION: {position.direction} thesis broken "
+                    f"(BOS @ {bos_level:.2f}) | Current R: {current_r:.2f} → CLOSE"
+                )
+                # Mark for close
+                self._current_trade_tags['bos_invalidation_close'] = True
+                self._current_trade_tags['bos_invalidation_r'] = current_r
+                
+                # Execute close
+                try:
+                    self.reconciler.notify_exit_started("BOS_INVALIDATION")
+                    
+                    # 🔥 FIX (Jan 27, 2026): ALWAYS get size from exchange to avoid orphans
+                    close_size = 0.0
+                    try:
+                        exchange_pos = await self.execution.get_position(self.symbol)
+                        if exchange_pos:
+                            close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                            logger.info(f"📊 BOS CLOSE: Using exchange size {close_size}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not get exchange position: {e} - using local size")
+                        close_size = position.size
+                    
+                    if close_size >= KRAKEN_BTC_MIN_SIZE:
+                        await self.execution.close_position_market(
+                            symbol=self.symbol,
+                            side='sell' if position.direction == 'LONG' else 'buy',
+                            amount=close_size,
+                            reason="BOS_INVALIDATION"
+                        )
+                        
+                        pnl = position.unrealized_pnl
+                        self.state_machine.record_trade_close(pnl, pnl > 0, exit_reason='BOS_INVALIDATION')
+                        self.state_machine.update_daily_pnl(pnl)
+                        
+                        # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                        self._record_trade_result('BOS_INVALIDATION', pnl, market_time)
+                        
+                        logger.info(f"✅ BOS INVALIDATION EXIT: PnL={pnl:.2f}")
+                        
+                        await self.risk_engine.clear_position("BOS_INVALIDATION")
+                        self._reset_trade_state("Trade closed: BOS_INVALIDATION")
+                        # 🔥 FIX (Jan 27, 2026): Longer cooldown after BOS to avoid churning
+                        self.state_machine.start_cooldown(5)  # 5 min cooldown (was 3)
+                        self.state_machine.transition_to(BotState.IDLE, "Trade closed: BOS_INVALIDATION")
+                        return
+                except Exception as e:
+                    logger.error(f"BOS invalidation close failed: {e}")
+                    
+            elif current_r >= 0.3:
+                # In profit - tighten stop by 50%
+                current_trailing_distance = abs(current_price - position.trailing_stop)
+                new_trailing_distance = current_trailing_distance * 0.5
+                
+                if position.direction == 'LONG':
+                    new_stop = current_price - new_trailing_distance
+                    if new_stop > position.trailing_stop:
+                        logger.warning(
+                            f"⚠️ BOS INVALIDATION: {position.direction} thesis breaking "
+                            f"(BOS @ {bos_level:.2f}) | R: {current_r:.2f} → Tightening SL 50%"
+                        )
+                        position.trailing_stop = new_stop
+                        self._current_trade_tags['bos_invalidation_tighten'] = True
+                else:  # SHORT
+                    new_stop = current_price + new_trailing_distance
+                    if new_stop < position.trailing_stop:
+                        logger.warning(
+                            f"⚠️ BOS INVALIDATION: {position.direction} thesis breaking "
+                            f"(BOS @ {bos_level:.2f}) | R: {current_r:.2f} → Tightening SL 50%"
+                        )
+                        position.trailing_stop = new_stop
+                        self._current_trade_tags['bos_invalidation_tighten'] = True
+        
+        # 🔥 FIX #3: Block logical exits when exchange is unavailable
+        # Only emergency close with confirmed position is allowed
+        if not self.reconciler.is_exchange_available():
+            if self.reconciler.is_degraded:
+                logger.warning("⚠️ DEGRADED MODE: Skipping logical exit checks - exchange unavailable")
+            return  # Don't make any decisions based on stale data
+        
+        # =====================================================================
+        # 🔥 ANOMALY DETECTION DATA (Jan 24, 2026)
+        # Calculate anomaly indicators for EMERGENCY system
+        # 🔧 FIX (Jan 25, 2026): Use real feed staleness from market_data
+        # =====================================================================
+        price_gap_pct = None
+        
+        # 🔧 FIX (Jan 25, 2026): Use REAL feed staleness from market_data
+        # Previous implementation calculated time between tick processing (buggy)
+        last_tick_age_sec = self.market_data.get_feed_age_sec()
+        
+        # Calculate price gap from previous tick (this one works correctly)
+        if self._prev_tick_price > 0 and current_price > 0:
+            price_gap_pct = ((current_price - self._prev_tick_price) / self._prev_tick_price) * 100
+        
+        # Update tracking for next tick (price gap calculation still needs prev price)
+        self._prev_tick_price = current_price
+        self._prev_tick_time = market_time
+        
+        # =====================================================================
+        # �🔒 FIX (Jan 13, 2026): SYNC SIZE FROM RECONCILER SNAPSHOT
+        # OPTIMIZED (Jan 20, 2026): Use cached snapshot instead of API call
+        # The reconciler already polls exchange every 5 seconds
+        # =====================================================================
+        if not self._is_backtest:
+            try:
+                snapshot = self.reconciler.get_snapshot()
+                if snapshot and snapshot.has_position:
+                    exchange_size = snapshot.position_size
+                    if exchange_size > 0 and abs(exchange_size - position.size) > 0.00001:
+                        logger.info(f"🔄 Pre-manage size sync: local={position.size:.6f} → snapshot={exchange_size:.6f}")
+                        # 🔒 FIX: Use thread-safe sync method
+                        await self.risk_engine.sync_position_size(exchange_size, "pre-manage")
+            except Exception as e:
+                logger.warning(f"Could not sync size before manage: {e}")
+        
+        # Manage position (con datos de estructura para SMART BE + TIME_INVALIDATION híbrido)
+        exit_action = await self.risk_engine.manage_position(
+            current_price,
+            atr_1m,
+            current_volume,
+            avg_volume,
+            tp2_target=tp2_target,
+            ema20_5m=ema20_5m,
+            has_bos_against=has_bos_against,
+            market_time=market_time,
+            adx=current_adx,           # For hybrid TIME_INVALIDATION
+            atr_ratio=atr_ratio,       # For volatility check (also anomaly detection)
+            rsi_1m=rsi_1m,             # For momentum exit
+            vpoc=vpoc_price,           # For VPOC resistance exit
+            bb_width=bb_width,         # For volatility squeeze
+            bb_avg=bb_avg,             # For volatility squeeze comparison
+            # 🔥 ANOMALY DETECTION PARAMS (Jan 24, 2026)
+            spread_bps=None,           # TODO: Get from order book when available
+            spread_normal_bps=3.0,     # BTC/USD typical spread
+            last_tick_age_sec=last_tick_age_sec,  # Feed staleness
+            price_gap_pct=price_gap_pct  # Price gap anomaly
+        )
+        
+        if exit_action:
+            action = exit_action.get('action')
+
+            # Execute exchange action to match local risk engine decisions
+            try:
+                if action == 'PARTIAL_CLOSE':
+                    close_size = float(exit_action.get('size', 0) or 0)
+                    
+                    # 🔒 FIX (Jan 14, 2026): Validate minimum order size before executing
+                    if close_size < KRAKEN_BTC_MIN_SIZE:
+                        logger.warning(f"⚠️ PARTIAL_CLOSE blocked: size {close_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}")
+                        return
+                    
+                    if close_size > 0:
+                        # =====================================================================
+                        # 🔒 CRITICAL FIX (Jan 21, 2026): VERIFY POSITION EXISTS BEFORE PARTIAL
+                        # Race condition: reconciler may detect position closed AFTER we decided
+                        # to do partial close. Executing partial on closed position = NEW POSITION!
+                        # =====================================================================
+                        
+                        # 🔐 ACQUIRE HARD_LOCK FIRST to prevent reconciler interference
+                        self.reconciler.notify_partial_close("SMART_PARTIAL_CLOSE_VERIFY")
+                        
+                        exchange_pos = await self.execution.get_position(self.symbol)
+                        if not exchange_pos:
+                            logger.warning("⚠️ PARTIAL_CLOSE ABORTED: No position on exchange (was closed externally)")
+                            self.reconciler.notify_exit_completed()  # Release lock
+                            # Clean up our state since position is gone
+                            self._reset_trade_state("Position closed externally before partial")
+                            self.state_machine.to_idle("Position closed externally")
+                            return
+                        
+                        exchange_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                        if exchange_size < KRAKEN_BTC_MIN_SIZE:
+                            logger.warning(f"⚠️ PARTIAL_CLOSE ABORTED: Exchange position too small ({exchange_size:.6f})")
+                            self.reconciler.notify_exit_completed()  # Release lock
+                            self._reset_trade_state("Position closed externally before partial")
+                            self.state_machine.to_idle("Position closed externally")
+                            return
+                        
+                        # Verify we're closing the RIGHT direction
+                        exchange_side = exchange_pos.get('side', '').lower()
+                        expected_side = position.direction.lower()
+                        if exchange_side and exchange_side != expected_side:
+                            logger.critical(f"⚠️ PARTIAL_CLOSE ABORTED: Direction mismatch! Exchange={exchange_side}, Expected={expected_side}")
+                            self.reconciler.notify_exit_completed()  # Release lock
+                            self._reset_trade_state("Direction mismatch detected")
+                            self.state_machine.to_idle("Direction mismatch")
+                            return
+                        
+                        # Lock already acquired, execute the close
+                        await self.execution.close_position_market(
+                            symbol=self.symbol,
+                            side='sell' if position.direction == 'LONG' else 'buy',
+                            amount=close_size,
+                            reason="PARTIAL"
+                        )
+                        
+                        # 🔥 CRITICAL: Sync local size with exchange after partial close
+                        await asyncio.sleep(0.5)  # Wait for exchange to update
+                        try:
+                            exchange_pos = await self.execution.get_position(self.symbol)
+                            if exchange_pos:
+                                exchange_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                                if exchange_size > 0 and abs(exchange_size - position.size) > 0.00001:
+                                    logger.warning(f"🔄 Size sync after TP1: local={position.size:.6f} → exchange={exchange_size:.6f}")
+                                    position.size = exchange_size
+                                    
+                                    # =========================================================================
+                                    # 🔥 FIX (Jan 27, 2026): UPDATE SL ORDER AFTER PARTIAL CLOSE
+                                    # The SL order on exchange is for the original position size.
+                                    # After partial close, we need to update SL to match new position size.
+                                    # =========================================================================
+                                    try:
+                                        current_sl = self.risk_engine.get_current_stop_loss()
+                                        if current_sl and exchange_size > 0:
+                                            logger.info(f"🔄 Updating SL order after partial: size={exchange_size:.6f}, SL={current_sl:.2f}")
+                                            await self.execution.update_stop_loss_on_exchange(
+                                                symbol=self.symbol,
+                                                new_sl_price=current_sl,
+                                                last_sent_sl=current_sl - 1,  # Force update by making it different
+                                                atr=self._last_momentum_atr or 100,
+                                                spread=self._last_spread_bps or 1,
+                                                initial_risk=abs(position.entry_price - current_sl),
+                                                direction=position.direction
+                                            )
+                                            logger.info(f"✅ SL order updated for new position size")
+                                    except Exception as sl_update_e:
+                                        logger.error(f"Error updating SL after partial: {sl_update_e}")
+                            else:
+                                # No position on exchange - full close happened
+                                logger.critical("⚠️ No position on exchange after partial close - was fully closed")
+                                position.size = 0
+                        except Exception as sync_e:
+                            logger.error(f"Error syncing size after partial: {sync_e}")
+
+                    # Mark TP1 reached for edge enforcement
+                    self._reached_tp1 = True
+                    
+                    await self.trade_logger.log_event('tp1_hit', {
+                        'entry': position.entry_price,
+                        'price': current_price,
+                        'size_closed': close_size,
+                        'pnl_realized': exit_action.get('pnl', 0),
+                        'reason': exit_action.get('reason', 'TP1')
+                    })
+                    # Stay in MANAGE with reduced local size
+                    return
+
+                if action == 'ADD_POSITION':
+                    # SCALE INTO WINNER: Trade has proven itself (MFE >= 0.6R)
+                    add_size = float(exit_action.get('add_size', 0))
+                    if add_size > 0:
+                        # =====================================================================
+                        # 🔒 FIX (Jan 13, 2026): VERIFY POSITION BEFORE SCALE-IN
+                        # Ensure we have a confirmed position with correct size before adding
+                        # =====================================================================
+                        
+                        # Verify position exists on exchange and get actual size
+                        exchange_pos = await self.execution.get_position(self.symbol)
+                        if not exchange_pos:
+                            logger.warning("⚠️ ADD_POSITION blocked: No position confirmed on exchange")
+                            return
+                        
+                        exchange_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                        if exchange_size < 0.00001:
+                            logger.warning("⚠️ ADD_POSITION blocked: Exchange position size is zero")
+                            return
+                        
+                        # 🔒 CRITICAL FIX (Jan 21, 2026): Verify direction matches
+                        exchange_side = exchange_pos.get('side', '').lower()
+                        expected_side = position.direction.lower()
+                        if exchange_side and exchange_side != expected_side:
+                            logger.critical(f"⚠️ ADD_POSITION ABORTED: Direction mismatch! Exchange={exchange_side}, Expected={expected_side}")
+                            self._reset_trade_state("Direction mismatch detected in ADD_POSITION")
+                            self.state_machine.to_idle("Direction mismatch")
+                            return
+                        
+                        # Sync local size if different
+                        if abs(exchange_size - position.size) > 0.00001:
+                            logger.warning(f"🔄 Size sync before ADD: local={position.size:.6f} → exchange={exchange_size:.6f}")
+                            position.size = exchange_size
+                        
+                        # Round add_size to exchange precision
+                        add_size = round_size_to_exchange(add_size)
+                        if add_size <= 0:
+                            logger.warning("⚠️ ADD_POSITION blocked: add_size rounds to zero")
+                            return
+                        
+                        # Place additional order at market
+                        side = 'buy' if position.direction == 'LONG' else 'sell'
+                        logger.info(f"💪 ADDING TO WINNER: {add_size:.6f} {side}")
+                        try:
+                            add_order = await self.execution.place_market_order(
+                                symbol=self.symbol,
+                                side=side,
+                                amount=add_size
+                            )
+                            if add_order:
+                                # Wait for fill confirmation and get actual filled size
+                                await asyncio.sleep(0.5)  # Brief wait for exchange to update
+                                
+                                # Re-fetch position to get actual new size
+                                new_exchange_pos = await self.execution.get_position(self.symbol)
+                                if new_exchange_pos:
+                                    new_exchange_size = abs(float(new_exchange_pos.get('contracts', 0) or 0))
+                                    actual_add = new_exchange_size - exchange_size
+                                    
+                                    if actual_add > 0:
+                                        # =========================================================================
+                                        # 🔥 FIX (Jan 27, 2026): UPDATE AVERAGE ENTRY PRICE AFTER ADD TO WINNER
+                                        # Without this, PnL is calculated on original entry, not weighted average
+                                        # =========================================================================
+                                        old_entry = position.entry_price
+                                        old_size = exchange_size
+                                        new_entry_price = (old_entry * old_size + current_price * actual_add) / (old_size + actual_add)
+                                        
+                                        logger.info(
+                                            f"📊 ENTRY PRICE UPDATE: old={old_entry:.2f} × {old_size:.6f} + "
+                                            f"new={current_price:.2f} × {actual_add:.6f} = avg={new_entry_price:.2f}"
+                                        )
+                                        
+                                        position.entry_price = new_entry_price
+                                        position.size = new_exchange_size
+                                        
+                                        # =========================================================================
+                                        # 🔥 FIX (Jan 27, 2026): CANCEL & REPLACE SL/TP ORDERS WITH NEW SIZE
+                                        # Without this, SL only protects original size, not the added position
+                                        # The old SL was for 0.0016 BTC, but now we have 0.0024 BTC.
+                                        # We must: 1) Cancel existing SL/TP, 2) Place new ones with full size
+                                        # =========================================================================
+                                        try:
+                                            current_sl = self.risk_engine.get_current_stop_loss()
+                                            # Get TP from last entry data if available
+                                            current_tp = getattr(self, '_last_entry_data', {}).get('take_profit') if hasattr(self, '_last_entry_data') else None
+                                            
+                                            if current_sl:
+                                                # Step 1: Cancel all existing SL/TP orders
+                                                logger.info(f"🔄 ADD TO WINNER: Cancelling old SL/TP to update size...")
+                                                cancelled = await self.execution.cancel_all_orders(self.symbol)
+                                                logger.info(f"✅ Cancelled {cancelled} orders")
+                                                
+                                                # Brief pause for exchange to process cancellations
+                                                await asyncio.sleep(0.3)
+                                                
+                                                # Step 2: Recalculate SL/TP based on new average entry
+                                                # SL stays at same PRICE (not R), TP adjusted for new entry
+                                                # Actually, let's keep same absolute SL price (protective)
+                                                # But recalculate based on new entry for proper R calculation
+                                                if position.direction == 'SHORT':
+                                                    # For SHORT: SL above entry
+                                                    if current_tp is None:
+                                                        # Calculate TP at 2R from new entry
+                                                        risk_distance = current_sl - new_entry_price  # Positive
+                                                        current_tp = new_entry_price - (risk_distance * 2.0)
+                                                else:
+                                                    # For LONG: SL below entry
+                                                    if current_tp is None:
+                                                        risk_distance = new_entry_price - current_sl
+                                                        current_tp = new_entry_price + (risk_distance * 2.0)
+                                                
+                                                # Step 3: Place new SL/TP with updated size
+                                                stops_placed = await self.execution.set_position_stops(
+                                                    symbol=self.symbol,
+                                                    stop_loss=current_sl,
+                                                    take_profit=current_tp
+                                                )
+                                                
+                                                if stops_placed:
+                                                    logger.info(f"✅ SL/TP REPLACED for ADD TO WINNER: SL={current_sl:.2f}, TP={current_tp:.2f}, Size={new_exchange_size:.6f}")
+                                                    if self.risk_engine.position:
+                                                        self.risk_engine.position.mark_exchange_sl_active()
+                                                else:
+                                                    logger.critical(f"❌ FAILED TO REPLACE SL/TP AFTER ADD - POSITION AT RISK!")
+                                                    if self.risk_engine.position:
+                                                        self.risk_engine.position.mark_exchange_sl_inactive("Failed to replace after ADD")
+                                        except Exception as sl_error:
+                                            logger.error(f"⚠️ Failed to update SL after ADD: {sl_error}")
+                                        
+                                        logger.info(f"✅ Position scaled: added {actual_add:.6f}, new size = {position.size:.6f}")
+                                    else:
+                                        logger.warning(f"⚠️ Scale-in order may not have filled: expected +{add_size:.6f}, got +{actual_add:.6f}")
+                                        position.size = new_exchange_size  # Use exchange truth anyway
+                                else:
+                                    # Fallback: assume fill succeeded
+                                    position.size = exchange_size + add_size
+                                    logger.warning(f"⚠️ Could not verify scale-in - assuming filled: {position.size:.6f}")
+                                
+                                await self.trade_logger.log_event('add_to_winner', {
+                                    'entry': position.entry_price,  # Now the updated average entry
+                                    'price': current_price,
+                                    'add_size': add_size,
+                                    'new_total_size': position.size,
+                                    'reason': exit_action.get('reason', 'ADD_POSITION')
+                                })
+                        except Exception as e:
+                            logger.error(f"Failed to add to winner: {e}")
+                    # Stay in MANAGE
+                    return
+
+                if action == 'FULL_CLOSE':
+                    # � FIX #2: Hard-lock during exit to prevent state corruption
+                    exit_reason = exit_action.get('reason', 'FULL_CLOSE')
+                    self.reconciler.notify_exit_started(exit_reason)
+                    
+                    # 🔥 CRITICAL: Get REAL size from exchange before closing
+                    try:
+                        exchange_pos = await self.execution.get_position(self.symbol)
+                        if exchange_pos:
+                            exchange_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                            if exchange_size > 0:
+                                # 🔒 CRITICAL FIX (Jan 21, 2026): Verify direction matches
+                                exchange_side = exchange_pos.get('side', '').lower()
+                                expected_side = position.direction.lower()
+                                if exchange_side and exchange_side != expected_side:
+                                    logger.critical(f"⚠️ FULL_CLOSE ABORTED: Direction mismatch! Exchange={exchange_side}, Expected={expected_side}")
+                                    self.reconciler.notify_exit_completed()
+                                    self._reset_trade_state("Direction mismatch detected in FULL_CLOSE")
+                                    self.state_machine.to_idle("Direction mismatch")
+                                    return
+                                
+                                # Use exchange size, not local size
+                                if abs(exchange_size - position.size) > 0.00001:
+                                    logger.warning(f"🔄 Size correction for FULL_CLOSE: local={position.size:.6f} → exchange={exchange_size:.6f}")
+                                close_size = exchange_size
+                            else:
+                                logger.warning("⚠️ No position on exchange for FULL_CLOSE - already closed externally")
+                                # Position was closed externally - clean up state
+                                self.reconciler.notify_exit_completed()
+                                self._reset_trade_state("Position closed externally during FULL_CLOSE")
+                                self.state_machine.to_idle("Position closed externally")
+                                return
+                        else:
+                            logger.warning("⚠️ Could not get exchange position - using local size")
+                            close_size = float(exit_action.get('size', 0) or position.size)
+                    except Exception as e:
+                        logger.error(f"Error getting exchange size: {e} - using local size")
+                        close_size = float(exit_action.get('size', 0) or position.size)
+                    
+                    if close_size > 0:
+                        # =========================================================================
+                        # 🔥 FIX (Jan 27, 2026): GET EXACT EXCHANGE SIZE BEFORE CLOSE
+                        # Prevents residual positions from partial fills or size mismatches
+                        # =========================================================================
+                        try:
+                            pre_close_pos = await self.execution.get_position(self.symbol)
+                            if pre_close_pos:
+                                exact_size = abs(float(pre_close_pos.get('contracts', 0) or 0))
+                                if exact_size > 0 and abs(exact_size - close_size) > 0.00001:
+                                    logger.info(f"🔄 Size adjustment before close: requested={close_size:.6f}, exchange={exact_size:.6f}")
+                                    close_size = exact_size
+                        except Exception as pre_e:
+                            logger.warning(f"Could not verify size before close: {pre_e}")
+                        
+                        await self.execution.close_position_market(
+                            symbol=self.symbol,
+                            side='sell' if position.direction == 'LONG' else 'buy',
+                            amount=close_size,
+                            reason="FULL_CLOSE"
+                        )
+                    
+                    # Check if TP2 was reached
+                    reason = exit_action.get('reason', '')
+                    if 'TP2' in reason or 'tp2' in reason:
+                        self._reached_tp2 = True
+                    if 'BE' in reason or 'breakeven' in reason.lower():
+                        self._is_be_stop = True
+                    
+                    # 🔥 CRITICAL: Verify position is actually closed after FULL_CLOSE
+                    await asyncio.sleep(0.5)
+                    try:
+                        still_has_position = await self.execution.has_open_position(self.symbol)
+                        if still_has_position:
+                            logger.critical("⚠️ FULL_CLOSE executed but position still exists! Emergency close...")
+                            # Force close remaining
+                            exchange_pos = await self.execution.get_position(self.symbol)
+                            if exchange_pos:
+                                remaining = abs(float(exchange_pos.get('contracts', 0) or 0))
+                                # 🔥 FIX #5: Check remaining > MIN_SIZE before emergency close
+                                # to prevent double close from creating reverse position
+                                min_size = 0.00001  # Minimum BTC size
+                                if remaining > min_size:
+                                    await self.execution.close_position_market(
+                                        symbol=self.symbol,
+                                        side='sell' if position.direction == 'LONG' else 'buy',
+                                        amount=remaining,
+                                        reason="RESIDUAL"
+                                    )
+                                    logger.info(f"✅ Emergency closed remaining {remaining:.6f}")
+                                else:
+                                    logger.info(f"✓ Remaining size {remaining:.8f} below minimum - position effectively closed")
+                    except Exception as verify_e:
+                        logger.error(f"Error verifying close: {verify_e}")
+                        
+            except Exception as e:
+                logger.error(f"Error executing exchange close for {action}: {e}")
+
+            # Record full-close only
+            pnl = exit_action.get('pnl', 0)
+            r_realized = position.calculate_r_realized(current_price) if position else 0
+            
+            # Refresh account value after trade
+            try:
+                fresh_capital = await self.execution.get_available_capital()
+                if fresh_capital > 0:
+                    self.risk_engine.capital = fresh_capital
+            except Exception as e:
+                logger.warning(f"Could not refresh capital for notification: {e}")
+            
+            if self.output_manager:
+                _create_safe_task(self.output_manager.send_exit_notification({
+                    'symbol': self.symbol,
+                    'reason': exit_action.get('reason', 'FULL_CLOSE'),
+                    'pnl': pnl,
+                    'r_realized': r_realized,
+                    'exit_price': current_price,
+                    'timestamp': market_time.isoformat(),
+                    'account_value': self.risk_engine.capital
+                }), "full_close_notification")
+            
+            is_win = pnl > 0
+            exit_reason = exit_action.get('reason', 'unknown')
+
+            self.state_machine.record_trade_close(pnl, is_win, exit_reason=exit_reason)
+            
+            # =========================================================================
+            # COMPLETE TRADE LOGGING (persist trade with exit data)
+            # =========================================================================
+            if self._current_trade_id and self.trade_logger:
+                mfe_r = position.calculate_mfe_r() if position else 0
+                mae_r = position.calculate_mae_r() if position else 0
+                
+                try:
+                    self.trade_logger.complete_trade(
+                        trade_id=self._current_trade_id,
+                        exit_price=current_price,
+                        exit_reason=exit_reason,
+                        pnl_usd=pnl,
+                        pnl_r=r_realized,
+                        mfe_r=mfe_r,
+                        mae_r=mae_r
+                    )
+                    logger.debug(f"📊 Trade {self._current_trade_id} logged: exit={exit_reason}, pnl=${pnl:.2f}")
+                    
+                    # 🔥 ML DRIFT MONITORING (Jan 24, 2026)
+                    # Record outcome for model performance tracking
+                    ml_prob = self._current_trade_tags.get('ml_win_prob', 0.5)
+                    if self._ml_inference and ml_prob != 0.5:  # Only if ML made prediction
+                        drift_result = self._ml_inference.record_outcome(
+                            trade_id=self._current_trade_id,
+                            ml_prob=ml_prob,
+                            actual_win=is_win
+                        )
+                        if drift_result.get('drift_detected'):
+                            logger.warning("⚠️ ML model degradation detected - consider retraining")
+                            
+                except Exception as log_err:
+                    logger.error(f"TradeLogger.complete_trade() failed: {log_err}")
+                self._current_trade_id = None  # Reset for next trade
+            
+            # =====================================================================
+            # PULLBACK SHORT TRACKING - Record result for limits/consecutive losses
+            # =====================================================================
+            if self._current_trade_type == TradeType.SHORT_PULLBACK:
+                self.pullback_short_engine.record_trade_result(pnl, is_win, market_time)
+                logger.info(f"[PULLBACK] Trade result recorded: {'WIN' if is_win else 'LOSS'} ${pnl:.2f}")
+                
+                # 📊 METRICS: Track pullback short exit
+                mfe_r = position.calculate_mfe_r()
+                mae_r = position.calculate_mae_r()
+                update_pullback_short_exit(self.symbol, pnl=pnl, is_win=is_win, mfe_r=mfe_r, mae_r=mae_r)
+                
+                # Update status metrics
+                stats = self.pullback_short_engine.get_daily_stats()
+                update_pullback_short_status(
+                    self.symbol,
+                    daily_count=stats.get('total_trades', 0),
+                    consecutive_losses=stats.get('consecutive_losses', 0),
+                    cumulative_pnl=stats.get('cumulative_pnl', 0.0)
+                )
+            
+            # 🔥 DAILY DRAWDOWN: Update after each trade close
+            if self.state_machine.update_daily_pnl(pnl):
+                # Daily halt triggered - close any remaining position and cancel orders
+                logger.critical("🛑 Daily drawdown limit reached - EMERGENCY CLOSE + trading halted for today")
+                await self._emergency_daily_halt_close()
+            
+            # DISCOVERY: Update score distribution metrics
+            if hasattr(self, '_entry_score') and self._entry_score > 0:
+                self._update_score_metrics(int(self._entry_score), pnl, is_win)
+            
+            # Record for loss cooldown tracking
+            self._record_trade_result(exit_reason, pnl, market_time)
+            
+            # Record for filter pipeline (overtrade filter zone tracking)
+            if hasattr(self, 'filter_pipeline') and self._current_trade_entry_time:
+                self.filter_pipeline.record_trade_result(
+                    entry_price=self._current_trade_entry_price or position.entry_price,
+                    exit_price=current_price,
+                    entry_time=self._current_trade_entry_time,
+                    exit_time=market_time,
+                    direction=position.direction if position else 'LONG',
+                    pnl=pnl
+                )
+            
+            # Record trade for edge enforcement degradation monitoring
+            if self._current_trade_entry_time:
+                self._record_trade_for_edge_enforcement(
+                    entry_price=self._current_trade_entry_price,
+                    exit_price=current_price,
+                    entry_time=self._current_trade_entry_time,
+                    exit_time=market_time,
+                    reached_tp1=self._reached_tp1,
+                    reached_tp2=self._reached_tp2,
+                    is_be_stop=self._is_be_stop
+                )
+
+            await self.trade_logger.log_event('trade_closed', {
+                'entry': exit_action.get('entry_price', position.entry_price),
+                'exit': current_price,
+                'size': exit_action.get('size', position.size),
+                'pnl': pnl,
+                'reason': exit_action.get('reason', 'unknown'),
+                'r': position.calculate_r_realized(current_price),
+                'mfe_r': position.calculate_mfe_r(),
+                'mae_r': position.calculate_mae_r(),
+                'direction': position.direction,
+                'regime': position.regime
+            })
+
+            self._reset_trade_state(f"Trade closed: {exit_action.get('reason')}")
+
+            # SMART COOLDOWN: Based on exit reason and loss size
+            pnl_r = position.calculate_r_realized(current_price) if position else 0
+            base_cooldown = OperatingMode.get_smart_cooldown(exit_reason, pnl_r)
+            
+            # Check if signal still aligned with HTF - reduce cooldown if so
+            final_cooldown = base_cooldown
+            try:
+                if self.current_bias and position:
+                    # If we exited and HTF bias still agrees with trade direction → reduce cooldown
+                    if self.current_bias == position.direction:
+                        final_cooldown = int(base_cooldown * OperatingMode.COOLDOWN_ALIGNED_REDUCTION)
+                        logger.info(f"📊 HTF still aligned ({self.current_bias}) - cooldown reduced: {base_cooldown}→{final_cooldown}min")
+            except Exception as e:
+                logger.warning(f"Could not check alignment for cooldown: {e}")
+            
+            logger.info(f"⏱️ Smart cooldown: {final_cooldown}min (reason={exit_reason}, pnl_r={pnl_r:.2f})")
+            self.state_machine.start_cooldown(final_cooldown)
+            self.state_machine.transition_to(BotState.IDLE, f"Trade closed: {exit_action.get('reason')}")
+    
+    # ===== HELPERS =====
+    
+    async def _open_position_from_order(self, fill_status: dict):
+        """Open position after order fill"""
+        try:
+            fill_price = fill_status.get('price', 0)
+            fill_size = fill_status.get('amount', 0)
+            
+            # Calculate stop loss and ATR
+            candles_1m = self.market_data.get_candles('1m')
+            if candles_1m and len(candles_1m) >= 14:
+                df_1m = pd.DataFrame(candles_1m)
+                highs = df_1m['high'].to_numpy()
+                lows = df_1m['low'].to_numpy()
+                closes = df_1m['close'].to_numpy()
+                atr_1m = calculate_atr(highs, lows, closes, 14)[-1]
+            else:
+                logger.warning("Not enough 1m data for ATR, using default")
+                atr_1m = fill_price * 0.01  # 1% as fallback
+            
+            # Find support/resistance
+            candles_5m = self.market_data.get_candles('5m')
+            df_5m = pd.DataFrame(candles_5m) if candles_5m else pd.DataFrame()
+            support_resistance = self._find_support_resistance(self.current_bias, df_5m)
+            
+            # Calculate ATR ratio for dynamic SL sizing
+            atr_ratio_for_sl = None
+            if len(df_5m) >= 14:
+                atr_values = calculate_atr(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
+                if len(atr_values) >= 10:
+                    current_atr = atr_values[-1]
+                    avg_atr = sum(atr_values[-10:]) / 10
+                    if avg_atr > 0:
+                        atr_ratio_for_sl = current_atr / avg_atr
+            
+            # Calculate stop loss
+            stop_loss = self.risk_engine.calculate_stop_loss(
+                fill_price,
+                self.current_bias,
+                support_resistance,
+                atr_1m,
+                atr_ratio=atr_ratio_for_sl
+            )
+            
+            # Open position in risk engine (use market_time for consistency)
+            market_time = self.market_data.get_market_time()
+            position = await self.risk_engine.open_position(
+                symbol=self.symbol,
+                direction=self.current_bias,
+                entry_price=fill_price,
+                stop_loss=stop_loss,
+                atr_1m=atr_1m,
+                hour=market_time.hour if market_time else 12,
+                minute=market_time.minute if market_time else 0
+            )
+            
+            if position:
+                # Log trade open
+                await self.trade_logger.log_event('trade_opened', {
+                    'symbol': self.symbol,
+                    'direction': self.current_bias,
+                    'entry': fill_price,
+                    'size': fill_size,
+                    'stop_loss': stop_loss
+                })
+                
+                # Initialize edge enforcement tracking
+                self._current_trade_entry_time = market_time
+                self._current_trade_entry_price = fill_price
+                self._current_trade_mfe = 0.0
+                self._current_trade_mae = 0.0
+                self._reached_tp1 = False
+                self._reached_tp2 = False
+                self._is_be_stop = False
+                
+                # Transition to MANAGE
+                self.state_machine.transition_to(BotState.MANAGE, "Position opened")
+                logger.debug(f"Position opened: {self.current_bias} {fill_size} @ {fill_price:.2f}")
+            else:
+                logger.error("Failed to open position in risk engine")
+                self.state_machine.transition_to(BotState.IDLE, "Failed to open position")
+                
+        except Exception as e:
+            logger.error(f"Error opening position from order: {e}", exc_info=True)
+            self.state_machine.transition_to(BotState.IDLE, "Error opening position")
+    
+    def _find_support_resistance(self, bias: str | None, df_5m: pd.DataFrame) -> float:
+        """Find technical support/resistance - delegates to indicator_helpers"""
+        return _find_sr_pure(bias or 'LONG', df_5m, lookback=10)
+    
+    # =========================================================================
+    # INDICATOR CACHE SYSTEM (Jan 20, 2026)
+    # Only recalculate indicators when new candle CLOSES (not just new candle starts)
+    # This dramatically reduces CPU usage during tick processing
+    # Key insight: Use candles[-2] (last CLOSED candle) as the cache key
+    # =========================================================================
+    def _get_cached_indicators(self, candles_1m: list, candles_5m: list, candles_1h: list) -> dict:
+        """
+        Get indicators with caching - only recalculate when candle CLOSES.
+        
+        Uses candles[-2] (last CLOSED candle) as the cache key, not candles[-1] (forming).
+        Returns dict with: adx_1h, atr_1m, atr_ratio, ema20_5m, rsi_1m, bb_width, bb_avg, vpoc
+        All values may be None if insufficient data.
+        """
+        cache = self._indicator_cache
+        needs_1m_update = False
+        needs_5m_update = False
+        needs_1h_update = False
+        
+        # Check if LAST CLOSED candle changed (candles[-2] is the last closed one)
+        # When a new candle closes, candles[-2] gets a new timestamp
+        if candles_1m and len(candles_1m) >= 2:
+            closed_ts_1m = candles_1m[-2].get('timestamp', 0)  # LAST CLOSED candle
+            if closed_ts_1m != cache['last_candle_ts_1m']:
+                cache['last_candle_ts_1m'] = closed_ts_1m
+                cache['df_1m'] = pd.DataFrame(candles_1m)
+                needs_1m_update = True
+        
+        if candles_5m and len(candles_5m) >= 2:
+            closed_ts_5m = candles_5m[-2].get('timestamp', 0)  # LAST CLOSED candle
+            if closed_ts_5m != cache['last_candle_ts_5m']:
+                cache['last_candle_ts_5m'] = closed_ts_5m
+                cache['df_5m'] = pd.DataFrame(candles_5m)
+                needs_5m_update = True
+        
+        if candles_1h and len(candles_1h) >= 2:
+            closed_ts_1h = candles_1h[-2].get('timestamp', 0)  # LAST CLOSED candle
+            if closed_ts_1h != cache['last_candle_ts_1h']:
+                cache['last_candle_ts_1h'] = closed_ts_1h
+                cache['df_1h'] = pd.DataFrame(candles_1h)
+                needs_1h_update = True
+        
+        # Update 1h indicators (ADX) - only when new 1h candle CLOSES
+        if needs_1h_update and cache['df_1h'] is not None and len(cache['df_1h']) >= 20:
+            try:
+                df_1h = cache['df_1h']
+                adx_arr, _ = calculate_adx(df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy())
+                if len(adx_arr) > 0 and not np.isnan(adx_arr[-1]):
+                    cache['adx_1h'] = float(adx_arr[-1])
+            except Exception as e:
+                logger.debug(f"ADX 1h calculation failed: {e}")
+        
+        # Update 1m indicators (ATR, RSI, BB, VPOC) - only when new 1m candle
+        if needs_1m_update and cache['df_1m'] is not None:
+            df_1m = cache['df_1m']
+            
+            # ATR and ratio
+            if len(df_1m) >= 20:
+                try:
+                    atr_values = calculate_atr(df_1m['high'].to_numpy(), df_1m['low'].to_numpy(), df_1m['close'].to_numpy())
+                    if len(atr_values) >= 10:
+                        cache['atr_1m'] = float(atr_values[-1])
+                        avg_atr = float(np.mean(atr_values[-10:]))
+                        cache['atr_ratio'] = cache['atr_1m'] / avg_atr if avg_atr > 0 else 1.0
+                except Exception as e:
+                    logger.debug(f"ATR/ratio calculation failed: {e}")
+            
+            # RSI
+            if len(df_1m) >= 14:
+                try:
+                    closes = df_1m['close'].to_numpy()
+                    rsi_values = calculate_rsi(closes, 14)
+                    if len(rsi_values) > 0:
+                        cache['rsi_1m'] = float(rsi_values[-1])
+                except Exception as e:
+                    logger.debug(f"RSI calculation failed: {e}")
+            
+            # Bollinger Bands
+            if len(df_1m) >= 20:
+                try:
+                    closes = df_1m['close'].to_numpy()
+                    bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(closes, period=20, std_dev=2)
+                    if len(bb_upper) > 0 and len(bb_lower) > 0:
+                        cache['bb_width'] = float(bb_upper[-1] - bb_lower[-1])
+                        if len(bb_upper) >= 20:
+                            bb_widths = bb_upper[-20:] - bb_lower[-20:]
+                            cache['bb_avg'] = float(np.mean(bb_widths))
+                        else:
+                            cache['bb_avg'] = cache['bb_width']
+                except Exception as e:
+                    logger.debug(f"Bollinger Bands calculation failed: {e}")
+            
+            # VPOC - use cached df_1m (already a DataFrame)
+            if cache['df_1m'] is not None and len(cache['df_1m']) >= 50:
+                try:
+                    from src.domain.market.filters import calculate_vpoc
+                    cache['vpoc'] = calculate_vpoc(cache['df_1m'].tail(100) if len(cache['df_1m']) >= 100 else cache['df_1m'])
+                except Exception as e:
+                    logger.debug(f"VPOC calculation failed: {e}")
+                    cache['vpoc'] = None
+        
+        # Update 5m indicators (EMA20) - only when new 5m candle
+        if needs_5m_update and cache['df_5m'] is not None and len(cache['df_5m']) >= 20:
+            try:
+                df_5m = cache['df_5m']
+                closes_5m = df_5m['close'].to_numpy()
+                ema_20 = calculate_ema(closes_5m, 20)
+                if len(ema_20) > 0:
+                    cache['ema20_5m'] = float(ema_20[-1])
+            except Exception as e:
+                logger.debug(f"EMA20 5m calculation failed: {e}")
+        
+        return {
+            'adx_1h': cache.get('adx_1h'),
+            'atr_ratio': cache.get('atr_ratio'),
+            'ema20_5m': cache.get('ema20_5m'),
+            'rsi_1m': cache.get('rsi_1m'),
+            'bb_width': cache.get('bb_width'),
+            'bb_avg': cache.get('bb_avg'),
+            'vpoc': cache.get('vpoc'),
+            'df_1m': cache.get('df_1m'),
+            'df_5m': cache.get('df_5m'),
+            'df_1h': cache.get('df_1h'),
+        }
+
+    def _calculate_atr_5m(self, df_5m: pd.DataFrame) -> float:
+        """Calculate ATR from 5m timeframe - delegates to indicator_helpers"""
+        return _calc_atr_5m_pure(df_5m)
+    
+    def _calculate_atr_generic(self, df: pd.DataFrame, period: int = 14) -> float:
+        """Calculate ATR for any timeframe - delegates to indicator_helpers"""
+        return _calc_atr_generic_pure(df, period)
+    
+    async def _check_position_has_stops(self) -> bool:
+        """
+        🔒 FIX (Jan 17, 2026): Check if current position has SL/TP protection on exchange
+        
+        Returns True if at least SL exists, False otherwise.
+        Used by STATE OVERRIDE to detect orphan positions without protection.
+        """
+        if not self.execution:
+            return False
+        
+        try:
+            verification = await self.execution.verify_stops_on_exchange(self.symbol)
+            return verification.get('has_sl', False)
+        except Exception as e:
+            logger.error(f"Error checking stops: {e}")
+            return False  # Assume no protection on error (safer)
+    
+    def _check_atr_regime_allows_entry(self, df_5m: pd.DataFrame) -> tuple[bool, str]:
+        """ATR REGIME FILTER - delegates to filter_checks module"""
+        return _check_atr_regime_pure(df_5m)
+    
+    def _check_volatility_minimum(self, df_1m: pd.DataFrame) -> tuple[bool, str]:
+        """VOLATILITY MINIMUM FILTER - delegates to filter_checks module"""
+        return _check_vol_min_pure(df_1m)
+    
+    def _check_loss_cooldown(self, market_time: datetime) -> tuple[bool, str]:
+        """
+        LOSS STREAK COOLDOWN + AUTO KILL-SWITCH
+        
+        🔥 ENHANCED (Jan 25, 2026): Tiered pauses + full kill switch
+        - 3 losses → 15 min pause
+        - 4 losses → 60 min pause  
+        - 5 losses → 180 min pause
+        - 6 losses → KILL SWITCH (daily)
+        
+        Also tracks dead hours losses and blocks after 2+ losses in 4am-7am UTC.
+        
+        Returns: (can_enter, reason)
+        """
+        from src.config.trading_config import OperatingMode
+        
+        # Check KILL SWITCH first (highest priority)
+        if self._kill_switch_active:
+            return False, "🔴 KILL SWITCH ACTIVE: Daily loss limit reached - no trading until tomorrow"
+        
+        # Check dead hours block
+        if hasattr(self, '_dead_hours_blocked') and self._dead_hours_blocked:
+            current_hour = market_time.hour
+            dead_start, dead_end = getattr(OperatingMode, 'DEAD_HOURS_UTC', (4, 7))
+            if dead_start <= current_hour < dead_end:
+                return False, f"🌙 DEAD HOURS BLOCKED: {self._dead_hours_losses} losses in dead zone - waiting for next session"
+            else:
+                # Reset dead hours block when exiting dead hours
+                self._dead_hours_blocked = False
+                self._dead_hours_losses = 0
+                logger.info("✅ Exited dead hours zone, block lifted")
+        
+        # Check if we're still in timed cooldown
+        if self._cooldown_until is not None:
+            if market_time < self._cooldown_until:
+                remaining = (self._cooldown_until - market_time).total_seconds() / 60
+                
+                # SMART COOLDOWN RESET (Jan 15, 2026)
+                # Check if micro trend allows early exit (after minimum 5 min)
+                min_cooldown_passed = remaining < (self._pause_after_3 - 5)  # At least 5 min in cooldown
+                if min_cooldown_passed and self.micro_trend_filter:
+                    should_reset, reset_reason = self.micro_trend_filter.should_reset_cooldown(
+                        min_bullish_bars=3, min_strength=0.5
+                    )
+                    if should_reset:
+                        logger.info(f"🔄 SMART COOLDOWN RESET: {reset_reason}")
+                        logger.info(f"   Exiting cooldown early ({remaining:.0f} min remaining → 0)")
+                        self._cooldown_until = None
+                        self._consecutive_losses = 0
+                        return True, f"Smart reset: {reset_reason}"
+                
+                return False, f"⏸️ LOSS COOLDOWN: {remaining:.0f} min remaining ({self._consecutive_losses} consecutive losses)"
+            else:
+                # Cooldown expired, reset
+                logger.info("✅ Loss cooldown expired, trading resumed")
+                self._cooldown_until = None
+                self._consecutive_losses = 0
+        
+        return True, f"No cooldown active (streak: {self._consecutive_losses})"
+    
+    def _record_trade_result(self, exit_reason: str, pnl: float, market_time: datetime):
+        """
+        Record trade result for cooldown tracking.
+        Called when a trade closes.
+        
+        IMPROVED (Jan 16, 2026): Weighted loss streak by exit type
+        - STOP_LOSS: Full weight (1.0) - indicates filter failure
+        - TIME_INVALIDATION: Partial weight (0.5) - market didn't move
+        - TRAILING_STOP: Small weight (0.25) - partial success
+        - TP1_FULL/TP2: Zero weight - wins reset streak
+        
+        IMPROVED (Jan 22, 2026): Track countertrend losses and short obstinacy
+        
+        🔥 ENHANCED (Jan 25, 2026): Auto kill-switch + dead hours blocking
+        🔥 ENHANCED (Jan 26, 2026): False expansion tracking
+        """
+        from src.config.trading_config import OperatingMode
+        
+        # 📊 CAPA 5: Record exit in health monitor
+        if self.health_monitor:
+            exit_type = 'sl' if exit_reason == 'STOP_LOSS' or pnl < 0 else 'tp'
+            self.health_monitor.record_exit(exit_type=exit_type)
+        
+        # Track countertrend and short obstinacy (Jan 22, 2026)
+        is_countertrend = self._current_trade_tags.get('is_countertrend', False)
+        was_short = self._current_trade_tags.get('direction', '') == 'SHORT'
+        bullish_signals = self._current_trade_tags.get('bullish_signals', 0)
+        
+        # =========================================================================
+        # 🔥 FALSE EXPANSION TRACKING (Jan 26, 2026)
+        # A "false expansion" is when expansion was detected but trade failed badly.
+        # This tracks detector quality, not entry quality.
+        # =========================================================================
+        was_expansion_trade = self._current_trade_tags.get('regime', '') == 'TREND_EXPANSION'
+        trade_mfe_r = self._current_trade_tags.get('mfe_r', 0.0)
+        
+        if was_expansion_trade:
+            self._expansion_trades_count += 1
+            
+            # False expansion: MFE < 0.3R AND loss
+            if pnl < 0 and trade_mfe_r < 0.3:
+                self._false_expansion_count += 1
+                self._consecutive_expansion_losses += 1
+                false_rate = (self._false_expansion_count / self._expansion_trades_count * 100) if self._expansion_trades_count > 0 else 0
+                logger.warning(
+                    f"🔴 FALSE EXPANSION #{self._false_expansion_count}: "
+                    f"MFE={trade_mfe_r:.2f}R < 0.3R AND loss → "
+                    f"Rate: {false_rate:.1f}% ({self._false_expansion_count}/{self._expansion_trades_count})"
+                )
+                
+                # Cluster protection: 3 consecutive false expansions = hard cooldown
+                if self._consecutive_expansion_losses >= 3:
+                    cooldown_mins = 120  # 2 hours
+                    self._cooldown_until = market_time + timedelta(minutes=cooldown_mins)
+                    logger.critical(
+                        f"🚨 EXPANSION CLUSTER PROTECTION: "
+                        f"{self._consecutive_expansion_losses} consecutive false expansions → "
+                        f"{cooldown_mins}min cooldown"
+                    )
+            elif pnl > 0:
+                # Win resets consecutive expansion losses
+                if self._consecutive_expansion_losses > 0:
+                    logger.info(f"✅ Expansion win: resetting consecutive expansion losses from {self._consecutive_expansion_losses}")
+                self._consecutive_expansion_losses = 0
+        
+        if pnl < 0:
+            # Get weight for this exit type from LossStreakConfig
+            # Use get_loss_weight method with pnl_r estimate (negative pnl = loss)
+            pnl_r = -1.0  # Approximate as 1R loss for weight calculation
+            exit_weight = LossStreakConfig.get_loss_weight(exit_reason, pnl_r)
+            
+            # Add weighted loss to streak
+            old_streak = self._consecutive_losses
+            self._consecutive_losses += exit_weight
+            self._daily_losses_count += 1
+            
+            # Track exit type distribution
+            if not hasattr(self, '_loss_exit_types') or not isinstance(self._loss_exit_types, dict):
+                self._loss_exit_types = {}
+            self._loss_exit_types[exit_reason] = self._loss_exit_types.get(exit_reason, 0) + 1
+            
+            logger.info(f"📉 Loss recorded: {exit_reason} (weight={exit_weight:.2f}) → streak: {old_streak:.2f} → {self._consecutive_losses:.2f}")
+            
+            # =========================================================================
+            # 🔥 DEAD HOURS LOSS TRACKING (Jan 25, 2026)
+            # =========================================================================
+            current_hour = market_time.hour
+            dead_start, dead_end = getattr(OperatingMode, 'DEAD_HOURS_UTC', (4, 7))
+            max_dead_hours_losses = getattr(OperatingMode, 'DEAD_HOURS_MAX_LOSSES', 2)
+            
+            if dead_start <= current_hour < dead_end:
+                self._dead_hours_losses = getattr(self, '_dead_hours_losses', 0) + 1
+                logger.warning(f"🌙 DEAD HOURS LOSS #{self._dead_hours_losses}: Loss during {current_hour}:00 UTC")
+                
+                if self._dead_hours_losses >= max_dead_hours_losses:
+                    self._dead_hours_blocked = True
+                    logger.critical(f"🚫 DEAD HOURS BLOCK: {self._dead_hours_losses} losses in dead zone - BLOCKING until next session")
+            
+            # COUNTERTREND LOSS TRACKING (Jan 22, 2026)
+            if is_countertrend:
+                self._countertrend_losses_session += 1
+                self._last_countertrend_loss_time = market_time
+                logger.warning(f"⚠️ CT LOSS #{self._countertrend_losses_session}: Countertrend trade failed")
+            
+            # SHORT OBSTINACY COOLDOWN (Jan 22, 2026)
+            # If we lost on a short with bullish context, apply extra cooldown
+            if was_short and bullish_signals >= 2:
+                cooldown_mins = ShortObstinacyConfig.COOLDOWN_CANDLES_5M * 5
+                self._short_cooldown_until = market_time + timedelta(minutes=cooldown_mins)
+                logger.warning(f"⚠️ SHORT OBSTINACY COOLDOWN: Lost SHORT with {bullish_signals} bullish signals → {cooldown_mins}min cooldown")
+            
+            # =========================================================================
+            # 🔥 TIERED COOLDOWN + KILL SWITCH (Jan 25, 2026)
+            # =========================================================================
+            effective_losses = int(self._consecutive_losses)
+            kill_switch_threshold = getattr(self, '_kill_switch_losses', 6)
+            
+            # KILL SWITCH CHECK - 6+ losses = STOP trading for the day
+            if effective_losses >= kill_switch_threshold:
+                self._kill_switch_active = True
+                logger.critical(f"🔴 KILL SWITCH ACTIVATED: {effective_losses} consecutive losses → NO MORE TRADING TODAY")
+            elif effective_losses >= 5:
+                # 5 losses = 3 hour pause
+                cooldown_mins = getattr(self, '_pause_after_5', 180)
+                self._cooldown_until = market_time + timedelta(minutes=cooldown_mins)
+                logger.critical(f"🚨 TIER 3 COOLDOWN: {self._consecutive_losses:.1f} losses → {cooldown_mins} min pause (3 hours)")
+            elif effective_losses >= 4:
+                # 4 losses = 60 min pause
+                cooldown_mins = getattr(self, '_pause_after_4', 60)
+                self._cooldown_until = market_time + timedelta(minutes=cooldown_mins)
+                logger.warning(f"🚫 TIER 2 COOLDOWN: {self._consecutive_losses:.1f} losses → {cooldown_mins} min pause")
+            elif effective_losses >= 3:
+                # 3 losses = 15 min pause
+                cooldown_mins = getattr(self, '_pause_after_3', 15)
+                self._cooldown_until = market_time + timedelta(minutes=cooldown_mins)
+                logger.warning(f"⚠️ TIER 1 COOLDOWN: {self._consecutive_losses:.1f} losses → {cooldown_mins} min pause")
+        else:
+            # =========================================================================
+            # WIN/BREAKEVEN: GRADUAL RECOVERY INSTEAD OF BINARY RESET
+            # FIX Jan 27, 2026: A single win shouldn't erase 4 losses completely
+            # Instead, recovery is proportional to win quality:
+            # - Big win (≥ 0.8R): recover 2.0 from streak
+            # - Good win (≥ 0.4R): recover 1.5 from streak
+            # - Small win (≥ 0.1R): recover 1.0 from streak
+            # - Breakeven/tiny (< 0.1R): recover 0.5 from streak
+            # =========================================================================
+            if self._consecutive_losses > 0:
+                # Calculate PnL in R for recovery calculation
+                sl_amount = self._current_trade_tags.get('sl_amount', 1.0)
+                pnl_r = pnl / sl_amount if sl_amount > 0 else 0.0
+                
+                # Determine recovery amount based on win quality
+                if pnl_r >= 0.8:
+                    recovery = 2.0  # Strong win - recover well
+                elif pnl_r >= 0.4:
+                    recovery = 1.5  # Decent win
+                elif pnl_r >= 0.1:
+                    recovery = 1.0  # Small win
+                else:
+                    recovery = 0.5  # Breakeven/tiny - minimal recovery
+                
+                old_streak = self._consecutive_losses
+                self._consecutive_losses = max(0, self._consecutive_losses - recovery)
+                logger.info(
+                    f"✅ Win recorded ({pnl_r:.2f}R): streak recovery -{recovery:.1f} "
+                    f"({old_streak:.1f} → {self._consecutive_losses:.1f})"
+                )
+            else:
+                # Already at 0, nothing to recover
+                pass
+        
+        # =========================================================================
+        # 📊 PROBE_MAX OBSERVABILITY (Jan 27, 2026)
+        # Log detailed metrics for PROBE_MAX trades to validate the edge
+        # =========================================================================
+        probing_mode = self._current_trade_tags.get('probing_mode', '')
+        if probing_mode == 'PROBE_MAX':
+            validated_then_mae = self._current_trade_tags.get('probe_max_validated_then_mae', False)
+            mae_after_validation = self._current_trade_tags.get('probe_max_mae_after_validation', 0.0)
+            clean_momentum = self._current_trade_tags.get('probe_max_clean_momentum', False)
+            conviction_score = self._current_trade_tags.get('conviction_score', 0)
+            
+            pnl_r = pnl / self._current_trade_tags.get('sl_amount', pnl) if pnl != 0 else 0.0
+            mfe_r = self._current_trade_tags.get('mfe_r', 0.0)
+            mae_r = self._current_trade_tags.get('mae_r', 0.0)
+            
+            logger.info(
+                f"📊 PROBE_MAX RESULT: PnL={pnl_r:.2f}R | MFE={mfe_r:.2f}R | MAE={mae_r:.2f}R | "
+                f"conviction={conviction_score} | "
+                f"{'VALIDATED_THEN_MAE' if validated_then_mae else 'CLEAN_MOMENTUM' if clean_momentum else 'NORMAL'} | "
+                f"MAE_post_val={mae_after_validation:.2f}R | exit={exit_reason}"
+            )
+    
+    def _check_expected_r(self, current_price: float, sl_distance: float, bias: str, df_1h: pd.DataFrame) -> tuple[bool, str]:
+        """
+        EXPECTED R FILTER: Only enter if potential reward >= 1.5R
+        
+        This is THE critical filter that P3 needs.
+        
+        Problem: System enters setups that can only produce 1R max.
+        With SL 2-2.5 ATR, if market can only give 1R, we're mathematically doomed.
+        
+        Solution: Calculate distance to next HTF level (resistance/support).
+        If expected_move / sl_distance < 1.5 → NO trade.
+        
+        This kills trades in the middle of ranges where there's no asymmetry.
+        
+        Returns: (can_enter, reason)
+        """
+        if len(df_1h) < 20:
+            return True, "Not enough HTF data for Expected R"
+        
+        if sl_distance <= 0:
+            return True, "Invalid SL distance"
+        
+        highs = df_1h['high'].to_numpy()
+        lows = df_1h['low'].to_numpy()
+        
+        # Find recent swing high and swing low (last 20 1h candles = 20 hours)
+        recent_high = max(highs[-20:])
+        recent_low = min(lows[-20:])
+        range_size = recent_high - recent_low
+        
+        if range_size <= 0:
+            return True, "No valid range"
+        
+        # Calculate position in range (0 = at low, 1 = at high)
+        position_in_range = (current_price - recent_low) / range_size
+        
+        if bias == 'LONG':
+            # For LONG: target is recent high (or higher)
+            # Distance to target = recent_high - current_price
+            distance_to_target = recent_high - current_price
+            
+            # If we're already near the top (>70% of range), very little upside
+            if position_in_range > 0.70:
+                return False, f"LONG near range top: {position_in_range:.0%} (no upside room)"
+            
+        else:  # SHORT
+            # For SHORT: target is recent low (or lower)
+            # Distance to target = current_price - recent_low
+            distance_to_target = current_price - recent_low
+            
+            # If we're already near the bottom (<30% of range), very little downside
+            if position_in_range < 0.30:
+                return False, f"SHORT near range bottom: {position_in_range:.0%} (no downside room)"
+        
+        # Calculate Expected R
+        expected_r = distance_to_target / sl_distance
+        
+        # Minimum threshold: 1.5R
+        MIN_EXPECTED_R = 1.5
+        
+        if expected_r < MIN_EXPECTED_R:
+            return False, f"Expected R too low: {expected_r:.2f}R < {MIN_EXPECTED_R}R (target ${distance_to_target:.0f} vs SL ${sl_distance:.0f})"
+        
+        return True, f"Expected R OK: {expected_r:.2f}R >= {MIN_EXPECTED_R}R (pos {position_in_range:.0%} in range)"
+    
+    def _calculate_chase_atr(self, df_1m: pd.DataFrame | None, atr_1m: float, bias: str | None) -> float:
+        """Calculate chase ATR using config values"""
+        from src.config.trading_config import OrderExecution
+        
+        if df_1m is None or len(df_1m) < 5 or atr_1m <= 0:
+            return 0.0
+        
+        lookback = OrderExecution.ANTI_CHASING_LOOKBACK
+        
+        if bias == 'LONG':
+            move = df_1m['close'].iloc[-1] - df_1m['open'].iloc[-lookback]
+        else:
+            move = df_1m['open'].iloc[-lookback] - df_1m['close'].iloc[-1]
+        
+        if move <= 0 or atr_1m <= 0:
+            return 0.0
+        
+        return move / atr_1m
+    
+    def _check_not_post_impulse(self, df_1m: pd.DataFrame, atr_1m: float) -> tuple[bool, str]:
+        """ANTI-IMPULSE FILTER - delegates to filter_checks module"""
+        from src.config.trading_config import OrderExecution
+        return _check_post_impulse_pure(
+            df_1m, atr_1m,
+            impulse_threshold=OrderExecution.ANTI_CHASING_ATR_THRESHOLD,
+            lookback=OrderExecution.ANTI_CHASING_LOOKBACK
+        )
+    
+    def _check_sweep_occurred(self, df_5m: pd.DataFrame, bias: str) -> tuple[bool, str]:
+        """SWEEP FILTER - delegates to filter_checks module"""
+        return _check_sweep_pure(df_5m, bias)
+    
+    # =========================================================================
+    # BIAS STRENGTH DETECTION (Jan 22, 2026)
+    # 3-state system: BULL_STRONG, BEAR_STRONG, NEUTRAL
+    # =========================================================================
+    
+    def _detect_bias_strength(self, df_1h: pd.DataFrame, df_5m: pd.DataFrame, 
+                               current_price: float) -> BiasStrength:
+        """
+        Detect the strength of market bias for asymmetric direction rules.
+        
+        Uses:
+        - ADX level (strong vs weak trend)
+        - EMA50/EMA200 separation
+        - VWAP slope
+        
+        Returns: BULL_STRONG, BEAR_STRONG, or NEUTRAL
+        """
+        try:
+            # Calculate indicators
+            ema_50 = df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+            ema_200 = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
+            
+            adx_vals, _ = calculate_adx(
+                df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14
+            )
+            # 🔥 FIX (Jan 25, 2026): Ensure ADX is Python float
+            adx = float(adx_vals[-1]) if len(adx_vals) > 0 else 20.0
+            
+            # EMA separation percentage
+            ema_separation = abs(ema_50 - ema_200) / ema_200 * 100 if ema_200 > 0 else 0
+            
+            # VWAP slope from 5m
+            if 'vwap' in df_5m.columns and len(df_5m) >= 10:
+                vwap_vals = df_5m['vwap'].tail(10).values
+                vwap_slope = (vwap_vals[-1] - vwap_vals[0]) / (10 * current_price) if current_price > 0 else 0
+            else:
+                # Calculate simple VWAP proxy
+                typical_price = (df_5m['high'] + df_5m['low'] + df_5m['close']) / 3
+                volume = df_5m['volume'] if 'volume' in df_5m.columns else pd.Series(1, index=df_5m.index)
+                vwap = (typical_price * volume).cumsum() / volume.cumsum()
+                vwap_vals = vwap.tail(10).values
+                vwap_slope = (vwap_vals[-1] - vwap_vals[0]) / (10 * current_price) if len(vwap_vals) >= 10 and current_price > 0 else 0
+            
+            # Determine direction
+            is_bullish_structure = ema_50 > ema_200
+            is_strong_adx = adx > BiasStrengthConfig.ADX_STRONG_THRESHOLD
+            is_weak_adx = adx < BiasStrengthConfig.ADX_WEAK_THRESHOLD
+            has_separation = ema_separation > BiasStrengthConfig.EMA_SEPARATION_PCT
+            
+            # Log for debugging
+            logger.debug(f"BiasStrength: ADX={adx:.1f}, EMA_sep={ema_separation:.2f}%, VWAP_slope={vwap_slope:.6f}, bull_struct={is_bullish_structure}")
+            
+            # Decision logic
+            if is_weak_adx or not has_separation:
+                return BiasStrength.NEUTRAL
+            elif is_strong_adx and has_separation:
+                if is_bullish_structure:
+                    return BiasStrength.BULL_STRONG
+                else:
+                    return BiasStrength.BEAR_STRONG
+            else:
+                # Medium ADX - check VWAP slope for tiebreaker
+                if abs(vwap_slope) > BiasStrengthConfig.VWAP_SLOPE_STRONG:
+                    if vwap_slope > 0:
+                        return BiasStrength.BULL_STRONG
+                    else:
+                        return BiasStrength.BEAR_STRONG
+                return BiasStrength.NEUTRAL
+                
+        except Exception as e:
+            logger.debug(f"BiasStrength detection error: {e}")
+            return BiasStrength.NEUTRAL
+    
+    # =========================================================================
+    # TREND EXPANSION DETECTION (Jan 22, 2026)
+    # Detects when market shifts from range to trending
+    # =========================================================================
+    
+    def _detect_trend_expansion(self, df_5m: pd.DataFrame, df_1m: pd.DataFrame,
+                                 current_price: float, atr_5m: float) -> tuple[bool, dict]:
+        """
+        Detect if market is in trend expansion mode (not ranging).
+        
+        Criteria (need 3 of 4):
+        1. BB width expanding after compression
+        2. ATR ratio increasing
+        3. Price persistently away from VWAP
+        4. ADX slope positive
+        
+        Returns: (is_expanding, criteria_met_dict)
+        """
+        criteria_met = {
+            'bb_expansion': False,
+            'atr_expansion': False,
+            'vwap_distance': False,
+            'adx_rising': False
+        }
+        
+        try:
+            # 1. Bollinger Band Width expansion
+            if len(df_5m) >= TrendExpansionConfig.BB_WIDTH_LOOKBACK:
+                bb_ma = df_5m['close'].rolling(20).mean()
+                bb_std = df_5m['close'].rolling(20).std()
+                bb_width = (2 * bb_std / bb_ma).fillna(0)
+                
+                current_width = bb_width.iloc[-1]
+                avg_width = bb_width.tail(TrendExpansionConfig.BB_WIDTH_LOOKBACK).mean()
+                
+                if avg_width > 0 and current_width > avg_width * TrendExpansionConfig.BB_WIDTH_EXPANSION_RATIO:
+                    criteria_met['bb_expansion'] = True
+                    logger.debug(f"TrendExpansion: BB width {current_width:.4f} > {avg_width * TrendExpansionConfig.BB_WIDTH_EXPANSION_RATIO:.4f}")
+            
+            # 2. ATR expansion
+            atr_vals = calculate_atr(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
+            if len(atr_vals) >= 20:
+                current_atr = atr_vals[-1]
+                avg_atr = np.mean(atr_vals[-20:])
+                
+                if avg_atr > 0 and current_atr > avg_atr * TrendExpansionConfig.ATR_EXPANSION_RATIO:
+                    criteria_met['atr_expansion'] = True
+                    logger.debug(f"TrendExpansion: ATR {current_atr:.2f} > {avg_atr * TrendExpansionConfig.ATR_EXPANSION_RATIO:.2f}")
+            
+            # 3. VWAP distance persistence
+            if len(df_5m) >= TrendExpansionConfig.VWAP_DISTANCE_PERSISTENCE:
+                # Calculate VWAP
+                typical_price = (df_5m['high'] + df_5m['low'] + df_5m['close']) / 3
+                volume = df_5m['volume'] if 'volume' in df_5m.columns else pd.Series(1, index=df_5m.index)
+                vwap = (typical_price * volume).cumsum() / volume.cumsum()
+                
+                # Check last N candles
+                recent_closes = df_5m['close'].tail(TrendExpansionConfig.VWAP_DISTANCE_PERSISTENCE).values
+                recent_vwap = vwap.tail(TrendExpansionConfig.VWAP_DISTANCE_PERSISTENCE).values
+                
+                # Count candles where price > 1 ATR from VWAP
+                away_count = 0
+                for close, vw in zip(recent_closes, recent_vwap):
+                    if abs(close - vw) > atr_5m * TrendExpansionConfig.VWAP_DISTANCE_ATR:
+                        away_count += 1
+                
+                if away_count >= TrendExpansionConfig.VWAP_DISTANCE_PERSISTENCE - 1:  # Allow 1 touch
+                    criteria_met['vwap_distance'] = True
+                    logger.debug(f"TrendExpansion: VWAP distance persisted {away_count}/{TrendExpansionConfig.VWAP_DISTANCE_PERSISTENCE} candles")
+            
+            # 4. ADX rising
+            adx_vals, _ = calculate_adx(df_5m['high'].to_numpy(), df_5m['low'].to_numpy(), df_5m['close'].to_numpy(), 14)
+            if len(adx_vals) >= 5:
+                # 🔥 FIX (Jan 25, 2026): Ensure ADX values are Python floats
+                adx_current = float(adx_vals[-1])
+                adx_prev = float(adx_vals[-5])
+                adx_slope = (adx_current - adx_prev) / 5
+                
+                if adx_current > TrendExpansionConfig.ADX_VALUE_EXPANDING and adx_slope > TrendExpansionConfig.ADX_SLOPE_POSITIVE_THRESHOLD:
+                    criteria_met['adx_rising'] = True
+                    logger.debug(f"TrendExpansion: ADX {adx_current:.1f} rising with slope {adx_slope:.2f}")
+            
+            # Count criteria met
+            criteria_count = sum(criteria_met.values())
+            is_expanding = criteria_count >= TrendExpansionConfig.MIN_CRITERIA_FOR_EXPANSION
+            
+            if is_expanding:
+                logger.info(f"🚀 TREND EXPANSION DETECTED: {criteria_count}/4 criteria met: {criteria_met}")
+            
+            return is_expanding, criteria_met
+            
+        except Exception as e:
+            logger.debug(f"TrendExpansion detection error: {e}")
+            return False, criteria_met
+    
+    # =========================================================================
+    # 🔥 NEW (Jan 26, 2026): PROBING MODE CRITERIA
+    # "Let the market SHOW you edge, don't guess"
+    # =========================================================================
+    
+    def _check_probing_criteria(self, current_price: float, atr_5m: float, 
+                                 bias: str | None, df_1h: pd.DataFrame | None = None,
+                                 df_5m: pd.DataFrame | None = None) -> tuple[float, str, int]:
+        """
+        Check PROBING eligibility and determine sizing level.
+        
+        PROBING = micro-risk validation with GRADUATED sizing:
+        - PROBE_MIN (0.25x): Base criteria met, minimal conviction
+        - PROBE_MED (0.50x): Base + EMA alignment + VWAP slope
+        - PROBE_MAX (0.65x): Base + squeeze ending + volume spike
+        
+        NOTE: This method calculates VPOC/VWAP internally because it's called
+        EARLY in the flow, before tags are populated.
+        
+        Returns: (size_multiplier, reason, conviction_score)
+                 size_multiplier = 0.0 means PROBING blocked
+                 size_multiplier > 0.0 is the probe level
+        """
+        # =====================================================================
+        # PHASE 1: HARD BLOCKS (any fail = no probing at all)
+        # =====================================================================
+        if bias is None:
+            return 0.0, "No bias determined", 0
+        
+        # Block 1: HTF must have passed at some point
+        if not self._htf_cache_passed:
+            return 0.0, "HTF filter not passed", 0
+        
+        # Block 2: No recent losing streak (max 2 consecutive losses)
+        if self._consecutive_losses >= 2:
+            return 0.0, f"Too many recent losses ({self._consecutive_losses})", 0
+        
+        # Block 3: Session quality check
+        session_quality = self._current_trade_tags.get('session_quality', 'unknown')
+        if session_quality == 'poor':
+            return 0.0, "Poor session quality", 0
+        
+        # =====================================================================
+        # PHASE 2: CALCULATE METRICS FOR LEVEL DETERMINATION
+        # =====================================================================
+        vpoc_price = None
+        vpoc_distance_atr = 999.0
+        current_vwap = 0.0
+        vwap_distance_atr = 999.0
+        vwap_slope = 0.0
+        ema20_aligned = False
+        ema50_aligned = False
+        bb_squeeze_ending = False
+        volume_spike = False
+        
+        # VPOC calculation
+        if df_1h is not None and len(df_1h) >= 20:
+            try:
+                vpoc_price = calculate_vpoc(df_1h)
+                if vpoc_price and vpoc_price > 0 and atr_5m > 0:
+                    vpoc_distance_atr = abs(current_price - float(vpoc_price)) / atr_5m
+            except Exception as e:
+                logger.debug(f"PROBING: VPOC calc error: {e}")
+        
+        # VWAP and slope calculation from 5m
+        if df_5m is not None and len(df_5m) >= 20:
+            try:
+                typical_price = (df_5m['high'] + df_5m['low'] + df_5m['close']) / 3
+                volume = df_5m['volume'] if 'volume' in df_5m.columns else pd.Series(1, index=df_5m.index)
+                vwap = (typical_price * volume).cumsum() / volume.cumsum()
+                current_vwap = float(vwap.iloc[-1])
+                
+                if current_vwap > 0 and atr_5m > 0:
+                    vwap_distance_atr = abs(current_price - current_vwap) / atr_5m
+                
+                # VWAP slope (last 10 bars)
+                if len(vwap) >= 10 and vwap.iloc[-10] > 0:
+                    vwap_slope = (vwap.iloc[-1] - vwap.iloc[-10]) / vwap.iloc[-10]
+            except Exception as e:
+                logger.debug(f"PROBING: VWAP calc error: {e}")
+        
+        # EMA alignment from 5m
+        if df_5m is not None and len(df_5m) >= 55:
+            try:
+                ema20 = df_5m['close'].ewm(span=20, adjust=False).mean()
+                ema50 = df_5m['close'].ewm(span=50, adjust=False).mean()
+                
+                # EMA20 slope check
+                ema20_slope = (ema20.iloc[-1] - ema20.iloc[-5]) / ema20.iloc[-5] if ema20.iloc[-5] > 0 else 0
+                
+                # EMA alignment: EMA20 trending in bias direction
+                if bias == 'LONG' and ema20_slope > 0.0005:  # +0.05% over 5 bars
+                    ema20_aligned = True
+                elif bias == 'SHORT' and ema20_slope < -0.0005:
+                    ema20_aligned = True
+                
+                # EMA50 alignment: EMA20/50 relationship supports bias
+                if bias == 'LONG' and ema20.iloc[-1] > ema50.iloc[-1]:
+                    ema50_aligned = True
+                elif bias == 'SHORT' and ema20.iloc[-1] < ema50.iloc[-1]:
+                    ema50_aligned = True
+                    
+            except Exception as e:
+                logger.debug(f"PROBING: EMA calc error: {e}")
+        
+        # BB squeeze detection from 5m
+        if df_5m is not None and len(df_5m) >= 25:
+            try:
+                bb_ma = df_5m['close'].rolling(20).mean()
+                bb_std = df_5m['close'].rolling(20).std()
+                bb_width = (2 * bb_std / bb_ma).fillna(0)
+                
+                current_width = bb_width.iloc[-1]
+                prev_width = bb_width.iloc[-5]  # 5 bars ago
+                avg_width = bb_width.tail(20).mean()
+                
+                # Squeeze ending = width was below avg and now expanding
+                if prev_width < avg_width * 0.9 and current_width > prev_width * 1.05:
+                    bb_squeeze_ending = True
+            except Exception as e:
+                logger.debug(f"PROBING: BB calc error: {e}")
+        
+        # Volume spike detection from 5m
+        if df_5m is not None and len(df_5m) >= 20 and 'volume' in df_5m.columns:
+            try:
+                vol_avg = df_5m['volume'].tail(20).mean()
+                vol_current = df_5m['volume'].iloc[-1]
+                
+                if vol_avg > 0 and vol_current > vol_avg * 1.5:  # 50% above average
+                    volume_spike = True
+            except Exception as e:
+                logger.debug(f"PROBING: Volume calc error: {e}")
+        
+        # =====================================================================
+        # PHASE 3: BASE CRITERIA CHECK (must pass for any PROBING)
+        # =====================================================================
+        if vpoc_price is None or vpoc_price <= 0:
+            return 0.0, "No VPOC reference available", 0
+        
+        # 🔥 FIX (Jan 26, 2026): Relaxed from 1.5 → 3.0 ATR
+        # Previous threshold was too strict, blocking most opportunities
+        if vpoc_distance_atr > 3.0:
+            return 0.0, f"Too far from VPOC ({vpoc_distance_atr:.1f} ATR)", 0
+        
+        # 🔥 FIX (Jan 26, 2026): Relaxed from 2.0 → 4.0 ATR  
+        if vwap_distance_atr > 4.0:
+            return 0.0, f"Too far from VWAP ({vwap_distance_atr:.1f} ATR)", 0
+        
+        # Check VWAP slope isn't against bias (hard block if strongly against)
+        if bias == 'LONG' and vwap_slope < -0.002:  # VWAP falling >0.2%
+            return 0.0, f"VWAP falling against LONG ({vwap_slope*100:.2f}%)", 0
+        elif bias == 'SHORT' and vwap_slope > 0.002:  # VWAP rising >0.2%
+            return 0.0, f"VWAP rising against SHORT ({vwap_slope*100:.2f}%)", 0
+        
+        # =====================================================================
+        # PHASE 4: DETERMINE PROBING LEVEL
+        # Count additional bullish/bearish signals for sizing
+        # =====================================================================
+        conviction_score = 0
+        conviction_reasons = []
+        
+        # Base passed - start with 1 point
+        conviction_score += 1
+        
+        # VPOC very close (<0.75 ATR) = +1
+        if vpoc_distance_atr < 0.75:
+            conviction_score += 1
+            conviction_reasons.append(f"VPOC_close({vpoc_distance_atr:.1f})")
+        
+        # VWAP very close (<1.0 ATR) = +1
+        if vwap_distance_atr < 1.0:
+            conviction_score += 1
+            conviction_reasons.append(f"VWAP_close({vwap_distance_atr:.1f})")
+        
+        # VWAP slope supports bias = +1
+        if (bias == 'LONG' and vwap_slope > 0.0005) or (bias == 'SHORT' and vwap_slope < -0.0005):
+            conviction_score += 1
+            conviction_reasons.append("VWAP_slope_aligned")
+        
+        # EMA20 aligned = +1
+        if ema20_aligned:
+            conviction_score += 1
+            conviction_reasons.append("EMA20_aligned")
+        
+        # EMA50 aligned = +1
+        if ema50_aligned:
+            conviction_score += 1
+            conviction_reasons.append("EMA50_aligned")
+        
+        # BB squeeze ending = +1
+        if bb_squeeze_ending:
+            conviction_score += 1
+            conviction_reasons.append("BB_squeeze_ending")
+        
+        # Volume spike = +1
+        if volume_spike:
+            conviction_score += 1
+            conviction_reasons.append("Volume_spike")
+        
+        # =====================================================================
+        # PHASE 5: MAP CONVICTION SCORE TO SIZE MULTIPLIER
+        # 
+        # Score 1-2: PROBE_MIN = 0.25x (base criteria only)
+        # Score 3-4: PROBE_MED = 0.50x (good alignment)
+        # Score 5+:  PROBE_MAX = 0.65x (strong conviction)
+        # =====================================================================
+        if conviction_score >= 5:
+            size_mult = 0.65
+            level = "PROBE_MAX"
+        elif conviction_score >= 3:
+            size_mult = 0.50
+            level = "PROBE_MED"
+        else:
+            size_mult = 0.25
+            level = "PROBE_MIN"
+        
+        reason = f"{level}(score={conviction_score}) VPOC={vpoc_distance_atr:.1f} VWAP={vwap_distance_atr:.1f}"
+        if conviction_reasons:
+            reason += f" [{','.join(conviction_reasons)}]"
+        
+        return size_mult, reason, conviction_score
+    
+    # =========================================================================
+    # SHORT OBSTINACY CHECK (Jan 22, 2026)
+    # Prevents repeated shorts in bullish context
+    # =========================================================================
+    
+    def _calculate_short_obstinacy_penalty(self, df_5m: pd.DataFrame, current_price: float,
+                                            atr_5m: float) -> tuple[float, int, str]:
+        """
+        Calculate penalty for shorting in bullish context.
+        
+        Checks:
+        1. Price above VWAP
+        2. VWAP slope positive
+        3. Price > VWAP + k*ATR
+        4. EMA20 > EMA50 on 5m
+        
+        Returns: (penalty, bullish_signals, reason_string)
+        """
+        bullish_signals = 0
+        reasons = []
+        
+        try:
+            # Calculate VWAP
+            typical_price = (df_5m['high'] + df_5m['low'] + df_5m['close']) / 3
+            volume = df_5m['volume'] if 'volume' in df_5m.columns else pd.Series(1, index=df_5m.index)
+            vwap = (typical_price * volume).cumsum() / volume.cumsum()
+            current_vwap = vwap.iloc[-1]
+            
+            # 1. Price above VWAP
+            if ShortObstinacyConfig.PRICE_ABOVE_VWAP and current_price > current_vwap:
+                bullish_signals += 1
+                reasons.append("price>VWAP")
+            
+            # 2. VWAP slope positive
+            if ShortObstinacyConfig.VWAP_SLOPE_POSITIVE and len(vwap) >= 10:
+                vwap_slope = (vwap.iloc[-1] - vwap.iloc[-10]) / vwap.iloc[-10] if vwap.iloc[-10] > 0 else 0
+                if vwap_slope > 0:
+                    bullish_signals += 1
+                    reasons.append("VWAP_slope+")
+            
+            # 3. Price > VWAP + k*ATR (extended)
+            if current_price > current_vwap + ShortObstinacyConfig.VWAP_DISTANCE_K * atr_5m:
+                bullish_signals += 1
+                reasons.append(f"price>{ShortObstinacyConfig.VWAP_DISTANCE_K}ATR_above_VWAP")
+            
+            # 4. EMA20 > EMA50
+            if ShortObstinacyConfig.EMA20_ABOVE_EMA50:
+                ema_20 = df_5m['close'].ewm(span=20, adjust=False).mean().iloc[-1]
+                ema_50 = df_5m['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+                if ema_20 > ema_50:
+                    bullish_signals += 1
+                    reasons.append("EMA20>EMA50")
+            
+            penalty = ShortObstinacyConfig.calculate_short_penalty(bullish_signals)
+            reason_str = ", ".join(reasons) if reasons else "none"
+            
+            if penalty < 0:
+                logger.info(f"⚠️ SHORT OBSTINACY: {bullish_signals} bullish signals ({reason_str}) → penalty {penalty}")
+            
+            return penalty, bullish_signals, reason_str
+            
+        except Exception as e:
+            logger.debug(f"ShortObstinacy calculation error: {e}")
+            return 0.0, 0, "error"
+    
+    # =========================================================================
+    # ENTRY SCORE SYSTEM - Delegated to EntryScorer (Jan 20, 2026)
+    # 4 blocks × 0-2 points = max 8. Threshold: 5
+    # Only Structure=0 blocks entry (the only real gate)
+    # =========================================================================
+    
+    def _calculate_entry_score(self, df_1h: pd.DataFrame, df_5m: pd.DataFrame, 
+                                df_1m: pd.DataFrame | None, bias: str | None, current_price: float,
+                                market_time: datetime) -> tuple[int, dict, bool]:
+        """
+        Calculate entry score using 4 blocks.
+        Delegated to EntryScorer module to reduce god class complexity.
+        
+        Returns: (total_score, breakdown_dict, structure_blocks)
+        If structure_blocks=True, DO NOT ENTER regardless of score.
+        """
+        # Handle None df_1m with empty DataFrame
+        if df_1m is None:
+            df_1m = pd.DataFrame()
+        
+        # Delegate to EntryScorer
+        score, breakdown, structure_blocks = self._entry_scorer.calculate_entry_score(
+            df_1h=df_1h,
+            df_5m=df_5m,
+            df_1m=df_1m,
+            bias=bias or 'LONG',
+            current_price=current_price,
+            market_time=market_time,
+            micro_trend_state=getattr(self, '_micro_trend_state', None),
+            filter_pipeline=getattr(self, 'filter_pipeline', None),
+        )
+        
+        # Copy trade tags from scorer to signal engine for backwards compatibility
+        scorer_tags = self._entry_scorer.trade_tags
+        self._current_trade_tags = {
+            'score': scorer_tags.score,
+            'mode': scorer_tags.mode,
+            'htf_aligned': scorer_tags.htf_aligned,
+            'ltf_clean': scorer_tags.ltf_clean,
+            'bos_confirmed': scorer_tags.bos_confirmed,
+            'ema_reclaim': scorer_tags.ema_reclaim,
+            'adx': scorer_tags.adx,
+            'adx_5m': scorer_tags.adx_5m,
+            'adx_slope': scorer_tags.adx_slope,
+            'adx_slope_bucket': scorer_tags.adx_slope_bucket,
+            'rsi': scorer_tags.rsi,
+            'atr': scorer_tags.atr,
+            'session': scorer_tags.session,
+            'session_quality': scorer_tags.session_quality,
+            'volatility_ratio': scorer_tags.volatility_ratio,
+            'volume_penalty': scorer_tags.volume_penalty,
+            'slope_penalty': scorer_tags.slope_penalty,
+            'penalty_hierarchy_saved': scorer_tags.penalty_hierarchy_saved,
+            'worst_context_penalty': scorer_tags.worst_context_penalty,
+            'worst_execution_penalty': scorer_tags.worst_execution_penalty,
+        }
+        
+        # Store ADX values in score breakdown for regime detection
+        scorer_breakdown = self._entry_scorer.breakdown
+        self._score_breakdown['adx_values'] = scorer_breakdown.adx_values
+        
+        return score, breakdown, structure_blocks
+    
+    # =========================================================================
+    # SCORING METHODS MOVED TO src/engine/scoring/entry_scorer.py (Jan 20, 2026)
+    # The following methods were extracted to reduce god class complexity:
+    # - _apply_penalty_hierarchy
+    # - _apply_rr_score_adjustment  
+    # - _score_structure, _score_timing, _score_momentum, _score_context
+    # - _get_score_size_multiplier
+    # Now accessed via self._entry_scorer
+    # =========================================================================
+    
+    def _update_score_metrics(self, score: int, pnl: float, is_win: bool):
+        """
+        Update DISCOVERY metrics for edge segmentation.
+        Track expectancy by score bucket to find real edge.
+        """
+        # Determine bucket
+        if score >= 9:
+            bucket = '9+'
+        elif score >= 7:
+            bucket = '7-8'
+        else:
+            bucket = '5-6'
+        
+        # Update metrics
+        self._score_distribution[bucket]['trades'] += 1
+        self._score_distribution[bucket]['pnl'] += pnl
+        if is_win:
+            self._score_distribution[bucket]['wins'] += 1
+        
+        # Log distribution for analysis
+        logger.info(f"📊 SCORE METRICS | Bucket {bucket}: trades={self._score_distribution[bucket]['trades']}, " +
+                    f"wins={self._score_distribution[bucket]['wins']}, " +
+                    f"pnl={self._score_distribution[bucket]['pnl']:.2f}")
+        
+        # Calculate and log expectancy per bucket
+        for b, data in self._score_distribution.items():
+            if data['trades'] > 0:
+                exp = data['pnl'] / data['trades']
+                wr = (data['wins'] / data['trades']) * 100
+                logger.debug(f"   {b}: expectancy={exp:.2f}, winrate={wr:.1f}%")
+    
+    def _check_session_filter(self, market_time: datetime) -> tuple[bool, str]:
+        """SESSION FILTER: 24/7 trading for BTC"""
+        return True, f"Session OK: 24/7 trading ({market_time.hour}:00 UTC)"
+    
+    def _check_trend_filter(self, df: pd.DataFrame, bias: str, current_price: float) -> tuple[bool, str]:
+        """TREND FILTER - delegates to filter_checks module"""
+        return _check_trend_pure(df, bias, current_price)
+    
+    def _check_momentum_filter(self, df: pd.DataFrame, bias: str) -> tuple[bool, str]:
+        """
+        MOMENTUM FILTER: RSI slope + ADX for trend confirmation
+        
+        FIXED LOGIC (trend-following):
+        - LONG: RSI rising (slope > 0) OR RSI < 70 (not overbought)
+        - SHORT: RSI falling (slope < 0) OR RSI > 30 (not oversold)
+        
+        RSI LEVEL ALONE IS NOT A SIGNAL!
+        - High RSI = good for SHORT (overbought, expect reversal/continuation down)
+        - Low RSI = good for LONG (oversold, expect reversal/continuation up)
+        
+        ADX > 20 confirms trending market (optional, not a hard veto)
+        
+        This filter now ALWAYS passes but returns momentum quality for sizing.
+        """
+        if len(df) < 30:
+            return True, "Not enough data for momentum"
+        
+        closes = df['close'].to_numpy()
+        highs = df['high'].to_numpy()
+        lows = df['low'].to_numpy()
+        volumes = df['volume'].to_numpy() if 'volume' in df.columns else None
+        
+        # Skip momentum check if recent candles have zero volume (ghost data)
+        if volumes is not None and len(volumes) >= 3:
+            recent_vol = volumes[-3:]
+            if np.sum(recent_vol) == 0:
+                return True, "Momentum check skipped: zero volume candles (ghost data)"
+        
+        rsi = calculate_rsi(closes, 14)
+        adx, _ = calculate_adx(highs, lows, closes, 14)
+        
+        if np.isnan(rsi[-1]) or np.isnan(adx[-1]):
+            return True, "RSI/ADX not ready"
+        
+        rsi_val = rsi[-1]
+        adx_val = adx[-1]
+        
+        # Calculate RSI slope (momentum direction)
+        rsi_slope = 0.0
+        if len(rsi) >= 5 and not np.isnan(rsi[-5]):
+            rsi_slope = rsi[-1] - rsi[-5]  # 5-period change
+        
+        # Calculate ATR for volatility adjustment
+        atr = calculate_atr(highs, lows, closes, 14)
+        atr_val = atr[-1] if not np.isnan(atr[-1]) else 100
+        
+        # Normalize ATR (rough BTC typical range 50-500)
+        atr_normalized = min(max((atr_val - 50) / 450, 0), 1)  # 0 to 1
+        
+        # Build momentum assessment (NOT a hard veto anymore)
+        momentum_quality = "STRONG"
+        issues = []
+        
+        # ADX check (soft, not hard veto)
+        if adx_val < 15:
+            momentum_quality = "WEAK"
+            issues.append(f"low ADX={adx_val:.1f}")
+        elif adx_val < 20:
+            momentum_quality = "MODERATE"
+        
+        if bias == 'LONG':
+            # LONG: Want RSI rising OR not overbought (< 75)
+            # High RSI with rising slope = strong uptrend, still valid
+            if rsi_slope < -5:  # RSI falling significantly
+                if rsi_val > 60:  # Falling from high = bearish
+                    momentum_quality = "WEAK"
+                    issues.append(f"RSI falling from high ({rsi_val:.1f}, slope={rsi_slope:.1f})")
+            # Extremely overbought + no momentum = caution
+            if rsi_val > 80 and rsi_slope <= 0:
+                momentum_quality = "WEAK"
+                issues.append(f"RSI extreme overbought={rsi_val:.1f}")
+        else:  # SHORT
+            # SHORT: Want RSI falling OR overbought (> 55 is GOOD for shorts!)
+            # HIGH RSI = OVERBOUGHT = GOOD SHORT OPPORTUNITY
+            if rsi_val > 65:  # Overbought = GOOD for short
+                if rsi_slope < 0:  # And falling = even better
+                    momentum_quality = "STRONG"
+                elif rsi_slope > 5:  # Rising strongly = wait
+                    momentum_quality = "MODERATE"
+                    issues.append(f"RSI still rising ({rsi_val:.1f}, slope={rsi_slope:.1f})")
+                # Else: high RSI, neutral slope = still good short
+            elif rsi_val > 55:  # Mildly overbought
+                if rsi_slope < 0:  # Falling = good
+                    momentum_quality = "STRONG"
+                else:  # Rising or flat = moderate
+                    momentum_quality = "MODERATE"
+            elif rsi_val < 35 and rsi_slope < -3:  # Already oversold and still falling
+                momentum_quality = "WEAK"
+                issues.append(f"RSI already oversold={rsi_val:.1f}")
+        
+        # NEVER BLOCK - momentum is for SIZING, not VETO
+        # Store momentum quality for position sizing
+        self._last_momentum_quality = momentum_quality
+        self._last_momentum_atr = atr_val
+        
+        if issues:
+            return True, f"Momentum {momentum_quality}: RSI={rsi_val:.1f} slope={rsi_slope:.1f} ADX={adx_val:.1f} ({', '.join(issues)})"
+        return True, f"Momentum {momentum_quality}: RSI={rsi_val:.1f} slope={rsi_slope:.1f} ADX={adx_val:.1f}"
+    
+    def _check_volatility_expansion(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """VOLATILITY FILTER - delegates to filter_checks module"""
+        return _check_volatility_expansion_pure(df)
+    
+    def _check_not_compressed(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """COMPRESSION FILTER: Disabled"""
+        return True, "Compression filter disabled"
+    
+    def _check_anti_reverso(self, df: pd.DataFrame, bias: str) -> tuple[bool, str]:
+        """ANTI-REVERSO FILTER - delegates to filter_checks module"""
+        return _check_anti_reversal_pure(df, bias)
+    
+    def _check_not_duplicate_zone(self, current_price: float) -> tuple[bool, str]:
+        """DUPLICATE ZONE FILTER: Disabled"""
+        return True, "Duplicate zone filter disabled"
+    
+    def _check_volume_confirmation(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """DELTA VOLUME FILTER - delegates to filter_checks module"""
+        return _check_volume_delta_pure(df)
+    
+    def _build_ml_feature_snapshot(self) -> dict[str, float]:
+        """
+        Build feature snapshot for ML training data collection.
+        
+        🔥 ML Data Collection (Jan 24, 2026)
+        Captures all relevant indicators at entry moment for:
+        - Regime prediction model training
+        - Entry quality model training
+        - Exit timing model training
+        
+        Returns:
+            Dict with all ML-relevant features matching ENTRY_FEATURES list
+        """
+        features = {}
+        
+        try:
+            # From current trade tags (already computed)
+            tags = self._current_trade_tags
+            
+            # === Score components (from _calculate_and_evaluate_entry_score) ===
+            features['score_structure'] = float(tags.get('score_structure', 1.0))
+            features['score_timing'] = float(tags.get('score_timing', 1.0))
+            features['score_momentum'] = float(tags.get('score_momentum', 1.0))
+            features['score_context'] = float(tags.get('score_context', 1.0))
+            features['score_synergy'] = float(tags.get('score_synergy', 0.0))
+            
+            # === Trend indicators ===
+            features['adx_1h'] = float(tags.get('htf_adx', tags.get('adx_1h', 20.0)))
+            features['adx_5m'] = float(tags.get('adx_5m_fast', tags.get('adx_5m', 20.0)))
+            features['effective_adx'] = float(tags.get('effective_adx', features['adx_1h']))
+            
+            # === Volatility ===
+            features['atr_ratio'] = float(tags.get('atr_ratio', tags.get('volatility_ratio', 1.0)))
+            features['bb_width'] = float(tags.get('bb_width', 300.0))
+            features['bb_squeeze'] = 1.0 if tags.get('bb_squeeze', False) else 0.0
+            
+            # === Location/Context ===
+            features['percentile_60d'] = float(tags.get('percentile_60d', tags.get('location_pct_60d', 50.0)))
+            features['location_headroom_atr'] = float(tags.get('location_headroom_atr', 5.0))
+            features['location_in_extreme'] = 1.0 if tags.get('location_in_extreme', False) else 0.0
+            
+            # === Momentum ===
+            features['rsi_14'] = float(tags.get('rsi', tags.get('rsi_14', 50.0)))
+            features['cvd_bullish'] = 1.0 if tags.get('cvd_bullish', False) else 0.0
+            features['volume_ratio'] = float(tags.get('volume_ratio', 1.0))
+            
+            # === Session (one-hot) ===
+            session = tags.get('session_quality', 'moderate')
+            features['session_good'] = 1.0 if session == 'good' else 0.0
+            features['session_poor'] = 1.0 if session == 'poor' else 0.0
+            
+            # === Regime (one-hot) ===
+            trading_mode = tags.get('trading_mode', tags.get('regime', 'RANGE'))
+            features['trading_mode_trend'] = 1.0 if trading_mode in ('TREND', 'TREND_EXPANSION') else 0.0
+            features['trading_mode_range'] = 1.0 if trading_mode in ('RANGE', 'MEAN_REVERSION') else 0.0
+            features['trading_mode_transition'] = 1.0 if trading_mode in ('TRANSITION', 'TREND_EXHAUSTION') else 0.0
+            
+            # === External data ===
+            features['funding_rate'] = float(tags.get('funding_rate', 0.0))
+            
+            # === Entry quality ===
+            features['chase_atr'] = float(tags.get('chase_atr', 0.0))
+            
+            # === Time features (BTC has strong intraday/weekly patterns) ===
+            from datetime import datetime
+            market_time = self.market_data.get_market_time() or datetime.utcnow()
+            features['day_of_week'] = float(market_time.weekday())  # 0=Monday, 6=Sunday
+            features['hour_utc'] = float(market_time.hour)          # 0-23 UTC
+            
+            # === Trade history ===
+            features['consecutive_losses'] = float(self._consecutive_losses)
+            
+        except Exception as e:
+            logger.warning(f"⚠️ ML feature snapshot error: {e}")
+        
+        return features
+    
+    def _record_trade_price(self, entry_price: float):
+        """Record trade price for duplicate zone detection"""
+        if not hasattr(self, '_recent_trade_prices'):
+            self._recent_trade_prices = []
+        self._recent_trade_prices.append(entry_price)
+        # Keep only last 5
+        self._recent_trade_prices = self._recent_trade_prices[-5:]
+    
+    def _find_tp2_target(self) -> float:
+        """Find TP2 target - delegates to indicator_helpers"""
+        candles_5m = self.market_data.get_candles('5m')
+        if not candles_5m:
+            return 0
+        
+        df_5m = pd.DataFrame(candles_5m)
+        
+        # Use position direction, not current_bias
+        position = self.risk_engine.position
+        direction = position.direction if position else self.current_bias
+        
+        return _find_tp2_pure(df_5m, direction or 'LONG')
+    
+    def _check_bos_against_position(self, direction: str, candles_5m: list) -> bool:
+        """BOS detection - delegates to filter_checks module with edge-triggered logging"""
+        result = _check_bos_pure(direction, candles_5m)
+        
+        # Edge-triggered logging (only log once per new BOS level)
+        if result and candles_5m:
+            df = pd.DataFrame(candles_5m)
+            if direction == 'LONG':
+                level = df['low'].iloc[-1]
+                if self._last_bos_level != level or self._last_bos_direction != 'LONG':
+                    logger.info(f"📉 BOS detectado (LONG): LL @ {level:.2f}")
+                    self._last_bos_level = level
+                    self._last_bos_direction = 'LONG'
+            else:
+                level = df['high'].iloc[-1]
+                if self._last_bos_level != level or self._last_bos_direction != 'SHORT':
+                    logger.info(f"📈 BOS detectado (SHORT): HH @ {level:.2f}")
+                    self._last_bos_level = level
+                    self._last_bos_direction = 'SHORT'
+        
+        return result
+    
+    async def emergency_close_all(self):
+        """Emergency close all positions (market order)"""
+        logger.critical("EMERGENCY POSITION CLOSE")
+        
+        # 🔐 FIX #2: Hard-lock during emergency exit
+        self.reconciler.notify_exit_started("EMERGENCY_CLOSE")
+        
+        try:
+            # 🔥 FIX #8: Cancel all pending orders FIRST to avoid SL/TP triggering during close
+            try:
+                await self.execution.cancel_all_orders(self.symbol)
+                logger.info("✅ All pending orders cancelled before emergency close")
+            except Exception as cancel_err:
+                logger.warning(f"⚠️ Could not cancel orders: {cancel_err}")
+            
+            position = self.risk_engine.position
+            if position:
+                # Get current price for PnL calculation
+                current_price = 0.0
+                candles_1m = self.market_data.get_candles('1m')
+                if candles_1m and len(candles_1m) > 0:
+                    current_price = candles_1m[-1]['close']
+                
+                # 🔒 FIX (Jan 14, 2026): Get real size from exchange for emergency close
+                close_size = position.size
+                try:
+                    exchange_pos = await self.execution.get_position(self.symbol)
+                    if exchange_pos:
+                        close_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                except Exception as e:
+                    logger.debug(f"Could not get exchange position for emergency close (using local size): {e}")
+                
+                if close_size < KRAKEN_BTC_MIN_SIZE:
+                    logger.warning(f"⚠️ Emergency close skipped: size {close_size:.6f} < min - position effectively closed")
+                    await self.risk_engine.clear_position("Position too small to close")
+                    self._reset_trade_state("Position too small to close")
+                    return
+                
+                # Calculate PnL
+                if position.direction == 'LONG':
+                    pnl = (current_price - position.entry_price) * close_size
+                else:
+                    pnl = (position.entry_price - current_price) * close_size
+                
+                # Market close via REST
+                close_result = await self.execution.close_position_market(
+                    symbol=self.symbol,
+                    side='sell' if position.direction == 'LONG' else 'buy',
+                    amount=close_size,
+                    reason="EMERGENCY"
+                )
+                
+                # ═══════════════════════════════════════════════════════════════
+                # 🔒 CRITICAL SAFETY CHECK: Verify close was successful
+                # If exchange still has position, HALT - do NOT continue
+                # ═══════════════════════════════════════════════════════════════
+                if close_result is None:
+                    logger.critical("🚨 CRITICAL: Emergency close FAILED - checking exchange position...")
+                    await asyncio.sleep(1)  # Brief wait for exchange to update
+                    
+                    exchange_has_position = await self.execution.has_open_position(self.symbol)
+                    if exchange_has_position:
+                        logger.critical("🔴🔴🔴 HALT: LOCAL CLOSED BUT EXCHANGE STILL HAS POSITION 🔴🔴🔴")
+                        logger.critical("🔴 SYSTEM HALTED - MANUAL INTERVENTION REQUIRED 🔴")
+                        logger.critical(f"🔴 Position: {position.direction} {position.size} @ {position.entry_price}")
+                        
+                        # Set halted flag to prevent any further trading
+                        self._system_halted = True
+                        self.is_running = False
+                        
+                        # DO NOT reset trade state - keep position info for manual recovery
+                        return
+                
+                # Record close in state machine
+                self.state_machine.record_trade_close(pnl, pnl > 0, exit_reason='EMERGENCY_CLOSE')
+                # 🔒 FIX (Jan 22, 2026): Also update daily PnL for DD tracking
+                self.state_machine.update_daily_pnl(pnl)
+                
+                # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                from datetime import datetime, UTC
+                self._record_trade_result('EMERGENCY_CLOSE', pnl, datetime.now(UTC))
+                
+                # Log to trade logger for backtest results
+                await self.trade_logger.log_event('trade_closed', {
+                    'entry': position.entry_price,
+                    'exit': current_price,
+                    'size': position.size,
+                    'pnl': pnl,
+                    'direction': position.direction,
+                    'reason': 'EMERGENCY_CLOSE',
+                    'r': position.calculate_r_realized(current_price),
+                    'mfe_r': position.calculate_mfe_r(),
+                    'mae_r': position.calculate_mae_r(),
+                    'regime': position.regime
+                })
+                
+                await self.risk_engine.clear_position("EMERGENCY_CLOSE")
+                
+                logger.critical(f"Emergency close completed - PnL: {pnl:.2f}")
+            
+            # 🔒 LIMPIEZA COMPLETA independientemente de si había posición
+            self._reset_trade_state("Emergency close")
+        
+        except Exception as e:
+            logger.error(f"Error in emergency close: {e}", exc_info=True)
+            # Check if we're in a dangerous state
+            try:
+                exchange_has_position = await self.execution.has_open_position(self.symbol)
+                if exchange_has_position:
+                    logger.critical("🔴🔴🔴 HALT: Exception during close but exchange has position 🔴🔴🔴")
+                    self._system_halted = True
+                    self.is_running = False
+                    return
+            except Exception as verify_err:
+                logger.error(f"Error verifying position after emergency close exception: {verify_err}")
+            # Limpia de todas formas
+            self._reset_trade_state("Emergency close error")
+
+    async def _emergency_daily_halt_close(self):
+        """
+        Emergency close triggered by daily drawdown limit.
+        
+        FIX #1 (Jan 13, 2026): When daily loss limit is hit:
+        1. Cancel ALL pending orders
+        2. Close ANY open position at market
+        3. Set system to halt state
+        4. Log clearly for audit
+        """
+        logger.critical("🛑🛑🛑 DAILY HALT CLOSE - Closing all positions and cancelling orders 🛑🛑🛑")
+        
+        try:
+            # Step 1: Cancel ALL pending orders
+            try:
+                await self.execution.cancel_all_open_orders(self.symbol)
+                logger.info("✅ All pending orders cancelled for daily halt")
+            except Exception as e:
+                logger.error(f"Error cancelling orders during daily halt: {e}")
+            
+            # Step 2: Close any open position
+            try:
+                exchange_pos = await self.execution.get_position(self.symbol)
+                if exchange_pos:
+                    size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                    side = exchange_pos.get('side', '').lower()
+                    
+                    if size >= KRAKEN_BTC_MIN_SIZE:
+                        close_side = 'sell' if side == 'long' else 'buy'
+                        logger.critical(f"🛑 Closing {side} position of {size:.6f} at market")
+                        
+                        await self.execution.close_position_market(
+                            symbol=self.symbol,
+                            side=close_side,
+                            amount=size,
+                            reason="DAILY_HALT"
+                        )
+                        logger.critical(f"✅ Daily halt position closed: {size:.6f} {side}")
+                    elif size > 0:
+                        logger.warning(f"⚠️ Daily halt: Position {size:.6f} < min - considered closed")
+                else:
+                    logger.info("No open position to close for daily halt")
+            except Exception as e:
+                logger.critical(f"🔴 CRITICAL: Failed to close position during daily halt: {e}")
+            
+            # Step 3: Reset local state
+            self._reset_trade_state("Daily halt emergency close")
+            
+            # Step 4: Clear risk engine position (thread-safe)
+            if self.risk_engine.position:
+                await self.risk_engine.clear_position("daily halt emergency close")
+            
+            logger.critical("🛑 Daily halt close completed - trading halted until next day")
+            
+        except Exception as e:
+            logger.critical(f"🔴🔴🔴 CRITICAL ERROR in daily halt close: {e}")
+    
+    # NOTE: _open_position_from_order REMOVED - duplicated and unused
+    # Position opening logic is in _handle_wait_fill_state after fill confirmation
+    
+    def get_status(self) -> dict:
+        """Get engine status"""
+        # Get position from PositionStore (source of truth in LIVE mode)
+        position_store_pos = None
+        if self._runtime_config and self._runtime_config.mode == RuntimeMode.LIVE:
+            ps_pos = self._position_store.get_position(self.symbol) if self.symbol else None
+            if ps_pos and not ps_pos.is_flat:
+                position_store_pos = {
+                    'side': ps_pos.side,
+                    'size': ps_pos.size,
+                    'entry_price': ps_pos.entry_price,
+                    'source': 'exchange'
+                }
+        
+        status = {
+            'state': str(self.state_machine.state),
+            'current_bias': self.current_bias,
+            'has_position': self.risk_engine.has_open_position(),
+            'position_store': position_store_pos,  # NEW: Source of truth
+            'pending_order': self.pending_order_id is not None,
+            'daily_trades': self.state_machine.daily_trades,
+            'edge_state': self.edge_enforcement.state_machine.current_state.value if self.edge_enforcement else 'N/A',
+            'regime': self.regime_classifier.current_regime.value if self.regime_classifier else 'N/A'
+        }
+        
+        # Add health monitor status
+        if self.health_monitor:
+            health = self.health_monitor.get_health_status()
+            status['health'] = health
+            should_stop, reason = self.health_monitor.should_stop_trading()
+            status['health_alert'] = reason if should_stop else None
+        
+        # Add important levels status
+        if self.important_levels and self.important_levels.is_initialized:
+            status['important_levels'] = self.important_levels.get_status()
+        
+        return status
+    
+    def get_important_levels_info(self, current_price: float | None = None) -> str:
+        """
+        Get formatted important levels info for Telegram/log notifications.
+        
+        Args:
+            current_price: Current market price (uses last_price if not provided)
+            
+        Returns:
+            Formatted string with level information
+        """
+        if not self.important_levels or not self.important_levels.is_initialized:
+            return "⚠️ Important levels not available"
+        
+        price = current_price or self.market_data.get_current_price() or 0
+        if price <= 0:
+            return "⚠️ No price available for level calculation"
+        
+        return self.important_levels.format_levels_for_notification(price)
+    
+    # ===== EDGE ENFORCEMENT INTEGRATION =====
+    
+    async def _update_edge_context(self):
+        """Update edge context for pre-trade validation"""
+        # Use market_time for consistency (live and backtest)
+        market_time = self.market_data.get_market_time()
+        if market_time is None:
+            return
+        
+        # Only update periodically
+        if self._last_context_update and (market_time - self._last_context_update).total_seconds() < self._context_update_interval:
+            return
+        
+        try:
+            candles_1h = self.market_data.get_candles('1h')
+            if not candles_1h or len(candles_1h) < 60:
+                return
+            
+            df_1h = pd.DataFrame(candles_1h)
+            highs = df_1h['high'].to_numpy()
+            lows = df_1h['low'].to_numpy()
+            closes = df_1h['close'].to_numpy()
+            volumes = df_1h['volume'].to_numpy()
+            
+            # Calculate ATR and history for Activity Regime analysis
+            atr_values = calculate_atr(highs, lows, closes, 14)
+            atr_current = atr_values[-1] if len(atr_values) > 0 else 0
+            
+            # Macro event check (simplified - no macro detected by default)
+            is_macro_event_day = False
+            if hasattr(self.external_data, 'macro') and self.external_data.macro:
+                is_macro_event_day = self.external_data.macro.is_in_quiet_zone()
+            
+            # Update context via edge enforcement using new Activity Regime model
+            # The new validate_context uses Activity Regime instead of session-based logic
+            self._edge_context = self.edge_enforcement.edge_validator.validate_context(
+                atr_current=atr_current,
+                atr_history=atr_values,
+                highs=highs,
+                lows=lows,
+                closes=closes,
+                volumes=volumes,
+                is_macro_event_day=is_macro_event_day,
+                candle_minutes=60  # 1h candles
+            )
+            
+            self._last_context_update = market_time
+            
+            if self._edge_context and not self._edge_context.is_valid():
+                logger.warning(f"⚠️ Edge context invalid: {self._edge_context.invalid_reasons()}")
+            else:
+                logger.debug(f"✅ Edge context valid - Score: {self._edge_context.edge_score:.2f} ({self._edge_context.edge_regime})")
+            
+        except Exception as e:
+            logger.error(f"Error updating edge context: {e}")
+    
+    async def _update_regime_classifier(self, current_price: float):
+        """Update regime classifier with market data"""
+        try:
+            candles_1h = self.market_data.get_candles('1h')
+            if not candles_1h or len(candles_1h) < 30:
+                return
+            
+            df_1h = pd.DataFrame(candles_1h)
+            highs = df_1h['high'].to_numpy()
+            lows = df_1h['low'].to_numpy()
+            closes = df_1h['close'].to_numpy()
+            volumes = df_1h['volume'].to_numpy()
+            
+            # Calculate metrics for regime classification
+            atr_values = calculate_atr(highs, lows, closes, 14)
+            atr_5d = (atr_values[-1] - atr_values[-5]) / atr_values[-5] if atr_values[-5] > 0 else 0
+            atr_20d = (atr_values[-1] - atr_values[-20]) / atr_values[-20] if len(atr_values) >= 20 and atr_values[-20] > 0 else 0
+            
+            # Session metrics
+            session_range = highs[-1] - lows[-1]
+            session_realized = abs(closes[-1] - closes[-2]) if len(closes) > 1 else 0
+            
+            # Expansion count
+            avg_atr = np.mean(atr_values[-20:]) if len(atr_values) >= 20 else atr_values[-1]
+            expansion_sizes = [(highs[i] - lows[i]) / avg_atr for i in range(-5, 0) if avg_atr > 0]
+            expansion_count = sum(1 for s in expansion_sizes if s > 1.0)
+            
+            # Volume quality (simplified)
+            vol_quality = 0.6  # Default moderate
+            if len(volumes) >= 20:
+                recent_vol = np.mean(volumes[-5:])
+                avg_vol = np.mean(volumes[-20:])
+                vol_quality = min(recent_vol / avg_vol, 1.0) if avg_vol > 0 else 0.5
+            
+            # Breakout success rate (simplified - use 0.6 default)
+            breakout_success = 0.6
+            
+            # Price action consistency (simplified)
+            price_consistency = 0.5
+            if len(closes) >= 10:
+                changes = np.diff(closes[-10:])
+                same_direction = sum(1 for i in range(len(changes)-1) if changes[i] * changes[i+1] > 0)
+                price_consistency = same_direction / (len(changes) - 1) if len(changes) > 1 else 0.5
+            
+            # Classify regime
+            regime, confidence = self.regime_classifier.classify_regime(
+                expansion_count=expansion_count,
+                expansion_sizes=expansion_sizes,
+                breakout_success_rate=breakout_success,
+                atr_trend_5d=atr_5d,
+                atr_trend_20d=atr_20d,
+                session_range=session_range,
+                session_realized_move=session_realized,
+                volume_profile_quality=float(vol_quality),
+                price_action_consistency=price_consistency,
+                order_flow_imbalance_std=0.2  # Default stable
+            )
+            
+            logger.debug(f"📊 Regime: {regime.value} (confidence: {confidence:.2f})")
+            
+        except Exception as e:
+            logger.error(f"Error updating regime classifier: {e}")
+    
+    def _record_trade_for_edge_enforcement(self, 
+                                           entry_price: float, 
+                                           exit_price: float,
+                                           entry_time: datetime,
+                                           exit_time: datetime,
+                                           reached_tp1: bool,
+                                           reached_tp2: bool,
+                                           is_be_stop: bool):
+        """Record completed trade in edge enforcement for degradation monitoring"""
+        try:
+            self._trade_counter += 1
+            
+            # Calculate MFE/MAE from position tracking if available
+            mfe = self._current_trade_mfe
+            mae = self._current_trade_mae
+            
+            self.edge_enforcement.record_completed_trade(
+                trade_id=self._trade_counter,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                entry_time=entry_time,
+                exit_time=exit_time,
+                mfe=mfe,
+                mae=mae,
+                reached_tp1=reached_tp1,
+                reached_tp2=reached_tp2,
+                is_be_stop=is_be_stop
+            )
+            
+            # Reset tracking
+            self._current_trade_mfe = 0.0
+            self._current_trade_mae = 0.0
+            self._current_trade_entry_time = None
+            
+            logger.info(f"📝 Trade #{self._trade_counter} recorded in edge enforcement")
+            
+        except Exception as e:
+            logger.error(f"Error recording trade for edge enforcement: {e}")
+
+    async def _periodic_reconciliation(self):
+        """
+        FIX #4 (Jan 13, 2026): Periodic reconciliation with exchange.
+        
+        Runs every 30s to ensure local state matches exchange reality.
+        Handles:
+        1. Position size drift (partial liquidations, etc.)
+        2. Orphan positions (position exists but no local tracking)
+        3. Ghost positions (local tracking but no exchange position)
+        4. Stale orders
+        """
+        try:
+            logger.debug("🔄 Periodic reconciliation starting...")
+            
+            # Step 1: Sync position store
+            sync_result = await self._position_store.sync_from_exchange(self.execution.exchange)
+            
+            # Step 2: Check for discrepancies and handle them
+            if sync_result.get('discrepancies'):
+                for d in sync_result['discrepancies']:
+                    disc_type = d.get('type', 'unknown')
+                    
+                    if disc_type == 'size_mismatch':
+                        # Exchange has different size than we think
+                        local_size = d.get('local_size', 0)
+                        exchange_size = d.get('exchange_size', 0)
+                        
+                        logger.warning(f"⚠️ SIZE MISMATCH: local={local_size:.6f} vs exchange={exchange_size:.6f}")
+                        
+                        # Update local position to match exchange
+                        if self.risk_engine.position:
+                            old_size = self.risk_engine.position.size
+                            self.risk_engine.position.size = exchange_size
+                            logger.info(f"🔄 Auto-corrected position size: {old_size:.6f} → {exchange_size:.6f}")
+                    
+                    elif disc_type == 'orphan_position':
+                        # Exchange has position, we don't track it
+                        logger.critical(f"🚨 ORPHAN POSITION DETECTED: {d}")
+                        
+                        # In production, we might want to adopt or close it
+                        # For now, just log critically
+                        if self.output_manager:
+                            await self.output_manager.send_critical_alert(
+                                f"🚨 ORPHAN POSITION: {d.get('exchange_side')} {d.get('exchange_size')} @ {d.get('exchange_entry')}"
+                            )
+                    
+                    elif disc_type == 'ghost_position':
+                        # We think we have position, exchange doesn't
+                        logger.warning(f"⚠️ GHOST POSITION: Local thinks we have position but exchange has none")
+                        
+                        # Clear local state (thread-safe)
+                        if self.risk_engine.position:
+                            logger.warning("🔄 Clearing ghost position from local state")
+                            await self.risk_engine.clear_position("ghost position - exchange has none")
+                            self._reset_trade_state("Ghost position cleared")
+                            self.state_machine.transition_to(BotState.IDLE, "Ghost position - synced with exchange")
+                    
+                    elif disc_type == 'phantom_position_cleared':
+                        # 🔥 FIX (Jan 14, 2026): Position was closed by exchange TP/SL
+                        # This is the MAIN case for TP/SL notifications!
+                        logger.critical(f"📤 PHANTOM POSITION CLEARED: Position closed by exchange (likely TP/SL)")
+                        
+                        local_size = d.get('local_size', 0)
+                        local_side = d.get('local_side', 'UNKNOWN')
+                        symbol = d.get('symbol', self.symbol)
+                        
+                        # Try to estimate PnL (we don't have exact exit price)
+                        pnl_estimate = 0.0
+                        r_realized = 0.0
+                        exit_type = "EXCHANGE_TP_SL"
+                        exit_price = 0.0
+                        entry_price = 0.0  # 🔥 FIX: Track entry for notification
+                        
+                        # Get last known price
+                        candles = self.market_data.get_candles('1m')
+                        if candles and len(candles) > 0:
+                            exit_price = candles[-1]['close']
+                        
+                        # If we still have position info in risk_engine, calculate PnL
+                        if self.risk_engine.position:
+                            pos = self.risk_engine.position
+                            entry_price = getattr(pos, 'entry_price', 0.0)  # 🔥 FIX: Get entry price
+                            if hasattr(pos, 'calculate_pnl') and exit_price > 0:
+                                pnl_estimate = pos.calculate_pnl(exit_price)
+                            if hasattr(pos, 'entry_price') and hasattr(pos, 'initial_stop_loss'):
+                                initial_risk = abs(pos.entry_price - pos.initial_stop_loss)
+                                if initial_risk > 0 and pos.size > 0:
+                                    r_realized = pnl_estimate / (initial_risk * pos.size)
+                                # Determine if TP or SL based on price
+                                if pos.direction == 'LONG':
+                                    exit_type = 'EXCHANGE_TAKE_PROFIT' if exit_price > pos.entry_price else 'EXCHANGE_STOP_LOSS'
+                                else:
+                                    exit_type = 'EXCHANGE_TAKE_PROFIT' if exit_price < pos.entry_price else 'EXCHANGE_STOP_LOSS'
+                        
+                        # Record trade close
+                        self.state_machine.record_trade_close(pnl_estimate, pnl_estimate > 0, exit_reason=exit_type)
+                        self.state_machine.update_daily_pnl(pnl_estimate)  # 🔥 FIX: Update daily PnL tracking
+                        
+                        # 🔥 SEND TELEGRAM NOTIFICATION
+                        if self.output_manager:
+                            try:
+                                from datetime import datetime, UTC
+                                _create_safe_task(self.output_manager.send_exit_notification({
+                                    'symbol': symbol,
+                                    'reason': exit_type,
+                                    'pnl': pnl_estimate,
+                                    'r_realized': r_realized,
+                                    'entry_price': entry_price,  # 🔥 FIX: Include entry price
+                                    'exit_price': exit_price,
+                                    'direction': local_side,
+                                    'size': local_size,
+                                    'timestamp': datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+                                }), "send_phantom_close_notification")
+                                logger.info("📱 Telegram notification sent for phantom position close")
+                            except Exception as e:
+                                logger.error(f"Failed to send phantom close notification: {e}")
+                        
+                        # Clear local state (thread-safe)
+                        await self.risk_engine.clear_position("phantom position cleared by exchange")
+                        self._reset_trade_state("Phantom position cleared by exchange")
+                        self.state_machine.transition_to(BotState.IDLE, "Exchange closed position (TP/SL)")
+                    
+                    else:
+                        logger.warning(f"⚠️ Unknown discrepancy: {d}")
+            
+            # Step 3: Verify local risk engine matches position store
+            pos_store_pos = self._position_store.get_position(self.symbol) if self.symbol else None
+            local_pos = self.risk_engine.position
+            
+            if pos_store_pos and not pos_store_pos.is_flat:
+                # Exchange has position
+                if not local_pos:
+                    # We should have local tracking but don't
+                    logger.warning("⚠️ Position store has position but risk engine doesn't")
+                    # The startup recovery or next candle will handle this
+                else:
+                    # Verify size matches
+                    if abs(pos_store_pos.size - local_pos.size) > 0.00001:
+                        logger.warning(f"🔄 Size correction: local={local_pos.size:.6f} → store={pos_store_pos.size:.6f}")
+                        local_pos.size = pos_store_pos.size
+            else:
+                # Exchange has no position
+                if local_pos:
+                    logger.warning("⚠️ Risk engine has position but exchange doesn't - clearing")
+                    await self.risk_engine.clear_position("periodic reconciliation - no exchange position")
+                    if self.state_machine.state == BotState.MANAGE:
+                        self._reset_trade_state("Periodic reconciliation - no exchange position")
+                        self.state_machine.transition_to(BotState.IDLE, "No exchange position")
+            
+            # =========================================================================
+            # Step 4: ZOMBIE ORDER REAPER (Jan 17, 2026)
+            # Use centralized cleanup_zombie_orders method from position_store
+            # This handles orders that are NOT in our tracking and NOT protective (SL/TP)
+            # =========================================================================
+            try:
+                zombie_result = await self._position_store.cleanup_zombie_orders(
+                    exchange=self.execution.exchange,
+                    symbol=self.symbol,
+                    max_age_minutes=5  # Cancel orders older than 5 min that we don't track
+                )
+                
+                if zombie_result.get('cancelled', 0) > 0:
+                    logger.warning(f"🧟 Zombie cleanup: {zombie_result['cancelled']} orders cancelled")
+                    # Send notification for zombie orders
+                    if self.output_manager and zombie_result.get('zombie_orders'):
+                        for zombie in zombie_result['zombie_orders']:
+                            if zombie.get('cancelled'):
+                                _create_safe_task(
+                                    self.output_manager.send_critical_alert(
+                                        f"🧟 ZOMBIE ORDER CANCELLED: {zombie.get('side')} @ ${zombie.get('price', 0):.2f} "
+                                        f"(age: {zombie.get('age_minutes', 0):.1f}min)"
+                                    ),
+                                    "zombie_alert"
+                                )
+            except Exception as e:
+                logger.debug(f"Error in zombie order cleanup: {e}")
+            
+            logger.debug("✅ Periodic reconciliation complete")
+            
+        except Exception as e:
+            logger.error(f"Periodic reconciliation error: {e}")
+

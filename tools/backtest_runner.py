@@ -24,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger('BacktestRunner')
 
 # Import backtester
-from src.engine.backtest import Backtester, BacktestResults
+from src.application.backtest.backtest_app import Backtester, BacktestResults
 
 
 class BacktestRunner:

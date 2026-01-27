@@ -68,10 +68,10 @@ load_env_file()
 # =====================================================================
 # 🔒 PHASE 2: Initialize production-grade settings and logging
 # =====================================================================
-from src.core.settings import get_settings, TradingMode, validate_startup, redact_secrets
-from src.core.logging_config import configure_logging, get_audit_logger, set_session_id
-from src.core.kill_switch import init_kill_switch, get_kill_switch
-from src.core.health import init_health_status, get_health_status, start_health_server
+from src.config.settings import get_settings, TradingMode, validate_startup, redact_secrets
+from src.bootstrap.logging import configure_logging, get_audit_logger, set_session_id
+from src.config.kill_switch import init_kill_switch, get_kill_switch
+from src.config.health import init_health_status, get_health_status, start_health_server
 
 # Get validated settings (will fail fast if invalid)
 try:
@@ -107,34 +107,34 @@ DEMO_MODE = settings.demo_mode
 # =====================================================================
 
 # 1. DATOS DE MERCADO
-from src.ingest.kraken_websocket import KrakenFuturesWebSocket
-from src.ingest.order_book import OrderBookManager
+from src.infrastructure.ingest.websocket.kraken_websocket import KrakenFuturesWebSocket
+from src.infrastructure.ingest.websocket.order_book import OrderBookManager
 
 # 2. BUFFER MULTI-TIMEFRAME
-from src.engine.market_data import SynchronizedMultiTimeframeBuffer
+from src.application.services.market_data import SynchronizedMultiTimeframeBuffer
 
 # 3. EJECUCIÓN REAL
-from src.engine.execution import RESTExecutionEngine
+from src.infrastructure.exchanges.kraken.execution import RESTExecutionEngine
 
 # 4. DATOS EXTERNOS
-from src.engine.external_data import ExternalDataManager
+from src.infrastructure.external_data import ExternalDataManager
 
 # 5. PERSISTENCIA
-from src.engine.persistence import TradeLogger, PositionReconciler
+from src.infrastructure.storage.parquet.persistence import TradeLogger, PositionReconciler
 
 # 6. SIGNAL ENGINE
-from src.engine.signal_engine import SignalEngine
+from src.application.live.trading_app import SignalEngine
 
 # 7. ERROR TRACKING
-from src.engine.error_tracker import ErrorTracker, ErrorTrackerConfig, ErrorSeverity, init_error_tracker
+from src.infrastructure.monitoring.error_tracker import ErrorTracker, ErrorTrackerConfig, ErrorSeverity, init_error_tracker
 
 # 8. NEW ARCHITECTURE - Runtime Mode & Position Store
-from src.core import RuntimeMode, init_runtime, get_runtime_config
-from src.accounting import get_position_store
-from src.core.events import get_event_bus, EventType
+from src.bootstrap.runtime import RuntimeMode, init_runtime, get_runtime_config
+from src.infrastructure.storage import get_position_store
+from src.domain.events.event_bus import get_event_bus, EventType
 
 # 9. METRICS
-from src.monitoring.metrics import (
+from src.infrastructure.monitoring.metrics import (
     start_metrics_server,
     BUILD_INFO,
     ORDERS_PLACED_TOTAL, ORDERS_FAILED_TOTAL,
@@ -144,13 +144,13 @@ from src.monitoring.metrics import (
 )
 
 # 10. BTC CONTEXT FEED (Jan 15, 2026)
-from src.engine.btc_context_feed import get_btc_context_feed
+from src.domain.market.structure.btc_context_feed import get_btc_context_feed
 
 # 11. HEALTH BRIDGE (Jan 20, 2026) - For FastAPI integration
-from src.core.health_bridge import HealthBridge, HealthBridgeWriter, get_health_bridge
+from src.config.health_bridge import HealthBridge, HealthBridgeWriter, get_health_bridge
 
 # Legacy (mantener compatibilidad)
-from src.output.output_manager import OutputManager
+from src.interfaces.output.output_manager import OutputManager
 
 # Set build info metric
 BUILD_INFO.info({
@@ -392,7 +392,7 @@ class TradingSystemOrchestrator:
         4. Notify user of recovery actions
         """
         from datetime import datetime, UTC
-        from src.engine.risk.risk_engine import Position
+        from src.domain.risk.risk_engine import Position
         
         logger.info("🔄 STARTUP RECOVERY: Checking for orphan positions/orders...")
         
@@ -522,6 +522,15 @@ class TradingSystemOrchestrator:
                             market_time=datetime.now(UTC)
                         )
                         
+                        # =========================================================================
+                        # 🔒 CRITICAL FIX (Jan 26, 2026): Mark as ADOPTED position
+                        # This prevents WORST_TRADE_PREVENTION from closing it immediately
+                        # if it's already in loss when we restart.
+                        # We don't know the original thesis for adopted positions!
+                        # =========================================================================
+                        self.signal_engine.risk_engine.position.is_adopted = True
+                        logger.info("   🏷️ Position marked as ADOPTED (WORST_TRADE_PREVENTION disabled)")
+                        
                         # Mark SL status
                         if sl_active:
                             self.signal_engine.risk_engine.position.exchange_sl_active = True
@@ -536,7 +545,7 @@ class TradingSystemOrchestrator:
                             logger.info(f"   ✅ TP tracked at {existing_tp:.2f}")
                         
                         # Transition signal engine to MANAGE state
-                        from src.engine.state.state_machine import BotState
+                        from src.domain.trading.state.state_machine import BotState
                         if hasattr(self.signal_engine, 'state_machine'):
                             self.signal_engine.state_machine.transition_to(BotState.MANAGE, "Adopted existing position")
                             self.signal_engine._stops_set = sl_active  # Track if SL needs to be set
