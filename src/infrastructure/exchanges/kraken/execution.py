@@ -120,10 +120,11 @@ def get_exchange_timeouts():
     try:
         from src.config.settings import get_settings
         settings = get_settings()
+        # 🔥 FIX: Use getattr with defaults to avoid AttributeError
         return (
-            settings.exchange_timeout_short,
-            settings.exchange_timeout_medium,
-            settings.exchange_timeout_long
+            getattr(settings, 'exchange_timeout_short', EXCHANGE_TIMEOUT_SHORT),
+            getattr(settings, 'exchange_timeout_medium', EXCHANGE_TIMEOUT_MEDIUM),
+            getattr(settings, 'exchange_timeout_long', EXCHANGE_TIMEOUT_LONG)
         )
     except Exception:
         return EXCHANGE_TIMEOUT_SHORT, EXCHANGE_TIMEOUT_MEDIUM, EXCHANGE_TIMEOUT_LONG

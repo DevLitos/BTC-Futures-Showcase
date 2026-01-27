@@ -728,14 +728,40 @@ class Position:
             current_r = (self.entry_price - current_price) / initial_risk
         
         # =====================================================================
-        # REGLA CRÍTICA: Límite de pérdida por TIME_INVALIDATION
-        # Si ya estamos en -0.25R o peor, cerrar INMEDIATAMENTE
+        # 🔥 FIX (Jan 27, 2026): INTELLIGENT TIME_INVALIDATION FOR RANGE
+        # 
+        # PROBLEM: In ranging markets, -0.3R limit was too tight.
+        # Price floats around, hits -0.3R, closes for "administrative" loss.
+        # This is DEATH BY A THOUSAND CUTS.
+        # 
+        # SOLUTION:
+        # - In TRENDING (ADX >= 20): Use tight limit (-0.30R)
+        # - In RANGING (ADX < 20): Use looser limit (-0.60R) OR
+        #   don't close unless structure is invalid
+        # 
+        # The key insight: In range, let the STOP do its job.
+        # TIME_INVALIDATION should only trigger if structure breaks.
         # =====================================================================
-        max_loss_r = ExitHierarchy.TIME_INVALIDATION_MAX_LOSS_R
         
+        # Determine market type
+        is_ranging = adx is not None and adx < 20
+        
+        # Set max loss based on market type
+        if is_ranging:
+            # In range: looser limit, let stop do its job
+            max_loss_r = -0.60  # 🔥 FIX: Allow more room in range
+            logger.debug(f"📊 TIME checkpoint: RANGING mode (ADX={adx:.1f}) → max_loss={max_loss_r}R")
+        else:
+            # In trend: normal limit
+            max_loss_r = ExitHierarchy.TIME_INVALIDATION_MAX_LOSS_R  # -0.30R
+        
+        # =====================================================================
+        # REGLA CRÍTICA: Límite de pérdida por TIME_INVALIDATION
+        # =====================================================================
         if current_r <= max_loss_r:
             logger.warning(
                 f"☠️ TIME_INVALIDATION: Loss {current_r:.2f}R exceeds limit {max_loss_r}R | "
+                f"ADX={'RANGE' if is_ranging else 'TREND'} | "
                 f"Closing immediately to prevent worse loss"
             )
             return {
@@ -743,7 +769,8 @@ class Position:
                 'reason': 'TIME_INVALIDATION_MAX_LOSS',
                 'current_r': current_r,
                 'max_loss_r': max_loss_r,
-                'candles': self.candle_count
+                'candles': self.candle_count,
+                'market_type': 'RANGE' if is_ranging else 'TREND'
             }
         
         # =====================================================================
@@ -767,6 +794,26 @@ class Position:
         if atr_ratio is not None and atr_ratio >= ATR_RATIO_THRESHOLD:
             market_alive = True
             logger.debug(f"📊 TIME checkpoint: ATR ratio={atr_ratio:.2f} >= {ATR_RATIO_THRESHOLD} (vol OK)")
+        
+        # =====================================================================
+        # 🔥 FIX (Jan 27, 2026): In RANGING market, ALWAYS HOLD unless
+        # we hit the max_loss or structure breaks. NO premature closes.
+        # =====================================================================
+        if is_ranging and not market_alive:
+            # In range with dead market: HOLD unless at max loss
+            # The stop will do its job if we're wrong
+            if current_r > max_loss_r + 0.1:  # Still have room
+                logger.info(
+                    f"⏱️ TIME checkpoint RANGE: {current_r:.2f}R | "
+                    f"Market dead but not at limit → HOLD (let stop work)"
+                )
+                return {
+                    'action': 'HOLD',
+                    'reason': 'RANGE_MARKET_HOLD',
+                    'current_r': current_r,
+                    'max_loss_r': max_loss_r,
+                    'candles': self.candle_count
+                }
         
         # =====================================================================
         # COMPORTAMIENTO SEGÚN P&L ACTUAL

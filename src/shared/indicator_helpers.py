@@ -195,41 +195,6 @@ def calculate_bb_values(df: pd.DataFrame, period: int = 20, std_dev: float = 2.0
     return result
 
 
-def calculate_chase_atr(
-    df_1m: pd.DataFrame,
-    atr_1m: float,
-    bias: str
-) -> float:
-    """
-    Calculate chase ATR for anti-chase filter.
-    
-    Measures how far price has moved in the trade direction
-    relative to ATR (catching moves already in progress).
-    
-    Args:
-        df_1m: 1-minute DataFrame
-        atr_1m: Current 1-minute ATR
-        bias: 'LONG' or 'SHORT'
-        
-    Returns:
-        Chase ATR ratio (1.0 = moved 1 ATR in direction)
-    """
-    if df_1m is None or len(df_1m) < 10 or atr_1m <= 0:
-        return 0.0
-    
-    # Last 10 candles
-    recent = df_1m.tail(10)
-    start_price = recent.iloc[0]['close']
-    current_price = recent.iloc[-1]['close']
-    
-    if bias == 'LONG':
-        move = current_price - start_price
-    else:
-        move = start_price - current_price
-    
-    return move / atr_1m if atr_1m > 0 else 0.0
-
-
 def find_support_resistance(
     bias: str,
     df_5m: pd.DataFrame,

@@ -52,6 +52,12 @@ from src.domain.trading.state.state_types import (
     compute_final_position_multiplier,
 )
 
+# 🎯 Edge State Manager (Jan 27, 2026)
+from src.domain.trading.edge_state_manager import (
+    EdgeStateManager, EdgeState, BOSEvent, EdgeStats,
+    get_edge_manager, reset_edge_manager
+)
+
 __all__ = [
     # Entities
     'Side', 'OrderType', 'OrderStatus', 'FillType', 'PositionState', 'TradeResult', 'MarketRegime',
@@ -64,6 +70,9 @@ __all__ = [
     'EntryScorer', 'get_entry_scorer',
     # Edge
     'EdgeEnforcement', 'EdgeValidator', 'ContextValidity', 'EdgeRecoveryProtocol',
+    # Edge State Manager
+    'EdgeStateManager', 'EdgeState', 'BOSEvent', 'EdgeStats',
+    'get_edge_manager', 'reset_edge_manager',
     # State
     'StateMachine', 'BotState', 'StatePositionState', 'StrategyState',
     'StateTransition', 'get_state_size_multiplier', 'can_trade_in_state',

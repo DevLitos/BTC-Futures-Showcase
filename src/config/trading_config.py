@@ -1006,16 +1006,23 @@ class EntryGateConfig:
     
     # RR-BASED SIZING
     # Graduated sizing based on risk:reward quality
-    # FIX (Jan 25, 2026): CRITICAL - slippage model was blocking ALL trades
-    # The P95 caps were subtracting ~0.65R from ideal RR, making 1.0R → 0.35R
-    # Lowered floors to allow trades to execute
-    RR_BLOCK_FLOOR = 0.30            # 🔥 FIX: was 0.5 → blocked everything
-    RR_PROBE_MAX = 0.50              # 0.3-0.5 = probe (0.25x)
-    RR_FULL_MIN = 0.80               # Above 0.8 = full size (was 1.0)
+    # 
+    # NOTE (Jan 27, 2026): HARD BLOCKS in entry_validators.py block trades with 
+    # worst-case RR < 0.7R. These floors below 0.7R are for edge cases where
+    # HARD BLOCKS are not applied (e.g., adopted positions, manual overrides).
+    #
+    # HIERARCHY:
+    # 1. HARD BLOCK: worst_case_rr < 0.7R → NO ENTRY (entry_validators.py)
+    # 2. EntryGate: worst_case_rr 0.7-0.8R → PROBE size (0.25x)
+    # 3. EntryGate: worst_case_rr > 0.8R → FULL size (1.0x)
+    #
+    RR_BLOCK_FLOOR = 0.70            # Aligned with HARD BLOCK (was 0.30)
+    RR_PROBE_MAX = 0.80              # 0.70-0.80 = probe (0.25x)
+    RR_FULL_MIN = 0.80               # Above 0.8 = full size
     
-    # RANGE regime has different RR tolerances (high winrate)
-    RR_BLOCK_FLOOR_RANGE = 0.25      # 🔥 FIX: was 0.4 → blocked RANGE trades
-    RR_PROBE_MAX_RANGE = 0.40        # 0.25-0.4 = probe in RANGE
+    # RANGE regime: HARD BLOCK requires RR >= 0.85 in ranging markets (ADX < 20)
+    RR_BLOCK_FLOOR_RANGE = 0.85      # Aligned with HARD BLOCK range check
+    RR_PROBE_MAX_RANGE = 0.95        # 0.85-0.95 = probe in RANGE
     
     # LTF CONFIRMATIONS
     # Never require all confirmations (anti-paralysis)

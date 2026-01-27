@@ -25,9 +25,9 @@ from src.shared.indicators import (
     calculate_relative_volume, calculate_orderbook_imbalance
 )
 from src.shared.utils import (
-    safe_float, ensure_utc, validate_candle,
-    PositionSizer, get_position_sizer
+    safe_float, ensure_utc, validate_candle
 )
+# NOTE: PositionSizer removed - risk sizing done via RiskEngine
 from src.shared.time_provider import get_time_provider, TimeProvider, reset_time_provider
 from src.domain.trading.edge.edge_enforcement import EdgeEnforcement
 from src.domain.market.regime.activity_regime import EnforcementMode
@@ -218,12 +218,7 @@ class ProfessionalBacktester:
         # Edge Enforcement - INTEGRATED (was missing before)
         self.edge_enforcement = EdgeEnforcement(mode=EnforcementMode.BACKTEST)
         
-        # Centralized Position Sizer
-        self._position_sizer = get_position_sizer(
-            risk_pct=0.01,
-            max_position_pct=0.10,
-            leverage=10
-        )
+        # NOTE: Position sizing handled by RiskEngine (not separate PositionSizer)
         
         # Trading state
         self.trades: List[BacktestTrade] = []
