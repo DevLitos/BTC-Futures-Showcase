@@ -39,35 +39,137 @@ def check_rejection_cooldown(engine: "SignalEngine") -> Tuple[bool, str]:
 
 
 # ==============================================================================
-# CANDLE GATE
+# EVENT-BASED EVALUATION GATE (Jan 28, 2026)
 # ==============================================================================
+# 
+# PROBLEMA ANTERIOR:
+# - Sistema solo evaluaba una vez por vela de 1m (60+ segundos de latencia)
+# - Edges intraday viven en segundos, no en minutos
+# - "Timeframe fantasma": datos en ms pero razonamiento en minutos
+#
+# SOLUCIÓN:
+# - Event-based: evalúa cuando hay un EVENTO significativo
+# - Max ticks fallback: evalúa cada N ticks aunque no haya evento
+# - Candle close: siempre evalúa en cierre de vela (backward compatible)
+#
+# EVENTOS QUE DISPARAN EVALUACIÓN:
+# 1. Nueva vela de 1m cerrada
+# 2. Movimiento de precio >= 0.3 * ATR desde última evaluación
+# 3. Max ticks alcanzado (30 ticks sin evento)
+# ==============================================================================
+
+# Configuration for event-based evaluation
+EVENT_GATE_CONFIG = {
+    "MAX_TICKS_WITHOUT_EVAL": 30,        # Evaluate every 30 ticks max
+    "PRICE_MOVE_ATR_THRESHOLD": 0.3,     # Evaluate if price moves 0.3 ATR
+    "MIN_TICKS_BETWEEN_EVAL": 5,         # Minimum 5 ticks between evaluations
+    "LOG_FREQUENCY": 30,                 # Log every N ticks
+}
+
 
 def check_candle_gate(
     engine: "SignalEngine",
     setup_state: str | None,
     idle_eval_count: int,
     current_price: float,
+    atr_1m: float = 0.0,
 ) -> Tuple[bool, int]:
     """
-    Check if we should evaluate on this tick (candle gate).
+    Event-based evaluation gate for intraday trading.
+    
+    Evaluates when:
+    1. WAIT_LTF state (every tick for fast trigger)
+    2. New 1m candle closed (candle-based, always)
+    3. Significant price movement (>= 0.3 ATR since last eval)
+    4. Max ticks reached (fallback every 30 ticks)
+    
+    Args:
+        engine: SignalEngine instance
+        setup_state: Current setup state
+        idle_eval_count: Current idle evaluation count
+        current_price: Current market price
+        atr_1m: Current 1m ATR (for price movement detection)
     
     Returns:
         (should_evaluate, new_eval_count) tuple
     """
-    # Exception: If in WAIT_LTF state, check every tick
-    if setup_state == "WAIT_LTF":
-        return True, idle_eval_count + 1
+    new_count = idle_eval_count + 1
     
-    if not engine._is_new_candle():
-        # Same candle, no need to re-evaluate
-        new_count = idle_eval_count + 1
-        if new_count % 60 == 0:  # Log every minute
-            logger.debug(f"📊 IDLE: Waiting for new candle | Tick #{new_count} | Price: ${current_price:.2f}")
+    # =========================================================================
+    # 1. WAIT_LTF: Evaluate every tick for fast LTF trigger response
+    # =========================================================================
+    if setup_state == "WAIT_LTF":
+        return True, new_count
+    
+    # =========================================================================
+    # 2. NEW CANDLE: Always evaluate on candle close (backward compatible)
+    # =========================================================================
+    if engine._is_new_candle():
+        engine._mark_candle_evaluated()
+        _update_last_eval_price(engine, current_price)
+        logger.info(f"🕯️ NEW CANDLE CLOSE → EVALUATING | Price: ${current_price:.2f} | ATR: {atr_1m:.2f}")
+        return True, new_count
+    
+    # =========================================================================
+    # 3. MINIMUM COOLDOWN: Prevent over-evaluation
+    # =========================================================================
+    ticks_since_last_eval = getattr(engine, '_ticks_since_last_eval', 0) + 1
+    engine._ticks_since_last_eval = ticks_since_last_eval
+    
+    if ticks_since_last_eval < EVENT_GATE_CONFIG["MIN_TICKS_BETWEEN_EVAL"]:
+        # Too soon since last evaluation
         return False, new_count
     
-    # New candle - mark as evaluated and proceed
-    engine._mark_candle_evaluated()
-    return True, idle_eval_count + 1
+    # =========================================================================
+    # 4. PRICE MOVEMENT EVENT: Evaluate if significant price move
+    # =========================================================================
+    if atr_1m > 0:
+        last_eval_price = getattr(engine, '_last_eval_price', current_price)
+        price_delta = abs(current_price - last_eval_price)
+        threshold = atr_1m * EVENT_GATE_CONFIG["PRICE_MOVE_ATR_THRESHOLD"]
+        
+        if price_delta >= threshold:
+            direction = "↑" if current_price > last_eval_price else "↓"
+            _update_last_eval_price(engine, current_price)
+            engine._ticks_since_last_eval = 0
+            logger.info(
+                f"📈 PRICE EVENT {direction} → EVALUATING | "
+                f"Move: ${price_delta:.2f} (threshold: ${threshold:.2f}) | "
+                f"Price: ${last_eval_price:.2f} → ${current_price:.2f}"
+            )
+            return True, new_count
+    
+    # =========================================================================
+    # 5. MAX TICKS FALLBACK: Evaluate every N ticks regardless
+    # =========================================================================
+    if ticks_since_last_eval >= EVENT_GATE_CONFIG["MAX_TICKS_WITHOUT_EVAL"]:
+        _update_last_eval_price(engine, current_price)
+        engine._ticks_since_last_eval = 0
+        logger.info(
+            f"⏰ MAX TICKS ({EVENT_GATE_CONFIG['MAX_TICKS_WITHOUT_EVAL']}) → EVALUATING | "
+            f"Price: ${current_price:.2f} | ATR: {atr_1m:.2f}"
+        )
+        return True, new_count
+    
+    # =========================================================================
+    # 6. NO EVENT: Skip evaluation (log rate-limited)
+    # =========================================================================
+    if new_count % 60 == 0:  # Log every 60 ticks
+        last_eval_price = getattr(engine, '_last_eval_price', 0)
+        price_delta = abs(current_price - last_eval_price) if last_eval_price > 0 else 0
+        threshold = atr_1m * EVENT_GATE_CONFIG["PRICE_MOVE_ATR_THRESHOLD"] if atr_1m > 0 else 0
+        logger.info(
+            f"📊 IDLE: Waiting | Ticks since eval: {ticks_since_last_eval}/{EVENT_GATE_CONFIG['MAX_TICKS_WITHOUT_EVAL']} | "
+            f"Price move: ${price_delta:.2f} (need ${threshold:.2f}) | "
+            f"Price: ${current_price:.2f}"
+        )
+    
+    return False, new_count
+
+
+def _update_last_eval_price(engine: "SignalEngine", price: float):
+    """Update the last evaluated price on engine."""
+    engine._last_eval_price = price
 
 
 # ==============================================================================
@@ -302,27 +404,56 @@ def check_anticipation_signal(
         
         engine._last_anticipation_state = anticipation
         
-        # Check for valid anticipation signal (confidence > 60%)
-        if anticipation.signal != AnticipationSignal.NONE and anticipation.confidence >= 0.6:
+        # =========================================================================
+        # 🔥 AJUSTE (Jan 27, 2026): ANTICIPATION = información, NO trigger
+        # 
+        # Crítica institucional:
+        # - ANTICIPATION no es un edge, es un early warning
+        # - Solo debe servir para cambiar estado interno / alertas
+        # - NUNCA como trigger directo de trades
+        #
+        # Subimos umbral de log a 55% y DESHABILITAMOS probe directo
+        # =========================================================================
+        
+        # Check for valid anticipation signal (confidence > 55% for logging)
+        if anticipation.signal != AnticipationSignal.NONE and anticipation.confidence >= 0.55:
             tags['anticipation_signal'] = anticipation.signal.value
             tags['anticipation_confidence'] = anticipation.confidence
             tags['anticipation_direction'] = anticipation.direction
             
+            # =====================================================================
+            # 🔥 FIX (Jan 28, 2026): Extraer BB percentile y volume ratio de reasons
+            # para que EdgeStateManager pueda usar estos valores para BREAKOUT edge
+            # =====================================================================
+            if anticipation.reasons:
+                for reason in anticipation.reasons:
+                    # Parse "squeeze: BB width X.XX% (percentile YY)"
+                    if 'squeeze' in reason.lower() and 'percentile' in reason.lower():
+                        import re
+                        pct_match = re.search(r'percentile\s*(\d+)', reason)
+                        if pct_match:
+                            tags['anticipation_bb_percentile'] = float(pct_match.group(1))
+                    
+                    # Parse "volume_decline: Volume ratio X.XX (Y/Z)"
+                    if 'volume' in reason.lower() and 'ratio' in reason.lower():
+                        import re
+                        vol_match = re.search(r'ratio\s*([\d.]+)', reason)
+                        if vol_match:
+                            tags['anticipation_volume_ratio'] = float(vol_match.group(1))
+            
             logger.info(
-                f"🔮 ANTICIPATION DETECTED: {anticipation.signal.value} {anticipation.direction} "
-                f"(conf={anticipation.confidence:.0%})"
+                f"🔮 ANTICIPATION: {anticipation.signal.value} {anticipation.direction} | "
+                f"conf={anticipation.confidence:.0%}"
             )
             if anticipation.reasons:
                 for reason in anticipation.reasons[:3]:
                     logger.info(f"   → {reason}")
             
-            # High confidence (>75%) -> consider early entry with probe size
-            if anticipation.confidence >= 0.75 and anticipation.direction:
-                tags['anticipation_entry'] = True
-                if anticipation.time_valid_until:
-                    tags['anticipation_valid_until'] = anticipation.time_valid_until.timestamp()
-                tags['anticipation_probe_size'] = 0.30  # 30% size
-                logger.info(f"🔬 ANTICIPATION PROBE: Will use 30% position size")
+            # 🔥 DESHABILITADO: No usar ANTICIPATION como trigger directo
+            # Solo loguear como información para breakout posterior
+            # if anticipation.confidence >= 0.75 and anticipation.direction:
+            #     tags['anticipation_entry'] = True
+            #     tags['anticipation_probe_size'] = 0.30
     
     except Exception as e:
         logger.warning(f"⚠️ Anticipation engine error (non-fatal): {e}")

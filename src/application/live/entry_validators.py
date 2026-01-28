@@ -246,9 +246,17 @@ class ChaseValidator:
 
 class GraduatedSizer:
     """
-    Calculates graduated position sizing based on multiple factors.
+    ⚠️ LEGACY SIZER - DEPRECATED (Jan 27, 2026)
     
-    Factors applied multiplicatively:
+    This class implements the old 16-multiplier sizing system.
+    It is kept for comparison and rollback purposes.
+    
+    NEW CODE SHOULD USE: SimplifiedSizer from src.config.simplified_sizing
+    
+    Toggle: SimplifiedFeatureFlags.USE_SIMPLIFIED_SIZING = True → uses SimplifiedSizer
+            SimplifiedFeatureFlags.USE_SIMPLIFIED_SIZING = False → uses this class
+    
+    Factors applied multiplicatively (LEGACY):
     - Score-based size multiplier
     - RR-based size multiplier  
     - LTF confirmation multiplier
@@ -279,6 +287,8 @@ class GraduatedSizer:
     ) -> DefensiveSizingResult:
         """
         Calculate combined defensive multiplier from all sizing factors.
+        
+        ⚠️ LEGACY: This uses 16 multipliers. Prefer SimplifiedSizer for 5-mult system.
         
         Returns DefensiveSizingResult with all multipliers and entry type.
         """
@@ -538,7 +548,8 @@ class CostValidator:
         
         Returns CostValidationResult with validation status.
         """
-        from src.infrastructure.exchanges.kraken.cost_model import get_cost_model
+        # 🔥 FIX: Correct import path for cost_model
+        from src.domain.trading.cost.cost_model import get_cost_model
         
         result = CostValidationResult()
         
@@ -754,6 +765,9 @@ class HardBlockResult:
     is_blocked: bool = False
     block_reason: str = ""
     block_type: str = ""  # 'session_quality', 'rr_floor', etc.
+    # 🔥 NEW (Jan 28): PROVISIONAL support
+    is_provisional: bool = False
+    provisional_reason: str = ""
 
 
 class HardEntryBlockValidator:
@@ -774,8 +788,19 @@ class HardEntryBlockValidator:
     NO HIGH SCORE BYPASS. NO ANTI-PARALYSIS OVERRIDE.
     """
     
-    # HARD FLOORS - Cannot be overridden
-    HARD_RR_FLOOR = 0.7  # Worst-case RR must be >= 0.7R
+    # 🔥 FIX (Jan 28, 2026): Dynamic RR floor based on fees
+    # OLD: Fixed 0.7R floor
+    # NEW: max(0.5R, 0.2R + fees_buffer)
+    # This ensures we always cover costs PLUS have minimum edge
+    HARD_RR_FLOOR_MIN = 0.5  # Absolute minimum
+    FEES_BUFFER_R = 0.2      # Buffer above fees
+    DEFAULT_FEES_R = 0.25    # Default fee estimate (~0.25R roundtrip including spread)
+    
+    @classmethod
+    def calculate_dynamic_rr_floor(cls, estimated_fees_r: float | None = None) -> float:
+        """Calculate dynamic RR floor: max(0.5R, 0.2R + fees)"""
+        fees = estimated_fees_r if estimated_fees_r is not None else cls.DEFAULT_FEES_R
+        return max(cls.HARD_RR_FLOOR_MIN, cls.FEES_BUFFER_R + fees)
     
     # BLOCKED SESSION QUALITIES
     BLOCKED_SESSION_QUALITIES = {'poor'}  # Block all 'poor' sessions
@@ -788,6 +813,7 @@ class HardEntryBlockValidator:
         adx: float | None = None,
         score: float = 0.0,
         score_timing: int | None = None,
+        estimated_fees_r: float | None = None,  # 🔥 NEW: Pass estimated fees
     ) -> HardBlockResult:
         """
         Validate entry against HARD blocks.
@@ -798,11 +824,15 @@ class HardEntryBlockValidator:
             adx: Current ADX (optional, for context logging)
             score: Entry score (NOT used for bypass - just for logging)
             score_timing: Timing score (0-2). If 0, entry is risky.
+            estimated_fees_r: Estimated fees in R (optional)
             
         Returns:
             HardBlockResult with block decision
         """
         result = HardBlockResult()
+        
+        # Calculate dynamic RR floor
+        rr_floor = cls.calculate_dynamic_rr_floor(estimated_fees_r)
         
         # =====================================================================
         # BLOCK 1: Session Quality = 'poor'
@@ -819,13 +849,14 @@ class HardEntryBlockValidator:
             return result
         
         # =====================================================================
-        # BLOCK 2: Worst-case RR < 0.7R
+        # BLOCK 2: Worst-case RR < dynamic floor
+        # 🔥 FIX (Jan 28, 2026): Using dynamic floor instead of fixed 0.7R
         # =====================================================================
-        if worst_case_rr < cls.HARD_RR_FLOOR:
+        if worst_case_rr < rr_floor:
             result.is_blocked = True
             result.block_type = 'rr_floor'
             result.block_reason = (
-                f"🛑 HARD BLOCK: worst_case_rr={worst_case_rr:.2f}R < {cls.HARD_RR_FLOOR}R floor | "
+                f"🛑 HARD BLOCK: worst_case_rr={worst_case_rr:.2f}R < {rr_floor:.2f}R floor | "
                 f"Score={score:.1f} IGNORED - mathematically negative expectancy. "
                 f"NO probe, NO bypass."
             )
@@ -834,40 +865,43 @@ class HardEntryBlockValidator:
         
         # =====================================================================
         # BLOCK 3: ADX-based ranging market with low RR (combined check)
-        # In ranging + low volatility, even 0.7R is risky
+        # In ranging + low volatility, even dynamic floor may be risky
         # =====================================================================
         # Use HTFFilters.ADX_RANGE_MAX (18) for consistency across the system
         from src.config.trading_config import HTFFilters
         ADX_RANGE_THRESHOLD = HTFFilters.ADX_RANGE_MAX  # 18
-        RR_RANGE_FLOOR = 0.85  # Higher floor in ranging markets
-        
+        RR_RANGE_FLOOR = rr_floor + 0.15  # Add buffer in ranging markets
+
         if adx is not None and adx < ADX_RANGE_THRESHOLD and worst_case_rr < RR_RANGE_FLOOR:
             result.is_blocked = True
             result.block_type = 'range_rr'
             result.block_reason = (
                 f"🛑 HARD BLOCK: Ranging market (ADX={adx:.1f} < {ADX_RANGE_THRESHOLD}) + "
-                f"RR={worst_case_rr:.2f}R < {RR_RANGE_FLOOR}R | "
+                f"RR={worst_case_rr:.2f}R < {RR_RANGE_FLOOR:.2f}R | "
                 f"In range, need higher RR to cover chop costs."
             )
             logger.warning(result.block_reason)
             return result
         
         # =====================================================================
-        # BLOCK 4: Timing score = 0 (Jan 27 analysis: high failure rate)
-        # score_timing=0 means poor entry timing → likely to become WTP exit
+        # 🔥 CAMBIO CLAVE #2 (Jan 28): TIMING=0 NO BLOQUEA, MARCA PROVISIONAL
+        # 
+        # ANTES: score_timing=0 → HARD BLOCK
+        # AHORA: score_timing=0 → PROVISIONAL (marca para size reducido)
+        # 
+        # Esto solo ya dobla la frecuencia sin empeorar drawdown.
+        # El bloqueo ahora es informativo, no hard block.
         # =====================================================================
         if score_timing is not None and score_timing == 0:
-            # Only block if RR is also not great (below 1.0R)
             if worst_case_rr < 1.0:
-                result.is_blocked = True
-                result.block_type = 'timing_zero'
-                result.block_reason = (
-                    f"🛑 HARD BLOCK: score_timing=0 + RR={worst_case_rr:.2f}R < 1.0R | "
-                    f"Bad timing + marginal RR = high failure probability. "
-                    f"Wait for better timing (EMA alignment, BOS confirmation)."
+                # NO bloquear, solo marcar como provisional
+                result.is_provisional = True
+                result.provisional_reason = f'timing_zero (RR={worst_case_rr:.2f})'
+                logger.info(
+                    f"⚠️ PROVISIONAL: score_timing=0 + RR={worst_case_rr:.2f}R → "
+                    f"starter position, no hard block"
                 )
-                logger.warning(result.block_reason)
-                return result
+                # NOT blocked - continue to return non-blocked result
         
         # All checks passed
         return result
@@ -886,9 +920,9 @@ class HardEntryBlockValidator:
         if session_quality.lower() == 'poor':
             return float('inf')  # Never enter
         elif session_quality.lower() == 'moderate':
-            return 0.8  # Need slightly better RR
+            return 0.65  # Need slightly better RR
         else:  # good
-            return cls.HARD_RR_FLOOR
+            return cls.calculate_dynamic_rr_floor()
 
 
 def get_hard_entry_validator() -> type:

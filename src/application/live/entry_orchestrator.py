@@ -99,6 +99,11 @@ class OrchestrationSizingResult:
     multipliers: Dict[str, float] = field(default_factory=dict)
     final_multiplier: float = 1.0
     min_size_ok: bool = True
+    # 🔥 NEW (Jan 28): PROVISIONAL support
+    is_provisional: bool = False
+    provisional_reason: str = ''
+    provisional_tp_r: float = 0.5
+    provisional_time_stop_min: int = 5
 
 
 @dataclass
@@ -407,21 +412,242 @@ class SizingOrchestrator:
     """
     Calculates final position size with all multipliers.
     
-    Multipliers:
-    1. Edge enforcement
-    2. Score-based
-    3. Regime-based
-    4. Volatility
-    5. Session quality
-    6. Loss streak
-    7. Spread factor
-    8. Countertrend factor
-    9. Day-of-week
-    10. Anticipation probe
-    11. RR-based
-    12. Gate size cap
-    13. Intelligent filter
+    SIMPLIFIED MODE (Jan 27, 2026):
+    Only 5 multipliers: RR, REGIME, LOSS_STREAK, SESSION + base_risk
+    Everything else becomes HARD BLOCK or 1.0
+    
+    LEGACY MODE (for comparison):
+    All 13+ multipliers active
     """
+    
+    @staticmethod
+    def calculate_size_simplified(
+        engine: 'SignalEngine',
+        ctx: EntryContext,
+        stop_loss: float,
+        worst_case_rr: float,
+    ) -> OrchestrationSizingResult:
+        """
+        SIMPLIFIED SIZING: 5 multipliers only.
+        
+        Philosophy: Stop reducing damage, start exploiting edge.
+        
+        🔥 NEW (Jan 28, 2026): Edge Mode Integration
+        - INSTITUTIONAL edge (BREAKOUT/TREND with high conviction): 1.0x-1.5x
+        - INTRADAY edge (micro-inefficiencies): 0.15x-0.30x
+        """
+        from src.config.simplified_sizing import SimplifiedSizer, SimplifiedFeatureFlags
+        
+        result = OrchestrationSizingResult()
+        
+        # Get values needed for simplified sizing
+        capital = engine.risk_engine.capital  # Direct access to capital attribute
+        consecutive_losses = getattr(engine, '_consecutive_losses', 0)
+        session_quality = engine._current_trade_tags.get('session_quality', 'moderate')
+        regime_str = engine._current_regime.value if engine._current_regime else "NORMAL"
+        adx = ctx.adx_1h if hasattr(ctx, 'adx_1h') else None
+        
+        # =====================================================================
+        # 🔥 NEW (Jan 28, 2026): EDGE MODE DETECTION
+        # 
+        # INSTITUTIONAL: Low frequency, high conviction (BREAKOUT, TREND with BOS)
+        #   - Size: 1.0x - 1.5x
+        #   - Activates when: EdgeStateManager has ACTIVE edge with high RR
+        #
+        # INTRADAY: High frequency, low conviction (micro-moves)
+        #   - Size: 0.15x - 0.30x
+        #   - Activates when: INSTITUTIONAL not active, but market is moving
+        # =====================================================================
+        edge_mode = 'INSTITUTIONAL'  # Default to INSTITUTIONAL
+        edge_mode_multiplier = 1.0
+        
+        if hasattr(engine, '_edge_manager') and engine._edge_manager is not None:
+            edge_manager = engine._edge_manager
+            
+            # Check if INSTITUTIONAL edge is active
+            if edge_manager.is_institutional_active():
+                edge_mode = 'INSTITUTIONAL'
+                edge_mode_multiplier = edge_manager.get_institutional_size_multiplier()
+                logger.info(f"🏛️ INSTITUTIONAL MODE | Size mult: {edge_mode_multiplier:.2f}x")
+            else:
+                # Check for INTRADAY edge opportunity
+                market_time = ctx.market_time if hasattr(ctx, 'market_time') else datetime.now()
+                
+                # Get ATR/Volume data from trade tags (calculated in main loop)
+                atr_current = engine._current_trade_tags.get('atr_1m', ctx.atr_1m if hasattr(ctx, 'atr_1m') else 100.0)
+                atr_average = engine._current_trade_tags.get('atr_1m_avg', atr_current)
+                volume_current = engine._current_trade_tags.get('volume_current', 1.0)
+                volume_average = engine._current_trade_tags.get('volume_average', 1.0)
+                
+                # Swing direction from trade tags (calculated in main loop)
+                swing_direction = engine._current_trade_tags.get('swing_direction', 'NEUTRAL')
+                swing_count = engine._current_trade_tags.get('swing_count', 0)
+                
+                # Session quality already available
+                
+                intraday_edge = edge_manager.check_for_intraday_edge(
+                    current_price=ctx.current_price,
+                    atr_current=atr_current,
+                    atr_average=atr_average,
+                    volume_current=volume_current,
+                    volume_average=volume_average,
+                    swing_direction=swing_direction,
+                    swing_count=swing_count,
+                    session_quality=session_quality,
+                    market_time=market_time
+                )
+                
+                if intraday_edge:
+                    edge_mode = 'INTRADAY'
+                    # Calculate ratios for size multiplier
+                    atr_ratio = atr_current / atr_average if atr_average > 0 else 1.0
+                    vol_ratio = volume_current / volume_average if volume_average > 0 else 1.0
+                    edge_mode_multiplier = edge_manager.get_intraday_size_multiplier(atr_ratio, vol_ratio)
+                    logger.info(f"⚡ INTRADAY MODE | Size mult: {edge_mode_multiplier:.2f}x")
+                else:
+                    # No edge active at all - block or use minimal size
+                    logger.debug("📊 NO EDGE MODE active - using default sizing")
+        
+        # =====================================================================
+        # 🔥 NEW (Jan 28, 2026): LIQUIDITY EVENT DETECTION FOR INTRADAY
+        # 
+        # Si INTRADAY y R < 0.30 → NECESITA liquidity event
+        # Detectar sweep, rejection, o failure_test ANTES de sizing
+        # =====================================================================
+        liquidity_event = None
+        
+        if edge_mode == 'INTRADAY' and worst_case_rr < 0.30:
+            try:
+                # Import detection functions
+                from src.domain.trading.edge_state_manager import (
+                    detect_any_liquidity_event, LiquidityEvent
+                )
+                import pandas as pd
+                
+                # Get candles from market_data
+                candles_1m = None
+                if hasattr(engine, 'market_data') and engine.market_data is not None:
+                    candles_1m = engine.market_data.get_candles('1m')
+                
+                df_1m = None
+                if candles_1m and len(candles_1m) >= 10:
+                    df_1m = pd.DataFrame(candles_1m[-30:])  # Last 30 candles
+                
+                if df_1m is not None and len(df_1m) >= 5:
+                    # Get direction from edge manager
+                    direction = 'LONG'
+                    if hasattr(engine, '_edge_manager') and engine._edge_manager._current_bos:
+                        direction = engine._edge_manager._current_bos.direction
+                    
+                    # Get ATR
+                    atr = ctx.atr_1m if hasattr(ctx, 'atr_1m') else engine._current_trade_tags.get('atr_1m', 100.0)
+                    
+                    # Get swing level (last micro swing)
+                    swing_level = None
+                    if direction == 'LONG':
+                        # Looking for swing low
+                        recent_lows = df_1m['low'].tail(10)
+                        swing_level = recent_lows.min()
+                    else:
+                        # Looking for swing high
+                        recent_highs = df_1m['high'].tail(10)
+                        swing_level = recent_highs.max()
+                    
+                    # Detect liquidity event
+                    liquidity_event = detect_any_liquidity_event(
+                        df=df_1m,
+                        direction=direction,
+                        atr=atr,
+                        swing_level=swing_level,
+                        test_level=swing_level,
+                        lookback_candles=5
+                    )
+                    
+                    if liquidity_event.is_valid():
+                        logger.info(
+                            f"🌊 LIQUIDITY EVENT DETECTED: {liquidity_event.event_type.value} "
+                            f"(conf: {liquidity_event.confidence:.2f}) - R={worst_case_rr:.2f} permitido"
+                        )
+                    else:
+                        logger.warning(
+                            f"⚠️ NO LIQUIDITY EVENT for R={worst_case_rr:.2f} - "
+                            f"trade may be blocked by sizing filter"
+                        )
+                else:
+                    logger.warning("⚠️ No 1m DataFrame available for liquidity detection")
+            except Exception as e:
+                logger.error(f"Error detecting liquidity event: {e}")
+                liquidity_event = None
+        
+        # Store edge mode in trade tags for analysis
+        if hasattr(engine, '_current_trade_tags'):
+            engine._current_trade_tags['edge_mode'] = edge_mode
+            engine._current_trade_tags['edge_mode_multiplier'] = edge_mode_multiplier
+            if liquidity_event and hasattr(liquidity_event, 'event_type'):
+                engine._current_trade_tags['liquidity_event'] = getattr(liquidity_event.event_type, 'value', 'NONE')
+                engine._current_trade_tags['liquidity_confidence'] = getattr(liquidity_event, 'confidence', 0.0)
+        
+        # Calculate using simplified system WITH edge mode AND liquidity event
+        sizing_result = SimplifiedSizer.calculate(
+            capital=capital,
+            entry_price=ctx.current_price,
+            stop_loss=stop_loss,
+            worst_case_rr=worst_case_rr,
+            regime_str=regime_str,
+            adx=adx,
+            consecutive_losses=consecutive_losses,
+            session_quality=session_quality,
+            edge_mode=edge_mode,
+            edge_mode_multiplier=edge_mode_multiplier,
+            liquidity_event=liquidity_event,  # 🔥 NEW: Pass liquidity event for R-validation
+        )
+        
+        # Map to OrchestrationSizingResult
+        if not sizing_result.should_trade:
+            result.size = 0.0
+            result.min_size_ok = False
+            result.multipliers = {}  # Empty dict for blocked trades
+            result.final_multiplier = 0.0
+            logger.warning(f"🚫 SIMPLIFIED SIZING BLOCK: {sizing_result.block_reason}")
+            return result
+        
+        result.size = sizing_result.final_size
+        result.size = round_size_to_exchange(result.size)
+        result.size_usd = result.size * ctx.current_price
+        result.min_size_ok = result.size >= KRAKEN_BTC_MIN_SIZE
+        
+        # Store multipliers for logging
+        result.multipliers = {
+            'rr': sizing_result.rr_mult,
+            'regime': sizing_result.regime_mult,
+            'loss_streak': sizing_result.loss_streak_mult,
+            'session': sizing_result.session_mult,
+            'edge_mode': sizing_result.edge_mult,  # 🔥 NEW: Edge mode multiplier
+        }
+        result.final_multiplier = sizing_result.combined_multiplier
+        
+        # 🔥 NEW (Jan 28): Track PROVISIONAL state from sizing
+        if sizing_result.is_provisional:
+            result.is_provisional = True
+            result.provisional_reason = sizing_result.provisional_reason
+            result.provisional_tp_r = sizing_result.provisional_tp_r
+            result.provisional_time_stop_min = sizing_result.provisional_time_stop_min
+            engine._current_trade_tags['provisional'] = True
+            engine._current_trade_tags['provisional_reason'] = sizing_result.provisional_reason
+            engine._current_trade_tags['provisional_tp_r'] = sizing_result.provisional_tp_r
+            engine._current_trade_tags['provisional_time_stop_min'] = sizing_result.provisional_time_stop_min
+            logger.info(
+                f"⚠️ PROVISIONAL ENTRY: {sizing_result.provisional_reason} | "
+                f"Size: {result.size:.6f} | TP: {sizing_result.provisional_tp_r}R | "
+                f"Time stop: {sizing_result.provisional_time_stop_min}min"
+            )
+        
+        # Tag for tracking
+        engine._current_trade_tags['simplified_sizing'] = True
+        engine._current_trade_tags['simplified_multipliers'] = result.multipliers
+        engine._current_trade_tags['edge_mode'] = edge_mode  # 🔥 NEW: Track edge mode
+        
+        return result
     
     @staticmethod
     def calculate_size(
@@ -432,7 +658,18 @@ class SizingOrchestrator:
         stop_loss: float,
         gate_size_cap: float = 1.0,
     ) -> OrchestrationSizingResult:
-        """Calculate final position size."""
+        """
+        ⚠️ LEGACY SIZING - DEPRECATED (Jan 27, 2026)
+        
+        Uses 13+ multipliers. Prefer calculate_size_simplified() for 5-mult system.
+        This method is kept for comparison and rollback.
+        
+        Toggle in src/config/simplified_sizing.py:
+        - USE_SIMPLIFIED_SIZING = True → uses calculate_size_simplified()
+        - USE_SIMPLIFIED_SIZING = False → uses this method
+        """
+        logger.debug("📊 LEGACY SIZING PATH (13+ multipliers)")
+        
         result = OrchestrationSizingResult()
         result.multipliers = {}
         
@@ -800,9 +1037,25 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     
     risk = abs(current_price - stop_loss)
     
-    # Get TP target
-    daily_tp = engine._daily_regime_config.get('tp_r_target', AsymmetryConfig.BASE_TP_R) if hasattr(engine, '_daily_regime_config') and engine._daily_regime_config else RiskManagement.TP1_RISK_MULTIPLE
-    tp_mult = daily_tp
+    # 🔥 SIMPLIFIED TP (Jan 27, 2026): Fixed TP based on regime only
+    # 🔥 UPDATE (Jan 28, 2026): Added edge_type for BREAKOUT 2.0R minimum
+    from src.config.simplified_sizing import SimplifiedFeatureFlags, SimplifiedExitConfig
+    
+    if SimplifiedFeatureFlags.USE_FIXED_TP:
+        # Get edge type from current trade tags
+        current_edge_type = engine._current_trade_tags.get('edge_type', None)
+        
+        # Simplified: 1.5R in trend, 1.0R in range, 2.0R in breakout
+        tp_mult = SimplifiedExitConfig.get_tp_r(
+            regime_str=engine._current_regime.value if engine._current_regime else "NORMAL",
+            adx=ctx.adx_1h if hasattr(ctx, 'adx_1h') else None,
+            edge_type=current_edge_type
+        )
+        logger.info(f"📊 SIMPLIFIED TP: {tp_mult}R (edge={current_edge_type})")
+    else:
+        # Legacy: Dynamic TP from daily regime config
+        daily_tp = engine._daily_regime_config.get('tp_r_target', AsymmetryConfig.BASE_TP_R) if hasattr(engine, '_daily_regime_config') and engine._daily_regime_config else RiskManagement.TP1_RISK_MULTIPLE
+        tp_mult = daily_tp
     
     if bias == 'LONG':
         take_profit = current_price + (risk * tp_mult)
@@ -864,6 +1117,14 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         )
         return result
     
+    # 🔥 NEW (Jan 28): Track PROVISIONAL state from hard_block
+    is_provisional_from_timing = hard_block.is_provisional
+    provisional_reason = hard_block.provisional_reason
+    if is_provisional_from_timing:
+        engine._current_trade_tags['provisional_from_timing'] = True
+        engine._current_trade_tags['provisional_reason'] = provisional_reason
+        logger.info(f"⚠️ Entry marked PROVISIONAL from validator: {provisional_reason}")
+    
     # Store worst_case_rr for later use
     engine._current_trade_tags['rr_worst_case'] = worst_case_rr
     
@@ -890,11 +1151,22 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     engine._current_trade_tags['rr_size_mult'] = rr_size_mult
     
     # ========== PHASE 7: SIZING ==========
-    sizing_result = SizingOrchestrator.calculate_size(
-        engine, ctx, score_result, guard_result,
-        stop_loss=stop_loss,
-        gate_size_cap=gate_result.max_size_multiplier,
-    )
+    # 🔥 SIMPLIFIED MODE (Jan 27, 2026): Use 5-multiplier system if enabled
+    from src.config.simplified_sizing import SimplifiedFeatureFlags
+    
+    if SimplifiedFeatureFlags.USE_SIMPLIFIED_SIZING:
+        sizing_result = SizingOrchestrator.calculate_size_simplified(
+            engine, ctx,
+            stop_loss=stop_loss,
+            worst_case_rr=rr_result.worst_case_rr,
+        )
+        logger.info(f"📊 SIMPLIFIED SIZING: {sizing_result.multipliers}")
+    else:
+        sizing_result = SizingOrchestrator.calculate_size(
+            engine, ctx, score_result, guard_result,
+            stop_loss=stop_loss,
+            gate_size_cap=gate_result.max_size_multiplier,
+        )
     
     if not sizing_result.min_size_ok:
         result.reason = f"Size {sizing_result.size:.6f} below minimum"
@@ -1059,6 +1331,25 @@ async def _handle_instant_fill(
     engine.state_machine.transition_to(BotState.MANAGE, "Instant fill (backtest)")
     
     logger.info(f"🎯 Position opened: {ctx.bias} {size:.6f} @ {ctx.current_price:.2f}")
+    
+    # 🔥 NEW (Jan 28, 2026): Send entry notification to Telegram
+    if engine.output_manager:
+        try:
+            from src.application.live.trading_app import _create_safe_task
+            _create_safe_task(engine.output_manager.send_entry_notification({
+                'symbol': engine.symbol,
+                'direction': ctx.bias,
+                'entry_price': ctx.current_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'size': size,
+                'score': engine._entry_score,
+                'regime': getattr(engine, '_current_regime', None),
+                'risk_usd': engine._current_trade_tags.get('risk_usd'),
+                'timestamp': ctx.market_time.isoformat() if hasattr(ctx.market_time, 'isoformat') else str(ctx.market_time)
+            }), "send_entry_notification")
+        except Exception as e:
+            logger.debug(f"Entry notification error: {e}")
 
 
 # =========================================================================

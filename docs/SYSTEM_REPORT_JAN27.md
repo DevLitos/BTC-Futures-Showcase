@@ -401,11 +401,34 @@ class HybridTrailingStop:
             return base * min(vol_ratio, 1.2)
 ```
 
-## 4.4 WORST_TRADE_PREVENTION (WTP)
+## 4.4 WORST_TRADE_PREVENTION (WTP) - 🔥 DESHABILITADO
 
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ ⚠️  WTP DESHABILITADO EN SIMPLIFIED MODE (Jan 27, 2026)            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│ RAZÓN: WTP amputa el edge.                                          │
+│                                                                     │
+│ Es una salida basada en:                                            │
+│   - frustración histórica                                           │
+│   - miedo a losers mediocres                                        │
+│   - overfitting conductual                                          │
+│                                                                     │
+│ Un trade mediocre NO es un error si forma parte del edge.           │
+│                                                                     │
+│ WTP reduce drawdown... pero reduce expectancy MÁS.                  │
+│                                                                     │
+│ DURACIÓN DEL TEST: 30 días                                          │
+│ TOGGLE: src/config/simplified_sizing.py → DISABLE_WTP = True        │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Código LEGACY (para referencia):**
 ```python
 ExitHierarchy:
-    WORST_TRADE_PREVENTION_ENABLED = True
+    WORST_TRADE_PREVENTION_ENABLED = True  # ← OVERRIDE by SimplifiedFeatureFlags
     
     # Time thresholds
     WTP_MIN_TIME_MINUTES = 5       # Don't trigger before 5 min
@@ -420,6 +443,10 @@ def check_worst_trade_prevention(position, current_price, market_time):
     Detect mediocre trades that are likely to become losers.
     Exit early to save capital.
     """
+    # 🔥 FIRST CHECK: Is WTP disabled in simplified mode?
+    if not ExitHierarchy.is_wtp_enabled():
+        return None  # WTP disabled, let trade run
+    
     age_minutes = (market_time - position.entry_time).total_seconds() / 60
     
     if age_minutes < WTP_MIN_TIME_MINUTES:
@@ -475,6 +502,58 @@ def check_mediocre_trade_exit(position, current_price, market_time, adx):
 
 # 5. SIZING (TAMAÑO DE POSICIÓN)
 
+## 5.0 🔥 SIMPLIFIED MODE (Jan 27, 2026 - ACTIVE)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ CAMBIO FILOSÓFICO: DE FILTRADO A EXPLOTACIÓN DE EDGE               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ANTES (16 multiplicadores): "Encontrar MUCHAS situaciones donde    │
+│  intentar apostar POCO" → Tamaño final ridículo siempre             │
+│                                                                     │
+│  AHORA (5 multiplicadores): "Encontrar POCAS situaciones donde      │
+│  merece apostar FUERTE" → HARD BLOCK o tamaño significativo         │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+5 MULTIPLICADORES CORE:
+┌──────────────────┬─────────┬──────────────────────────────────────┐
+│ Multiplicador    │ Rango   │ Lógica                               │
+├──────────────────┼─────────┼──────────────────────────────────────┤
+│ 1. base_risk     │ 1%      │ Siempre 1% del capital               │
+│ 2. rr_mult       │ 0-1.0   │ <0.7=BLOCK, 0.7-1.0=0.5x, ≥1.0=1.0x │
+│ 3. regime_mult   │ 0.7-1.0 │ RANGE=0.7x, TREND=1.0x               │
+│ 4. loss_streak   │ 0.5-1.0 │ 0-1 loss=1.0x, 2+=0.5x               │
+│ 5. session_mult  │ 0-1.0   │ good=1.0x, moderate=0.8x, poor=BLOCK │
+└──────────────────┴─────────┴──────────────────────────────────────┘
+
+HARD BLOCKS (no reducen size, BLOQUEAN trade):
+- session_quality == 'poor' → NO TRADE
+- worst_case_rr < 0.70 → NO TRADE
+- score_structure == 0 → NO TRADE
+- chase > 2.5 ATR → NO TRADE
+
+MULTIPLICADORES ELIMINADOS (set to 1.0):
+- score_mult, ltf_mult, day_mult, spread_mult, countertrend_mult
+- anticipation_mult, volatility_mult, gate_cap, range_mult
+- daily_regime_mult, location_cap
+
+Toggle: src/config/simplified_sizing.py → SimplifiedFeatureFlags
+```
+
+**Ejemplo Comparativo:**
+```
+Capital: $10,000 | Entry: $88,000 | SL: $87,500 | RR: 1.2
+
+LEGACY (16 mults):   0.5 × 0.25 × 0.8 × 0.7 × 1.0 × 0.7 = 0.049 → $431
+SIMPLIFIED (5 mults): 1.0 × 1.0 × 1.0 × 1.0              = 1.00  → $8,800
+
+Diferencia: 20x más tamaño cuando hay edge real
+```
+
+---
+
 ## 5.1 Fórmula Base
 
 ```python
@@ -482,7 +561,7 @@ base_size = (capital * risk_per_trade) / risk_in_points
 # risk_per_trade default = 0.01 (1% of capital)
 ```
 
-## 5.2 Multiplicadores (16 en total)
+## 5.2 Multiplicadores LEGACY (16 en total) - DEPRECATED
 
 | # | Multiplicador | Rango | Condición |
 |---|---------------|-------|-----------|
@@ -503,7 +582,7 @@ base_size = (capital * risk_per_trade) / risk_in_points
 | 15 | `daily_regime_mult` | 0.7-1.0 | Daily regime (RANGE_DAY=0.7) |
 | 16 | `location_cap` | 0.5-1.0 | Near extreme = 0.5 |
 
-## 5.3 Fórmula Final
+## 5.3 Fórmula Final LEGACY
 
 ```python
 final_size = base_size 
@@ -528,7 +607,7 @@ final_size = base_size
 final_size = max(final_size, KRAKEN_BTC_MIN_SIZE)  # 0.0001
 ```
 
-## 5.4 Ejemplo de Cálculo
+## 5.4 Ejemplo de Cálculo LEGACY
 
 ```
 Capital: $10,000
@@ -853,36 +932,105 @@ class ActivityTracker:
 
 ---
 
+# 11. 🔥 SIMPLIFIED MODE (ACTIVO Jan 27, 2026)
+
+## 11.1 Cambio Filosófico
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ ANTES: Sistema de FILTRADO (reducir daño esperando varianza)       │
+│ AHORA: Sistema de EXPLOTACIÓN DE EDGE (apostar fuerte con edge)    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│ Un sistema GANADOR:                                                 │
+│   → Encuentra POCAS situaciones donde merece apostar FUERTE        │
+│                                                                     │
+│ Un sistema de filtrado:                                             │
+│   → Encuentra MUCHAS situaciones donde intenta apostar POCO        │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## 11.2 Cambios Implementados
+
+| Componente | LEGACY | SIMPLIFIED | Razón |
+|------------|--------|------------|-------|
+| **Multiplicadores** | 16 | 5 | Menos control = más edge real |
+| **WTP** | Habilitado | **DESHABILITADO** | Amputa edge, no reduce drawdown net |
+| **TP** | Dinámico (daily config) | **Fijo (1.5R/1.0R)** | Ver verdad del edge |
+| **Trailing** | Siempre activo | **Solo >1R** | Dejar trades trabajar |
+
+## 11.3 Feature Flags
+
+```python
+# src/config/simplified_sizing.py
+
+class SimplifiedFeatureFlags:
+    USE_SIMPLIFIED_SIZING = True    # 5 mults vs 16 mults
+    DISABLE_WTP = True              # WTP OFF for 30 days
+    USE_FIXED_TP = True             # 1.5R trend / 1.0R range
+    SIMPLIFIED_TRAILING = True      # Trail only after 1R
+    STRICT_EDGE_MODE = True         # Only trade with edge_state == ACTIVE
+    MAX_TRADES_PER_EDGE = 2         # Max 2 attempts per BOS event
+```
+
+## 11.4 Impacto Esperado
+
+```
+ANTES (ejemplo real):
+  Combined multiplier: 0.049
+  Size final: $431 en trade de $8,800 base
+  → Fees se comen expectancy
+  → Winners no compensan losers
+
+AHORA (mismo trade):
+  Combined multiplier: 1.0
+  Size final: $8,800 (o BLOCKED si no hay edge)
+  → Trade significativo cuando hay edge
+  → BLOCK completo cuando no hay edge
+```
+
+## 11.5 Métricas a Monitorear (30 días)
+
+- **Expectancy per trade** (debe aumentar)
+- **Número de trades** (debe disminuir)
+- **Win rate** (puede bajar, pero R promedio sube)
+- **Max drawdown** (puede aumentar temporalmente)
+- **Trades con WTP que habrían salido** (observar, no actuar)
+
+---
+
 # ANEXO: QUICK REFERENCE
 
 ```
+🔥 SIMPLIFIED MODE ACTIVE 🔥
+
 ENTRY REQUIREMENTS:
-✓ Score >= 5.0 (4.5 in RANGE, 4.0 discovery)
-✓ Structure score > 0
-✓ worst_case_rr >= 0.7R (0.85R if RANGE)
-✓ session_quality != 'poor'
-✓ timing_score > 0 OR rr >= 1.0R
-✓ chase < 2.5 ATR
-✓ cost_ratio < 0.35
+✓ Structure score > 0 (HARD BLOCK if 0)
+✓ worst_case_rr >= 0.7R (HARD BLOCK)
+✓ session_quality != 'poor' (HARD BLOCK)
+✓ chase < 2.5 ATR (HARD BLOCK)
+✓ Score >= 5.0 (soft gate for legacy path)
 
-SIZING CAPS:
-- Min size: 0.0001 BTC
-- Max single position: 2% of capital
-- Max daily risk: 3% of capital
+SIMPLIFIED SIZING (5 factors):
+1. base_risk: 1% always
+2. rr_mult: <0.7=BLOCK, 0.7-1.0=0.5x, ≥1.0=1.0x
+3. regime_mult: RANGE=0.7x, TREND=1.0x
+4. loss_streak: 0-1=1.0x, 2+=0.5x
+5. session: good=1.0x, moderate=0.8x, poor=BLOCK
 
-EXIT TRIGGERS:
-- Stop Loss hit
-- Take Profit hit  
-- Trailing stop triggered
-- WORST_TRADE_PREVENTION (mediocre trade)
-- TIME_INVALIDATION (60min TREND, 90min RANGE)
-- Regime change
+SIMPLIFIED EXITS:
+- Stop Loss (structural, no change)
+- Take Profit: 1.5R (TREND) / 1.0R (RANGE)
+- Trailing: Only after 1R profit
+- WTP: DISABLED ⚠️
+- TIME_INVALIDATION: 60min flat
 
 SESSIONS (UTC):
 07-12: LONDON (good)
 12-16: OVERLAP (good)
 16-21: NY (good)
-21-23: DEAD_HOURS (BLOCKED)
+21-23: DEAD_HOURS (HARD BLOCK)
 23-07: ASIA (moderate)
 ```
 
@@ -890,3 +1038,4 @@ SESSIONS (UTC):
 
 *Documento generado: 27 Enero 2026*
 *Sistema: FideiRatioCapital DayTrader v2.1*
+*Modo: SIMPLIFIED ACTIVE*

@@ -1002,6 +1002,10 @@ class Position:
           - If price improving (moving toward TP) → extend grace
           - If price stagnating/worsening AND loss > threshold → close
         
+        🔥 SIMPLIFIED MODE (Jan 27, 2026):
+        If SimplifiedFeatureFlags.DISABLE_WTP is True, WTP is completely disabled
+        to measure true edge without "fear-based" exits.
+        
         Args:
             current_price: Current market price
             market_time: Current market time (for backtest compatibility). Falls back to time.time() if None.
@@ -1012,7 +1016,8 @@ class Position:
         from src.config.trading_config import ExitHierarchy
         import time
         
-        if not ExitHierarchy.WORST_TRADE_PREVENTION_ENABLED:
+        # 🔥 Check if WTP is disabled in simplified mode
+        if not ExitHierarchy.is_wtp_enabled():
             return None
         
         # EXCLUDE ADOPTED POSITIONS
@@ -1115,6 +1120,7 @@ class Position:
           - MFE >= 0.6R (historical high)
           - Current R >= 0.5R (price still near highs, NOT falling)
           - Never touched -0.2R (clean move)
+          - 🔥 NOT in RANGE mode (Jan 28, 2026)
         
         This increases R on clear winners without increasing drawdown.
         
@@ -1122,6 +1128,12 @@ class Position:
         """
         if self.added_to_winner:
             return None  # Already added
+        
+        # 🔥 FIX (Jan 28, 2026): DISABLE ADD_TO_WINNER in RANGE mode
+        # In RANGE, adding size increases correlation exposure, not edge
+        # The original move often reverses in mean-reversion context
+        if self.regime_mode == 'RANGE':
+            return None
         
         mfe_r = self.calculate_mfe_r()
         

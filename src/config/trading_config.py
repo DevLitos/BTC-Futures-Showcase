@@ -2578,7 +2578,20 @@ class ExitHierarchy:
     # 5. WORST-TRADE PREVENTION (Jan 23, 2026)
     # "Si no invalida la tesis, no puede ser el peor trade del día"
     # =========================================================================
-    WORST_TRADE_PREVENTION_ENABLED = True
+    # 🔥 SIMPLIFIED MODE (Jan 27, 2026): Check SimplifiedFeatureFlags first
+    # If in simplified mode, WTP is DISABLED to measure true edge
+    @classmethod
+    def is_wtp_enabled(cls) -> bool:
+        """Check if WTP should be enabled based on mode"""
+        try:
+            from src.config.simplified_sizing import SimplifiedFeatureFlags
+            if SimplifiedFeatureFlags.DISABLE_WTP:
+                return False
+        except ImportError:
+            pass
+        return cls.WORST_TRADE_PREVENTION_ENABLED
+    
+    WORST_TRADE_PREVENTION_ENABLED = True  # Legacy default (override via simplified_sizing)
     
     # Si trade está dentro de tesis (no invalida estructura):
     # - Pérdida máxima = hard stop O cap de -0.25R

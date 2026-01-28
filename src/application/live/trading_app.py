@@ -215,8 +215,9 @@ from src.application.live.entry_orchestrator import (
 
 # 🎯 EDGE STATE MANAGER (Jan 27, 2026): Edge como evento discreto
 # El sistema SOLO opera cuando hay un edge ACTIVO (BOS + pullback)
+# 🔥 Extended (Jan 27, 2026): Soporte para RANGE y BREAKOUT edges
 from src.domain.trading.edge_state_manager import (
-    EdgeStateManager, get_edge_manager, EdgeState
+    EdgeStateManager, get_edge_manager, EdgeState, EdgeType
 )
 
 logger = logging.getLogger(__name__)
@@ -531,6 +532,13 @@ class SignalEngine:
         self._loss_exit_types = {}  # Track loss exit types for analysis (dict not list!)
         
         # =====================================================================
+        # 💰 SESSION TRACKING (Jan 28, 2026)
+        # Track session start capital for PnL reporting
+        # =====================================================================
+        self._session_start_capital: float | None = None  # Capital at session start
+        self._session_start_time: datetime | None = None  # Session start time
+        
+        # =====================================================================
         # 🔥 ANOMALY DETECTION TRACKING (Jan 24, 2026)
         # Track previous tick data to detect anomalies (gaps, staleness)
         # =====================================================================
@@ -580,10 +588,19 @@ class SignalEngine:
         self._last_evaluated_candle_ts: int = 0  # Timestamp of last evaluated LTF candle
         
         # =====================================================================
+        # EVENT-BASED EVALUATION GATE (Jan 28, 2026)
+        # - Ticks since last evaluation (for max ticks fallback)
+        # - Last evaluated price (for price movement detection)
+        # =====================================================================
+        self._ticks_since_last_eval: int = 0  # Ticks since last full evaluation
+        self._last_eval_price: float = 0.0    # Price at last evaluation
+        
+        # =====================================================================
         # MOMENTUM QUALITY - For position sizing, not hard veto
         # =====================================================================
         self._last_momentum_quality: str = "MODERATE"  # STRONG, MODERATE, WEAK
         self._last_momentum_atr: float = 100.0  # Last ATR value
+        self._last_spread_bps: float = 1.0  # Last spread in basis points (for SL updates)
         
         # =====================================================================
         # ENTRY SCORE SYSTEM - Score > Gates architecture
@@ -642,6 +659,16 @@ class SignalEngine:
         # 🔥 FIX (Jan 23, 2026): Cache HTF regime mode based on ADX
         self._htf_cache_regime_mode: str = 'UNKNOWN'  # 'RANGE', 'WEAK_TREND', 'TREND', 'LOW_ADX'
         self._htf_cache_adx: float = 0.0  # ADX value for logging
+        
+        # =====================================================================
+        # 🔥 BIAS INVALIDATION BY PRICE ACTION (Jan 28, 2026)
+        # Track price movement since bias was established
+        # If price moves significantly against bias in RANGE mode → invalidate
+        # =====================================================================
+        self._bias_established_price: float = 0.0  # Price when bias was set
+        self._bias_established_time: datetime | None = None  # When bias was set
+        self._bias_high_since: float = 0.0  # Highest price since bias established
+        self._bias_low_since: float = 0.0  # Lowest price since bias established
         
         # =====================================================================
         # SYSTEM HEALTH MONITOR - Independent of PnL
@@ -1422,6 +1449,13 @@ class SignalEngine:
                 self.risk_engine.initial_equity = capital
                 self.risk_engine.equity = capital
                 self.risk_engine.max_equity = capital
+            
+            # 💰 NEW (Jan 28, 2026): Track session start capital for PnL reporting
+            if self._session_start_capital is None:
+                self._session_start_capital = capital
+                self._session_start_time = datetime.now(UTC)
+                logger.info(f"📊 SESSION START: Capital=${capital:.2f}")
+            
             logger.info(f"✅ Capital loaded via get_available_capital: ${self.risk_engine.capital:.2f}")
             logger.info(f"✅ Equity synced: initial=${self.risk_engine.initial_equity:.2f}, current=${self.risk_engine.equity:.2f}")
         else:
@@ -1616,6 +1650,30 @@ class SignalEngine:
                         logger.info(f"🤖 ML STATUS: phase={ml_stats['phase']}, predictions={ml_stats['prediction_count']}, "
                                     f"failures={ml_stats['model_failures']}, avg_latency={ml_stats['avg_latency_ms']:.1f}ms, "
                                     f"drift={'⚠️ YES' if ml_stats['drift_detected'] else 'NO'}")
+                        
+                        # 💰 ACCOUNT REPORT (every 5 minutes - Jan 28, 2026)
+                        try:
+                            current_capital = self.risk_engine.capital
+                            session_start = self._session_start_capital or current_capital
+                            session_pnl = current_capital - session_start
+                            session_pnl_pct = (session_pnl / session_start * 100) if session_start > 0 else 0.0
+                            session_duration = "N/A"
+                            if self._session_start_time:
+                                duration_sec = (tick_start - self._session_start_time).total_seconds()
+                                hours = int(duration_sec // 3600)
+                                minutes = int((duration_sec % 3600) // 60)
+                                session_duration = f"{hours}h{minutes}m"
+                            
+                            # Get daily PnL from state machine if available
+                            daily_pnl = getattr(self.state_machine, '_daily_pnl', 0.0)
+                            
+                            pnl_emoji = "🟢" if session_pnl >= 0 else "🔴"
+                            logger.info(f"💰 ACCOUNT REPORT: Balance=${current_capital:.2f} | "
+                                        f"Session {pnl_emoji} ${session_pnl:+.2f} ({session_pnl_pct:+.2f}%) | "
+                                        f"Daily P&L=${daily_pnl:+.2f} | "
+                                        f"Duration={session_duration}")
+                        except Exception as acc_err:
+                            logger.debug(f"Account report error: {acc_err}")
                     
                     last_heartbeat_time = tick_start
                 
@@ -1853,9 +1911,13 @@ class SignalEngine:
                 logger.debug(f"⏸️ {cooldown_reason}")
             return
         
-        # 2. CANDLE GATE CHECK
+        # 2. CANDLE GATE CHECK (EVENT-BASED - Jan 28, 2026)
+        # Now evaluates on:
+        # - New candle close (always)
+        # - Price movement >= 0.3 ATR
+        # - Max 30 ticks without event
         should_eval, self._idle_eval_count = check_candle_gate(
-            self, self.setup_state, self._idle_eval_count, current_price
+            self, self.setup_state, self._idle_eval_count, current_price, atr_1m
         )
         if not should_eval:
             return
@@ -1938,6 +2000,12 @@ class SignalEngine:
             self._htf_cache_adx = float(_raw_adx) if hasattr(_raw_adx, '__float__') else float(_raw_adx) if _raw_adx else 0.0
             logger.debug(f"HTF cache updated: ts={last_1h_ts}, passed={htf_passed}, bias={bias}, regime_mode={self._htf_cache_regime_mode}, adx={self._htf_cache_adx:.1f}")
             
+            # 🔥 FIX (Jan 28, 2026): Reset bias price tracking on new bias
+            self._bias_established_price = current_price
+            self._bias_established_time = market_time
+            self._bias_high_since = current_price
+            self._bias_low_since = current_price
+            
             # =================================================================
             # 🔥 TREND INTELLIGENCE UPDATE (Jan 23, 2026)
             # Update trend phase detection on each new 1h candle
@@ -1983,6 +2051,81 @@ class SignalEngine:
             htf_passed = self._htf_cache_passed
             bias = self._htf_cache_bias
             htf_reason = self._htf_cache_reason
+        
+        # =====================================================================
+        # 🔥 FIX (Jan 28, 2026): BIAS INVALIDATION BY PRICE ACTION
+        # 
+        # PROBLEMA: El bias se "pega" por 1 hora aunque el precio baje $150.
+        # En modo RANGE esto es peligroso - el bias debe ser sensible a price action.
+        #
+        # SOLUCIÓN: Invalidar bias si el precio se mueve significativamente en contra
+        # - Track high/low desde que se estableció el bias
+        # - Si LONG pero precio cae >1.5 ATR desde high → NEUTRAL
+        # - Si SHORT pero precio sube >1.5 ATR desde low → NEUTRAL
+        # =====================================================================
+        
+        # Update price tracking
+        if self._bias_high_since > 0:
+            self._bias_high_since = max(self._bias_high_since, current_price)
+            self._bias_low_since = min(self._bias_low_since, current_price)
+        else:
+            # Initialize on first run
+            self._bias_high_since = current_price
+            self._bias_low_since = current_price
+            self._bias_established_price = current_price
+        
+        # Get ATR for invalidation threshold
+        candles_1m_for_atr = self.market_data.get_candles('1m')
+        atr_for_invalidation = current_price * 0.003  # Default 0.3%
+        if candles_1m_for_atr and len(candles_1m_for_atr) >= 14:
+            try:
+                df_1m_temp = pd.DataFrame(candles_1m_for_atr[-30:])
+                atr_vals = calculate_atr(
+                    df_1m_temp['high'].to_numpy(),
+                    df_1m_temp['low'].to_numpy(),
+                    df_1m_temp['close'].to_numpy(),
+                    14
+                )
+                if len(atr_vals) > 0:
+                    atr_for_invalidation = float(atr_vals[-1])
+            except Exception:
+                pass
+        
+        # Invalidation threshold: 1.5 ATR movement against bias
+        BIAS_INVALIDATION_ATR_MULT = 1.5
+        invalidation_threshold = atr_for_invalidation * BIAS_INVALIDATION_ATR_MULT
+        
+        bias_invalidated = False
+        if bias == 'LONG':
+            # LONG bias invalid if price dropped >1.5 ATR from high
+            drop_from_high = self._bias_high_since - current_price
+            if drop_from_high > invalidation_threshold:
+                logger.warning(
+                    f"⚠️ BIAS INVALIDATED: LONG but price dropped ${drop_from_high:.0f} "
+                    f"(>{invalidation_threshold:.0f}) from high ${self._bias_high_since:.0f} → NEUTRAL"
+                )
+                bias = None  # Neutral - no directional bias
+                bias_invalidated = True
+                self._current_trade_tags['bias_invalidated'] = True
+                self._current_trade_tags['bias_invalidation_reason'] = f'drop_{drop_from_high:.0f}_from_high'
+        elif bias == 'SHORT':
+            # SHORT bias invalid if price rose >1.5 ATR from low
+            rise_from_low = current_price - self._bias_low_since
+            if rise_from_low > invalidation_threshold:
+                logger.warning(
+                    f"⚠️ BIAS INVALIDATED: SHORT but price rose ${rise_from_low:.0f} "
+                    f"(>{invalidation_threshold:.0f}) from low ${self._bias_low_since:.0f} → NEUTRAL"
+                )
+                bias = None  # Neutral - no directional bias
+                bias_invalidated = True
+                self._current_trade_tags['bias_invalidated'] = True
+                self._current_trade_tags['bias_invalidation_reason'] = f'rise_{rise_from_low:.0f}_from_low'
+        
+        # If bias invalidated, skip trading this tick (wait for new signal)
+        if bias_invalidated or bias is None:
+            if self._idle_eval_count % 60 == 1:
+                logger.info(f"⏸️ NO BIAS: Waiting for directional signal | Last: {self._htf_cache_bias}")
+            return
         
         # =====================================================================
         # 🔥 FIX (Jan 23, 2026): RANGE MODE - NOT BLOCK, USE DIFFERENT RULES
@@ -2047,21 +2190,139 @@ class SignalEngine:
         self._current_trade_tags['htf_adx'] = htf_adx
         self._current_trade_tags['effective_adx'] = effective_adx
         
-        # Determine trading mode based on EFFECTIVE ADX (not just 1h)
+        # =====================================================================
+        # 🔥 FIX (Jan 28, 2026): TREND INTELLIGENCE SOVEREIGNTY
+        # 
+        # PROBLEMA: ADX dice TREND (>20) pero TrendIntelligence dice RANGE_BOUND
+        # Esto crea "zona muerta" donde nada funciona.
+        #
+        # SOLUCIÓN: TrendIntelligence tiene soberanía sobre el régimen
+        # - Si TrendIntelligence = RANGE_BOUND → forzar RANGE mode
+        # - Si TrendIntelligence = TRENDING → puede ser TREND mode
+        # - ADX solo sirve para ajustar agresividad DENTRO del modo
+        #
+        # TrendIntelligence usa más señales (price action, volume, momentum)
+        # ADX es solo un indicador, no el juez final
+        # =====================================================================
+        
+        # PHASE 1: Start with ADX-based mode (legacy)
         if effective_adx < 18:
-            trading_mode = 'RANGE'
+            adx_suggested_mode = 'RANGE'
         elif effective_adx < 20:
-            trading_mode = 'TRANSITION'  # Less size, higher score threshold
+            adx_suggested_mode = 'TRANSITION'
         else:
-            trading_mode = 'TREND'
+            adx_suggested_mode = 'TREND'
+        
+        # PHASE 2: TrendIntelligence override (sovereignty)
+        trend_phase = getattr(self, '_trend_phase', TrendPhase.RANGE_BOUND)
+        trend_phase_str = trend_phase.value if hasattr(trend_phase, 'value') else str(trend_phase)
+        
+        # TrendIntelligence says RANGE_BOUND → force RANGE mode regardless of ADX
+        if trend_phase_str == 'RANGE_BOUND':
+            trading_mode = 'RANGE'
+            if adx_suggested_mode != 'RANGE' and self._idle_eval_count % 60 == 1:
+                logger.info(
+                    f"🎯 TREND INTELLIGENCE OVERRIDE: ADX says {adx_suggested_mode} but phase is RANGE_BOUND → RANGE"
+                )
+        # TrendIntelligence says ACCUMULATION → TRANSITION (could break either way)
+        elif trend_phase_str == 'ACCUMULATION':
+            trading_mode = 'TRANSITION'
+        # TrendIntelligence in active trend → respect ADX for intensity
+        elif trend_phase_str in ('TREND_BIRTH', 'ACCELERATION', 'MATURE'):
+            trading_mode = adx_suggested_mode if adx_suggested_mode == 'TREND' else 'TRANSITION'
+        # TrendIntelligence says exhaustion/death → conservative
+        elif trend_phase_str in ('EXHAUSTION', 'TREND_DEATH'):
+            trading_mode = 'RANGE'  # Don't fight dying trends
+        else:
+            # Fallback to ADX-based mode
+            trading_mode = adx_suggested_mode
         
         self._current_trade_tags['trading_mode'] = trading_mode
+        self._current_trade_tags['adx_suggested_mode'] = adx_suggested_mode
+        self._current_trade_tags['trend_phase'] = trend_phase_str
         
-        # Log mode changes (rate limited)
-        if self._idle_eval_count % 60 == 1:
+        # =====================================================================
+        # 🔥 NEW (Jan 28, 2026): INTRADAY EDGE DATA COLLECTION
+        # Calculate data needed for INTRADAY edge detection in entry_orchestrator
+        # =====================================================================
+        try:
+            candles_1m = self.market_data.get_candles('1m')
+            if candles_1m and len(candles_1m) >= 30:
+                df_1m_intraday = pd.DataFrame(candles_1m[-30:])
+                
+                # ATR current vs average (for expansion ratio)
+                atr_1m_arr = calculate_atr(
+                    df_1m_intraday['high'].to_numpy(),
+                    df_1m_intraday['low'].to_numpy(),
+                    df_1m_intraday['close'].to_numpy(),
+                    14
+                )
+                if len(atr_1m_arr) >= 10:
+                    atr_1m_current = float(atr_1m_arr[-1])
+                    atr_1m_avg = float(np.mean(atr_1m_arr[-20:-1]))  # Average of last 20 excluding current
+                    self._current_trade_tags['atr_1m'] = atr_1m_current
+                    self._current_trade_tags['atr_1m_avg'] = atr_1m_avg
+                    self._current_trade_tags['atr_expansion_ratio'] = atr_1m_current / atr_1m_avg if atr_1m_avg > 0 else 1.0
+                
+                # Volume current vs average
+                if 'volume' in df_1m_intraday.columns:
+                    vol_current = float(df_1m_intraday['volume'].iloc[-1])
+                    vol_avg = float(df_1m_intraday['volume'].iloc[:-1].mean())
+                    self._current_trade_tags['volume_current'] = vol_current
+                    self._current_trade_tags['volume_average'] = vol_avg
+                    self._current_trade_tags['volume_ratio'] = vol_current / vol_avg if vol_avg > 0 else 1.0
+                
+                # Swing direction (HH/HL = BULLISH, LL/LH = BEARISH)
+                highs = df_1m_intraday['high'].to_numpy()[-10:]
+                lows = df_1m_intraday['low'].to_numpy()[-10:]
+                
+                # Find swing points (simple: local highs and lows)
+                hh_count = 0
+                ll_count = 0
+                for i in range(2, len(highs)):
+                    if highs[i] > highs[i-1] and highs[i-1] > highs[i-2]:
+                        hh_count += 1
+                    if lows[i] > lows[i-1] and lows[i-1] > lows[i-2]:
+                        hh_count += 1  # Higher lows also bullish
+                    if lows[i] < lows[i-1] and lows[i-1] < lows[i-2]:
+                        ll_count += 1
+                    if highs[i] < highs[i-1] and highs[i-1] < highs[i-2]:
+                        ll_count += 1  # Lower highs also bearish
+                
+                if hh_count > ll_count + 1:
+                    swing_dir = 'BULLISH'
+                    swing_count = hh_count
+                elif ll_count > hh_count + 1:
+                    swing_dir = 'BEARISH'
+                    swing_count = ll_count
+                else:
+                    swing_dir = 'NEUTRAL'
+                    swing_count = 0
+                
+                self._current_trade_tags['swing_direction'] = swing_dir
+                self._current_trade_tags['swing_count'] = swing_count
+                
+        except Exception as e:
+            logger.debug(f"INTRADAY data collection error: {e}")
+            # Set defaults
+            self._current_trade_tags.setdefault('atr_1m', 100.0)
+            self._current_trade_tags.setdefault('atr_1m_avg', 100.0)
+            self._current_trade_tags.setdefault('volume_current', 1.0)
+            self._current_trade_tags.setdefault('volume_average', 1.0)
+            self._current_trade_tags.setdefault('swing_direction', 'NEUTRAL')
+            self._current_trade_tags.setdefault('swing_count', 0)
+        
+        # Log mode changes with full context (rate limited)
+        if self._idle_eval_count % 30 == 1:
+            override_note = ""
+            if adx_suggested_mode != trading_mode:
+                override_note = f" ⚡ OVERRIDE from {adx_suggested_mode}"
+            
             logger.info(
-                f"🎯 TRADING MODE: {trading_mode} | ADX_1h={htf_adx:.1f} | ADX_5m={fast_adx:.1f} | "
-                f"Effective={effective_adx:.1f} | Bias={bias}"
+                f"🎯 TRADING MODE: {trading_mode}{override_note} | "
+                f"TrendPhase={trend_phase_str} | "
+                f"ADX[1h={htf_adx:.1f}, 5m={fast_adx:.1f}, eff={effective_adx:.1f}] | "
+                f"Bias={bias}"
             )
         
         # ===================================================================
@@ -2137,14 +2398,34 @@ class SignalEngine:
             
             if not at_extreme:
                 # =========================================================================
-                # 🔥 FIX (Jan 26, 2026): PROBING MODE instead of early exit
+                # 🔥 AJUSTE (Jan 28, 2026): PROBING HABILITADO con restricciones
                 # 
-                # OLD BEHAVIOR: Not at extreme → early exit, no trade
-                # NEW BEHAVIOR: Not at extreme → check if PROBING criteria met
-                #               If yes → continue with 0.25x size (diagnostic probe)
-                #               If no → early exit (pure observation)
+                # BALANCE:
+                # - PROBING permitido cerca de VWAP/VPOC con alineación de bias
+                # - Size reducido al 25% para controlar riesgo
+                # - Requiere score mínimo de 4
+                #
+                # SI PROBING_ENABLED = True → evaluar cerca de VWAP/VPOC
                 # =========================================================================
+                from src.domain.trading.edge_state_manager import RangeEdgeCriteria
                 
+                if not RangeEdgeCriteria.PROBING_ENABLED:
+                    # PROBING deshabilitado - solo observar
+                    if self._idle_eval_count % 120 == 1:  # Log cada 2 min
+                        logger.info(
+                            f"👁️ NO_EDGE (RANGE): pct={pct_60d:.0f}% (need ≤{RangeEdgeCriteria.EXTREME_LOW_PCT:.0f}% or ≥{RangeEdgeCriteria.EXTREME_HIGH_PCT:.0f}%) | "
+                            f"PROBING disabled - only extremes tradable"
+                        )
+                    return
+                
+                # PROBING habilitado - log status
+                if self._idle_eval_count % 60 == 1:
+                    logger.info(
+                        f"🔍 RANGE PROBING: pct={pct_60d:.0f}% | extremes ≤{RangeEdgeCriteria.EXTREME_LOW_PCT:.0f}% or ≥{RangeEdgeCriteria.EXTREME_HIGH_PCT:.0f}% | "
+                        f"Evaluating near VWAP/VPOC with {RangeEdgeCriteria.PROBING_SIZE_MULT*100:.0f}% size"
+                    )
+                
+                # PROBING habilitado - continuar con la lógica original
                 # Prepare dataframes for PROBING check
                 # df_1h already available from HTF filter block above
                 # df_5m needs to be built from candles_5m
@@ -2185,8 +2466,10 @@ class SignalEngine:
                 probing_conviction = probing_result.conviction_score
                 
                 if probing_size_mult > 0:
-                    # PROBING MODE: Continue with graduated risk
+                    # PROBING MODE: Continue with graduated risk (capped at RANGE_SIZE_MAX)
                     # Determine level name FIRST for tag storage
+                    probing_size_mult = min(probing_size_mult, RangeEdgeCriteria.RANGE_SIZE_MAX)
+                    
                     if probing_size_mult >= 0.65:
                         level_name = "PROBE_MAX"
                     elif probing_size_mult >= 0.50:
@@ -2194,10 +2477,11 @@ class SignalEngine:
                     else:
                         level_name = "PROBE_MIN"
                     
-                    self._current_trade_tags['probing_mode'] = level_name  # 🔥 FIX: Store level name, not True
-                    self._current_trade_tags['range_mode_extreme'] = 'PROBING'  # Not at extreme but probing
-                    self._current_trade_tags['range_size_mult'] = probing_size_mult  # Graduated size
-                    self._current_trade_tags['conviction_score'] = probing_conviction  # 🔥 Store for observability
+                    self._current_trade_tags['probing_mode'] = level_name
+                    self._current_trade_tags['range_mode_extreme'] = 'PROBING'
+                    self._current_trade_tags['range_size_mult'] = probing_size_mult
+                    self._current_trade_tags['conviction_score'] = probing_conviction
+                    self._current_trade_tags['probing_triggers_edge'] = True
                     
                     logger.info(
                         f"🔍 {level_name}: Not at extreme (pct={pct_60d:.0f}%) | "
@@ -2206,7 +2490,7 @@ class SignalEngine:
                     # DON'T RETURN - continue to evaluation
                 else:
                     # NO PROBING - pure observation mode
-                    if self._idle_eval_count % 120 == 1:  # Log every 2 min
+                    if self._idle_eval_count % 60 == 1:  # Log every minute
                         logger.info(
                             f"👁️ NO_EDGE MODE: Not at extreme (pct={pct_60d:.0f}%) | "
                             f"PROBING blocked: {probing_reason}"
@@ -2336,30 +2620,229 @@ class SignalEngine:
         self._edge_manager.check_expiration(market_time)
         self._edge_manager.check_invalidation(current_price, atr_1h)
         
-        # 2. Check for new BOS (solo si no hay edge activo)
-        if self._edge_manager.state == EdgeState.NO_EDGE:
-            bos_detected = self._edge_manager.check_for_bos(
-                current_price=current_price,
-                htf_bias=bias,
-                swing_high=self._last_swing_high,
-                swing_low=self._last_swing_low,
-                prev_swing_high=self._prev_swing_high,
-                prev_swing_low=self._prev_swing_low,
-                atr=atr_1h,
-                market_time=market_time
-            )
-            if bos_detected:
-                self._current_trade_tags['bos_detected'] = True
+        # =====================================================================
+        # 🔥 FIX (Jan 27, 2026): DETECCIÓN DE EDGE POR TIPO DE MERCADO
+        # 
+        # PROBLEMA ORIGINAL:
+        #   - En RANGE (ADX<18), no hay BOS → NO_EDGE → NO TRADES
+        #   - El sistema detectaba PROBING/EXTREMOS pero EdgeStateManager
+        #     solo entendía TREND (BOS+pullback)
+        #
+        # SOLUCIÓN:
+        #   - TREND (ADX≥18): BOS + Pullback (original)
+        #   - RANGE (ADX<18): Extremos (85%/15%) o PROBING con alta confluencia
+        #   - BREAKOUT: Compresión + ruptura (para ANTICIPATION)
+        # =====================================================================
         
-        # 3. Check for pullback (si edge está armado)
+        # 2. Detectar edge según modo de trading
+        if self._edge_manager.state == EdgeState.NO_EDGE:
+            
+            # =====================================================================
+            # 🔥 FIX (Jan 28, 2026): BREAKOUT EDGE - Integrar con ANTICIPATION
+            # 
+            # Cuando ANTICIPATION detecta COMPRESSION_BREAKOUT, activar edge de breakout
+            # Esto conecta el sistema de anticipación con el edge state manager
+            # =====================================================================
+            anticipation_signal = self._current_trade_tags.get('anticipation_signal')
+            if anticipation_signal == 'COMPRESSION_BREAKOUT':
+                anticipation_direction = self._current_trade_tags.get('anticipation_direction', 'LONG')
+                anticipation_bb_pct = self._current_trade_tags.get('anticipation_bb_percentile', 50.0)
+                anticipation_vol_ratio = self._current_trade_tags.get('anticipation_volume_ratio', 1.0)
+                
+                # Intentar armar edge de breakout
+                breakout_armed = self._edge_manager.check_for_breakout_edge(
+                    current_price=current_price,
+                    bb_width_percentile=anticipation_bb_pct,
+                    volume_ratio=anticipation_vol_ratio,
+                    direction=anticipation_direction,
+                    atr=atr_1h,
+                    market_time=market_time
+                )
+                
+                if breakout_armed:
+                    self._current_trade_tags['breakout_edge_armed'] = True
+                    self._current_trade_tags['edge_type'] = 'BREAKOUT'
+                    logger.info(
+                        f"🔥 BREAKOUT EDGE ARMED from ANTICIPATION | "
+                        f"Direction: {anticipation_direction} | BB%: {anticipation_bb_pct:.0f}"
+                    )
+            
+            if trading_mode == 'RANGE':
+                # RANGE: Buscar edge en extremos CON SWEEP + REJECTION obligatorio
+                percentile_60d = self._location_context.percentile_60d if self._location_context else 50.0
+                
+                # =====================================================================
+                # 🔥 FIX (Jan 28, 2026): PROBING ≠ EDGE
+                # 
+                # PROBING es un TAG INFORMATIVO, NO activa edge automáticamente.
+                # Solo indica que estamos cerca de VWAP/VPOC para referencia.
+                #
+                # Para entrar necesitamos:
+                # - EXTREMOS (pct <=15% o >=85%) + sweep/rejection, O
+                # - CONFIRMACIÓN adicional (BOS, delta aligned, etc.)
+                #
+                # PROBING solo reduce size y ajusta TP, no sustituye edge detection
+                # =====================================================================
+                probing_active = self._current_trade_tags.get('probing_triggers_edge', False)
+                
+                if probing_active:
+                    # Log que estamos en zona de probing - pero NO armar edge directamente
+                    if self._idle_eval_count % 60 == 1:
+                        logger.info(
+                            f"👁️ PROBING ZONE (informational): Near VWAP/VPOC | "
+                            f"Edge still requires sweep/rejection or extreme location"
+                        )
+                    # Solo marcar como probing mode para ajustes de size/TP downstream
+                    self._current_trade_tags['probing_mode'] = True
+                    self._current_trade_tags['edge_type'] = None  # NO hay edge por probing solo
+                
+                # =====================================================================
+                # 🔥 SWEEP + REJECTION: Obtener datos de últimas 2 velas 5m
+                # Sin sweep+rejection NO hay edge, solo localización
+                # =====================================================================
+                curr_high, curr_low, curr_open, curr_close = 0.0, 0.0, 0.0, 0.0
+                prev_high, prev_low = 0.0, 0.0
+                
+                if candles_5m and len(candles_5m) >= 2:
+                    curr_candle = candles_5m[-1]
+                    prev_candle = candles_5m[-2]
+                    
+                    curr_high = float(curr_candle.get('high', 0))
+                    curr_low = float(curr_candle.get('low', 0))
+                    curr_open = float(curr_candle.get('open', 0))
+                    curr_close = float(curr_candle.get('close', 0))
+                    prev_high = float(prev_candle.get('high', 0))
+                    prev_low = float(prev_candle.get('low', 0))
+                
+                # =====================================================================
+                # 🔥 COMPRESIÓN CHECK: Calcular BB width percentile
+                # Si BB width <= 5% percentile → RANGE deshabilitado (pre-breakout)
+                # =====================================================================
+                bb_width_percentile = 50.0  # Default neutral
+                try:
+                    candles_1m = self.market_data.get_candles('1m')
+                    if candles_1m and len(candles_1m) >= 50:
+                        from src.shared.indicators import calculate_bollinger_bands
+                        df_1m = pd.DataFrame(candles_1m)
+                        closes_1m = df_1m['close'].to_numpy()
+                        bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(closes_1m, period=20, std_dev=2)
+                        if len(bb_upper) >= 20:
+                            bb_widths = bb_upper[-20:] - bb_lower[-20:]
+                            current_bb_width = bb_upper[-1] - bb_lower[-1]
+                            # Percentile: qué % de valores son MENORES que el actual
+                            bb_width_percentile = (np.sum(bb_widths < current_bb_width) / len(bb_widths)) * 100
+                except Exception as e:
+                    logger.debug(f"BB width percentile calc failed: {e}")
+                
+                range_edge = self._edge_manager.check_for_range_edge(
+                    current_price=current_price,
+                    htf_bias=bias,
+                    percentile_60d=percentile_60d,
+                    atr=atr_1h,
+                    market_time=market_time,
+                    # Datos para sweep + rejection
+                    curr_high=curr_high,
+                    curr_low=curr_low,
+                    curr_open=curr_open,
+                    curr_close=curr_close,
+                    prev_high=prev_high,
+                    prev_low=prev_low,
+                    # 🔥 BB width percentile para compresión check
+                    bb_width_percentile=bb_width_percentile
+                )
+                
+                if range_edge:
+                    self._current_trade_tags['range_edge_activated'] = True
+                    self._current_trade_tags['edge_type'] = 'RANGE'
+                    self._current_trade_tags['sweep_rejection_confirmed'] = True
+                    # El SL binario está en el BOSEvent.bos_level
+                    if self._edge_manager.current_bos:
+                        self._current_trade_tags['range_invalidation_level'] = self._edge_manager.current_bos.bos_level
+            
+            else:
+                # TREND/TRANSITION: Buscar BOS clásico
+                bos_detected = self._edge_manager.check_for_bos(
+                    current_price=current_price,
+                    htf_bias=bias,
+                    swing_high=self._last_swing_high,
+                    swing_low=self._last_swing_low,
+                    prev_swing_high=self._prev_swing_high,
+                    prev_swing_low=self._prev_swing_low,
+                    atr=atr_1h,
+                    market_time=market_time
+                )
+                if bos_detected:
+                    self._current_trade_tags['bos_detected'] = True
+                    self._current_trade_tags['edge_type'] = 'TREND'
+        
+        # 3. Check for pullback o breakout confirmation (si edge está armado)
         if self._edge_manager.state == EdgeState.EDGE_ARMED:
-            pullback_valid = self._edge_manager.check_for_pullback(
-                current_price=current_price,
-                atr=atr_1h,
-                market_time=market_time
-            )
-            if pullback_valid:
-                self._current_trade_tags['pullback_validated'] = True
+            current_bos = self._edge_manager.current_bos
+            
+            if current_bos and current_bos.edge_type == EdgeType.BREAKOUT:
+                # =====================================================================
+                # 🔥 BREAKOUT CONFIRMATION (Jan 28, 2026): Criterios institucionales
+                # 
+                # No solo distancia ATR - necesitamos:
+                # 1. Close FUERA de Bollinger Bands
+                # 2. Dirección coincide con anticipation
+                # 3. Expansión de BB comenzando
+                # =====================================================================
+                
+                # Obtener datos de BB para confirmación institucional
+                bb_upper, bb_lower, bb_expansion_ratio = 0.0, 0.0, 0.0
+                close_price = current_price  # Default al precio actual
+                
+                try:
+                    candles_1m = self.market_data.get_candles('1m')
+                    if candles_1m and len(candles_1m) >= 50:
+                        from src.shared.indicators import calculate_bollinger_bands
+                        df_1m = pd.DataFrame(candles_1m)
+                        closes_1m = df_1m['close'].to_numpy()
+                        bb_upper_arr, bb_middle, bb_lower_arr = calculate_bollinger_bands(closes_1m, period=20, std_dev=2)
+                        
+                        if len(bb_upper_arr) >= 20:
+                            bb_upper = float(bb_upper_arr[-1])
+                            bb_lower = float(bb_lower_arr[-1])
+                            close_price = float(closes_1m[-1])
+                            
+                            # Calcular ratio de expansión
+                            bb_widths = bb_upper_arr[-20:] - bb_lower_arr[-20:]
+                            avg_bb_width = float(np.mean(bb_widths[:-1]))  # Excluir actual
+                            current_bb_width = bb_upper - bb_lower
+                            bb_expansion_ratio = float(current_bb_width / avg_bb_width) if avg_bb_width > 0 else 1.0
+                except Exception as e:
+                    logger.debug(f"BB data for breakout confirmation failed: {e}")
+                
+                # Verificar dirección correcta primero
+                direction_ok = (
+                    (current_bos.direction == 'LONG' and current_price > current_bos.price) or
+                    (current_bos.direction == 'SHORT' and current_price < current_bos.price)
+                )
+                
+                if direction_ok:
+                    breakout_confirmed = self._edge_manager.confirm_breakout(
+                        current_price=current_price,
+                        breakout_direction=current_bos.direction,
+                        atr=atr_1h,
+                        market_time=market_time,
+                        bb_upper=bb_upper,
+                        bb_lower=bb_lower,
+                        close_price=close_price,
+                        expansion_ratio=bb_expansion_ratio
+                    )
+                    if breakout_confirmed:
+                        self._current_trade_tags['breakout_confirmed'] = True
+                        self._current_trade_tags['bb_expansion_ratio'] = bb_expansion_ratio
+            else:
+                # TREND edge - check pullback
+                pullback_valid = self._edge_manager.check_for_pullback(
+                    current_price=current_price,
+                    atr=atr_1h,
+                    market_time=market_time
+                )
+                if pullback_valid:
+                    self._current_trade_tags['pullback_validated'] = True
         
         # 4. Guardar estado del edge en tags para observabilidad
         edge_status = self._edge_manager.get_status()
@@ -2932,6 +3415,9 @@ class SignalEngine:
                 # Update spread filter with bid/ask for rolling window analysis
                 self.spread_filter.update_spread(bid_price, ask_price, current_price)
                 spread = spread_pct  # Use the percentage for other calculations
+                # 🔥 FIX (Jan 28, 2026): Store spread for SL updates in exit_actions
+                if spread_pct:
+                    self._last_spread_bps = spread_pct * 100  # Convert to basis points
         
         filter_decision = self.filter_pipeline.evaluate(
             df_1m=df_1m_micro,  # pyright: ignore[reportArgumentType]
@@ -3047,13 +3533,25 @@ class SignalEngine:
                     delta_score_bonus = 0.5 if delta_ratio < -1.0 else 0.25
                     logger.debug(f"📊 DELTA ALIGNED: {delta_ratio:.2f}x avg vol supports SHORT (+{delta_score_bonus} score)")
                 elif bias == 'LONG' and delta_ratio < -0.5:
-                    # Negative delta contradicts LONG - warning but not block
+                    # Negative delta contradicts LONG - PENALTY in RANGE mode
                     self._current_trade_tags['delta_contradicts'] = True
-                    logger.info(f"⚠️ DELTA CONTRADICT: {delta_ratio:.2f}x avg vol AGAINST LONG bias")
+                    # 🔥 FIX Jan 28: Delta contradict must penalize in RANGE (mean reversion depends on flow)
+                    current_mode = self._current_trade_tags.get('trading_mode', '')
+                    if current_mode == 'RANGE':
+                        delta_score_bonus = -1.0  # Penalty in RANGE
+                        logger.warning(f"⚠️ DELTA CONTRADICT RANGE: {delta_ratio:.2f}x vol AGAINST LONG → -1 score penalty")
+                    else:
+                        logger.info(f"⚠️ DELTA CONTRADICT: {delta_ratio:.2f}x avg vol AGAINST LONG bias")
                 elif bias == 'SHORT' and delta_ratio > 0.5:
-                    # Positive delta contradicts SHORT - warning but not block
+                    # Positive delta contradicts SHORT - PENALTY in RANGE mode
                     self._current_trade_tags['delta_contradicts'] = True
-                    logger.info(f"⚠️ DELTA CONTRADICT: +{delta_ratio:.2f}x avg vol AGAINST SHORT bias")
+                    # 🔥 FIX Jan 28: Delta contradict must penalize in RANGE
+                    current_mode = self._current_trade_tags.get('trading_mode', '')
+                    if current_mode == 'RANGE':
+                        delta_score_bonus = -1.0  # Penalty in RANGE
+                        logger.warning(f"⚠️ DELTA CONTRADICT RANGE: +{delta_ratio:.2f}x vol AGAINST SHORT → -1 score penalty")
+                    else:
+                        logger.info(f"⚠️ DELTA CONTRADICT: +{delta_ratio:.2f}x avg vol AGAINST SHORT bias")
         except Exception as e:
             logger.debug(f"Delta volume calculation error: {e}")
         
@@ -3974,6 +4472,26 @@ class SignalEngine:
                     self.pending_order_id = None
                     self.state_machine.transition_to(BotState.IDLE, "Fill without entry data")
                     return
+                
+                # 🔥 NEW (Jan 28, 2026): Send entry notification to Telegram
+                if self.output_manager and hasattr(self, '_last_entry_data') and self._last_entry_data:
+                    try:
+                        entry_data = self._last_entry_data
+                        _create_safe_task(self.output_manager.send_entry_notification({
+                            'symbol': self.symbol,
+                            'direction': entry_data.get('bias', 'UNKNOWN'),
+                            'entry_price': actual_price if 'actual_price' in dir() else entry_data.get('entry_price'),
+                            'stop_loss': entry_data.get('stop_loss'),
+                            'take_profit': entry_data.get('take_profit'),
+                            'size': actual_size if 'actual_size' in dir() else entry_data.get('position_size'),
+                            'score': self._entry_score,
+                            'regime': self._current_trade_regime,
+                            'risk_usd': entry_data.get('tags', {}).get('risk_usd'),
+                            'timestamp': market_time.isoformat() if hasattr(market_time, 'isoformat') else str(market_time)
+                        }), "send_entry_notification")
+                        logger.info("📲 Entry notification sent to Telegram")
+                    except Exception as notif_err:
+                        logger.debug(f"Entry notification error: {notif_err}")
                 
                 # Limpia pending_order_id PERO mantiene _last_entry_data para tracking
                 self.pending_order_id = None

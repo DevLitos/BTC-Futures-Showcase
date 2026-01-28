@@ -463,21 +463,29 @@ class ProbingCriteriaChecker:
         metrics = self._calculate_metrics(current_price, atr_5m, bias, df_1h, df_5m)
         
         # Phase 3: Base criteria check
-        if metrics['vpoc_price'] is None or metrics['vpoc_price'] <= 0:
-            return ProbingResult(0.0, "No VPOC reference available", 0, "BLOCKED")
+        # =================================================================
+        # 🔥 AJUSTE (Jan 28, 2026): VPOC threshold relajado
+        # 
+        # PROBLEMA: En RANGE amplio (BTC ~$1000), VPOC puede estar a 4-5 ATR
+        # Threshold de 3.0 ATR bloqueaba todo probing legítimo
+        #
+        # NUEVO: 
+        # - VPOC threshold: 5.0 ATR (antes 3.0)
+        # - Si no hay VPOC válido, usar solo VWAP + alineación de bias
+        # =================================================================
         
-        if metrics['vpoc_distance_atr'] > 3.0:
+        # VPOC check más permisivo
+        vpoc_valid = metrics['vpoc_price'] is not None and metrics['vpoc_price'] > 0
+        vpoc_close = vpoc_valid and metrics['vpoc_distance_atr'] <= 5.0
+        
+        # VWAP check más permisivo  
+        vwap_close = metrics['vwap_distance_atr'] <= 6.0
+        
+        # Necesitamos AL MENOS uno cerca (no ambos)
+        if not vpoc_close and not vwap_close:
             return ProbingResult(
                 0.0,
-                f"Too far from VPOC ({metrics['vpoc_distance_atr']:.1f} ATR)",
-                0,
-                "BLOCKED"
-            )
-        
-        if metrics['vwap_distance_atr'] > 4.0:
-            return ProbingResult(
-                0.0,
-                f"Too far from VWAP ({metrics['vwap_distance_atr']:.1f} ATR)",
+                f"Too far from anchors (VPOC={metrics['vpoc_distance_atr']:.1f}, VWAP={metrics['vwap_distance_atr']:.1f} ATR)",
                 0,
                 "BLOCKED"
             )

@@ -1138,6 +1138,26 @@ class TradingSystemOrchestrator:
                     self.health_bridge_writer.update_extra_data(extra_health_data)
                 logger.debug("📊 [MON] health_bridge_writer done")
                 
+                # 🔥 NEW (Jan 28, 2026): Balance info in 5min report
+                try:
+                    if self.signal_engine and self.signal_engine.risk_engine:
+                        current_capital = self.signal_engine.risk_engine.current_capital
+                        
+                        # Track session start capital (first report sets baseline)
+                        if not hasattr(self, '_session_start_capital'):
+                            self._session_start_capital = current_capital
+                        
+                        session_pnl = current_capital - self._session_start_capital
+                        session_pnl_pct = (session_pnl / self._session_start_capital * 100) if self._session_start_capital > 0 else 0
+                        
+                        pnl_emoji = "📈" if session_pnl >= 0 else "📉"
+                        logger.info(
+                            f"💰 Balance: ${current_capital:.2f} | "
+                            f"Session: {pnl_emoji} ${session_pnl:+.2f} ({session_pnl_pct:+.2f}%)"
+                        )
+                except Exception as e:
+                    logger.debug(f"Balance info error: {e}")
+                
                 # External data
                 logger.debug("📊 [MON] About to get external_data status...")
                 if self.external_data:
