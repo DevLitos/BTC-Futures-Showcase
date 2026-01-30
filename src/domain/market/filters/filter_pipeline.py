@@ -119,6 +119,7 @@ class EntryFilterPipeline:
                  # Context
                  market_time: datetime | None = None,
                  regime_mode: str = 'TREND',  # 🔥 FIX (Jan 22): Added regime_mode parameter
+                 displacement_bypass: bool = False,  # 🔥 FIX (Jan 29): Bypass sweep on displacement
                  
                  # Control
                  early_exit: bool = True) -> FilterDecision:
@@ -218,7 +219,8 @@ class EntryFilterPipeline:
                 df=df_short_tf,
                 current_price=current_price,
                 atr=atr,
-                bias=bias
+                bias=bias,
+                displacement_bypass=displacement_bypass  # 🔥 FIX (Jan 29): Pass through
             )
             decision.regime_source = 'post_sweep'
             self._last_decisions['post_sweep'] = decision

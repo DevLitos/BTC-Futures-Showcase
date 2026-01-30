@@ -2225,7 +2225,8 @@ class SessionTradeLimits:
     OVERRIDE_SCORE_THRESHOLD_RANGE = 8.5  # 🔥 FIX: 8.5 in RANGE (was 8.0)
     
     # Max trades per day (across all sessions)
-    MAX_TRADES_PER_DAY = 6  # 🔥 FIX: Reduced from 8 to 6 (prevent overtrading)
+    # PASO 5 — REDUCE EJECUCIONES (NO TRADES): target 2–4 trades/day
+    MAX_TRADES_PER_DAY = 4
     
     @classmethod
     def get_limit(cls, session: str, regime_mode: str | None = None) -> int:

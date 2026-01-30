@@ -103,7 +103,8 @@ class SimplifiedSizingResult:
     # 🔥 NEW (Jan 28): PROVISIONAL edge support
     is_provisional: bool = False      # True if this is a provisional/starter position
     provisional_reason: str = ''      # Why it's provisional (timing_zero, low_r_no_liquidity, etc)
-    provisional_tp_r: float = 0.5     # TP target for provisional (0.4-0.6R)
+    # PASO 6 — Elimina micro-TPs: provisional no puede tener TP corto
+    provisional_tp_r: float = 1.0
     provisional_time_stop_min: int = 5  # Time stop in minutes
     
     # Debug info - use field(default_factory=dict) for mutable default
@@ -324,7 +325,8 @@ class SimplifiedSizer:
                 # 🔥 NUEVO: NO bloquear, DEGRADAR a PROVISIONAL
                 result.is_provisional = True
                 result.provisional_reason = f'low_r_no_liquidity (R={worst_case_rr:.2f})'
-                result.provisional_tp_r = 0.4  # TP corto para R bajo
+                # PASO 6 — Elimina micro-TPs
+                result.provisional_tp_r = max(result.provisional_tp_r, 1.0)
                 result.provisional_time_stop_min = 3  # Time stop corto
                 result.edge_mult = PROVISIONAL_SIZE_MULT  # Forzar size 0.10x
                 result.tags['provisional'] = True
@@ -503,6 +505,10 @@ class SimplifiedExitConfig:
     TP_R_BREAKOUT = 2.0       # BREAKOUT MUST target 2.0R minimum (low winrate)
     TP_R_BREAKOUT_IDEAL = 3.0 # Ideal target for BREAKOUT
     
+    # 🔥 DISPLACEMENT edge (Jan 30, 2026) - Momentum plays need room to run
+    TP_R_DISPLACEMENT = 2.0        # DISPLACEMENT targets 2.0R (institutional momentum)
+    TP_R_DISPLACEMENT_IDEAL = 2.5  # Ideal 2.5R for strong displacement
+    
     # 🔥 INTRADAY edge - Must be >= RR floor (0.7R) to be viable
     # Jan 28, 2026: Changed from 0.5R to 1.0R - 0.5R was ALWAYS blocked by RR floor
     TP_R_INTRADAY = 1.0       # Same as RANGE (must pass RR floor)
@@ -535,6 +541,7 @@ class SimplifiedExitConfig:
         - RANGE regime → 1.0R (mean reversion)
         - TREND regime → 1.5R (momentum)
         - BREAKOUT edge → 2.0R (expansion play)
+        - DISPLACEMENT edge → 2.0R (institutional momentum)
         
         IMPORTANTE: edge_type=None vs edge_type=INTRADAY NO debe cambiar TP
         """
@@ -542,6 +549,11 @@ class SimplifiedExitConfig:
         if edge_type and edge_type.upper() == 'BREAKOUT':
             logger.info(f"📊 BREAKOUT edge detected - using minimum TP {cls.TP_R_BREAKOUT}R")
             return cls.TP_R_BREAKOUT
+        
+        # 🔥 DISPLACEMENT edge (Jan 30, 2026) - institutional momentum needs room
+        if edge_type and edge_type.upper() == 'DISPLACEMENT':
+            logger.info(f"📊 DISPLACEMENT edge detected - using minimum TP {cls.TP_R_DISPLACEMENT}R")
+            return cls.TP_R_DISPLACEMENT
         
         # 🔥 FIX: REGIME is primary, NOT edge_type
         # This prevents TP inconsistency between ticks

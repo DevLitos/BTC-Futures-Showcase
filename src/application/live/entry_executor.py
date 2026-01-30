@@ -463,11 +463,15 @@ async def execute_entry_order(
     side = 'buy' if bias == 'LONG' else 'sell'
     
     try:
-        # Place market order
-        order_response = await engine.execution.place_market_order(
+        # PASO 2 — MAKER ONLY REAL (SIN EXCEPCIONES)
+        # Entry is always LIMIT + post-only. If it doesn't fill, higher-level logic cancels.
+        order_response = await engine.execution.place_limit_order(
             symbol=engine.symbol,
             side=side,
-            amount=size
+            amount=size,
+            price=current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
         )
         
         if order_response:

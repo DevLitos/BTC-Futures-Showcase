@@ -61,9 +61,13 @@ class CostValidationResult:
     is_valid: bool = True
     cost_usd: float = 0.0
     expected_profit_usd: float = 0.0
+    expected_profit_usd_net: float = 0.0
+    expected_net_r: float = 0.0
+    fee_r_estimate: float = 0.0
     cost_ratio: float = 0.0
     threshold: float = 0.0
     block_reason: str = ""
+    cost_validation_failed: bool = False  # 🔥 Flag when validation errors occur
 
 
 @dataclass
@@ -77,6 +81,17 @@ class RRValidationResult:
     high_score_bypass: bool = False
     block_reason: str = ""
     tags: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ProbeValidationResult:
+    """Result of PROBE-specific validation."""
+    is_valid: bool = True
+    block_reason: str = ""
+    expected_r: float = 0.0
+    expected_net_profit: float = 0.0
+    tp_r: float = 0.0
+    fees_usd: float = 0.0
 
 
 # ==============================================================================
@@ -342,7 +357,7 @@ class GraduatedSizer:
         result.combined_defensive *= loss_streak_multiplier
         
         # SESSION QUALITY SIZING
-        from src.domain.trading.session_utils import get_session_name
+        from src.config.trading_config import get_session_name
         session_name = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
         session_multiplier = OperatingMode.get_session_multiplier(session_name)
         if session_multiplier < 1.0:
@@ -411,6 +426,21 @@ class GraduatedSizer:
                 logger.info(f"📊 RANGE sizing: {range_size_mult:.0%}")
             result.tags['range_size_mult_applied'] = range_size_mult
             result.combined_defensive *= range_size_mult
+        
+        # 🔥 MOVE QUALITY SIZE MODIFIER (Jan 28, 2026)
+        # If move is EXHAUSTING, block entry entirely
+        # If move is DEVELOPING, reduce size
+        move_quality = trade_tags.get('move_quality', 'UNKNOWN')
+        move_quality_mult = trade_tags.get('move_quality_size_mult', 1.0)
+        if move_quality == 'EXHAUSTING':
+            # HARD BLOCK - do not enter exhausted moves
+            logger.info(f"🚫 MOVE EXHAUSTING: Blocking entry | Wait for pullback")
+            result.tags['move_quality_block'] = True
+            result.combined_defensive = 0.0  # This will block the trade
+        elif move_quality_mult < 1.0 and move_quality != 'UNKNOWN':
+            logger.info(f"📉 MOVE QUALITY [{move_quality}]: size × {move_quality_mult:.0%}")
+            result.tags['move_quality_applied'] = move_quality_mult
+            result.combined_defensive *= move_quality_mult
         
         # DAILY REGIME SIZE MODIFIER
         daily_regime_config = trade_tags.get('_daily_regime_config', {})
@@ -540,8 +570,10 @@ class CostValidator:
         position_size: float,
         current_price: float,
         stop_loss: float,
+        take_profit: float,
         bias: str,
-        use_market_order: bool,
+        is_maker_entry: bool = True,
+        is_maker_exit: bool = True,
     ) -> CostValidationResult:
         """
         Validate that costs don't eat expected profit.
@@ -562,20 +594,37 @@ class CostValidator:
                 side=bias,
                 size_usd=notional_usd,
                 entry_price=current_price,
-                is_maker_entry=not use_market_order,
-                is_maker_exit=False,
+                is_maker_entry=is_maker_entry,
+                is_maker_exit=is_maker_exit,
             )
             
-            # Calculate expected profit at 1.2R
+            # Risk in USD (1R)
             sl_distance = abs(current_price - stop_loss)
-            result.expected_profit_usd = position_size * sl_distance * 1.2
+            risk_usd = position_size * sl_distance
+
+            # Expected gross profit at TP (not a fixed 1.2R)
+            tp_distance = abs(take_profit - current_price)
+            expected_gross_profit_usd = position_size * tp_distance
+
+            result.expected_profit_usd = expected_gross_profit_usd
             result.cost_usd = costs.total_usd
+
+            # Fee estimate in R terms
+            result.fee_r_estimate = (result.cost_usd / risk_usd) if risk_usd > 0 else 999.0
+
+            # Expected net R (after estimated costs)
+            gross_r = (expected_gross_profit_usd / risk_usd) if risk_usd > 0 else 0.0
+            result.expected_net_r = gross_r - result.fee_r_estimate
+
+            # Expected net profit in USD
+            result.expected_profit_usd_net = expected_gross_profit_usd - result.cost_usd
             
-            # Adaptive threshold based on order type
-            if use_market_order:
-                result.threshold = 0.50  # 50% for market orders
+            # Adaptive threshold based on maker/taker profile
+            # (Kept for diagnostics; hard blocks live elsewhere.)
+            if not is_maker_entry or not is_maker_exit:
+                result.threshold = 0.50
             else:
-                result.threshold = 0.80  # 80% for limit orders
+                result.threshold = 0.80
             
             result.cost_ratio = (
                 result.cost_usd / result.expected_profit_usd 
@@ -595,9 +644,15 @@ class CostValidator:
                     f"✅ Cost validator PASS: ${result.cost_usd:.4f} = "
                     f"{result.cost_ratio*100:.1f}% of profit (< {result.threshold*100:.0f}%)"
                 )
+
+            logger.info(
+                f"📉 Net expectancy: gross={gross_r:.2f}R | fees≈{result.fee_r_estimate:.3f}R | net≈{result.expected_net_r:.2f}R | "
+                f"profit_net=${result.expected_profit_usd_net:.2f}"
+            )
         
         except Exception as e:
-            logger.warning(f"⚠️ Cost validator error (proceeding anyway): {e}")
+            logger.warning(f"⚠️ Cost validator error (proceeding with caution): {e}")
+            result.cost_validation_failed = True  # Flag for observability
         
         return result
 
@@ -925,6 +980,173 @@ class HardEntryBlockValidator:
             return cls.calculate_dynamic_rr_floor()
 
 
+# ==============================================================================
+# PROBE VALIDATOR (Jan 28, 2026)
+# ==============================================================================
+
+class ProbeValidator:
+    """
+    Validates PROBE-specific entry requirements.
+    
+    PROBE trades have relaxed RR but MUST meet minimum profitability:
+    - expected_R ≥ 0.25
+    - expected_net_profit ≥ fees × 2
+    - TP ≥ 0.3R
+    - maker only (entrada + salida) - enforced elsewhere
+    
+    PROBE PROHIBIDO SI:
+    - TP < spread × 2 (ruido puro)
+    - SL < ATR × 0.3 (ruido puro)
+    """
+    
+    # Constants for PROBE validation
+    MIN_EXPECTED_R = 0.25
+    MIN_PROFIT_FEE_MULT = 2.0  # profit >= fees * 2
+    MIN_TP_R = 0.3
+    MIN_TP_SPREAD_MULT = 2.0  # TP must be > spread * 2
+    MIN_SL_ATR_MULT = 0.3     # SL must be > ATR * 0.3
+    
+    # Kraken maker fee for estimation
+    MAKER_FEE_PCT = 0.02 / 100  # 0.02%
+    
+    @classmethod
+    def validate_probe(
+        cls,
+        is_probe: bool,
+        position_size: float,
+        current_price: float,
+        stop_loss: float,
+        take_profit: float,
+        bias: str,
+        atr_1m: float,
+        spread_bps: float = 1.0,
+    ) -> ProbeValidationResult:
+        """
+        Validate a PROBE trade meets minimum profitability requirements.
+        
+        Only applies if is_probe=True. Non-probe trades pass through.
+        
+        Args:
+            is_probe: Whether this is a probe trade (probing_mode set)
+            position_size: Size in BTC
+            current_price: Current price
+            stop_loss: SL price
+            take_profit: TP price
+            bias: 'LONG' or 'SHORT'
+            atr_1m: 1-minute ATR
+            spread_bps: Current spread in basis points
+            
+        Returns:
+            ProbeValidationResult with validation status
+        """
+        result = ProbeValidationResult()
+        
+        # Non-probe trades pass through
+        if not is_probe:
+            return result
+        
+        # Calculate trade metrics
+        if bias == 'LONG':
+            risk_usd = (current_price - stop_loss) * position_size
+            reward_usd = (take_profit - current_price) * position_size
+            tp_distance = take_profit - current_price
+            sl_distance = current_price - stop_loss
+        else:
+            risk_usd = (stop_loss - current_price) * position_size
+            reward_usd = (current_price - take_profit) * position_size
+            tp_distance = current_price - take_profit
+            sl_distance = stop_loss - current_price
+        
+        # Ensure positive values
+        risk_usd = abs(risk_usd)
+        reward_usd = abs(reward_usd)
+        tp_distance = abs(tp_distance)
+        sl_distance = abs(sl_distance)
+        
+        # Calculate R values
+        result.expected_r = reward_usd / risk_usd if risk_usd > 0 else 0
+        result.tp_r = result.expected_r  # TP in R terms
+        
+        # Estimate fees (maker entry + maker exit)
+        notional = position_size * current_price
+        result.fees_usd = notional * cls.MAKER_FEE_PCT * 2  # entry + exit
+        
+        # Net profit
+        result.expected_net_profit = reward_usd - result.fees_usd
+        
+        # =========================================================================
+        # PROBE VALIDATION RULES
+        # =========================================================================
+        
+        # Rule 1: expected_R ≥ 0.25
+        if result.expected_r < cls.MIN_EXPECTED_R:
+            result.is_valid = False
+            result.block_reason = (
+                f"🔬 PROBE BLOCK: expected_R={result.expected_r:.2f} < {cls.MIN_EXPECTED_R} "
+                f"(need minimum edge)"
+            )
+            logger.warning(result.block_reason)
+            return result
+        
+        # Rule 2: expected_net_profit ≥ fees × 2
+        min_profit = result.fees_usd * cls.MIN_PROFIT_FEE_MULT
+        if result.expected_net_profit < min_profit:
+            result.is_valid = False
+            result.block_reason = (
+                f"🔬 PROBE BLOCK: net_profit=${result.expected_net_profit:.2f} < "
+                f"fees×{cls.MIN_PROFIT_FEE_MULT:.0f}=${min_profit:.2f} "
+                f"(fees would eat profit)"
+            )
+            logger.warning(result.block_reason)
+            return result
+        
+        # Rule 3: TP ≥ 0.3R
+        if result.tp_r < cls.MIN_TP_R:
+            result.is_valid = False
+            result.block_reason = (
+                f"🔬 PROBE BLOCK: TP={result.tp_r:.2f}R < {cls.MIN_TP_R}R "
+                f"(target too small)"
+            )
+            logger.warning(result.block_reason)
+            return result
+        
+        # Rule 4: TP > spread × 2 (avoid noise)
+        spread_usd = current_price * (spread_bps / 10000)
+        min_tp_spread = spread_usd * cls.MIN_TP_SPREAD_MULT
+        if tp_distance < min_tp_spread:
+            result.is_valid = False
+            result.block_reason = (
+                f"🔬 PROBE BLOCK: TP_dist=${tp_distance:.2f} < spread×{cls.MIN_TP_SPREAD_MULT:.0f}=${min_tp_spread:.2f} "
+                f"(pure noise)"
+            )
+            logger.warning(result.block_reason)
+            return result
+        
+        # Rule 5: SL > ATR × 0.3 (avoid noise)
+        min_sl_atr = atr_1m * cls.MIN_SL_ATR_MULT
+        if sl_distance < min_sl_atr:
+            result.is_valid = False
+            result.block_reason = (
+                f"🔬 PROBE BLOCK: SL_dist=${sl_distance:.2f} < ATR×{cls.MIN_SL_ATR_MULT}=${min_sl_atr:.2f} "
+                f"(SL in noise zone)"
+            )
+            logger.warning(result.block_reason)
+            return result
+        
+        # All PROBE checks passed
+        logger.info(
+            f"✅ PROBE VALID: R={result.expected_r:.2f} | "
+            f"net_profit=${result.expected_net_profit:.2f} | "
+            f"fees=${result.fees_usd:.2f}"
+        )
+        return result
+
+
 def get_hard_entry_validator() -> type:
     """Get the HardEntryBlockValidator class."""
     return HardEntryBlockValidator
+
+
+def get_probe_validator() -> type:
+    """Get the ProbeValidator class."""
+    return ProbeValidator

@@ -819,9 +819,13 @@ class Position:
         # COMPORTAMIENTO SEGÚN P&L ACTUAL
         # =====================================================================
         
-        # A) EN PROFIT (>= 0.1R): Parcial + runner
-        # 🔥 FIX (Jan 23, 2026): IDEMPOTENCY - Only allow ONE TIME_IN_PROFIT partial
-        if current_r >= 0.1:
+        # 🔥 CAMBIO CRÍTICO (Jan 28): NO PARCIALES < 0.3R
+        # Parciales muy pequeños destruyen convexidad del trade
+        # Si no llega a 0.3R → NO SE TOCA
+        MIN_PARTIAL_R = 0.3
+        
+        # A) EN PROFIT (>= 0.3R): Parcial + runner (con LIMIT, no MARKET)
+        if current_r >= MIN_PARTIAL_R:
             # Check if we already did the TIME_IN_PROFIT partial
             if self.time_checkpoint_profit_partial_done:
                 # Already executed - return HOLD instead of repeating
@@ -835,8 +839,8 @@ class Position:
             
             partial_pct = ExitHierarchy.TIME_IN_PROFIT_PARTIAL_PCT
             logger.info(
-                f"⏱️ TIME checkpoint in PROFIT: {current_r:.2f}R | "
-                f"Action: {partial_pct:.0%} partial, keep runner (ONE-SHOT)"
+                f"⏱️ TIME checkpoint in PROFIT: {current_r:.2f}R >= {MIN_PARTIAL_R}R | "
+                f"Action: {partial_pct:.0%} LIMIT partial, keep runner"
             )
             return {
                 'action': 'PARTIAL',
@@ -844,6 +848,19 @@ class Position:
                 'current_r': current_r,
                 'partial_pct': partial_pct,
                 'keep_runner': True,
+                'candles': self.candle_count,
+                'use_limit': True,  # 🔥 NO MARKET PARTIALS
+            }
+        
+        # Si profit < 0.3R → NO PARCIAL, HOLD y esperar
+        if current_r > 0 and current_r < MIN_PARTIAL_R:
+            logger.debug(
+                f"⏱️ TIME checkpoint: {current_r:.2f}R < MIN_PARTIAL ({MIN_PARTIAL_R}R) → HOLD"
+            )
+            return {
+                'action': 'HOLD',
+                'reason': f'PROFIT_BELOW_MIN_PARTIAL ({current_r:.2f}R < {MIN_PARTIAL_R}R)',
+                'current_r': current_r,
                 'candles': self.candle_count
             }
         
@@ -2613,6 +2630,32 @@ class RiskEngine:
         async with self._lock:
             pos = self.position
             pos.update_unrealized_pnl(current_price)
+            
+            # ================================================================
+            # 🔥 PROBE MODE: TP O SL, NADA MÁS (Jan 28, 2026)
+            # 
+            # PROBE trades = sin parciales, sin trailing, sin time stop
+            # Solo: TP o SL (dejar que el edge se pruebe limpio)
+            # 
+            # Si no, no sabes qué estás midiendo.
+            # ================================================================
+            trade_tags = getattr(pos, 'trade_tags', {}) or {}
+            is_probe = bool(trade_tags.get('probing_mode', False))
+            
+            if is_probe:
+                # PROBE: Solo verificar SL y TP
+                sl_check = pos.check_stop_hit(current_price, market_time=market_time)
+                if sl_check:
+                    logger.info(f"🔬 PROBE STOP: R={pos.current_r_multiple:.2f}")
+                    return await self._close_position(current_price, 'STOP_LOSS')
+                
+                tp_check = pos.check_tp_hit(current_price)
+                if tp_check:
+                    logger.info(f"🔬 PROBE TP: R={pos.current_r_multiple:.2f}")
+                    return await self._close_position(current_price, 'TAKE_PROFIT')
+                
+                # PROBE: No ejecutar ningún otro check (parciales, trailing, time)
+                return None
             
             # ================================================================
             # 🔥 ANOMALY-BASED EMERGENCY EXIT (Jan 24, 2026)

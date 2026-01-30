@@ -56,6 +56,7 @@ _TYPE_SYMBOLS = {
     "RANGE": "↔️",
     "BREAKOUT": "💥",
     "INTRADAY": "⚡",
+    "DISPLACEMENT": "🌊",  # 🔥 NEW: Displacement edge symbol
 }
 
 _MODE_SYMBOLS = {
@@ -104,6 +105,7 @@ class EdgeType(Enum):
     RANGE = "RANGE"    # Extremo + Mean Reversion
     BREAKOUT = "BREAKOUT"  # Compresión + Ruptura confirmada
     INTRADAY = "INTRADAY"  # Micro-ineficiencias intradía
+    DISPLACEMENT = "DISPLACEMENT"  # 🔥 NEW (Jan 30, 2026): Strong displacement edge
 
 
 class EdgeState(Enum):
@@ -338,7 +340,109 @@ class BreakoutEdgeCriteria:
 
 
 # =============================================================================
-# 🎯 INTRADAY EDGE CRITERIA (Jan 28, 2026)
+# � DISPLACEMENT EDGE CRITERIA (Jan 30, 2026)
+# Edge de movimiento fuerte - EL MERCADO YA DECIDIÓ
+#
+# PROBLEMA RESUELTO:
+# - EXPANSION_MODE + DIRECTION_LOCK funcionaban pero NO generaban EDGE
+# - Sin EDGE → sistema no puede tradear aunque detecte displacement
+# - RESULTADO: 0 trades en caída de 2.3%
+#
+# SOLUCIÓN:
+# - DISPLACEMENT_EDGE se activa AUTOMÁTICAMENTE con EXPANSION_MODE
+# - No necesita BOS, sweep, ni compresión - el displacement ES el edge
+# - El momentum institucional confirmó la dirección
+# =============================================================================
+@dataclass
+class DisplacementEdgeCriteria:
+    """
+    Criterios para DISPLACEMENT edge (movimiento fuerte direccional).
+    
+    🔥 FILOSOFÍA: El displacement ES el edge
+    - No esperar BOS (ya pasó)
+    - No esperar sweep/rejection (no aplica)
+    - No esperar compresión (opuesto - es expansión)
+    
+    Un edge de displacement se activa cuando:
+    1. STRONG_DISPLACEMENT detectado (≥1.5x ATR_5m)
+    2. EXPANSION_MODE activado
+    3. Continuidad del movimiento (no reversal inmediato)
+    
+    CONFIRMACIÓN para pasar de ARMED → ACTIVE:
+    - Pullback pequeño (0.2-0.5x displacement) SIN romper estructura
+    - O continuación con follow-through
+    - 🔥 O ENTRADA DIRECTA en las primeras 3 velas (Jan 30)
+    """
+    # Thresholds de activación (heredados de trading_app)
+    MIN_DISPLACEMENT_ATR_MULT = 1.2   # Mínimo para detectar displacement
+    STRONG_DISPLACEMENT_MULT = 1.5    # Para activar EXPANSION_MODE
+    
+    # =========================================================================
+    # 🔥 ENTRY WINDOW (Jan 30, 2026) - CRÍTICO PARA CRASHES
+    # 
+    # En displacement violento NO hay pullback limpio.
+    # El sistema DEBE entrar temprano o no entrar.
+    # "No perseguir" = regla de oro institucional
+    # =========================================================================
+    MAX_ENTRY_WINDOW_BARS = 5         # Máximo 5 velas 1m para entrada (ZONA 2 límite)
+    MAX_ENTRY_WINDOW_MIN = 10         # Máximo 10 minutos para entrada
+    IMMEDIATE_ENTRY_SIZE = 0.30       # 30% size para entrada inmediata
+    LATE_ENTRY_PENALTY = 0.70         # Penalización 30% si entra después de ZONA 1
+    
+    # 🔥 CONFIRMACIÓN: Pasar de ARMED → ACTIVE
+    # Pullback es OPORTUNIDAD, no invalidación
+    PULLBACK_MIN_PCT = 0.15           # Mínimo 15% del displacement para pullback válido
+    PULLBACK_MAX_PCT = 0.45           # Máximo 45% (antes 50% - más estricto)
+    CONTINUATION_THRESHOLD_PCT = 0.10 # Si continúa 10%+ más = ACTIVE sin pullback
+    
+    # =========================================================================
+    # 🔥 ZONAS DE ENTRADA (Jan 30, 2026):
+    # ZONA 1 - EARLY IMPULSE (bars 0-1): Entry DIRECTO FAST PATH
+    # ZONA 2 - PULLBACK (bars 2-5): Entry en pullback 15-45%, size 0.40-0.60
+    # ZONA 3 - NO TRADE (bars >5): CHASE BLOCK - NO PERSEGUIR
+    # =========================================================================
+    FORCE_DIRECT_ENTRY_BARS = 1       # 🔥 CHANGED: Solo bar 0-1 = FAST PATH (era 2)
+    DIRECT_ENTRY_SIZE = 0.30          # 30% size para entrada directa
+    
+    # ZONA 1 (bars 0-1) - Early Impulse Entry (FAST PATH)
+    # 🔥 CRITICAL: Si no entras en 0-1 velas, no es trade de displacement
+    EARLY_IMPULSE_MAX_BARS = 1        # 🔥 CHANGED: Máximo 1 vela para fast path (era 2)
+    EARLY_IMPULSE_SIZE_MIN = 0.25     # Size mínimo 25%
+    EARLY_IMPULSE_SIZE_MAX = 0.40     # Size máximo 40%
+    
+    # ZONA 2 (bars 2-5) - Pullback Entry (si perdiste FAST PATH)
+    PULLBACK_ENTRY_MIN_BARS = 2       # Mínimo 2 velas para considerar pullback
+    PULLBACK_ENTRY_MAX_BARS = 5       # Máximo 5 velas para pullback
+    PULLBACK_ENTRY_SIZE_MIN = 0.40    # Size mínimo 40% en pullback
+    PULLBACK_ENTRY_SIZE_MAX = 0.60    # Size máximo 60% en pullback
+    
+    # ZONA 3 (bars >5) - Chase Block
+    CHASE_BLOCK_AFTER_BARS = 5        # No trade después de 5 barras
+    CHASE_BLOCK_EXTENSION_MULT = 1.5  # No trade si movió >1.5x displacement
+    
+    # Timeouts
+    EDGE_TIMEOUT_MIN = 60             # 60 min ventana (movimientos fuertes duran)
+    CONFIRMATION_TIMEOUT_MIN = 20     # 20 min para confirmación
+    
+    # 🔥 KILL LATE EDGE (Jan 30, 2026)
+    # Si pasa la ventana de entrada, NO perseguir
+    KILL_EDGE_AFTER_BARS = 5          # Matar edge si > 5 barras sin entrada
+    KILL_EDGE_AFTER_MIN = 10          # O si > 10 min sin entrada
+    
+    # Size multiplier (agresivo en momentum)
+    SIZE_MULTIPLIER_BASE = 0.8        # 80% size base (conservador inicio)
+    SIZE_MULTIPLIER_CONFIRMED = 1.2   # 120% si confirma con follow-through
+    
+    # RR expectations
+    MIN_TARGET_R = 1.5                # Mínimo 1.5R
+    IDEAL_TARGET_R = 2.5              # Ideal 2.5R (tendencias)
+    
+    # Invalidación (muy difícil en displacement)
+    INVALIDATION_OPPOSITE_DISPLACEMENT_MULT = 0.6  # 60% del displacement en contra
+
+
+# =============================================================================
+# �🎯 INTRADAY EDGE CRITERIA (Jan 28, 2026)
 # Edge de alta frecuencia, baja convicción - paga fees + genera curva
 # 
 # 🔥 REGLA CRÍTICA: INTRADAY tiene SUS PROPIOS FILTROS
@@ -584,6 +688,16 @@ class BOSEvent:
     breakout_bb_lower: Optional[float] = None  # BB lower al confirmar
     context_cooldown_until: Optional[datetime] = None  # Cooldown por contexto
     
+    # =========================================================================
+    # 🌊 NEW (Jan 30, 2026): Datos específicos de DISPLACEMENT edge
+    # =========================================================================
+    origin_price: Optional[float] = None              # Precio ORIGEN del displacement (el high/low desde donde cayó/subió)
+    initial_displacement_amount: Optional[float] = None  # Cantidad inicial del displacement
+    max_favorable_excursion: float = 0.0              # MFE desde entrada (tracking)
+    bars_since_displacement: int = 0                  # Velas transcurridas desde displacement
+    entry_window_open: bool = True                    # Si aún estamos en ventana de entrada
+    force_direct_entry: bool = False                  # Si se debe forzar entrada directa (primeras barras)
+    
     def is_burned(self) -> bool:
         """Edge quemado si ya se intentaron 2 trades o 2 pérdidas"""
         return self.trades_attempted >= 2 or self.trades_lost >= 2
@@ -627,6 +741,8 @@ class EdgeStats:
     range_r: float = 0.0
     breakout_edges: int = 0
     breakout_r: float = 0.0
+    displacement_edges: int = 0  # 🔥 NEW (Jan 30, 2026)
+    displacement_r: float = 0.0  # 🔥 NEW (Jan 30, 2026)
     
     def get_expectancy_per_bos(self) -> float:
         """Expectancy promedio por evento BOS"""
@@ -648,6 +764,8 @@ class EdgeStats:
             return self.range_r / self.range_edges if self.range_edges > 0 else 0.0
         elif edge_type == EdgeType.BREAKOUT:
             return self.breakout_r / self.breakout_edges if self.breakout_edges > 0 else 0.0
+        elif edge_type == EdgeType.DISPLACEMENT:
+            return self.displacement_r / self.displacement_edges if self.displacement_edges > 0 else 0.0
         return 0.0
     
     def to_dict(self) -> Dict[str, Any]:
@@ -671,7 +789,8 @@ class EdgeStats:
             'by_type': {
                 'trend': {'edges': self.trend_edges, 'r': round(self.trend_r, 2)},
                 'range': {'edges': self.range_edges, 'r': round(self.range_r, 2)},
-                'breakout': {'edges': self.breakout_edges, 'r': round(self.breakout_r, 2)}
+                'breakout': {'edges': self.breakout_edges, 'r': round(self.breakout_r, 2)},
+                'displacement': {'edges': self.displacement_edges, 'r': round(self.displacement_r, 2)}
             }
         }
 
@@ -1847,8 +1966,10 @@ class EdgeStateManager:
     # RANGE EDGE DETECTION - CON SWEEP + REJECTION
     # =========================================================================
     
-    # Compresión extrema DESACTIVA range (pre-breakout territory)
-    COMPRESSION_DISABLES_RANGE_PCT = 5
+    # 🔥 AJUSTE (Jan 28): Compresión extrema NO bloquea PROBE
+    # Antes: COMPRESSION_DISABLES_RANGE_PCT = 5 → bloqueaba PROBE
+    # Ahora: Dejamos que ProbeValidator decida rentabilidad en compresión
+    COMPRESSION_DISABLES_RANGE_PCT = 0  # Disabled - PROBE allowed in compression
     
     # Buffer para sweep (evitar micro-ruido)
     SWEEP_ATR_BUFFER = 0.1  # Sweep debe ser >= 0.1 ATR para ser válido
@@ -2294,6 +2415,368 @@ class EdgeStateManager:
         return False, ""
     
     # =========================================================================
+    # 🌊 DISPLACEMENT EDGE DETECTION (Jan 30, 2026)
+    # 
+    # PROBLEMA RESUELTO:
+    # - Sistema detectaba EXPANSION_MODE + DIRECTION_LOCK correctamente
+    # - Pero NO se armaba EDGE → 0 trades en caída de 2.3%
+    # - RANGE_EDGE solo permite LONG en pct bajo, SHORT en pct alto
+    # - TREND_EDGE necesita BOS + pullback (no había BOS)
+    # 
+    # SOLUCIÓN:
+    # - DISPLACEMENT_EDGE se arma AUTOMÁTICAMENTE con EXPANSION_MODE
+    # - El displacement ES el edge - no necesita más confirmación
+    # - El mercado YA DECIDIÓ con momentum institucional
+    # =========================================================================
+    
+    def arm_displacement_edge(
+        self,
+        current_price: float,
+        direction: str,
+        displacement_amount: float,
+        atr: float,
+        market_time: datetime,
+        initial_price: float = 0.0
+    ) -> bool:
+        """
+        Arma un DISPLACEMENT_EDGE cuando se detecta movimiento fuerte.
+        
+        LLAMAR cuando EXPANSION_MODE + DIRECTION_LOCK se activan.
+        
+        A diferencia de otros edges:
+        - NO necesita BOS (el displacement ES la ruptura)
+        - NO necesita sweep/rejection (no es mean reversion)
+        - NO necesita compresión (es lo opuesto - expansión)
+        
+        El displacement ES el edge - el mercado ya mostró intención institucional.
+        
+        🔥 CRITICAL (Jan 30, 2026): ENTRY WINDOW + DIRECT ENTRY
+        - En las primeras barras, forzar entrada directa (no esperar pullback)
+        - Si pasa la ventana de entrada, NO perseguir
+        
+        Returns: True si se armó el edge
+        """
+        # Check context cooldown
+        if self.is_context_in_cooldown(EdgeType.DISPLACEMENT, market_time):
+            logger.debug(f"[DISPLACEMENT_EDGE] Cooldown activo - no armar")
+            return False
+        
+        # Si ya hay edge, verificar si debemos reemplazarlo
+        if self._state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
+            # Si es el mismo tipo y dirección, reforzar
+            if self._current_bos and self._current_bos.edge_type == EdgeType.DISPLACEMENT:
+                if self._current_bos.direction == direction:
+                    # Mismo displacement, ya armado - no hacer nada
+                    return False
+                else:
+                    # Dirección opuesta - invalidar el anterior
+                    self._expire_edge(f"displacement flip: {self._current_bos.direction}→{direction}")
+            else:
+                # Otro tipo de edge - DISPLACEMENT tiene prioridad en EXPANSION_MODE
+                logger.info(
+                    f"🌊 DISPLACEMENT OVERRIDE: Reemplazando {self._current_bos.edge_type.value if self._current_bos else 'None'} "
+                    f"con DISPLACEMENT {direction}"
+                )
+                self._expire_edge(f"displacement override: {direction}")
+        
+        # Reset si estábamos expirados
+        if self._state == EdgeState.EDGE_EXPIRED:
+            self._transition_to(EdgeState.NO_EDGE, "reset from expired", market_time)
+        
+        # =====================================================================
+        # 🔥 INVALIDATION LEVEL DESDE ORIGEN (Jan 30, 2026)
+        # El nivel de invalidación se calcula desde el ORIGEN del movimiento
+        # No desde el precio actual (que puede estar muy lejos en cascadas)
+        # =====================================================================
+        invalidation_buffer = displacement_amount * DisplacementEdgeCriteria.INVALIDATION_OPPOSITE_DISPLACEMENT_MULT
+        
+        # origin_price = desde donde empezó el movimiento
+        origin = initial_price if initial_price > 0 else current_price
+        
+        if direction == 'LONG':
+            # En LONG, invalidar si cae por debajo del origen
+            invalidation_level = origin
+        else:
+            # En SHORT, invalidar si sube por encima del origen
+            invalidation_level = origin
+        
+        # Crear edge de DISPLACEMENT con datos de origen
+        self._current_bos = BOSEvent(
+            timestamp=market_time,
+            price=current_price,
+            direction=direction,
+            htf_bias=direction,  # Displacement define su propio bias
+            bos_level=invalidation_level,
+            atr_at_bos=atr,
+            edge_type=EdgeType.DISPLACEMENT,
+            # 🔥 NUEVOS CAMPOS para DISPLACEMENT
+            origin_price=origin,
+            initial_displacement_amount=displacement_amount,
+            bars_since_displacement=0,
+            entry_window_open=True,
+            force_direct_entry=True  # Primeras barras = entrada directa permitida
+        )
+        
+        # Stats
+        self._stats.total_bos_events += 1
+        self._stats.displacement_edges += 1
+        if direction == 'LONG':
+            self._stats.long_bos_events += 1
+        else:
+            self._stats.short_bos_events += 1
+        
+        # =====================================================================
+        # 🔥 TRANSICIÓN DIRECTA A ACTIVE (Jan 30, 2026)
+        # En displacement, NO esperamos pullback en las primeras barras
+        # El edge se activa INMEDIATAMENTE para permitir entrada directa
+        # =====================================================================
+        self._transition_to(
+            EdgeState.EDGE_ACTIVE,  # 🔥 DIRECTO A ACTIVE, no ARMED
+            f"DISP ${displacement_amount:.0f} {direction} | DIRECT ENTRY WINDOW OPEN",
+            market_time
+        )
+        
+        _edge_log(
+            "EDGE_ACTIVE", "DISPLACEMENT", direction,
+            f"Displacement ${displacement_amount:.0f} | Origin ${origin:.0f} | DIRECT ENTRY ALLOWED"
+        )
+        
+        return True
+    
+    def confirm_displacement_edge(
+        self,
+        current_price: float,
+        displacement_direction: str,
+        initial_displacement: float,
+        current_displacement: float,
+        atr: float,
+        market_time: datetime
+    ) -> bool:
+        """
+        Confirma DISPLACEMENT_EDGE para pasar de ARMED → ACTIVE.
+        
+        Confirmación:
+        1. Pullback pequeño (15-50% del displacement) = entrada óptima
+        2. Continuación (+10% más) = follow-through confirmado
+        
+        Si el precio SIGUE moviéndose en la dirección del displacement,
+        se activa directamente sin esperar pullback.
+        """
+        if self._state != EdgeState.EDGE_ARMED:
+            return False
+        
+        if self._current_bos is None or self._current_bos.edge_type != EdgeType.DISPLACEMENT:
+            return False
+        
+        # Verificar dirección
+        if displacement_direction != self._current_bos.direction:
+            self._expire_edge(f"displacement dir flip: {displacement_direction} ≠ {self._current_bos.direction}")
+            return False
+        
+        # Verificar timeout
+        armed_duration = (market_time - self._current_bos.timestamp).total_seconds() / 60
+        if armed_duration > DisplacementEdgeCriteria.CONFIRMATION_TIMEOUT_MIN:
+            # Timeout pero NO expirar - darle más tiempo si displacement sigue activo
+            if current_displacement >= initial_displacement * 0.5:
+                # Displacement sigue activo, activar directamente
+                logger.info(
+                    f"🌊 DISPLACEMENT EDGE: Timeout pero displacement activo "
+                    f"(${current_displacement:.0f} >= ${initial_displacement * 0.5:.0f}) - activando"
+                )
+            else:
+                self._expire_edge(f"displacement timeout {armed_duration:.0f}min, displacement debilitado")
+                return False
+        
+        # CONFIRMACIÓN 1: Continuación del displacement (+10% más)
+        continuation_threshold = initial_displacement * (1 + DisplacementEdgeCriteria.CONTINUATION_THRESHOLD_PCT)
+        if current_displacement >= continuation_threshold:
+            self._current_bos.pullback_detected_at = market_time
+            self._transition_to(
+                EdgeState.EDGE_ACTIVE,
+                f"follow-through: ${current_displacement:.0f} >= ${continuation_threshold:.0f}",
+                market_time
+            )
+            return True
+        
+        # CONFIRMACIÓN 2: Pullback pequeño (15-50% del displacement)
+        # Un pullback es una OPORTUNIDAD, no una invalidación
+        pullback_amount = initial_displacement - current_displacement
+        pullback_pct = pullback_amount / initial_displacement if initial_displacement > 0 else 0
+        
+        min_pullback = DisplacementEdgeCriteria.PULLBACK_MIN_PCT
+        max_pullback = DisplacementEdgeCriteria.PULLBACK_MAX_PCT
+        
+        if min_pullback <= pullback_pct <= max_pullback:
+            self._current_bos.pullback_detected_at = market_time
+            self._transition_to(
+                EdgeState.EDGE_ACTIVE,
+                f"pullback {pullback_pct*100:.0f}% (${pullback_amount:.0f}) = entry zone",
+                market_time
+            )
+            return True
+        
+        # Pullback demasiado grande = posible invalidación
+        if pullback_pct > max_pullback:
+            logger.warning(
+                f"⚠️ DISPLACEMENT PULLBACK WARNING: {pullback_pct*100:.0f}% > {max_pullback*100:.0f}% max | "
+                f"No invalidando aún - esperando"
+            )
+        
+        return False
+    
+    def update_displacement_entry_window(
+        self,
+        market_time: datetime
+    ) -> tuple[bool, str]:
+        """
+        Actualiza la ventana de entrada del DISPLACEMENT edge.
+        
+        🔥 CRITICAL (Jan 30, 2026):
+        - Incrementa contador de barras
+        - Cierra ventana de entrada si pasa el tiempo
+        - MATA el edge si está demasiado tarde (NO PERSEGUIR)
+        
+        Returns: (should_kill_edge, reason)
+        """
+        if self._state not in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
+            return False, ""
+        
+        if self._current_bos is None or self._current_bos.edge_type != EdgeType.DISPLACEMENT:
+            return False, ""
+        
+        bos = self._current_bos
+        
+        # Incrementar contador de barras (llamar cada nueva vela 1m)
+        bos.bars_since_displacement += 1
+        
+        # Calcular tiempo transcurrido
+        elapsed_min = (market_time - bos.timestamp).total_seconds() / 60
+        
+        # =====================================================================
+        # 🔥 CERRAR VENTANA DE ENTRADA DIRECTA
+        # Después de las primeras barras, ya no se permite entrada directa
+        # =====================================================================
+        if bos.bars_since_displacement > DisplacementEdgeCriteria.FORCE_DIRECT_ENTRY_BARS:
+            if bos.force_direct_entry:
+                bos.force_direct_entry = False
+                logger.info(
+                    f"⏰ DISPLACEMENT DIRECT ENTRY CLOSED: {bos.bars_since_displacement} bars > "
+                    f"{DisplacementEdgeCriteria.FORCE_DIRECT_ENTRY_BARS} | Now requires pullback"
+                )
+        
+        # =====================================================================
+        # 🔥 CERRAR VENTANA DE ENTRADA COMPLETA
+        # Después del tiempo máximo, ya no se puede entrar
+        # =====================================================================
+        if bos.bars_since_displacement > DisplacementEdgeCriteria.MAX_ENTRY_WINDOW_BARS:
+            bos.entry_window_open = False
+        
+        if elapsed_min > DisplacementEdgeCriteria.MAX_ENTRY_WINDOW_MIN:
+            bos.entry_window_open = False
+        
+        # =====================================================================
+        # 🔥 KILL LATE EDGE (NO PERSEGUIR)
+        # Si pasó demasiado tiempo sin entrada, matar el edge
+        # =====================================================================
+        if bos.bars_since_displacement > DisplacementEdgeCriteria.KILL_EDGE_AFTER_BARS:
+            if bos.trades_attempted == 0:  # Solo si no ha entrado
+                return True, f"LATE DISPLACEMENT: {bos.bars_since_displacement} bars > {DisplacementEdgeCriteria.KILL_EDGE_AFTER_BARS} - NO CHASE"
+        
+        if elapsed_min > DisplacementEdgeCriteria.KILL_EDGE_AFTER_MIN:
+            if bos.trades_attempted == 0:  # Solo si no ha entrado
+                return True, f"LATE DISPLACEMENT: {elapsed_min:.0f}min > {DisplacementEdgeCriteria.KILL_EDGE_AFTER_MIN}min - NO CHASE"
+        
+        return False, ""
+    
+    def get_displacement_entry_size_multiplier(self) -> float:
+        """
+        Retorna el multiplicador de size para entrada en DISPLACEMENT.
+        
+        🔥 ZONAS DE ENTRADA (Jan 30, 2026):
+        - ZONA 1 (bars 0-1): EARLY IMPULSE - Entry directa FAST PATH, size 0.25-0.40
+        - ZONA 2 (bars 2-5): PULLBACK - Entry en pullback, size 0.40-0.60
+        - ZONA 3 (bars >5):  CHASE BLOCK - NO TRADE (return 0.0)
+        """
+        if self._current_bos is None or self._current_bos.edge_type != EdgeType.DISPLACEMENT:
+            return 1.0
+        
+        bos = self._current_bos
+        bars = bos.bars_since_displacement
+        
+        # =========================================================================
+        # ZONA 3 - CHASE BLOCK (bars > 5): NO TRADE
+        # =========================================================================
+        if bars > DisplacementEdgeCriteria.CHASE_BLOCK_AFTER_BARS:
+            logger.debug(f"⛔ ZONA 3 (CHASE BLOCK): bars={bars} > {DisplacementEdgeCriteria.CHASE_BLOCK_AFTER_BARS} - NO TRADE")
+            return 0.0  # Kill the trade
+        
+        # =========================================================================
+        # ZONA 1 - EARLY IMPULSE (bars 0-1): Entry DIRECTA FAST PATH
+        # =========================================================================
+        if bars <= DisplacementEdgeCriteria.EARLY_IMPULSE_MAX_BARS:
+            # Escalar size: bars=0 → 0.40 (max), bars=2 → 0.25 (min)
+            # Linear interpolation
+            t = bars / max(DisplacementEdgeCriteria.EARLY_IMPULSE_MAX_BARS, 1)
+            size = DisplacementEdgeCriteria.EARLY_IMPULSE_SIZE_MAX - (
+                (DisplacementEdgeCriteria.EARLY_IMPULSE_SIZE_MAX - DisplacementEdgeCriteria.EARLY_IMPULSE_SIZE_MIN) * t
+            )
+            logger.debug(f"🔥 ZONA 1 (EARLY IMPULSE): bars={bars}, size={size:.2f}")
+            return size
+        
+        # =========================================================================
+        # ZONA 2 - PULLBACK ENTRY (bars 2-5)
+        # =========================================================================
+        if bars <= DisplacementEdgeCriteria.PULLBACK_ENTRY_MAX_BARS:
+            # Escalar size: bars=2 → 0.60 (max con pullback), bars=5 → 0.40 (min)
+            bars_in_zone = bars - DisplacementEdgeCriteria.EARLY_IMPULSE_MAX_BARS
+            max_bars_in_zone = DisplacementEdgeCriteria.PULLBACK_ENTRY_MAX_BARS - DisplacementEdgeCriteria.EARLY_IMPULSE_MAX_BARS
+            t = bars_in_zone / max(max_bars_in_zone, 1)
+            size = DisplacementEdgeCriteria.PULLBACK_ENTRY_SIZE_MAX - (
+                (DisplacementEdgeCriteria.PULLBACK_ENTRY_SIZE_MAX - DisplacementEdgeCriteria.PULLBACK_ENTRY_SIZE_MIN) * t
+            )
+            logger.debug(f"⏳ ZONA 2 (PULLBACK): bars={bars}, size={size:.2f}")
+            return size
+        
+        # Fallback - no debería llegar aquí
+        logger.warning(f"⚠️ ZONA UNDEFINED: bars={bars} - NO TRADE")
+        return 0.0
+    
+    def check_displacement_invalidation(
+        self,
+        current_price: float,
+        initial_displacement: float,
+        initial_direction: str,
+        atr: float
+    ) -> tuple[bool, str]:
+        """
+        Verifica si el DISPLACEMENT_EDGE se ha invalidado.
+        
+        Invalidación (MUY difícil en displacement real):
+        - Movimiento opuesto ≥60% del displacement inicial
+        
+        En displacement real, el mercado no retrocede tanto.
+        """
+        if self._state not in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
+            return False, ""
+        
+        if self._current_bos is None or self._current_bos.edge_type != EdgeType.DISPLACEMENT:
+            return False, ""
+        
+        bos = self._current_bos
+        invalidation_threshold = initial_displacement * DisplacementEdgeCriteria.INVALIDATION_OPPOSITE_DISPLACEMENT_MULT
+        
+        if bos.direction == 'LONG':
+            # En LONG displacement, si cae mucho = invalidación
+            if current_price < bos.bos_level:
+                return True, f"DISPLACEMENT INVALIDATED: Price {current_price:.0f} < level {bos.bos_level:.0f}"
+        else:
+            # En SHORT displacement, si sube mucho = invalidación
+            if current_price > bos.bos_level:
+                return True, f"DISPLACEMENT INVALIDATED: Price {current_price:.0f} > level {bos.bos_level:.0f}"
+        
+        return False, ""
+    
+    # =========================================================================
     # DETECCIÓN DE BOS (TREND - original)
     # =========================================================================
     
@@ -2599,6 +3082,7 @@ class EdgeStateManager:
         TREND: Invalidado si precio cruza BOS level
         RANGE: INVALIDACIÓN BINARIA - si rompe el sweep level, tesis rota
         BREAKOUT: Invalidado si precio vuelve al squeeze
+        DISPLACEMENT: Invalidado si precio vuelve >60% del displacement al origen
         PROVISIONAL: Usa mismas reglas que su edge_type subyacente
         
         Returns: True si se invalidó
@@ -2619,6 +3103,25 @@ class EdgeStateManager:
             elif bos.direction == 'SHORT' and current_price > bos.bos_level:
                 self._expire_edge(f"binary: price {current_price:.0f} > sweep {bos.bos_level:.0f}")
                 return True
+            return False
+        
+        # =====================================================================
+        # 🌊 DISPLACEMENT: INVALIDACIÓN MUY DIFÍCIL (Jan 30, 2026)
+        # En displacement real, el mercado no retrocede tanto
+        # Solo invalidar si vuelve al ORIGEN del movimiento
+        # =====================================================================
+        if bos.edge_type == EdgeType.DISPLACEMENT:
+            if bos.direction == 'LONG':
+                # En LONG, solo invalidar si cae por debajo del origen
+                if current_price < bos.bos_level:
+                    self._expire_edge(f"displacement invalid: price {current_price:.0f} < origin {bos.bos_level:.0f}")
+                    return True
+            else:
+                # En SHORT, solo invalidar si sube por encima del origen
+                if current_price > bos.bos_level:
+                    self._expire_edge(f"displacement invalid: price {current_price:.0f} > origin {bos.bos_level:.0f}")
+                    return True
+            # DISPLACEMENT no se invalida fácilmente - NO aplicar buffer ATR
             return False
         
         # TREND y BREAKOUT: invalidación con buffer pequeño

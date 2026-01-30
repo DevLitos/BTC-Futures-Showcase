@@ -16,7 +16,7 @@ from typing import Optional, Tuple, Dict, Any, TYPE_CHECKING
 
 from src.shared.indicators import calculate_atr, calculate_adx, calculate_ema
 from src.config.trading_config import DailyRegimeDetector
-from src.domain.trading.anticipation import AnticipationSignal
+from src.domain.trading.anticipation import AnticipationSignal, AnticipationState
 
 if TYPE_CHECKING:
     from src.application.live.trading_app import SignalEngine
@@ -403,6 +403,28 @@ def check_anticipation_signal(
         )
         
         engine._last_anticipation_state = anticipation
+        
+        # =========================================================================
+        # 🔥 FIX (Jan 28, 2026): VERIFICAR MOMENTUM EN TIEMPO REAL
+        # 
+        # Problema: Anticipation detecta compresión pero el precio ya se movió
+        # contra la dirección sugerida → entrada en la peor ubicación
+        #
+        # Solución: Si hay displacement activo CONTRA la dirección de anticipation,
+        # invalidar la señal de anticipation
+        # =========================================================================
+        displacement_direction = getattr(engine, '_active_direction', None)
+        displacement_bypass = getattr(engine, '_displacement_bypass', False)
+        
+        if displacement_bypass and displacement_direction:
+            # Hay displacement activo - verificar si contradice anticipation
+            if anticipation.direction and anticipation.direction != displacement_direction:
+                logger.info(
+                    f"⛔ ANTICIPATION INVALIDATED: {anticipation.direction} vs "
+                    f"DISPLACEMENT={displacement_direction} | Ignorando señal"
+                )
+                anticipation = AnticipationState()  # Reset to empty
+                engine._last_anticipation_state = anticipation
         
         # =========================================================================
         # 🔥 AJUSTE (Jan 27, 2026): ANTICIPATION = información, NO trigger

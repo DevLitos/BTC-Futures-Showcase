@@ -516,36 +516,27 @@ class OrderExecutor:
         result = ExecutionResult()
         
         side = 'buy' if bias == 'LONG' else 'sell'
-        order_type = 'market' if use_market_order else 'limit'
+
+        # PASO 2 — MAKER ONLY REAL (SIN EXCEPCIONES)
+        # Force maker-only entries even if caller requested market.
+        if use_market_order:
+            logger.warning("🚫 MAKER-ONLY ENFORCED: ignoring use_market_order=True")
+        use_market_order = False
+        order_type = 'limit'
         
         try:
-            # Determine limit price if using limit order
-            limit_price = None
-            if not use_market_order:
-                offset_mult = OrderExecution.LIMIT_OFFSET_ATR_MULT
-                atr_for_offset = engine._last_momentum_atr or 100.0
-                offset = atr_for_offset * offset_mult
-                
-                if bias == 'LONG':
-                    limit_price = current_price + offset
-                else:
-                    limit_price = current_price - offset
+            # Determine limit price
+            limit_price = current_price
             
-            # Place order
-            if use_market_order:
-                order = await engine.execution.place_market_order(
-                    symbol=engine.symbol,
-                    side=side,
-                    amount=position_size
-                )
-            else:
-                order = await engine.execution.place_limit_order(
-                    symbol=engine.symbol,
-                    side=side,
-                    amount=position_size,
-                    price=limit_price,
-                    post_only=True
-                )
+            # Place order (limit post-only)
+            order = await engine.execution.place_limit_order(
+                symbol=engine.symbol,
+                side=side,
+                amount=position_size,
+                price=limit_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+            )
             
             if order:
                 result.success = True

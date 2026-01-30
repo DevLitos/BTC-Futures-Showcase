@@ -171,6 +171,9 @@ class BlackSwanFilter:
         self.cooldown_until: Optional[datetime] = None
         self.defensive_mode: bool = False
         self.defensive_until: Optional[datetime] = None
+        # 🔥 FIX (Jan 29, 2026): Throttle defensive mode reactivation logs
+        self._last_defensive_activation: Optional[datetime] = None
+        self._defensive_activation_min_interval = 120  # Seconds between log messages
     
     def check(self, price_change: float, atr: float, market_time: datetime,
               candle_high: float | None = None, candle_low: float | None = None,
@@ -196,11 +199,14 @@ class BlackSwanFilter:
             self.cooldown_until = None
             logger.info("Black swan cooldown expired - back to normal")
         
-        # 2) Check defensive mode expiry
+        # 2) Check defensive mode expiry (only log once)
         if self.defensive_until and market_time >= self.defensive_until:
             self.defensive_mode = False
             self.defensive_until = None
-            logger.info("Defensive mode expired - back to normal")
+            # Only log if we were actually in defensive mode recently
+            if self._last_defensive_activation and \
+               (market_time - self._last_defensive_activation).total_seconds() < 600:
+                logger.debug("Defensive mode expired - back to normal")
         
         abs_change = abs(price_change)
         
@@ -244,9 +250,23 @@ class BlackSwanFilter:
     
     def _activate_defensive_mode(self, market_time: datetime, duration_minutes: int = 5):
         """Activate defensive mode (reduced size, not full stop)"""
+        should_log = False
+        
         if not self.defensive_mode:
             self.defensive_mode = True
-            self.defensive_until = market_time + timedelta(minutes=duration_minutes)
+            # Check if we should log (first time or after interval)
+            if self._last_defensive_activation is None:
+                should_log = True
+            else:
+                elapsed = (market_time - self._last_defensive_activation).total_seconds()
+                if elapsed >= self._defensive_activation_min_interval:
+                    should_log = True
+        
+        # Always extend the defensive period
+        self.defensive_until = market_time + timedelta(minutes=duration_minutes)
+        
+        if should_log:
+            self._last_defensive_activation = market_time
             logger.warning(f"⚠️ DEFENSIVE MODE activated for {duration_minutes} min")
     
     def activate_cooldown(self, market_time: datetime):

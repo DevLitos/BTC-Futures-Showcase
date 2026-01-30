@@ -186,11 +186,31 @@ async def handle_add_position(
     logger.info(f"💪 ADDING TO WINNER: {add_size:.6f} {side}")
     
     try:
-        add_order = await engine.execution.place_market_order(
+        # PASO 2 — MAKER ONLY REAL (SIN EXCEPCIONES)
+        # Add-to-winner is also an entry: LIMIT post-only, no chasing.
+        add_order = await engine.execution.place_limit_order(
             symbol=engine.symbol,
             side=side,
-            amount=add_size
+            amount=add_size,
+            price=current_price,
         )
+
+        # If it doesn't fill quickly, cancel (do not chase)
+        if add_order and add_order.get('id'):
+            await asyncio.sleep(1.0)
+            try:
+                fill_status = await engine.execution.poll_fill_status(add_order['id'], engine.symbol)
+                if not fill_status.get('filled'):
+                    await engine.execution.cancel_order(add_order['id'], engine.symbol)
+                    logger.info("🧊 ADD_POSITION maker-only: not filled → cancelled")
+                    return True
+            except Exception as e:
+                logger.warning(f"⚠️ ADD_POSITION fill check failed - cancelling for safety: {e}")
+                try:
+                    await engine.execution.cancel_order(add_order['id'], engine.symbol)
+                except Exception:
+                    pass
+                return True
         
         if add_order:
             await asyncio.sleep(0.5)

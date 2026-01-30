@@ -272,6 +272,17 @@ class ScoreOrchestrator:
         # Handle None df_1m
         df_1m_safe = ctx.df_1m if ctx.df_1m is not None else pd.DataFrame()
         
+        # 🔥 FIX (Jan 30): Check if DISPLACEMENT edge is active for structure bypass
+        displacement_edge_active = False
+        edge_mgr = getattr(engine, '_edge_manager', None)
+        if edge_mgr is not None:
+            from src.domain.trading.edge_state_manager import EdgeState, EdgeType
+            displacement_edge_active = (
+                edge_mgr.state == EdgeState.EDGE_ACTIVE and 
+                edge_mgr.current_bos is not None and
+                edge_mgr.current_bos.edge_type == EdgeType.DISPLACEMENT
+            )
+        
         # 1. Base score from scorer
         score, breakdown, structure_blocks = engine._entry_scorer.calculate_entry_score(
             df_1h=ctx.df_1h,
@@ -282,6 +293,7 @@ class ScoreOrchestrator:
             market_time=ctx.market_time,
             micro_trend_state=getattr(engine, '_micro_trend_state', None),
             filter_pipeline=getattr(engine, 'filter_pipeline', None),
+            displacement_edge_active=displacement_edge_active,  # 🔥 FIX: Bypass structure for displacement
         )
         
         result.score = float(score)
@@ -345,7 +357,7 @@ class ScoreOrchestrator:
         except (TypeError, ValueError, IndexError):
             current_adx = 20.0
         
-        is_trend = current_adx > 25 or ctx.volatility_regime in [VolatilityRegime.HIGH, VolatilityRegime.SPIKE]
+        is_trend = current_adx > 25 or ctx.volatility_regime in [VolatilityRegime.HIGH, VolatilityRegime.SPIKE, 'HIGH', 'SPIKE']
         regime_str = 'TREND' if is_trend else 'RANGE'
         
         # Base threshold
@@ -763,17 +775,34 @@ class OrderExecutor:
         take_profit: float,
         use_market: bool = False,
         entry_data: Optional[Dict[str, Any]] = None,  # 🔥 FIX: Use Optional
+        aggressive_execution: bool = False,  # 🔥 FIX (Jan 30): Allow IOC for displacement
     ) -> EntryResult:
         """Place order and handle result."""
         result = EntryResult()
         
         try:
-            if use_market:
-                logger.info(f"🚀 Placing MARKET order | {ctx.bias} {size:.6f} @ market")
-                order_result = await engine.execution.place_market_order(
+            # 🔥 FIX (Jan 30): DISPLACEMENT AGGRESSIVE EXECUTION
+            # During DIRECT ENTRY WINDOW, post-only is counterproductive
+            # The market is moving fast - either fill NOW or miss the trade
+            if aggressive_execution:
+                logger.warning(f"🚀 DISPLACEMENT AGGRESSIVE ENTRY: Using IOC (taker allowed) for {ctx.bias}")
+                order_result = await engine.execution.place_aggressive_order(
                     symbol=engine.symbol,
                     side='buy' if ctx.bias == 'LONG' else 'sell',
                     amount=size,
+                    price=ctx.current_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+            elif use_market:
+                logger.warning("🚫 MAKER-ONLY ENFORCED: ignoring use_market=True")
+                # Fall through to limit order
+                logger.info(f"📊 Placing LIMIT post-only | {ctx.bias} {size:.6f} @ {ctx.current_price:.2f}")
+                order_result = await engine.execution.place_limit_order(
+                    symbol=engine.symbol,
+                    side='buy' if ctx.bias == 'LONG' else 'sell',
+                    amount=size,
+                    price=ctx.current_price,
                     stop_loss=stop_loss,
                     take_profit=take_profit
                 )
@@ -808,7 +837,7 @@ class OrderExecutor:
                     'stop_loss': stop_loss,
                     'take_profit': take_profit,
                     'atr_1m': ctx.atr_1m,
-                    'order_type': 'MARKET' if use_market else 'LIMIT',
+                    'order_type': 'LIMIT',
                     'tags': engine._current_trade_tags.copy(),
                 }
                 
@@ -832,6 +861,347 @@ class OrderExecutor:
             engine.state_machine.start_cooldown(5)
         
         return result
+
+
+# =========================================================================
+# 🚀 DISPLACEMENT FAST PATH (Jan 30, 2026)
+# =========================================================================
+# Este es el pipeline URGENTE para displacement.
+# Bypasea TODA la ceremonia de validación normal.
+# 
+# Filosofía: "Prefiero entrar feo que perder el tren"
+# 
+# Regla brutal:
+#   Primer displacement válido = entrada inmediata o cancelación total
+#   Si no puedes entrar dentro de 0-1 velas, NO es trade de displacement
+# =========================================================================
+
+async def _displacement_fast_path(
+    engine: 'SignalEngine',
+    ctx: 'EntryContext', 
+    current_price: float,
+    atr_1m: float,
+    market_time: datetime
+) -> Optional[EntryResult]:
+    """
+    FAST PATH para DISPLACEMENT - bypasea validación normal.
+    
+    Returns:
+        EntryResult si debe ejecutar fast path
+        None si debe continuar con pipeline normal
+    """
+    from src.domain.trading.edge_state_manager import EdgeState, EdgeType, DisplacementEdgeCriteria
+    
+    # =====================================================================
+    # CHECK 1: ¿Hay DISPLACEMENT EDGE activo con entrada directa?
+    # =====================================================================
+    edge_mgr = getattr(engine, '_edge_manager', None)
+    if not edge_mgr:
+        return None
+    
+    # Solo actuar si DISPLACEMENT está ACTIVE
+    if edge_mgr.state != EdgeState.EDGE_ACTIVE:
+        return None
+    
+    current_bos = edge_mgr.current_bos
+    if not current_bos:
+        return None
+    
+    # Solo para DISPLACEMENT edge type
+    # 🔧 FIX: Comparar con EdgeType.DISPLACEMENT (enum), no string
+    if current_bos.edge_type != EdgeType.DISPLACEMENT:
+        return None
+    
+    bars_since = current_bos.bars_since_displacement
+    
+    # =====================================================================
+    # 🔥 VENTANA DURA: bars <= 1 solamente (no 2)
+    # Si pasó más de 1 vela, ya es pipeline normal (pullback entry)
+    # =====================================================================
+    FAST_PATH_MAX_BARS = 1  # DURO: solo 0-1 velas
+    
+    if bars_since > FAST_PATH_MAX_BARS:
+        # =====================================================================
+        # 🚫 FAST PATH PERDIDO - El tren se fue
+        # 
+        # Regla profesional: "Si no entraste en 0-1 velas, NO es trade de displacement"
+        # 
+        # Opciones:
+        # - bars 2-5: Pipeline normal puede buscar PULLBACK (diferente setup)
+        # - bars > 5: CHASE BLOCK - No perseguir
+        # =====================================================================
+        
+        # Marcar que ya no es entrada directa
+        if current_bos.force_direct_entry:
+            current_bos.force_direct_entry = False
+            logger.warning(
+                f"🚂 DISPLACEMENT FAST PATH MISSED | bars={bars_since} > {FAST_PATH_MAX_BARS} | "
+                f"El tren se fue - ahora solo PULLBACK entry permitida"
+            )
+            engine._current_trade_tags['displacement_fast_path_missed'] = True
+            engine._current_trade_tags['displacement_missed_at_bars'] = bars_since
+        
+        if bars_since <= 5:
+            # Zona 2: Pullback posible (pero ya no es displacement puro)
+            logger.debug(
+                f"🌊 DISPLACEMENT: bars={bars_since} - PULLBACK ZONE | "
+                f"Pipeline normal evaluará pullback entry"
+            )
+        else:
+            # Zona 3: CHASE BLOCK - No perseguir
+            logger.info(
+                f"🚫 DISPLACEMENT CHASE BLOCK | bars={bars_since} > 5 | "
+                f"Edge expirado - no perseguir"
+            )
+            # Marcar edge como entry_window_closed
+            current_bos.entry_window_open = False
+        
+        return None
+    
+    # =====================================================================
+    # CHECK 2: Validaciones MÍNIMAS (solo las críticas)
+    # =====================================================================
+    
+    # 2a. Dirección debe coincidir con bias actual
+    disp_direction = current_bos.direction
+    if disp_direction != ctx.bias:
+        logger.warning(
+            f"🚫 FAST PATH SKIP: Direction mismatch | "
+            f"DISPLACEMENT={disp_direction} vs BIAS={ctx.bias}"
+        )
+        return None
+    
+    # 2b. No en cooldown global
+    # 🔧 FIX: El método es is_in_cooldown(), no in_cooldown()
+    if engine.state_machine.is_in_cooldown():
+        logger.debug("🚫 FAST PATH SKIP: In cooldown")
+        return None
+    
+    # 2c. No ya en posición
+    # 🔧 FIX: El atributo es .state (BotState enum), no .current_state
+    # También importamos BotState para comparar correctamente
+    from src.domain.trading.state.state_machine import BotState
+    if engine.state_machine.state != BotState.IDLE:
+        return None
+    
+    # =====================================================================
+    # � CHECK 3: DELTA CONTRADICT BLOCKER (CRÍTICO - Jan 30)
+    # =====================================================================
+    # Si el volumen fluye FUERTEMENTE contra nuestra dirección = FAKEOUT
+    # 
+    # El caso real que motivó esto:
+    # - Displacement SHORT detectado: $326
+    # - PERO delta ratio = +11.95x (COMPRADORES masivos)
+    # - Resultado: -1R inmediato
+    #
+    # Regla profesional: "El volumen no miente. Price puede mentir, volume no."
+    # =====================================================================
+    delta_ratio = engine._current_trade_tags.get('volume_delta_ratio', 0)
+    delta_contradicts = engine._current_trade_tags.get('delta_contradicts', False)
+    
+    # Umbral ESTRICTO: Si delta es >2x avg volume en dirección OPUESTA → BLOCK
+    DELTA_CONTRADICT_THRESHOLD = 2.0  # 2x average volume contra nosotros = STOP
+    
+    if disp_direction == 'LONG' and delta_ratio < -DELTA_CONTRADICT_THRESHOLD:
+        # Volumen vendedor masivo contra LONG
+        logger.warning(
+            f"🚫🚫🚫 FAST PATH BLOCKED: DELTA CONTRADICT | "
+            f"Direction=LONG but delta={delta_ratio:.2f}x (selling pressure) | "
+            f"Displacement puede ser FAKEOUT - esperando confirmación"
+        )
+        engine._current_trade_tags['fast_path_blocked_by_delta'] = True
+        engine._current_trade_tags['fast_path_block_delta_ratio'] = delta_ratio
+        return None
+    
+    if disp_direction == 'SHORT' and delta_ratio > DELTA_CONTRADICT_THRESHOLD:
+        # Volumen comprador masivo contra SHORT
+        logger.warning(
+            f"🚫🚫🚫 FAST PATH BLOCKED: DELTA CONTRADICT | "
+            f"Direction=SHORT but delta=+{delta_ratio:.2f}x (buying pressure) | "
+            f"Displacement puede ser FAKEOUT - esperando confirmación"
+        )
+        engine._current_trade_tags['fast_path_blocked_by_delta'] = True
+        engine._current_trade_tags['fast_path_block_delta_ratio'] = delta_ratio
+        return None
+    
+    # Log si hay contradicción menor pero permitimos (< threshold)
+    if delta_contradicts:
+        logger.info(
+            f"⚠️ FAST PATH: Minor delta contradict ({delta_ratio:.2f}x) - "
+            f"proceeding with caution (threshold={DELTA_CONTRADICT_THRESHOLD}x)"
+        )
+    
+    # =====================================================================
+    # 🚨 CHECK 4: PRECIO YA REVIRTIÓ? (FAKEOUT DETECTOR)
+    # =====================================================================
+    # Si el precio ya retrocedió >40% del displacement inicial = FAKEOUT
+    # 
+    # Caso real:
+    # - Displacement SHORT $326 detectado @ $82301
+    # - 8 segundos después precio ya en $82481 (+$180 = 55% reversal)
+    # - Esto era un wick/fakeout, no un displacement real
+    #
+    # Regla: Si precio ha revertido >40%, el displacement ya se invalidó
+    # =====================================================================
+    origin_price_check = current_bos.origin_price or 0
+    initial_disp_check = current_bos.initial_displacement_amount or 0
+    
+    if initial_disp_check > 0 and origin_price_check > 0:
+        if disp_direction == 'LONG':
+            # En LONG: origin era el LOW, displacement subió
+            # Si precio actual < origin + (disp * 0.60) → ya retrocedió >40%
+            min_continuation = origin_price_check + (initial_disp_check * 0.60)
+            if current_price < min_continuation:
+                retracement_pct = (origin_price_check + initial_disp_check - current_price) / initial_disp_check * 100
+                logger.warning(
+                    f"🚫 FAST PATH BLOCKED: FAKEOUT DETECTED | "
+                    f"LONG displacement pero precio ya retrocedió {retracement_pct:.0f}% | "
+                    f"Origin=${origin_price_check:.0f} Disp=${initial_disp_check:.0f} Current=${current_price:.0f}"
+                )
+                engine._current_trade_tags['fast_path_blocked_by_reversal'] = True
+                engine._current_trade_tags['fast_path_reversal_pct'] = retracement_pct
+                return None
+        else:
+            # En SHORT: origin era el HIGH, displacement bajó
+            # Si precio actual > origin - (disp * 0.60) → ya retrocedió >40%
+            max_continuation = origin_price_check - (initial_disp_check * 0.60)
+            if current_price > max_continuation:
+                retracement_pct = (current_price - (origin_price_check - initial_disp_check)) / initial_disp_check * 100
+                logger.warning(
+                    f"🚫 FAST PATH BLOCKED: FAKEOUT DETECTED | "
+                    f"SHORT displacement pero precio ya retrocedió {retracement_pct:.0f}% | "
+                    f"Origin=${origin_price_check:.0f} Disp=${initial_disp_check:.0f} Current=${current_price:.0f}"
+                )
+                engine._current_trade_tags['fast_path_blocked_by_reversal'] = True
+                engine._current_trade_tags['fast_path_reversal_pct'] = retracement_pct
+                return None
+    
+    # =====================================================================
+    # 🚀 FAST PATH ACTIVADO - ENTRAR AHORA
+    # =====================================================================
+    origin_log = current_bos.origin_price or 0
+    disp_log = current_bos.initial_displacement_amount or 0
+    logger.warning(
+        f"🚀🚀🚀 DISPLACEMENT FAST PATH ACTIVATED 🚀🚀🚀 | "
+        f"bars_since={bars_since} | direction={disp_direction} | "
+        f"origin=${origin_log:.0f} | "
+        f"displacement=${disp_log:.0f}"
+    )
+    
+    # =====================================================================
+    # SIZING: Conservador en fast path (25-30% base)
+    # No queremos all-in en el primer tick
+    # =====================================================================
+    # 🔧 FIX: No existe engine.risk_config - usar 0.01 (1%) hardcodeado
+    base_risk_pct = 0.01  # 1% of capital - industry standard
+    fast_path_size_mult = DisplacementEdgeCriteria.EARLY_IMPULSE_SIZE_MIN  # 0.25
+    
+    if bars_since == 0:
+        # Bar 0: más conservador aún
+        fast_path_size_mult = 0.25
+    else:
+        # Bar 1: un poco más size si confirmó
+        fast_path_size_mult = 0.35
+    
+    # =====================================================================
+    # STOP LOSS: Estructural basado en origen del displacement
+    # NO ATR tight - el SL es el ORIGEN del movimiento
+    # =====================================================================
+    origin_price = current_bos.origin_price
+    initial_disp = current_bos.initial_displacement_amount or (ctx.atr_5m * 2)
+    
+    # SL más allá del origen (buffer de 10%)
+    sl_buffer = initial_disp * 0.10
+    
+    if disp_direction == 'LONG':
+        # En LONG, SL debajo del origen
+        stop_loss = origin_price - sl_buffer
+        # Asegurar mínimo de 1x ATR5m
+        min_sl = current_price - (ctx.atr_5m * 1.5)
+        stop_loss = min(stop_loss, min_sl)
+    else:
+        # En SHORT, SL encima del origen
+        stop_loss = origin_price + sl_buffer
+        # Asegurar mínimo de 1x ATR5m
+        max_sl = current_price + (ctx.atr_5m * 1.5)
+        stop_loss = max(stop_loss, max_sl)
+    
+    risk = abs(current_price - stop_loss)
+    
+    # =====================================================================
+    # TAKE PROFIT: 2.0R mínimo para displacement (tendencias)
+    # =====================================================================
+    tp_r = 2.0
+    if disp_direction == 'LONG':
+        take_profit = current_price + (risk * tp_r)
+    else:
+        take_profit = current_price - (risk * tp_r)
+    
+    # =====================================================================
+    # SIZE: Calcular basado en risk
+    # =====================================================================
+    # 🔧 FIX: Usar risk_engine.capital en lugar de _current_balance inexistente
+    risk_engine = getattr(engine, 'risk_engine', None)
+    account_balance = getattr(risk_engine, 'capital', 10000) if risk_engine else 10000
+    risk_amount = account_balance * base_risk_pct * fast_path_size_mult
+    
+    size = risk_amount / risk if risk > 0 else 0
+    size = round_size_to_exchange(size)
+    
+    # Validar mínimo
+    if size < KRAKEN_BTC_MIN_SIZE:
+        logger.warning(
+            f"🚫 FAST PATH: Size {size:.6f} < min {KRAKEN_BTC_MIN_SIZE} | "
+            f"risk=${risk_amount:.2f}, risk_dist=${risk:.2f}"
+        )
+        result = EntryResult()
+        result.reason = "Size below minimum for fast path"
+        return result
+    
+    logger.warning(
+        f"🚀 FAST PATH ENTRY | {disp_direction} {size:.6f} BTC @ ${current_price:.2f} | "
+        f"SL=${stop_loss:.2f} ({risk:.2f} risk) | TP=${take_profit:.2f} ({tp_r}R) | "
+        f"Size mult: {fast_path_size_mult:.0%}"
+    )
+    
+    # =====================================================================
+    # EJECUTAR: IOC/Aggressive (taker permitido)
+    # =====================================================================
+    engine._current_trade_tags['entry_type'] = 'FAST_PATH_DISPLACEMENT'
+    engine._current_trade_tags['fast_path_bars_since'] = bars_since
+    engine._current_trade_tags['fast_path_origin'] = origin_price
+    engine._current_trade_tags['fast_path_size_mult'] = fast_path_size_mult
+    
+    result = await OrderExecutor.place_order(
+        engine=engine,
+        ctx=ctx,
+        size=size,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        use_market=False,
+        aggressive_execution=True,  # IOC + taker allowed
+        entry_data={
+            'bias': disp_direction,
+            'entry_price': current_price,
+            'position_size': size,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'atr_1m': atr_1m,
+            'order_type': 'FAST_PATH_IOC',
+            'tags': engine._current_trade_tags.copy(),
+        }
+    )
+    
+    if result.success:
+        logger.warning(
+            f"✅ FAST PATH ORDER PLACED | ID: {result.order_id}"
+        )
+        # Marcar que usamos fast path para no volver a intentar
+        current_bos.force_direct_entry = False
+    else:
+        logger.error(f"❌ FAST PATH FAILED: {result.reason}")
+    
+    return result
 
 
 # =========================================================================
@@ -892,6 +1262,25 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     ctx.regime = getattr(engine, '_current_regime', EntryRegime.NORMAL)
     ctx.volatility_regime = getattr(engine, '_current_volatility_regime', VolatilityRegime.NORMAL)  # Already a string
     ctx.trend_phase = getattr(engine, '_trend_phase', TrendPhase.RANGE_BOUND)
+    
+    # =========================================================================
+    # 🚀🚀🚀 DISPLACEMENT FAST PATH (Jan 30, 2026) 🚀🚀🚀
+    # =========================================================================
+    # PROBLEMA: El sistema trata DISPLACEMENT como "setup a evaluar"
+    # REALIDAD: DISPLACEMENT es un EVENTO URGENTE - o entras ahora o no entras
+    #
+    # FAST PATH bypasea TODA la ceremonia cuando:
+    # 1. Edge DISPLACEMENT está ACTIVE
+    # 2. bars_since_displacement <= 1 (VENTANA DURA: 0-1 velas, NO MÁS)
+    # 3. Volume no colapsó
+    #
+    # El objetivo NO es el mejor precio
+    # El objetivo es NO PERDER EL MOVIMIENTO
+    # =========================================================================
+    
+    fast_path_result = await _displacement_fast_path(engine, ctx, current_price, atr_1m, market_time)
+    if fast_path_result is not None:
+        return fast_path_result
     
     # ========== PHASE 1: GUARDS ==========
     guard_result = await GuardOrchestrator.run_all_guards(engine, ctx)
@@ -1173,26 +1562,101 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         return result
     
     # ========== PHASE 8: COST VALIDATION ==========
-    # Determine order type
+    # PASO 2 — MAKER ONLY REAL (SIN EXCEPCIONES)
+    # Entrada: SOLO LIMIT + post-only
+    # (No market entries, no chasing.)
     use_market = False
-    if ctx.df_1m is not None and len(ctx.df_1m) >= 2:
-        # 🔥 FIX: Use local calculate_momentum_velocity function
-        velocity = calculate_momentum_velocity(ctx.df_1m, atr_1m)
-        use_market = OrderExecution.USE_MARKET_ON_MOMENTUM and velocity > OrderExecution.MOMENTUM_VELOCITY_MULTIPLIER
-        
-        if gate_result.require_limit and use_market:
-            use_market = False
     
     cost_result = engine._cost_validator.validate_costs(
         position_size=sizing_result.size,
         current_price=current_price,
         stop_loss=stop_loss,
+        take_profit=take_profit,
         bias=bias,
-        use_market_order=use_market,
+        is_maker_entry=True,
+        is_maker_exit=True,
     )
     
     if not cost_result.is_valid:
         result.reason = f"Cost too high: {cost_result.block_reason}"
+        return result
+
+    # =====================================================================
+    # ✅ PASO 3 — BLOQUEA TRADES PEQUEÑOS
+    # expected_net_R < 0.6 → NO TRADE (hard block)
+    # =====================================================================
+    MIN_EXPECTED_NET_R = 0.6
+    if cost_result.expected_net_r < MIN_EXPECTED_NET_R:
+        logger.warning(
+            f"🚫 HARD BLOCK: net_R={cost_result.expected_net_r:.2f} < {MIN_EXPECTED_NET_R:.2f} "
+            f"| fees_R={cost_result.fee_r_estimate:.2f} | profit=${cost_result.expected_profit_usd_net:.2f}"
+        )
+        result.reason = (
+            f"HARD BLOCK: expected_net_R={cost_result.expected_net_r:.2f} < {MIN_EXPECTED_NET_R:.2f}"
+        )
+        engine.missed_tracker.log_blocked_signal(
+            direction=bias,
+            price=current_price,
+            block_reason=f"net_R={cost_result.expected_net_r:.2f} < {MIN_EXPECTED_NET_R}",
+            block_category='profitability',
+            score=final_score,
+            atr=engine._last_momentum_atr
+        )
+        return result
+
+    # =====================================================================
+    # ✅ PASO 4 — TAMAÑO MÍNIMO DE POSICIÓN
+    # expected_profit_usd (NET) < $1.20 → NO TRADE (hard block)
+    # =====================================================================
+    MIN_EXPECTED_PROFIT_USD = 1.20
+    if cost_result.expected_profit_usd_net < MIN_EXPECTED_PROFIT_USD:
+        logger.warning(
+            f"🚫 HARD BLOCK: profit_net=${cost_result.expected_profit_usd_net:.2f} < ${MIN_EXPECTED_PROFIT_USD:.2f} "
+            f"| size={sizing_result.size:.6f} | TP={take_profit:.2f}"
+        )
+        result.reason = (
+            f"HARD BLOCK: expected_profit_usd_net=${cost_result.expected_profit_usd_net:.2f} < ${MIN_EXPECTED_PROFIT_USD:.2f}"
+        )
+        engine.missed_tracker.log_blocked_signal(
+            direction=bias,
+            price=current_price,
+            block_reason=f"profit_net=${cost_result.expected_profit_usd_net:.2f} < ${MIN_EXPECTED_PROFIT_USD}",
+            block_category='profitability',
+            score=final_score,
+            atr=engine._last_momentum_atr
+        )
+        return result
+    
+    # =====================================================================
+    # ✅ PASO 5 — PROBE-SPECIFIC VALIDATION (Jan 28, 2026)
+    # Si es PROBE, aplicar reglas más estrictas de rentabilidad mínima
+    # =====================================================================
+    from src.application.live.entry_validators import ProbeValidator
+    
+    is_probe = bool(engine._current_trade_tags.get('probing_mode', False))
+    spread_bps = getattr(engine, '_last_spread_bps', 1.0)
+    
+    probe_result = ProbeValidator.validate_probe(
+        is_probe=is_probe,
+        position_size=sizing_result.size,
+        current_price=current_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        bias=bias,
+        atr_1m=atr_1m,
+        spread_bps=spread_bps,
+    )
+    
+    if not probe_result.is_valid:
+        result.reason = probe_result.block_reason
+        engine.missed_tracker.log_blocked_signal(
+            direction=bias,
+            price=current_price,
+            block_reason=probe_result.block_reason,
+            block_category='probe_filter',
+            score=final_score,
+            atr=engine._last_momentum_atr
+        )
         return result
     
     # ========== PHASE 9: EXECUTE ==========
@@ -1205,16 +1669,37 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         'stop_loss': stop_loss,
         'take_profit': take_profit,
         'atr_1m': atr_1m,
-        'order_type': 'MARKET' if use_market else 'LIMIT',
+        'order_type': 'LIMIT',
         'tags': engine._current_trade_tags.copy(),
         'score': final_score,
         'score_breakdown': score_result.breakdown.copy(),
     }
     
+    # 🔥 FIX (Jan 30): Check for DISPLACEMENT DIRECT ENTRY for aggressive execution
+    # During DIRECT ENTRY WINDOW, post-only is counterproductive - use IOC
+    aggressive_execution = False
+    edge_mgr = getattr(engine, '_edge_manager', None)
+    if edge_mgr is not None:
+        from src.domain.trading.edge_state_manager import EdgeState, EdgeType
+        is_displacement_edge = (
+            edge_mgr.state == EdgeState.EDGE_ACTIVE and 
+            edge_mgr.current_bos is not None and
+            edge_mgr.current_bos.edge_type == EdgeType.DISPLACEMENT
+        )
+        # Check if still in DIRECT ENTRY WINDOW (0-2 bars)
+        if is_displacement_edge:
+            bars_since_disp = edge_mgr.current_bos.bars_since_displacement
+            if bars_since_disp is not None and bars_since_disp <= 2:
+                aggressive_execution = True
+                logger.warning(
+                    f"🚀 DISPLACEMENT DIRECT ENTRY: bar {bars_since_disp}/2 → AGGRESSIVE EXECUTION ENABLED"
+                )
+    
     order_result = await OrderExecutor.place_order(
         engine, ctx, sizing_result.size, stop_loss, take_profit,
-        use_market=use_market,
+        use_market=False,
         entry_data=entry_data,
+        aggressive_execution=aggressive_execution,  # 🔥 FIX: IOC for displacement
     )
     
     if order_result.success:

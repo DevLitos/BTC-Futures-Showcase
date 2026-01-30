@@ -213,6 +213,7 @@ class PostSweepConfirmationFilter(BaseFilter):
                  current_price: float | None = None,
                  atr: float | None = None,
                  bias: str | None = None,
+                 displacement_bypass: bool = False,
                  **kwargs) -> FilterDecision:
         """
         Evaluate post-sweep confirmation conditions.
@@ -222,7 +223,19 @@ class PostSweepConfirmationFilter(BaseFilter):
             current_price: Current price
             atr: Current ATR
             bias: 'LONG' or 'SHORT'
+            displacement_bypass: If True, bypass sweep blocking (strong momentum)
         """
+        # =====================================================================
+        # 🔥 DISPLACEMENT BYPASS: Strong momentum overrides sweep blocking
+        # =====================================================================
+        if displacement_bypass:
+            return FilterDecision(
+                allow=True,
+                score_adjust=0.0,
+                reasons=["🔥 DISPLACEMENT BYPASS: Sweep filter disabled"],
+                tags={'displacement_bypass': True}
+            )
+        
         if df is None or len(df) < 25 or current_price is None:
             return FilterDecision.allow_default()
         

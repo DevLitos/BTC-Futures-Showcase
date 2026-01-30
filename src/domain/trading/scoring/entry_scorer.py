@@ -218,6 +218,7 @@ class EntryScorer:
         market_time: datetime,
         micro_trend_state: Optional['MicroTrendState'] = None,
         filter_pipeline: Optional['EntryFilterPipeline'] = None,
+        displacement_edge_active: bool = False,  # 🔥 FIX (Jan 30): Bypass structure for displacement
     ) -> Tuple[int, Dict[str, Any], bool]:
         """
         Calculate entry score using 4 blocks.
@@ -231,6 +232,7 @@ class EntryScorer:
             market_time: Current market timestamp
             micro_trend_state: Optional MicroTrendState for adjustment
             filter_pipeline: Optional filter pipeline for adjustments
+            displacement_edge_active: If True, bypass STRUCTURE GATE (market already voted)
         
         Returns:
             (total_score, breakdown_dict, structure_blocks)
@@ -241,9 +243,21 @@ class EntryScorer:
         self._trade_tags = TradeTags(mode=OperatingMode.MODE)
         
         # 1️⃣ STRUCTURE (0-2) - THE ONLY GATE
+        # 🔥 FIX (Jan 30): DISPLACEMENT EDGE bypasses structure gate
+        # Rationale: The market has already "voted" with size, speed and continuation.
+        # Following slow EMA50_1h against a $300+ displacement is retail thinking.
         structure_score, structure_blocks, htf_clean = self._score_structure(
             df_1h, df_5m, bias, current_price
         )
+        
+        # 🔥 DISPLACEMENT OVERRIDE: If displacement edge is active, IGNORE structure gate
+        if structure_blocks and displacement_edge_active:
+            logger.warning(
+                f"🌊 DISPLACEMENT STRUCTURE BYPASS: Ignoring STRUCTURE GATE for {bias} | "
+                f"Market momentum > HTF structure (EMA50_1h is SLOW during fast moves)"
+            )
+            structure_blocks = False
+            structure_score = 1  # Give partial structure credit
         self._breakdown.structure = structure_score
         self._trade_tags.htf_aligned = structure_score > 0
         self._trade_tags.ltf_clean = structure_score == 2

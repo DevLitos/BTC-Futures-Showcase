@@ -370,7 +370,10 @@ class RESTExecutionEngine:
             # Build params for Kraken Futures
             params = {
                 'timeInForce': 'GTC',
-                'clientOrderId': client_order_id
+                'clientOrderId': client_order_id,
+                # PASO 2 — MAKER ONLY REAL (SIN EXCEPCIONES)
+                # Ensure entry is strictly post-only.
+                'postOnly': True,
             }
             
             # ⚠️ IMPORTANT: Kraken Futures NO acepta stopLoss/takeProfit en órdenes LIMIT
@@ -423,7 +426,141 @@ class RESTExecutionEngine:
             await asyncio.sleep(30)
             return None
         except Exception as e:
-            logger.error(f"Error placing order: {e}")
+            error_str = str(e).lower()
+            # postWouldExecute = limit order would cross spread (act as taker)
+            # This is EXPECTED with postOnly=True - means price moved too fast
+            if 'postwouldexecute' in error_str:
+                logger.warning(
+                    f"🚫 POST-ONLY REJECTED: Price moved - would execute as taker | "
+                    f"CORRECT: Not chasing market"
+                )
+            else:
+                logger.error(f"Error placing order: {e}")
+            return None
+    
+    async def place_aggressive_order(self, symbol: str, side: str, amount: float,
+                                     price: float, stop_loss: float | None = None,
+                                     take_profit: float | None = None,
+                                     client_order_id: str | None = None) -> Optional[Dict]:
+        """
+        🔥 DISPLACEMENT AGGRESSIVE ENTRY (Jan 30, 2026)
+        
+        Place order with IOC (Immediate-Or-Cancel) instead of post-only.
+        Used during DISPLACEMENT DIRECT ENTRY WINDOW when:
+        - Market is moving fast
+        - Post-only would reject
+        - Better to fill as taker than miss the trade
+        
+        Key differences from place_limit_order:
+        - postOnly=False (allows taker)
+        - timeInForce='IOC' (fill immediately or cancel)
+        - Price offset: +0.1% for BUY, -0.1% for SELL (crosses spread)
+        
+        Args:
+            Similar to place_limit_order
+            
+        Returns:
+            order object or None if fails/not filled
+        """
+        if not self.exchange:
+            logger.error("Exchange not initialized")
+            return None
+        
+        # Pre-round size
+        original_amount = amount
+        amount = round_size_to_exchange(amount)
+        if amount == 0 or amount < KRAKEN_BTC_MIN_SIZE:
+            logger.error(f"⛔ Cannot place aggressive order: size {original_amount:.8f} → {amount:.8f} (min: {KRAKEN_BTC_MIN_SIZE})")
+            return None
+        if amount != original_amount:
+            logger.info(f"📊 Size pre-rounded: {original_amount:.8f} → {amount:.8f}")
+        
+        # Generate idempotent client order ID
+        if client_order_id is None:
+            client_order_id = generate_client_order_id(
+                symbol=symbol,
+                side=side,
+                timestamp=datetime.now(UTC),
+                strategy_id="aggro"
+            )
+        
+        # 🔥 AGGRESSIVE PRICE: Cross the spread to ensure fill
+        # For BUY: price + 0.1% (willing to pay more)
+        # For SELL: price - 0.1% (willing to accept less)
+        AGGRO_OFFSET_PCT = 0.001  # 0.1%
+        if side.lower() == 'buy':
+            aggressive_price = price * (1 + AGGRO_OFFSET_PCT)
+        else:
+            aggressive_price = price * (1 - AGGRO_OFFSET_PCT)
+        
+        try:
+            params = {
+                'timeInForce': 'IOC',  # Immediate-Or-Cancel
+                'clientOrderId': client_order_id,
+                'postOnly': False,  # Allow taker execution
+            }
+            
+            logger.warning(
+                f"🚀 AGGRESSIVE {side.upper()}: {amount} {symbol} @ {aggressive_price:.2f} "
+                f"(original: {price:.2f}, offset: {AGGRO_OFFSET_PCT*100:.1f}%) [IOC]"
+            )
+            
+            async with self._exchange_lock:
+                try:
+                    order = await asyncio.wait_for(
+                        self.exchange.create_order(
+                            symbol=symbol,
+                            type='limit',
+                            side=side.lower(),
+                            amount=amount,
+                            price=aggressive_price,
+                            params=params
+                        ),
+                        timeout=EXCHANGE_TIMEOUT_MEDIUM
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"⏰ TIMEOUT placing aggressive order (30s)")
+                    return None
+            
+            # Check if IOC was filled
+            filled_amount = order.get('filled', 0)
+            order_status = order.get('status', 'unknown')
+            
+            if filled_amount > 0:
+                order['created_at'] = datetime.now(UTC).isoformat()
+                order['clientOrderId'] = client_order_id
+                order['_aggressive'] = True
+                self.open_orders[order['id']] = order
+                
+                if stop_loss or take_profit:
+                    order['_pending_sl'] = stop_loss
+                    order['_pending_tp'] = take_profit
+                    logger.info(f"   📌 SL @ {stop_loss:.2f} | 🎯 TP @ {take_profit:.2f} (will be set after fill)")
+                
+                logger.info(
+                    f"🚀 AGGRESSIVE ORDER FILLED: {order['id']} | "
+                    f"Filled: {filled_amount}/{amount} @ {order.get('average', aggressive_price):.2f}"
+                )
+                return order
+            else:
+                logger.warning(
+                    f"🚫 AGGRESSIVE ORDER NOT FILLED: IOC expired | "
+                    f"Status: {order_status} | Price gap too large or no liquidity"
+                )
+                return None
+                
+        except ccxt.errors.OrderNotFound:
+            logger.error("Aggressive order not found on exchange")
+            return None
+        except ccxt.InsufficientFunds:
+            logger.error("Insufficient balance for aggressive order")
+            return None
+        except ccxt.errors.DDoSProtection:
+            logger.warning("Exchange rate limit - waiting 30s")
+            await asyncio.sleep(30)
+            return None
+        except Exception as e:
+            logger.error(f"Error placing aggressive order: {e}")
             return None
     
     async def cancel_all_orders(self, symbol: str) -> int:
@@ -1033,58 +1170,31 @@ class RESTExecutionEngine:
             if need_tp and take_profit:
                 try:
                     tp_side = 'sell' if position_side == 'long' else 'buy'
-                    
-                    # ATTEMPT 1: 'take-profit' type (Kraken Futures standard)
-                    # 🔥 FIX (Jan 20, 2026): Added timeout to all exchange calls
-                    logger.debug(f"[TP Attempt 1] Using 'take-profit' type: {tp_side} {position_size:.8f} @ {take_profit:.2f}")
+
+                    # PASO 2 — MAKER ONLY REAL (SIN EXCEPCIONES)
+                    # SALIDA (TP): SIEMPRE LIMIT + post-only (resting), reduceOnly=True
+                    logger.debug(f"[TP] Placing LIMIT post-only TP: {tp_side} {position_size:.8f} @ {take_profit:.2f}")
                     try:
                         tp_order = await asyncio.wait_for(
                             self.exchange.create_order(
                                 symbol=symbol,
-                                type='take-profit',
+                                type='limit',
                                 side=tp_side,
                                 amount=position_size,
                                 price=take_profit,
                                 params={
                                     'reduceOnly': True,
-                                    'postOnly': False
+                                    'postOnly': True,
                                 }
                             ),
                             timeout=EXCHANGE_TIMEOUT_MEDIUM
                         )
-                        logger.info(f"✅ TP (take-profit) placed: {tp_order.get('id')}")
+                        logger.info(f"✅ TP (limit post-only) placed: {tp_order.get('id')}")
                         tp_success = True
-                        
                     except asyncio.TimeoutError:
-                        logger.debug(f"[TP Attempt 1 TIMEOUT]")
-                        raise ExchangeTimeoutError("Timeout on take-profit attempt 1")
-                    except Exception as e1:
-                        logger.debug(f"[TP Attempt 1 FAILED]: {str(e1)[:100]}")
-                        
-                        # ATTEMPT 2: Simple 'limit' order
-                        logger.debug(f"[TP Attempt 2] Using simple 'limit' order")
-                        try:
-                            tp_order = await asyncio.wait_for(
-                                self.exchange.create_order(
-                                    symbol=symbol,
-                                    type='limit',
-                                    side=tp_side,
-                                    amount=position_size,
-                                    price=take_profit,
-                                    params={
-                                        'reduceOnly': True,
-                                        'postOnly': False
-                                    }
-                                ),
-                                timeout=EXCHANGE_TIMEOUT_MEDIUM
-                            )
-                            logger.info(f"✅ TP (limit) placed: {tp_order.get('id')}")
-                            tp_success = True
-                            
-                        except asyncio.TimeoutError:
-                            logger.error(f"❌ TP Attempt 2 TIMEOUT")
-                        except Exception as e2:
-                            logger.error(f"❌ TP placement failed: {str(e2)[:150]}")
+                        logger.error("❌ TP placement TIMEOUT")
+                    except Exception as e_tp:
+                        logger.error(f"❌ TP placement failed: {str(e_tp)[:150]}")
                             
                 except Exception as outer_e:
                     logger.error(f"❌ TP outer exception: {str(outer_e)[:150]}")
@@ -1162,21 +1272,25 @@ class RESTExecutionEngine:
                 logger.error(f"❌ SL failed: {e}")
                 return False
             
-            # TP: Intento directo (secondary) - 🔥 FIX: Added timeout
+            # TP: Secondary (SL is critical)
+            # PASO 2 — SALIDA: TP SIEMPRE LIMIT + post-only (no market TP)
             try:
                 await asyncio.wait_for(
                     self.exchange.create_order(
-                        symbol=symbol, type='take-profit', side=tp_side,
-                        amount=position_size, price=take_profit,
-                        params={'reduceOnly': True, 'postOnly': False}
+                        symbol=symbol,
+                        type='limit',
+                        side=tp_side,
+                        amount=position_size,
+                        price=take_profit,
+                        params={'reduceOnly': True, 'postOnly': True}
                     ),
                     timeout=EXCHANGE_TIMEOUT_MEDIUM
                 )
-                logger.info(f"✅ TP placed: {take_profit:.2f}")
+                logger.info(f"✅ TP (limit post-only) placed: {take_profit:.2f}")
             except asyncio.TimeoutError:
-                logger.warning(f"⚠️ TP timeout (SL is OK)")
+                logger.warning("⚠️ TP timeout (SL is OK)")
             except Exception as e:
-                logger.warning(f"⚠️  TP failed (SL is OK): {e}")
+                logger.warning(f"⚠️ TP failed (SL is OK): {e}")
             
             return True
             
@@ -1940,9 +2054,11 @@ class RESTExecutionEngine:
         
         # Detect exchange outage (503, unavailable, timeout, etc.)
         # CRITICAL: Timeout is also an outage indicator!
+        # 🔥 FIX (Jan 29, 2026): Also detect DNS failures
         is_outage = any(x in error_str.lower() for x in [
             '503', 'service unavailable', 'unavailable', 'try again later',
-            'timeout', 'timed out', 'connection'
+            'timeout', 'timed out', 'connection', 'dns', 'name resolution',
+            'errno -3', 'temporary failure'
         ])
         
         if is_outage:
@@ -1958,8 +2074,9 @@ class RESTExecutionEngine:
                 # Throttle repeated outage logs
                 logger.warning(f"⚠️ Exchange REST still down ({self._consecutive_rest_failures} failures, backoff={self._backoff_seconds:.0f}s)")
         else:
-            # Regular error - always log
-            logger.error(f"Error in {operation}: {error_str}")
+            # Regular error - throttle after first few
+            if self._rest_failure_log_count <= 5 or self._rest_failure_log_count % 30 == 0:
+                logger.error(f"Error in {operation}: {error_str}")
     
     def is_circuit_breaker_open(self) -> bool:
         """Check if circuit breaker is blocking calls (in backoff period)"""
