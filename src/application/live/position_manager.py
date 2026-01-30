@@ -258,11 +258,12 @@ def check_time_stagnation(
     Returns:
         (should_exit, reason)
     """
-    if not hasattr(position, 'entry_time') or not position.entry_time:
+    # 🔧 FIX (Jan 30, 2026): Position uses 'open_time', not 'entry_time'
+    if not hasattr(position, 'open_time') or not position.open_time:
         return False, ""
     
     # Calculate time in trade
-    time_in_trade = (market_time - position.entry_time).total_seconds() / 60.0
+    time_in_trade = (market_time - position.open_time).total_seconds() / 60.0
     
     if time_in_trade < max_stagnation_minutes:
         return False, ""
@@ -320,16 +321,28 @@ class PositionHealthChecker:
         # 1. Calculate current R
         result['current_r'] = calculate_current_r(position, current_price)
         
-        # 2. Check BOS invalidation
+        # 2. Check BOS invalidation (with GRACE PERIOD - same as BOSInvalidationChecker)
         has_bos, bos_level = check_bos_against_position(df_5m, position.direction)
         result['has_bos'] = has_bos
         result['bos_level'] = bos_level
         
-        if has_bos and -0.3 < result['current_r'] < 0.3:
-            # Near breakeven with BOS = close
+        # 🔧 FIX (Jan 30, 2026): Apply 5min grace period BEFORE acting on BOS
+        # This prevents closing on pre-existing BOS detected immediately after entry
+        GRACE_PERIOD_MINUTES = 5.0
+        trade_age_min = 0.0
+        within_grace = False
+        # 🔧 FIX (Jan 30, 2026): Position uses 'open_time', not 'entry_time'
+        if hasattr(position, 'open_time') and position.open_time:
+            trade_age_min = (market_time - position.open_time).total_seconds() / 60.0
+            within_grace = trade_age_min < GRACE_PERIOD_MINUTES
+            if within_grace and has_bos:
+                logger.info(f"🛡️ BOS GRACE PERIOD: Trade age {trade_age_min:.1f}m < {GRACE_PERIOD_MINUTES}m → IGNORING BOS in HealthChecker")
+        
+        if has_bos and not within_grace and -0.3 < result['current_r'] < 0.3:
+            # Near breakeven with BOS = close (only outside grace period)
             result['should_close'] = True
             result['close_reason'] = f'BOS_INVALIDATION (R={result["current_r"]:.2f})'
-        elif has_bos and result['current_r'] >= 0.3:
+        elif has_bos and not within_grace and result['current_r'] >= 0.3:
             # In profit with BOS = tighten 50%
             result['should_tighten'] = True
             trail_dist = abs(current_price - position.trailing_stop) * 0.5
@@ -658,8 +671,9 @@ class BOSInvalidationChecker:
             return result
         
         # Check grace period
-        if hasattr(position, 'entry_time') and position.entry_time:
-            trade_age_min = (market_time - position.entry_time).total_seconds() / 60.0
+        # 🔧 FIX (Jan 30, 2026): Position uses 'open_time', not 'entry_time'
+        if hasattr(position, 'open_time') and position.open_time:
+            trade_age_min = (market_time - position.open_time).total_seconds() / 60.0
             if trade_age_min < BOSInvalidationChecker.GRACE_PERIOD_MINUTES:
                 logger.info(f"🛡️ BOS GRACE PERIOD: Trade age {trade_age_min:.1f}m < {BOSInvalidationChecker.GRACE_PERIOD_MINUTES}m → IGNORING BOS")
                 return result
