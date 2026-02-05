@@ -71,6 +71,22 @@ class ActivityTracker:
     # Position sizing already reduces after losses - no need for double punishment.
     # We still track WTP exits for observability but don't block on them.
     
+    # =========================================================================
+    # 🔥 FIX #10: HOT HAND SESSION LIMIT (Feb 02, 2026)
+    # =========================================================================
+    # Base limit = 3 trades per session (ALWAYS guaranteed)
+    # After base is consumed:
+    #   - If last trade was WIN: +1 trade allowed
+    #   - If last trade was LOSS: session STOPPED
+    # 
+    # Example:
+    #   Trade 1: LOSS → OK (within base)
+    #   Trade 2: LOSS → OK (within base)
+    #   Trade 3: WIN  → OK (base consumed, but WIN allows trade 4)
+    #   Trade 4: WIN  → OK (bonus, WIN allows trade 5)
+    #   Trade 5: LOSS → STOPPED (no more trades)
+    # =========================================================================
+    
     def __init__(self):
         self._last_trade_time: Optional[datetime] = None
         self._trade_count_today: int = 0
@@ -84,6 +100,10 @@ class ActivityTracker:
         self._worst_trade_preventions_today: int = 0
         self._last_loss_time: Optional[datetime] = None
         self._pnl_today_r: float = 0.0
+        
+        # 🔥 FIX #10: Hot Hand - track last trade result
+        self._last_trade_was_win: bool = False
+        self._current_session: Optional[str] = None  # Track session for reset
         
     def record_trade_executed(self, market_time: datetime) -> None:
         """
@@ -158,6 +178,9 @@ class ActivityTracker:
             self._losses_today += 1
             self._last_loss_time = market_time
             
+            # 🔥 FIX #10: Track last trade result
+            self._last_trade_was_win = False
+            
             if is_wtp:
                 self._worst_trade_preventions_today += 1
                 logger.warning(
@@ -179,6 +202,13 @@ class ActivityTracker:
                 )
             self._consecutive_losses = 0
             self._wins_today += 1
+            
+            # 🔥 FIX #10: Track last trade result - enables Hot Hand bonus
+            self._last_trade_was_win = True
+            logger.info(
+                f"🔥 HOT HAND: Last trade was WIN | "
+                f"Session limit +1 if base consumed"
+            )
     
     def get_daily_stats(self) -> dict:
         """Get daily trading statistics (observability)."""
@@ -189,7 +219,37 @@ class ActivityTracker:
             'consecutive_losses': self._consecutive_losses,
             'wtp_exits_today': self._worst_trade_preventions_today,
             'pnl_today_r': self._pnl_today_r,
+            'last_trade_was_win': self._last_trade_was_win,
         }
+    
+    def last_trade_was_win(self) -> bool:
+        """
+        🔥 FIX #10: Check if last trade was a win.
+        
+        Used by Hot Hand system to determine if bonus trade is allowed
+        after base limit is consumed.
+        
+        Returns:
+            True if last closed trade was a win, False otherwise.
+        """
+        return self._last_trade_was_win
+    
+    def reset_session_state(self, session_name: str) -> None:
+        """
+        🔥 FIX #10: Reset session state when session changes.
+        
+        Called when trading session changes (e.g., ASIA → LONDON)
+        to reset the Hot Hand state.
+        """
+        if self._current_session != session_name:
+            old_session = self._current_session
+            self._current_session = session_name
+            self._last_trade_was_win = False  # Reset on session change
+            if old_session:
+                logger.info(
+                    f"📊 Session change: {old_session} → {session_name} | "
+                    f"Hot Hand state reset"
+                )
     
     def get_hours_since_last_trade(self, current_time: datetime) -> float:
         """
@@ -244,6 +304,10 @@ class ActivityTracker:
         """Get the last trade time (read-only)."""
         return self._last_trade_time
     
+    def get_last_loss_time(self) -> Optional[datetime]:
+        """Get the time of last losing trade (for cooldown calculations)."""
+        return self._last_loss_time
+    
     def get_trade_count_today(self) -> int:
         """Get number of trades today."""
         return self._trade_count_today
@@ -287,6 +351,16 @@ def get_activity_tracker() -> ActivityTracker:
 def record_trade_executed(market_time: datetime) -> None:
     """Convenience function to record a trade execution."""
     get_activity_tracker().record_trade_executed(market_time)
+
+
+def get_last_loss_time() -> Optional[datetime]:
+    """
+    Get time of last losing trade (for cooldown calculations).
+    
+    🔥 NEW (Feb 2, 2026): Used by LossStreakCooldown to enforce
+    wait periods after consecutive losses.
+    """
+    return get_activity_tracker().get_last_loss_time()
 
 
 def get_hours_since_last_trade(current_time: datetime) -> float:

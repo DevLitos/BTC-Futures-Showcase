@@ -44,7 +44,12 @@ class Position:
                  size: float, stop_loss: float, atr_1m: float,
                  market_time: datetime | None = None,
                  trade_type: TradeType = TradeType.LONG_MAIN,
-                 regime_mode: str = 'TREND'):  # 🔥 NEW: regime_mode for BE logic
+                 regime_mode: str = 'TREND',  # 🔥 NEW: regime_mode for BE logic
+                 edge_type: str | None = None,  # 🔥 FIX (Jan 30): Track edge type for TIME_INVALIDATION
+                 entry_score: float | None = None,  # 🔥 FIX (Feb 01): Track entry score for TIME_INVALIDATION
+                 is_weekend: bool = False,  # 🔥 FIX (Feb 01): Track weekend for stricter exits
+                 bos_quality: str = 'NORMAL',  # 🔥 NEW (Feb 03): BOS quality for dynamic trailing
+                 displacement_origin: float | None = None):  # 🔥 NEW (Feb 04): Origin for reclaim exit
         # ===== INPUT VALIDATION =====
         if not symbol:
             raise ValueError("symbol cannot be empty")
@@ -68,6 +73,7 @@ class Position:
         self.trade_type = trade_type  # LONG_MAIN, SHORT_STRUCTURAL, or SHORT_PULLBACK
         self.regime_mode = regime_mode  # 🔥 NEW: 'TREND', 'RANGE', 'BREAKOUT'
         self.entry_price = entry_price
+        self.initial_entry_price = entry_price  # 🔥 FIX (Feb 4): NEVER changes, used for R/MFE calculations
         self.size = size
         self.stop_loss = stop_loss
         self.initial_stop_loss = stop_loss
@@ -137,8 +143,56 @@ class Position:
         self.initial_size = size  # Track original size before adds
         self.touched_minus_02r = False  # Track if price went -0.2R against
         
+        # 🔥 FIX (Jan 30): Edge type tracking for TIME_INVALIDATION relaxation
+        self.edge_type = edge_type  # 'DISPLACEMENT', 'BREAKOUT', 'RANGE', 'TREND', or None
+        
+        # 🔥 FIX (Feb 01): Entry score tracking for TIME_INVALIDATION strictness
+        # score=0 means FAST_PATH entry without quality validation → stricter exit
+        self.entry_score = entry_score
+        
+        # 🔥 FIX (Feb 01): Weekend tracking for stricter TIME_INVALIDATION exits
+        # Weekend has lower liquidity, more gaps, less follow-through
+        # Data: 29 trades, 37.9% win, -0.62R total (vs weekday 42.4% win, +0.42R)
+        self.is_weekend = is_weekend
+        
         # Candle counter for mediocre trade detection
         self.candle_count = 0
+        
+        # =====================================================================
+        # 🔥 NEW (Feb 2, 2026): EARLY PARTIAL AT +0.5R
+        # =====================================================================
+        # Take 50% at +0.5R to secure profits, then let rest run
+        self.early_partial_done = False  # Track if early partial at +0.5R was taken
+        self.early_partial_price: Optional[float] = None  # Price for early partial
+        
+        # =====================================================================
+        # 🔥 NEW (Feb 4, 2026): TRADE TYPE MODE SWITCH
+        # =====================================================================
+        # EVENT_DRIVEN trades (DISPLACEMENT, FAST_PATH, compression_fakeout):
+        #   - Use EARLY_PARTIAL, NO ADD_TO_WINNER
+        #   - These are shock trades that often reverse quickly
+        #
+        # STRUCTURED trades (TREND, BOS, pullback):
+        #   - Allow ADD_TO_WINNER, Early partial at 1.0R (later)
+        #   - These have structural confirmation
+        # =====================================================================
+        self.is_event_driven = edge_type in ['DISPLACEMENT', 'FAST_REVERSAL'] if edge_type else False
+        
+        # =====================================================================
+        # 🔥 NEW (Feb 4, 2026): DISPLACEMENT ORIGIN TRACKING
+        # =====================================================================
+        # For DISPLACEMENT trades, if price reclaims origin → thesis invalidated
+        # Origin is where the displacement candle started, passed from signal
+        self.displacement_origin: Optional[float] = displacement_origin  # 🔥 FIX: Use parameter
+        self.origin_reclaimed = False  # Track if we already triggered reclaim exit
+        
+        # =====================================================================
+        # 🔥 NEW (Feb 4, 2026): ANTI-ROUNDTRIP PROTECTION
+        # =====================================================================
+        # If trade reached MFE >= 0.5R but then falls to <= -0.1R, close immediately
+        # This prevents "gave it back" scenarios
+        self.reached_profit_threshold = False  # True once MFE >= 0.5R
+        self.roundtrip_closed = False  # Prevent double-close
         
         # =====================================================================
         # SMART EXITS TRACKING (Jan 13, 2026)
@@ -186,7 +240,9 @@ class Position:
         # =====================================================================
         self.time_checkpoint_profit_partial_done = False  # Only one TIME_IN_PROFIT partial
         self.time_checkpoint_last_action: Optional[str] = None  # Last checkpoint action taken
-        self.time_checkpoint_last_r_bucket: Optional[float] = None  # Last logged R bucket (0.05R increments)
+        # 🔥 FIX #43 (Feb 05, 2026): Changed from R-bucket to TIME-based rate limiting
+        self.time_checkpoint_last_log_time: Optional[datetime] = None  # Last time we logged
+        self.TIME_CHECKPOINT_LOG_INTERVAL_SEC = 60  # Only log every 60 seconds
         self.last_management_action_time: Optional[datetime] = None  # Debounce management actions
         self.MANAGEMENT_COOLDOWN_SEC = 30  # Seconds to wait between management actions
         
@@ -197,6 +253,7 @@ class Position:
         # Initialize hybrid trailing stop manager
         self.hybrid_trailing: Optional[HybridATRTrailing] = None
         self.use_hybrid_trailing = True  # Feature flag
+        self.bos_quality = bos_quality  # 🔥 NEW (Feb 03): Store for trailing adjustment
         
         if self.use_hybrid_trailing:
             # 🔥 FIX: Use regime_mode passed from SignalEngine (SINGLE SOURCE OF TRUTH)
@@ -227,9 +284,10 @@ class Position:
                 entry_price=entry_price,
                 initial_stop=stop_loss,
                 direction=direction,
-                regime_str=initial_regime.value
+                regime_str=initial_regime.value,
+                bos_quality=bos_quality
             )
-            logger.info(f"🎯 Trailing using regime={initial_regime.value} (from regime_mode={regime_mode})")
+            logger.info(f"🎯 Trailing using regime={initial_regime.value}, bos_quality={bos_quality}")
         
         logger.info(f"Position opened: {direction} {size} {symbol} @ {entry_price:.2f} | SL: {stop_loss:.2f} | TP1: {self.tp1_price:.2f}")
     
@@ -238,43 +296,167 @@ class Position:
         Calculate realized R multiple for this trade.
         R = PnL / Initial Risk
         """
-        initial_risk_per_unit = abs(self.entry_price - self.initial_stop_loss)
+        # 🔥 FIX (Feb 4): Use initial_entry_price for consistent R calculation after adds
+        initial_risk_per_unit = abs(self.initial_entry_price - self.initial_stop_loss)
         if initial_risk_per_unit == 0:
             return 0.0
         
         if self.direction == 'LONG':
-            price_move = exit_price - self.entry_price
+            price_move = exit_price - self.initial_entry_price
         else:
-            price_move = self.entry_price - exit_price
+            price_move = self.initial_entry_price - exit_price
         
         return price_move / initial_risk_per_unit
     
     def calculate_mfe_r(self) -> float:
-        """Calculate Maximum Favorable Excursion in R."""
-        initial_risk = abs(self.entry_price - self.initial_stop_loss)
+        """Calculate Maximum Favorable Excursion in R.
+        
+        🔥 FIX (Feb 4, 2026): Use initial_entry_price, NOT entry_price
+        After ADD_TO_WINNER, entry_price becomes avg_entry which would
+        artificially reduce MFE and cause inconsistent reporting.
+        """
+        # 🔥 FIX: Use initial values for consistent MFE tracking
+        initial_risk = abs(self.initial_entry_price - self.initial_stop_loss)
         if initial_risk == 0:
             return 0.0
         
         if self.direction == 'LONG':
-            mfe = self.highest_price - self.entry_price
+            mfe = self.highest_price - self.initial_entry_price
         else:
-            mfe = self.entry_price - self.lowest_price
+            mfe = self.initial_entry_price - self.lowest_price
         
         return mfe / initial_risk
     
     def calculate_mae_r(self) -> float:
         """Calculate Maximum Adverse Excursion in R."""
-        initial_risk = abs(self.entry_price - self.initial_stop_loss)
+        # 🔥 FIX: Use initial values for consistent MAE tracking
+        initial_risk = abs(self.initial_entry_price - self.initial_stop_loss)
         if initial_risk == 0:
             return 0.0
         
         if self.direction == 'LONG':
-            mae = self.entry_price - self.lowest_price
+            mae = self.initial_entry_price - self.lowest_price
         else:
-            mae = self.highest_price - self.entry_price
+            mae = self.highest_price - self.initial_entry_price
         
         return mae / initial_risk
     
+    def check_anti_roundtrip(self, current_price: float) -> dict | None:
+        """
+        🔥 FIX (Feb 4, 2026): ANTI-ROUNDTRIP PROTECTION
+        
+        If trade reached profit (MFE >= 0.5R) but then falls to <= -0.1R,
+        close immediately to prevent "gave it all back" scenarios.
+        
+        This addresses the Feb 3 trade:
+          - Entry SHORT @ $76,210
+          - Reached +0.65R MFE ($76,044)
+          - Fell back and hit trailing at $76,272 → -0.38R
+        
+        With this protection, we'd close at -0.1R after seeing +0.5R,
+        saving ~0.28R vs waiting for trailing stop.
+        
+        Returns: Close signal dict if triggered, None otherwise
+        """
+        if self.roundtrip_closed:
+            return None  # Already handled
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        # Track once we've reached profit threshold
+        if mfe_r >= 0.5:
+            self.reached_profit_threshold = True
+        
+        if not self.reached_profit_threshold:
+            return None  # Haven't been profitable enough to trigger protection
+        
+        # Calculate current R using initial_entry_price for consistency
+        risk = abs(self.initial_entry_price - self.initial_stop_loss)
+        if risk <= 0:
+            return None
+        
+        if self.direction == 'LONG':
+            current_r = (current_price - self.initial_entry_price) / risk
+        else:
+            current_r = (self.initial_entry_price - current_price) / risk
+        
+        # If we were at 0.5R+ and now at -0.1R or worse, close immediately
+        ROUNDTRIP_CLOSE_THRESHOLD = -0.1
+        
+        if current_r <= ROUNDTRIP_CLOSE_THRESHOLD:
+            self.roundtrip_closed = True
+            logger.warning(
+                f"🛑 ANTI-ROUNDTRIP: Was at +{mfe_r:.2f}R, now at {current_r:.2f}R | "
+                f"Closing to prevent full roundtrip"
+            )
+            return {
+                'action': 'CLOSE',
+                'reason': f'Anti-roundtrip: MFE={mfe_r:.2f}R, now={current_r:.2f}R',
+                'mfe_r': mfe_r,
+                'current_r': current_r
+            }
+        
+        return None
+    
+    def check_displacement_reclaim(self, current_price: float) -> dict | None:
+        """
+        🔥 FIX (Feb 4, 2026): DISPLACEMENT ORIGIN RECLAIM EXIT
+        
+        For DISPLACEMENT trades, if price reclaims the origin level,
+        the thesis is invalidated. The "displacement" was just noise.
+        
+        Example from Feb 3 trade:
+          - Origin was $76,441
+          - Entry SHORT @ $76,210 (below origin ✓)
+          - If price goes back ABOVE origin → displacement reclaimed → exit
+        
+        This is a structural invalidation, not just a trailing stop.
+        
+        Returns: Close signal dict if origin reclaimed, None otherwise
+        """
+        if self.origin_reclaimed:
+            return None  # Already handled
+        
+        if not self.displacement_origin:
+            return None  # Not a displacement trade or origin not set
+        
+        if self.edge_type != 'DISPLACEMENT':
+            return None  # Only applies to displacement trades
+        
+        origin = self.displacement_origin
+        
+        # Check if price reclaimed origin
+        if self.direction == 'SHORT':
+            # For SHORT: If price goes above origin, displacement reclaimed
+            if current_price > origin:
+                self.origin_reclaimed = True
+                logger.warning(
+                    f"🔄 DISPLACEMENT RECLAIM: Price {current_price:.2f} > origin {origin:.2f} | "
+                    f"Thesis invalidated - closing SHORT"
+                )
+                return {
+                    'action': 'CLOSE',
+                    'reason': f'Displacement reclaim: price {current_price:.2f} > origin {origin:.2f}',
+                    'origin': origin,
+                    'current_price': current_price
+                }
+        else:
+            # For LONG: If price goes below origin, displacement reclaimed
+            if current_price < origin:
+                self.origin_reclaimed = True
+                logger.warning(
+                    f"🔄 DISPLACEMENT RECLAIM: Price {current_price:.2f} < origin {origin:.2f} | "
+                    f"Thesis invalidated - closing LONG"
+                )
+                return {
+                    'action': 'CLOSE',
+                    'reason': f'Displacement reclaim: price {current_price:.2f} < origin {origin:.2f}',
+                    'origin': origin,
+                    'current_price': current_price
+                }
+        
+        return None
+
     def _calculate_tp1(self, entry: float, stop: float, direction: str) -> float:
         """Calculate TP1 at +1R"""
         risk = abs(entry - stop)
@@ -283,6 +465,56 @@ class Position:
         else:
             return entry - (risk * RiskManagement.TP1_RISK_MULTIPLE)
     
+    def _calculate_early_partial_price(self) -> float:
+        """
+        Calculate price for early partial.
+        
+        🔥 FIX (Feb 4, 2026): MODE SWITCH
+        - EVENT_DRIVEN trades (DISPLACEMENT, FAST_PATH): Take partial at EARLY_PARTIAL_R (0.7R)
+        - STRUCTURED trades (TREND, BOS): Move partial later to 1.0R (TP1)
+        """
+        # 🔥 FIX (Feb 4): Use initial values for consistent R after ADD
+        risk = abs(self.initial_entry_price - self.initial_stop_loss)
+        
+        # 🔥 FIX (Feb 4, 2026): Use different threshold based on trade type
+        if self.is_event_driven:
+            # EVENT_DRIVEN: Secure profits earlier at 0.7R 
+            partial_r = RiskManagement.EARLY_PARTIAL_R
+        else:
+            # STRUCTURED: Let winners run, partial at 1.0R (TP1 level)
+            partial_r = 1.0
+        
+        if self.direction == 'LONG':
+            return self.entry_price + (risk * partial_r)
+        else:
+            return self.entry_price - (risk * partial_r)
+    
+    def check_early_partial_hit(self, current_price: float) -> bool:
+        """
+        Check if early partial price (+0.5R) was reached.
+        Simple and clean - let R_LOCK_TIERS handle the intelligent protection.
+        """
+        if not RiskManagement.EARLY_PARTIAL_ENABLED:
+            return False
+        
+        if self.early_partial_done:
+            return False  # Already taken
+        
+        if self.early_partial_price is None:
+            self.early_partial_price = self._calculate_early_partial_price()
+        
+        # Check if price reached the level
+        if self.direction == 'LONG':
+            if current_price >= self.early_partial_price:
+                logger.info(f"💰 EARLY PARTIAL HIT at {current_price:.2f} (target: {self.early_partial_price:.2f})")
+                return True
+        else:
+            if current_price <= self.early_partial_price:
+                logger.info(f"💰 EARLY PARTIAL HIT at {current_price:.2f} (target: {self.early_partial_price:.2f})")
+                return True
+        
+        return False
+
     def validate_integrity(self, exchange_side: str, exchange_qty: float, 
                           qty_tolerance: float = 0.02) -> bool:
         """
@@ -532,8 +764,9 @@ class Position:
         # =====================================================================
         # LEGACY STEPPED TRAILING (fallback if hybrid disabled)
         # 🔥 FIX (Jan 22, 2026): Added regime-aware BE logic
+        # 🔥 FIX (Feb 4, 2026): Use initial_entry_price for consistent R after ADD
         # =====================================================================
-        risk = abs(self.entry_price - self.initial_stop_loss)
+        risk = abs(self.initial_entry_price - self.initial_stop_loss)
         if risk <= 0:
             return
         
@@ -545,20 +778,20 @@ class Position:
         if mfe_r >= 2.2:
             # Lock in +1.6R (new level for big runners)
             if self.direction == 'LONG':
-                new_stop = self.entry_price + (risk * 1.6)
+                new_stop = self.initial_entry_price + (risk * 1.6)
                 self.trailing_stop = max(self.trailing_stop, new_stop)
             else:
-                new_stop = self.entry_price - (risk * 1.6)
+                new_stop = self.initial_entry_price - (risk * 1.6)
                 self.trailing_stop = min(self.trailing_stop, new_stop)
             logger.debug(f"📈 TRAILING STEP 4: MFE {mfe_r:.2f}R >= 2.2R → Lock +1.6R")
         
         elif mfe_r >= 1.5:
             # Lock in +0.9R
             if self.direction == 'LONG':
-                new_stop = self.entry_price + (risk * 0.9)
+                new_stop = self.initial_entry_price + (risk * 0.9)
                 self.trailing_stop = max(self.trailing_stop, new_stop)
             else:
-                new_stop = self.entry_price - (risk * 0.9)
+                new_stop = self.initial_entry_price - (risk * 0.9)
                 self.trailing_stop = min(self.trailing_stop, new_stop)
             logger.debug(f"📈 TRAILING STEP 3: MFE {mfe_r:.2f}R >= 1.5R → Lock +0.9R")
         
@@ -570,17 +803,17 @@ class Position:
             if self.regime_mode == 'RANGE':
                 # RANGE: Lock BE earlier (less runners expected)
                 if self.direction == 'LONG':
-                    self.trailing_stop = max(self.trailing_stop, self.entry_price)
+                    self.trailing_stop = max(self.trailing_stop, self.initial_entry_price)
                 else:
-                    self.trailing_stop = min(self.trailing_stop, self.entry_price)
+                    self.trailing_stop = min(self.trailing_stop, self.initial_entry_price)
                 logger.debug(f"📈 TRAILING (RANGE): MFE {mfe_r:.2f}R >= 1.2R → Lock BE")
             else:
                 # TREND/BREAKOUT: Lock +0.4R (give room)
                 if self.direction == 'LONG':
-                    new_stop = self.entry_price + (risk * 0.4)
+                    new_stop = self.initial_entry_price + (risk * 0.4)
                     self.trailing_stop = max(self.trailing_stop, new_stop)
                 else:
-                    new_stop = self.entry_price - (risk * 0.4)
+                    new_stop = self.initial_entry_price - (risk * 0.4)
                     self.trailing_stop = min(self.trailing_stop, new_stop)
                 logger.debug(f"📈 TRAILING STEP 2: MFE {mfe_r:.2f}R >= 1.2R → Lock +0.4R")
         
@@ -589,13 +822,106 @@ class Position:
             if self.regime_mode == 'RANGE':
                 if self.direction == 'LONG':
                     # Lock at -0.2R (slightly protective but not full BE)
-                    new_stop = self.entry_price - (risk * 0.2)
+                    new_stop = self.initial_entry_price - (risk * 0.2)
                     self.trailing_stop = max(self.trailing_stop, new_stop)
                 else:
-                    new_stop = self.entry_price + (risk * 0.2)
+                    new_stop = self.initial_entry_price + (risk * 0.2)
                     self.trailing_stop = min(self.trailing_stop, new_stop)
                 logger.debug(f"📈 TRAILING (RANGE): MFE {mfe_r:.2f}R >= 1.0R → Lock -0.2R")
             # TREND: no action at 1.0R, wait for 1.2R
+        
+        # =====================================================================
+        # 🔥 NEW (Feb 2, 2026): AGGRESSIVE TRAILING AT +0.7R
+        # 
+        # Configurable via RiskManagement.TRAILING_STEP_07R_ENABLED
+        # Locks +0.3R when MFE reaches 0.7R
+        # =====================================================================
+        elif mfe_r >= 0.7:
+            if RiskManagement.TRAILING_STEP_07R_ENABLED:
+                # Lock in +0.3R (early protection for intermediate moves)
+                if self.direction == 'LONG':
+                    new_stop = self.initial_entry_price + (risk * 0.3)
+                    if new_stop > self.trailing_stop:
+                        old_stop = self.trailing_stop
+                        self.trailing_stop = new_stop
+                        logger.debug(f"📈 TRAILING: MFE {mfe_r:.2f}R >= 0.7R → Lock +0.3R (was {old_stop:.2f})")
+                else:
+                    new_stop = self.initial_entry_price - (risk * 0.3)
+                    if new_stop < self.trailing_stop:
+                        old_stop = self.trailing_stop
+                        self.trailing_stop = new_stop
+                        logger.debug(f"📈 TRAILING: MFE {mfe_r:.2f}R >= 0.7R → Lock +0.3R (was {old_stop:.2f})")
+        
+        # =====================================================================
+        # 🔥 FIX (Feb 01, 2026): EARLY PROFIT PROTECTION
+        # 
+        # Data shows 8 trades with MFE > 0.2R ended in losses = +5.82R lost
+        # Problem: Trailing starts at 1.0R+ but many trades peak at 0.3-0.5R
+        # 
+        # Solution: After MFE >= 0.35R, tighten max allowed loss to -0.15R
+        # This catches trades that showed momentum but reversed
+        # 
+        # LOGIC:
+        # - MFE >= 0.35R: Move stop to -0.15R (was potentially at -0.30R or worse)
+        # - This is NOT full BE, but limits the downside after showing promise
+        # - Only for RANGE/WEEKEND - TREND trades get more room
+        # =====================================================================
+        # =====================================================================
+        # 🔥 FIX #42 (Feb 05, 2026): PROTECT AT 0.20R
+        # 
+        # Trade reached MFE=0.24R but lost -0.22R because no protection kicked in.
+        # Add protection at 0.20R: tighten stop to -0.10R
+        # This catches trades that showed promise but reversed early
+        # =====================================================================
+        elif mfe_r >= 0.20 and not self.be_moved:
+            # Tighten stop to -0.10R when MFE shows trade was right
+            if self.direction == 'LONG':
+                new_stop = self.initial_entry_price - (risk * 0.10)
+                if new_stop > self.trailing_stop:
+                    old_stop = self.trailing_stop
+                    self.trailing_stop = new_stop
+                    self.be_moved = True
+                    logger.info(
+                        f"🛡️ MFE PROTECT: MFE {mfe_r:.2f}R >= 0.20R → "
+                        f"Tighten SL to {new_stop:.2f} (-0.10R) (was {old_stop:.2f})"
+                    )
+            else:  # SHORT
+                new_stop = self.initial_entry_price + (risk * 0.10)
+                if new_stop < self.trailing_stop:
+                    old_stop = self.trailing_stop
+                    self.trailing_stop = new_stop
+                    self.be_moved = True
+                    logger.info(
+                        f"🛡️ MFE PROTECT: MFE {mfe_r:.2f}R >= 0.20R → "
+                        f"Tighten SL to {new_stop:.2f} (-0.10R) (was {old_stop:.2f})"
+                    )
+        
+        elif mfe_r >= 0.35:
+            is_weekend = getattr(self, 'is_weekend', False)
+            
+            # Apply early protection in RANGE mode OR weekend
+            if self.regime_mode == 'RANGE' or is_weekend:
+                # Tighten stop to -0.15R (not full BE, but protected)
+                if self.direction == 'LONG':
+                    new_stop = self.initial_entry_price - (risk * 0.15)
+                    if new_stop > self.trailing_stop:
+                        old_stop = self.trailing_stop
+                        self.trailing_stop = new_stop
+                        self.be_moved = True  # Mark as having early protection
+                        logger.info(
+                            f"🛡️ EARLY PROFIT PROTECT: MFE {mfe_r:.2f}R >= 0.35R → "
+                            f"Tighten SL to {new_stop:.2f} (-0.15R) (was {old_stop:.2f})"
+                        )
+                else:  # SHORT
+                    new_stop = self.initial_entry_price + (risk * 0.15)
+                    if new_stop < self.trailing_stop:
+                        old_stop = self.trailing_stop
+                        self.trailing_stop = new_stop
+                        self.be_moved = True
+                        logger.info(
+                            f"🛡️ EARLY PROFIT PROTECT: MFE {mfe_r:.2f}R >= 0.35R → "
+                            f"Tighten SL to {new_stop:.2f} (-0.15R) (was {old_stop:.2f})"
+                        )
     
     def increment_candle_count(self):
         """Increment candle count for mediocre trade detection"""
@@ -626,14 +952,15 @@ class Position:
             
             # RUNNER SL = el MEJOR entre trailing actual y BE
             # NO reducir el SL si trailing ya lo subió
+            # 🔥 FIX (Feb 4): Use initial_entry_price for consistent BE after ADD
             if self.direction == 'LONG':
                 # Para LONG, mayor = mejor
-                runner_stop = max(self.trailing_stop, self.entry_price)
+                runner_stop = max(self.trailing_stop, self.initial_entry_price)
                 self.stop_loss = runner_stop
                 self.trailing_stop = runner_stop
             else:
                 # Para SHORT, menor = mejor
-                runner_stop = min(self.trailing_stop, self.entry_price)
+                runner_stop = min(self.trailing_stop, self.initial_entry_price)
                 self.stop_loss = runner_stop
                 self.trailing_stop = runner_stop
             
@@ -660,6 +987,67 @@ class Position:
             return True
         
         return False
+    
+    def check_early_mfe_exit(self, current_price: float | None = None) -> dict | None:
+        """
+        🔥 NEW (Feb 04, 2026): EARLY MFE CHECK
+        
+        DATA SHOWS:
+        - MFE >= 0.2R: 47 trades → P&L = +7.49R (WR 70%)
+        - MFE < 0.2R:  33 trades → P&L = -9.20R (WR 0%)
+        
+        CONCLUSION: If trade doesn't show momentum in first 4 minutes,
+        it NEVER becomes a winner. Cut it early to minimize loss.
+        
+        RULE: After 4 candles (4 min), if MFE < 0.15R → CLOSE at current price
+        This catches trades before they become -0.30R to -0.60R losses.
+        """
+        # Skip adopted positions
+        if self.is_adopted:
+            return None
+        
+        # Only check at 4 candles
+        EARLY_CHECK_CANDLES = 4
+        EARLY_MFE_THRESHOLD = 0.15  # Minimum MFE required
+        
+        if self.candle_count != EARLY_CHECK_CANDLES:
+            return None
+        
+        mfe_r = self.calculate_mfe_r()
+        
+        if mfe_r >= EARLY_MFE_THRESHOLD:
+            return None  # Trade is showing momentum, let it run
+        
+        # Calculate current R
+        if current_price is None:
+            return None
+        
+        initial_risk = abs(self.entry_price - self.initial_stop_loss)
+        if initial_risk <= 0:
+            return None
+            
+        if self.direction == 'LONG':
+            current_r = (current_price - self.entry_price) / initial_risk
+        else:
+            current_r = (self.entry_price - current_price) / initial_risk
+        
+        # Only close if we're losing or flat (don't close small winners)
+        if current_r > 0.05:
+            return None
+        
+        logger.warning(
+            f"⚡ EARLY_MFE_EXIT: After {EARLY_CHECK_CANDLES} candles, MFE={mfe_r:.2f}R < {EARLY_MFE_THRESHOLD}R | "
+            f"Current P&L={current_r:.2f}R | Data shows these trades NEVER win → Cutting early"
+        )
+        
+        return {
+            'action': 'CLOSE',
+            'reason': 'EARLY_MFE_EXIT',
+            'mfe_r': mfe_r,
+            'current_r': current_r,
+            'candles': self.candle_count,
+            'threshold': EARLY_MFE_THRESHOLD
+        }
     
     def check_mediocre_trade_exit(self, n_candles: int = 6, mfe_threshold: float = 0.3,
                                      adx: float | None = None, atr_ratio: float | None = None,
@@ -743,26 +1131,133 @@ class Position:
         # TIME_INVALIDATION should only trigger if structure breaks.
         # =====================================================================
         
-        # Determine market type
-        is_ranging = adx is not None and adx < 20
+        # 🔄 REFACTORED Feb 04: Use ADXThresholds.TREND for consistent threshold
+        from src.config.trading_config import ADXThresholds
         
-        # Set max loss based on market type
-        if is_ranging:
-            # In range: looser limit, let stop do its job
-            max_loss_r = -0.60  # 🔥 FIX: Allow more room in range
-            logger.debug(f"📊 TIME checkpoint: RANGING mode (ADX={adx:.1f}) → max_loss={max_loss_r}R")
+        # Determine market type
+        is_ranging = adx is not None and adx < ADXThresholds.TREND
+        
+        # 🔥 FIX (Jan 30): Check if this is a DISPLACEMENT trade
+        # DISPLACEMENT trades need more room - they're catching fast moves
+        # Don't kill them at -0.30R when SL is properly placed
+        is_displacement_trade = self.edge_type == 'DISPLACEMENT'
+        
+        # 🔥 FIX (Feb 02, 2026): Use ACTUAL SCORE instead of entry_score==0 hack
+        # Now FAST_PATH entries calculate an informative score, so we can use it
+        # 
+        # THRESHOLDS:
+        # - Score < 4: Very low quality → -0.25R (cut fast)
+        # - Score 4-5: Below average → -0.30R (normal TIME_INVALIDATION)
+        # - Score >= 5: Good quality → respect edge type / market mode
+        #
+        # This replaces the old logic that assumed entry_score=0 meant FAST_PATH
+        is_low_quality_entry = self.entry_score is not None and self.entry_score < 4
+        
+        # 🔥 FIX (Feb 04, 2026): AGGRESSIVE LOSS CUTTING
+        # =====================================================================
+        # PROBLEM: TIME_INVALIDATION_MAX_LOSS = -10.27R (27 trades, avg -0.38R)
+        # This destroyed ALL gains from other trades (+8.56R).
+        # Root cause: Code allowed -0.50R for DISPLACEMENT, -0.60R for RANGE
+        # 
+        # SOLUTION: STRICT limits for ALL cases. Better to cut early and re-enter.
+        # =====================================================================
+        is_weekend_trade = getattr(self, 'is_weekend', False)
+        
+        # 🔥 UNIVERSAL MAX LOSS = -0.25R (no exceptions anymore)
+        # The data shows ANY trade losing more than -0.25R is unlikely to recover.
+        if is_weekend_trade:
+            max_loss_r = -0.15  # 🔥 WEEKEND: -0.15R (was -0.20R) - liquidity issues
+            logger.info(f"📊 TIME checkpoint: WEEKEND → max_loss={max_loss_r}R (strictest)")
+        elif is_low_quality_entry:
+            max_loss_r = -0.15  # 🔥 LOW QUALITY: -0.15R (was -0.25R) - cut fast
+            logger.info(f"📊 TIME checkpoint: LOW_QUALITY (score={self.entry_score:.1f}) → max_loss={max_loss_r}R")
+        elif is_displacement_trade:
+            # DISPLACEMENT: Still give a bit more room (stop is the invalidation)
+            max_loss_r = -0.25  # 🔥 FIX: -0.25R (was -0.50R) - much stricter
+            logger.debug(f"📊 TIME checkpoint: DISPLACEMENT mode → max_loss={max_loss_r}R")
+        elif is_ranging:
+            # RANGE: No more special treatment
+            max_loss_r = -0.20  # 🔥 FIX: -0.20R (was -0.60R!!) - major reduction
+            logger.debug(f"📊 TIME checkpoint: RANGING mode → max_loss={max_loss_r}R")
         else:
-            # In trend: normal limit
-            max_loss_r = ExitHierarchy.TIME_INVALIDATION_MAX_LOSS_R  # -0.30R
+            # TREND: normal limit
+            max_loss_r = ExitHierarchy.TIME_INVALIDATION_MAX_LOSS_R  # -0.20R
+        
+        # =====================================================================
+        # 🔥 FIX #44 (Feb 05, 2026): STRONG TREND TOLERANCE
+        # =====================================================================
+        # PROBLEMA: Trades cerrados en -0.20R con ADX=58 que luego fueron ganadores.
+        # En tendencia MUY fuerte (ADX > 50), pullbacks de 0.3-0.4R son NORMALES.
+        # 
+        # SOLUCIÓN: Si ADX > 50, extender max_loss para dar room al pullback
+        # - ADX 50-60: max_loss = -0.35R
+        # - ADX > 60: max_loss = -0.40R
+        # =====================================================================
+        STRONG_TREND_ADX = 50
+        VERY_STRONG_TREND_ADX = 60
+        
+        if adx is not None and adx >= VERY_STRONG_TREND_ADX and not is_ranging:
+            max_loss_r = -0.40
+            logger.info(
+                f"📊 TIME checkpoint: VERY STRONG TREND (ADX={adx:.1f}) → "
+                f"Extended max_loss to {max_loss_r}R (pullbacks normal)"
+            )
+        elif adx is not None and adx >= STRONG_TREND_ADX and not is_ranging:
+            max_loss_r = -0.35
+            logger.info(
+                f"📊 TIME checkpoint: STRONG TREND (ADX={adx:.1f}) → "
+                f"Extended max_loss to {max_loss_r}R (pullbacks normal)"
+            )
+        
+        # =====================================================================
+        # 🔥 FIX (Feb 04, 2026): MFE TOLERANCE - TRADE PROVED CORRECT
+        # =====================================================================
+        # PROBLEMA REAL: Trade entró SHORT, bajó a MFE=0.31R (dirección CORRECTA),
+        # luego pullback temporal a -0.20R, TIME_INVALIDATION cerró, y el precio
+        # siguió bajando después (habría sido ganador).
+        #
+        # INSIGHT: Si el trade YA DEMOSTRÓ ser correcto (MFE >= 0.25R), un pullback
+        # de 0.4-0.5R es NORMAL en BTC. No es señal de trade malo.
+        #
+        # SOLUCIÓN: Si MFE >= 0.25R, extender tolerancia:
+        # - MFE 0.25-0.50R → max_loss = -0.40R (trade mostró vida)
+        # - MFE >= 0.50R → max_loss = -0.50R (trade probado, dar room)
+        # =====================================================================
+        # 🔥 FIX #42 (Feb 05, 2026): Lowered from 0.25 to 0.20
+        # Trade con MFE=0.24R no estaba protegido y perdió -0.22R
+        MFE_PROVED_THRESHOLD = 0.20  # Trade mostró dirección correcta
+        MFE_STRONG_THRESHOLD = 0.50  # Trade claramente correcto
+        
+        if mfe_r >= MFE_STRONG_THRESHOLD:
+            # Trade clearly proved correct - give it room
+            extended_max_loss = -0.50
+            if current_r > extended_max_loss:
+                logger.info(
+                    f"📊 TIME checkpoint: MFE={mfe_r:.2f}R PROVED CORRECT | "
+                    f"Pullback to {current_r:.2f}R is normal | "
+                    f"Extended tolerance to {extended_max_loss}R"
+                )
+                return None  # Don't close - pullback is normal
+        elif mfe_r >= MFE_PROVED_THRESHOLD:
+            # Trade showed life - extend tolerance
+            extended_max_loss = -0.40
+            if current_r > extended_max_loss:
+                logger.info(
+                    f"📊 TIME checkpoint: MFE={mfe_r:.2f}R showed direction correct | "
+                    f"Pullback to {current_r:.2f}R within tolerance | "
+                    f"Extended tolerance to {extended_max_loss}R"
+                )
+                return None  # Don't close - give it room
         
         # =====================================================================
         # REGLA CRÍTICA: Límite de pérdida por TIME_INVALIDATION
         # =====================================================================
         if current_r <= max_loss_r:
+            edge_info = f" | Edge={self.edge_type}" if self.edge_type else ""
             logger.warning(
                 f"☠️ TIME_INVALIDATION: Loss {current_r:.2f}R exceeds limit {max_loss_r}R | "
-                f"ADX={'RANGE' if is_ranging else 'TREND'} | "
-                f"Closing immediately to prevent worse loss"
+                f"ADX={'RANGE' if is_ranging else 'TREND'}{edge_info} | "
+                f"MFE was {mfe_r:.2f}R | Closing immediately to prevent worse loss"
             )
             return {
                 'action': 'CLOSE',
@@ -867,18 +1362,26 @@ class Position:
         # B) FLAT o pequeña pérdida: Evaluar si mercado está vivo
         if market_alive:
             # Mercado activo - dar más tiempo, solo ajustar stop
-            # 🔥 FIX (Jan 23, 2026): Rate-limited logging - only log on R bucket change
-            current_r_bucket = round(current_r * 20) / 20  # 0.05R increments
+            # 🔥 FIX #43 (Feb 05, 2026): TIME-based rate limiting (every 60s, not per R-bucket)
             adx_str = f"{adx:.1f}" if adx is not None else "N/A"
+            now = datetime.now(timezone.utc)
             
-            # Only log if R bucket changed (avoid spam)
-            if self.time_checkpoint_last_r_bucket != current_r_bucket:
-                self.time_checkpoint_last_r_bucket = current_r_bucket
+            # Only log if 60 seconds have passed since last log
+            should_log = False
+            if self.time_checkpoint_last_log_time is None:
+                should_log = True
+            else:
+                elapsed = (now - self.time_checkpoint_last_log_time).total_seconds()
+                if elapsed >= self.TIME_CHECKPOINT_LOG_INTERVAL_SEC:
+                    should_log = True
+            
+            if should_log:
+                self.time_checkpoint_last_log_time = now
                 logger.info(
                     f"⏱️ TIME checkpoint FLAT (market alive): {current_r:.2f}R | "
                     f"ADX={adx_str} | Holding"
                 )
-            # else: skip logging (same bucket)
+            # else: skip logging (rate limited)
             
             return {
                 'action': 'HOLD',
@@ -1102,7 +1605,7 @@ class Position:
         
         if self.thesis_intact and current_r <= max_loss_when_thesis_intact:
             # Final check: is distance to TP reasonable?
-            distance_to_tp = abs(self.take_profit_1 - current_price) if self.take_profit_1 else float('inf')
+            distance_to_tp = abs(self.take_profit - current_price) if self.take_profit else float('inf')
             distance_to_sl = abs(current_price - self.current_stop_loss) if self.current_stop_loss else float('inf')
             
             # If TP is closer than SL, give more time
@@ -1129,77 +1632,132 @@ class Position:
         
         return None
     
-    def check_add_to_winner(self, current_price: float) -> dict | None:
+    def check_add_to_winner(self, current_price: float, candles_1m: list | None = None) -> dict | None:
         """
-        DYNAMIC SIZING: Add 0.5x position when trade proves itself
+        DYNAMIC SIZING: Add 0.5x position when trade proves continuation
         
-        Condition:
-          - MFE >= 0.6R (historical high)
-          - Current R >= 0.5R (price still near highs, NOT falling)
-          - Never touched -0.2R (clean move)
-          - 🔥 NOT in RANGE mode (Jan 28, 2026)
+        🔥 FIX (Feb 4, 2026): REQUIRE CONTINUATION CONFIRMATION
+        Not just MFE >= 0.6R, but also proof that move is continuing:
+        - Pullback was shallow (didn't give back >40% of MFE)
+        - Making new highs/lows (continuation)
+        - Or momentum still aligned (delta not contradicting hard)
         
-        This increases R on clear winners without increasing drawdown.
+        🔥 FIX (Feb 4, 2026): MODE SWITCH - NO ADD ON EVENT_DRIVEN TRADES
+        DISPLACEMENT/FAST_PATH trades use Early Partial instead.
         
         Returns: dict with add_size if should add, None otherwise
         """
         if self.added_to_winner:
             return None  # Already added
         
+        # 🔥 FIX (Feb 4, 2026): NO ADD_TO_WINNER on EVENT_DRIVEN trades
+        # These are shock trades - use Early Partial instead
+        if self.is_event_driven:
+            logger.debug(f"🔄 ADD TO WINNER blocked: EVENT_DRIVEN trade (edge={self.edge_type}) uses Early Partial")
+            return None
+        
         # 🔥 FIX (Jan 28, 2026): DISABLE ADD_TO_WINNER in RANGE mode
-        # In RANGE, adding size increases correlation exposure, not edge
-        # The original move often reverses in mean-reversion context
         if self.regime_mode == 'RANGE':
             return None
         
         mfe_r = self.calculate_mfe_r()
         
-        # 🔒 FIX (Jan 16, 2026): Calculate CURRENT R, not just historical MFE
-        # This prevents adding to a position that WAS winning but is now falling
-        risk = abs(self.entry_price - self.initial_stop_loss)
+        # 🔥 FIX (Feb 4): Use initial_entry_price for consistent R after ADD
+        risk = abs(self.initial_entry_price - self.initial_stop_loss)
         if risk <= 0:
             return None
         
         if self.direction == 'LONG':
-            current_r = (current_price - self.entry_price) / risk
+            current_r = (current_price - self.initial_entry_price) / risk
         else:
-            current_r = (self.entry_price - current_price) / risk
+            current_r = (self.initial_entry_price - current_price) / risk
         
         # Track if we've been -0.2R against
         if self.direction == 'LONG':
-            worst_drawdown = (self.entry_price - self.lowest_price) / risk
+            worst_drawdown = (self.initial_entry_price - self.lowest_price) / risk
         else:
-            worst_drawdown = (self.highest_price - self.entry_price) / risk
+            worst_drawdown = (self.highest_price - self.initial_entry_price) / risk
         
         if worst_drawdown >= 0.2:
             self.touched_minus_02r = True
         
-        # Check conditions - MUST include current_r check!
-        # MFE >= 0.6R means it REACHED that level
-        # current_r >= 0.5R means it's STILL there (not fallen back)
+        # =====================================================================
+        # 🔥 FIX (Feb 4, 2026): CONTINUATION CONFIRMATION
+        # Don't add on first touch of +0.6R - require proof of continuation
+        # =====================================================================
+        MIN_MFE_FOR_ADD = 0.6
         MIN_CURRENT_R_FOR_ADD = 0.5
         
-        if mfe_r >= 0.6 and current_r >= MIN_CURRENT_R_FOR_ADD and not self.touched_minus_02r:
-            add_size = self.initial_size * 0.5
-            
-            # 🔒 FIX (Jan 14, 2026): Validate minimum order size
-            if add_size < KRAKEN_BTC_MIN_SIZE:
-                logger.info(f"🔄 ADD TO WINNER blocked: add_size {add_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}")
-                return None
-            
-            self.added_to_winner = True
-            logger.info(f"💪 ADD TO WINNER: MFE {mfe_r:.2f}R, current={current_r:.2f}R >= 0.5R → Adding {add_size:.6f}")
-            return {
-                'action': 'ADD_POSITION',
-                'add_size': add_size,
-                'new_total_size': self.size + add_size,
-                'reason': f'Winner add at MFE {mfe_r:.2f}R (current={current_r:.2f}R)'
-            }
-        elif mfe_r >= 0.6 and current_r < MIN_CURRENT_R_FOR_ADD:
-            # Log why we're NOT adding (for debugging)
-            logger.debug(f"🔄 ADD TO WINNER skipped: MFE {mfe_r:.2f}R but current_r {current_r:.2f}R < {MIN_CURRENT_R_FOR_ADD}R")
+        if mfe_r < MIN_MFE_FOR_ADD or current_r < MIN_CURRENT_R_FOR_ADD or self.touched_minus_02r:
+            if mfe_r >= MIN_MFE_FOR_ADD and current_r < MIN_CURRENT_R_FOR_ADD:
+                logger.debug(f"🔄 ADD TO WINNER skipped: MFE {mfe_r:.2f}R but current_r {current_r:.2f}R < {MIN_CURRENT_R_FOR_ADD}R")
+            return None
         
-        return None
+        # =====================================================================
+        # CONTINUATION CHECK: Verify move is extending, not exhausting
+        # =====================================================================
+        continuation_confirmed = False
+        continuation_reason = ""
+        
+        # Check 1: Shallow pullback - didn't give back more than 40% of MFE
+        # If MFE is 0.6R and current is 0.5R, pullback is only 17% - GOOD
+        # If MFE is 0.8R and current is 0.5R, pullback is 37.5% - borderline
+        pullback_pct = (mfe_r - current_r) / mfe_r if mfe_r > 0 else 0
+        if pullback_pct <= 0.25:  # Gave back 25% or less = very healthy
+            continuation_confirmed = True
+            continuation_reason = f"shallow pullback ({pullback_pct*100:.0f}%)"
+        
+        # Check 2: Making new extremes (candle analysis)
+        if not continuation_confirmed and candles_1m and len(candles_1m) >= 3:
+            try:
+                c1 = candles_1m[-1]  # Current
+                c2 = candles_1m[-2]  # Previous
+                c3 = candles_1m[-3]  # Before that
+                
+                if self.direction == 'SHORT':
+                    # For SHORT: Check if making lower lows
+                    if c1.get('low', 0) < c2.get('low', 0) < c3.get('low', 0):
+                        continuation_confirmed = True
+                        continuation_reason = "making lower lows"
+                else:
+                    # For LONG: Check if making higher highs
+                    if c1.get('high', 0) > c2.get('high', 0) > c3.get('high', 0):
+                        continuation_confirmed = True
+                        continuation_reason = "making higher highs"
+            except (KeyError, TypeError):
+                pass  # Candle data issue, skip this check
+        
+        # Check 3: Current price is at or near MFE (momentum still going)
+        if not continuation_confirmed:
+            if current_r >= mfe_r * 0.95:  # Within 5% of MFE
+                continuation_confirmed = True
+                continuation_reason = f"at MFE peak ({current_r:.2f}R ≈ {mfe_r:.2f}R)"
+        
+        if not continuation_confirmed:
+            logger.debug(
+                f"🔄 ADD TO WINNER blocked: No continuation | "
+                f"MFE={mfe_r:.2f}R, current={current_r:.2f}R, pullback={pullback_pct*100:.0f}%"
+            )
+            return None
+        
+        # All checks passed - add to winner
+        add_size = self.initial_size * 0.5
+        
+        if add_size < KRAKEN_BTC_MIN_SIZE:
+            logger.info(f"🔄 ADD TO WINNER blocked: add_size {add_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}")
+            return None
+        
+        self.added_to_winner = True
+        logger.info(
+            f"💪 ADD TO WINNER: MFE {mfe_r:.2f}R, current={current_r:.2f}R | "
+            f"Confirmation: {continuation_reason} → Adding {add_size:.6f}"
+        )
+        return {
+            'action': 'ADD_POSITION',
+            'add_size': add_size,
+            'new_total_size': self.size + add_size,
+            'reason': f'Winner add at MFE {mfe_r:.2f}R ({continuation_reason})'
+        }
     
     def move_stop_to_breakeven(self, reason: str = "Structure break"):
         """
@@ -1833,11 +2391,12 @@ class Position:
             return None
         
         # Calculate lock price (entry + lock_R * risk)
-        initial_risk = abs(self.entry_price - self.initial_stop_loss)
+        # 🔥 FIX (Feb 4): Use initial_entry_price for consistent R after ADD
+        initial_risk = abs(self.initial_entry_price - self.initial_stop_loss)
         lock_r = SmartExits.TIME_LOCK_FLOOR_R
         
         if self.direction == 'LONG':
-            lock_price = self.entry_price + (initial_risk * lock_r)
+            lock_price = self.initial_entry_price + (initial_risk * lock_r)
             # Only lock if current stop is below lock price
             if self.trailing_stop < lock_price:
                 self.trailing_stop = lock_price
@@ -1845,7 +2404,7 @@ class Position:
                 self.profit_locked = True
                 self.locked_r = lock_r
         else:
-            lock_price = self.entry_price - (initial_risk * lock_r)
+            lock_price = self.initial_entry_price - (initial_risk * lock_r)
             # Only lock if current stop is above lock price
             if self.trailing_stop > lock_price:
                 self.trailing_stop = lock_price
@@ -2304,11 +2863,21 @@ class RiskEngine:
                        market_time: datetime | None = None,
                        trade_type: TradeType = TradeType.LONG_MAIN,
                        regime_mode: str = 'RANGE',
-                       entry_conditions: dict | None = None) -> Position:  # 🔥 FIX (Jan 23): Added entry_conditions
+                       entry_conditions: dict | None = None,
+                       edge_type: str | None = None,
+                       entry_score: float | None = None,
+                       is_weekend: bool = False,
+                       bos_quality: str = 'NORMAL',
+                       displacement_origin: float | None = None) -> Position:  # 🔥 NEW (Feb 04)
         """
         Create a new position object for tracking.
         
         UPDATED (Jan 23, 2026): Also records entry for anti-reentry tracking
+        UPDATED (Jan 30, 2026): Added edge_type for TIME_INVALIDATION relaxation
+        UPDATED (Feb 01, 2026): Added entry_score for TIME_INVALIDATION strictness
+        UPDATED (Feb 01, 2026): Added is_weekend for stricter weekend exits
+        UPDATED (Feb 03, 2026): Added bos_quality for dynamic trailing adjustment
+        UPDATED (Feb 04, 2026): Added displacement_origin for reclaim exit
         """
         self.position = Position(
             symbol=symbol or 'UNKNOWN',
@@ -2319,7 +2888,12 @@ class RiskEngine:
             atr_1m=atr_1m,
             market_time=market_time,
             trade_type=trade_type,
-            regime_mode=regime_mode  # 🔥 Pass regime for trailing
+            regime_mode=regime_mode,  # 🔥 Pass regime for trailing
+            edge_type=edge_type,  # 🔥 FIX (Jan 30): Pass edge_type for TIME_INVALIDATION
+            entry_score=entry_score,  # 🔥 FIX (Feb 01): Pass entry_score for stricter TIME_INVALIDATION
+            is_weekend=is_weekend,  # 🔥 FIX (Feb 01): Pass is_weekend for stricter exits
+            bos_quality=bos_quality,  # 🔥 NEW (Feb 03): Pass bos_quality for dynamic trailing
+            displacement_origin=displacement_origin  # 🔥 NEW (Feb 04): Pass origin for reclaim exit
         )
         
         # Record entry for anti-reentry tracking
@@ -2649,7 +3223,7 @@ class RiskEngine:
                     logger.info(f"🔬 PROBE STOP: R={pos.current_r_multiple:.2f}")
                     return await self._close_position(current_price, 'STOP_LOSS')
                 
-                tp_check = pos.check_tp_hit(current_price)
+                tp_check = pos.check_tp1_hit(current_price)
                 if tp_check:
                     logger.info(f"🔬 PROBE TP: R={pos.current_r_multiple:.2f}")
                     return await self._close_position(current_price, 'TAKE_PROFIT')
@@ -2685,7 +3259,15 @@ class RiskEngine:
                     anomaly_reason = f"SPREAD_ANOMALY (spread={spread_bps:.1f}bps, {spread_ratio:.1f}x normal)"
             
             # 2. Price gap anomaly (flash crash/spike)
-            if price_gap_pct is not None and abs(price_gap_pct) > 0.3:
+            # 🔥 FIX (Feb 01, 2026): INTELLIGENT MULTI-TICK DETECTION
+            # The price_gap_pct passed here is now pre-filtered by trading_app.py:
+            # - Single tick: Only passed if > 1.5% (massive gap)
+            # - Multi-tick: Passed if 2+ of last 3 ticks > 0.8% (confirmed trend)
+            # This eliminates false positives from isolated tick spikes
+            # 
+            # The 0.8% threshold here is a SAFETY NET (should rarely trigger
+            # since filtering is done upstream)
+            if price_gap_pct is not None and abs(price_gap_pct) > 0.8:
                 anomaly_detected = True
                 anomaly_reason = f"PRICE_GAP_ANOMALY (gap={price_gap_pct:.2f}%)"
             
@@ -2829,6 +3411,16 @@ class RiskEngine:
                         logger.info(f"🚀 SMART EXIT: {action_type} - {reason}")
                         return await self._close_position(current_price, action_type)
                 
+                # 🔥 NEW (Feb 04): Check EARLY MFE exit (4 candles, MFE < 0.15R → cut)
+                # Data shows: MFE < 0.2R = -9.20R total loss (0% WR)
+                early_mfe_check = pos.check_early_mfe_exit(current_price=current_price)
+                if early_mfe_check and early_mfe_check.get('action') == 'CLOSE':
+                    logger.warning(
+                        f"⚡ EARLY_MFE_EXIT triggered: MFE={early_mfe_check.get('mfe_r', 0):.2f}R, "
+                        f"current={early_mfe_check.get('current_r', 0):.2f}R | Cutting early to prevent worse loss"
+                    )
+                    return await self._close_position(current_price, 'EARLY_MFE_EXIT')
+                
                 # 0. Check mediocre trade exit (TIME_INVALIDATION INTELIGENTE)
                 # 🔥 FIX (Jan 23, 2026): Now returns dict with action, not bool
                 time_check = pos.check_mediocre_trade_exit(
@@ -2922,6 +3514,26 @@ class RiskEngine:
                     return add_action
                 
                 # ============================================================
+                # 0.6. ANTI-ROUNDTRIP PROTECTION - REMOVED (Feb 4, 2026)
+                # ============================================================
+                # 🔥 FIX: Removed because R-LOCK tiers now use initial_entry_price
+                # If MFE >= 0.5R, Tier 2 locks stop at -0.2R from ORIGINAL entry
+                # This makes anti-roundtrip redundant - the SL protects us
+                # The bug was: after ADD, entry_price changed so R-LOCK calculated wrong
+                # Now R-LOCK uses initial_entry_price → consistent protection
+                # ============================================================
+                
+                # ============================================================
+                # 0.65. DISPLACEMENT ORIGIN RECLAIM (Feb 4, 2026)
+                # If price reclaims the displacement origin, thesis invalidated
+                # This is a structural exit, not just trailing stop
+                # ============================================================
+                reclaim_check = pos.check_displacement_reclaim(current_price)
+                if reclaim_check and reclaim_check.get('action') == 'CLOSE':
+                    reason = f"DISPLACEMENT_RECLAIM: {reclaim_check.get('reason', '')}"
+                    return await self._close_position(current_price, reason)
+                
+                # ============================================================
                 # 0.75. WORST-TRADE PREVENTION (Jan 23, 2026)
                 # If thesis intact but hitting loss cap, exit early
                 # FIX Jan 27, 2026: Pass market_time for backtest compatibility
@@ -2936,6 +3548,12 @@ class RiskEngine:
                 sl_check = pos.check_stop_hit(current_price, market_time=market_time)
                 if sl_check:
                     return await self._close_position(current_price, 'STOP_LOSS')
+                
+                # 1.5 🔥 NEW (Feb 2): Check EARLY PARTIAL at +0.5R
+                # Takes 50% off the table early to secure profits
+                if pos.check_early_partial_hit(current_price):
+                    logger.info(f"💰 EARLY PARTIAL HIT @ {current_price:.2f} (+0.5R)")
+                    return await self._handle_early_partial(pos, current_price)
                 
                 # 2. Check TP1 (partial close, promotes toward RUNNER)
                 if pos.check_tp1_hit(current_price):
@@ -2988,6 +3606,71 @@ class RiskEngine:
             
             return None
     
+    async def _handle_early_partial(self, pos: Position, current_price: float) -> dict | None:
+        """
+        Handle early partial at +0.5R.
+        
+        🔥 NEW (Feb 2, 2026): Close 50% at +0.5R to secure early profits.
+        Analysis showed 18 trades reach +0.5R MFE but end in loss.
+        By taking partial, we capture +0.25R per trade = +4.50R total.
+        """
+        if pos.early_partial_done:
+            return None
+        
+        # Get early partial percentage from config
+        early_pct = RiskManagement.EARLY_PARTIAL_PCT
+        
+        # Calculate partial close
+        close_size = pos.size * (early_pct / 100.0)
+        remaining_size = pos.size - close_size
+        
+        # 🔒 Validate minimum order sizes
+        if remaining_size < KRAKEN_BTC_MIN_SIZE:
+            logger.info(f"🔄 EARLY PARTIAL: Remaining {remaining_size:.6f} < min, closing FULL")
+            return await self._close_position(current_price, 'EARLY_PARTIAL_FULL')
+        
+        if close_size < KRAKEN_BTC_MIN_SIZE:
+            logger.info(f"🔄 EARLY PARTIAL: Close size {close_size:.6f} < min, skipping")
+            pos.early_partial_done = True
+            return None
+        
+        # Calculate PnL for closed portion
+        if pos.direction == 'LONG':
+            pnl = (current_price - pos.entry_price) * close_size
+        else:
+            pnl = (pos.entry_price - current_price) * close_size
+        
+        self.total_pnl += pnl
+        self.winning_trades.append(pnl)
+        
+        # Update position
+        pos.size = remaining_size
+        pos.early_partial_done = True
+        
+        # Optionally move SL to break-even after early partial
+        old_sl = pos.stop_loss
+        if RiskManagement.EARLY_PARTIAL_MOVE_SL:
+            pos.stop_loss = pos.entry_price
+            pos.trailing_stop = pos.entry_price
+            pos.be_moved = True
+            logger.info(f"🔒 SL moved to BE after early partial: {old_sl:.2f} → {pos.entry_price:.2f}")
+        
+        logger.info(
+            f"💰 EARLY PARTIAL @ +0.5R - Closed {close_size:.4f} ({early_pct}%) @ {current_price:.2f} | "
+            f"PnL: ${pnl:.2f} | Remaining: {remaining_size:.4f}"
+        )
+        
+        return {
+            'action': 'PARTIAL_CLOSE',
+            'reason': 'EARLY_PARTIAL',
+            'price': current_price,
+            'size': close_size,
+            'pnl': pnl,
+            'remaining_size': remaining_size,
+            'partial_pct': early_pct,
+            'requires_validation': True
+        }
+
     async def _handle_tp1(self, current_price: float, regime: str | None = None) -> dict | None:
         """Handle TP1 hit - close dynamic % and move stop to BE immediately"""
         pos = self.position
@@ -3238,6 +3921,8 @@ class RiskEngine:
         - 'side': 'long' or 'short' (most reliable for direction)
         - 'contracts': can be signed (+ long, - short) or unsigned depending on exchange
         - 'info': raw exchange response
+        
+        🔥 FIX (Feb 4, 2026): Also syncs PositionStore to prevent desync warnings
         """
         # Minimum position size to consider valid (prevents float precision issues)
         MIN_POSITION_SIZE = 0.00001
@@ -3296,6 +3981,39 @@ class RiskEngine:
                 )
                 
                 logger.warning(f"RECOVERED POSITION from exchange: {direction} {size} @ {entry_price} | SL: {estimated_stop:.2f}")
+                
+                # 🔥 FIX (Feb 4, 2026): Sync PositionStore to prevent desync warnings
+                # When RiskEngine recovers a position, PositionStore must also know about it
+                # Otherwise sync_from_exchange will report mismatch (local=0, exchange=X)
+                try:
+                    from src.infrastructure.storage import get_position_store
+                    import uuid as uuid_mod
+                    from src.infrastructure.storage.parquet.position_store import TrackedPosition
+                    
+                    position_store = get_position_store()
+                    ps_pos = position_store.get_position(symbol)
+                    
+                    if ps_pos is None or ps_pos.is_flat:
+                        # PositionStore doesn't know about this position - update it
+                        position_store._positions[symbol] = TrackedPosition(
+                            symbol=symbol,
+                            side=direction,
+                            size=size,
+                            entry_price=entry_price,
+                            updated_at=datetime.now(UTC),
+                            trade_id=f"recovered_{uuid_mod.uuid4().hex[:8]}",
+                        )
+                        logger.info(f"✅ PositionStore synced with recovered position: {direction} {size:.6f}")
+                    elif abs(ps_pos.size - size) > MIN_POSITION_SIZE:
+                        # PositionStore has different size - correct it
+                        ps_pos.size = size
+                        ps_pos.side = direction
+                        ps_pos.entry_price = entry_price
+                        ps_pos.updated_at = datetime.now(UTC)
+                        logger.info(f"✅ PositionStore size corrected: {ps_pos.size:.6f} → {size:.6f}")
+                except Exception as ps_error:
+                    # Don't fail recovery if PositionStore sync fails - log and continue
+                    logger.warning(f"⚠️ Failed to sync PositionStore during recovery: {ps_error}")
                 
             except Exception as e:
                 logger.error(f"Error updating from exchange position: {e}")

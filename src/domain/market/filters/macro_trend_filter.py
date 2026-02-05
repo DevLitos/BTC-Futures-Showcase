@@ -17,13 +17,17 @@ Updated: January 22, 2026
 import numpy as np
 import pandas as pd
 from typing import Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 
 from src.domain.market.filters.filter_interface import BaseFilter, FilterDecision
 from src.shared.indicators import calculate_ema
 
 logger = logging.getLogger(__name__)
+
+# 🔥 FIX #47 (Feb 05): Rate-limit MACRO SLOPE block logs
+_last_macro_block_log: dict[str, datetime] = {}  # key = bias+tf -> last log time
+_macro_log_interval = timedelta(seconds=60)  # Log at most once per minute
 
 
 class MacroTrendFilter(BaseFilter):
@@ -41,20 +45,22 @@ class MacroTrendFilter(BaseFilter):
     In RANGE/BREAKOUT mode: No hard veto, only penalties
     """
     
-    # EMA periods
-    EMA_FAST = 50
-    EMA_SLOW = 200
+    # 🔥 FIX #48 (Feb 05): EMA periods adjusted for INTRADAY SCALPING
+    # EMA200 en 1h = 200 horas = 8+ días de lag → ABSURDO para scalping
+    # Cambiado a EMA20/EMA50 que son mucho más reactivos
+    EMA_FAST = 20   # Was 50 - now 20 for faster reaction
+    EMA_SLOW = 50   # Was 200 - now 50 (50h = ~2 días, no 8+ días)
     
-    # Slope calculation
-    SLOPE_LOOKBACK_15M = 5   # 5 candles = 1h15m
-    SLOPE_LOOKBACK_1H = 4    # 4 candles = 4h
+    # Slope calculation - también más corto para scalping
+    SLOPE_LOOKBACK_15M = 3   # Was 5 - now 3 candles = 45min
+    SLOPE_LOOKBACK_1H = 2    # Was 4 - now 2 candles = 2h (not 4h)
     
-    # 🔥 NEW: Slope thresholds (as percentage change)
-    # Only EXTREME slope should hard block
-    SLOPE_EXTREME_THRESHOLD = 0.0025   # 0.25% - TRUE reversal
-    SLOPE_MODERATE_THRESHOLD = 0.0010  # 0.10% - heavy penalty
-    SLOPE_MILD_THRESHOLD = 0.0005      # 0.05% - light penalty
-    SLOPE_STRONG_THRESHOLD = 0.001     # +0.1% = strong trend bonus
+    # 🔥 FIX #48: Slope thresholds más permisivos para scalping
+    # Con EMAs más cortas, el slope cambia más rápido
+    SLOPE_EXTREME_THRESHOLD = 0.0050   # Was 0.25% - now 0.50% (más permisivo)
+    SLOPE_MODERATE_THRESHOLD = 0.0020  # Was 0.10% - now 0.20%
+    SLOPE_MILD_THRESHOLD = 0.0010      # Was 0.05% - now 0.10%
+    SLOPE_STRONG_THRESHOLD = 0.002     # Was 0.1% - now 0.2% = strong trend bonus
     
     # Score adjustments
     # FIX (Jan 24, 2026): Reduced penalties - bot was at 0 trades in 9h
@@ -171,6 +177,8 @@ class MacroTrendFilter(BaseFilter):
                  current_price: float | None = None,
                  bias: str | None = None,
                  regime_mode: str | None = None,  # 🔥 NEW: 'TREND', 'RANGE', or 'BREAKOUT'
+                 displacement_bypass: bool = False,  # 🔥 FIX (Feb 3): Skip hard veto during displacement
+                 anticipation_bypass: bool = False,  # 🔥 FIX #46 (Feb 05): ANTICIPATION bypasses macro slope
                  **kwargs) -> FilterDecision:
         """
         Evaluate macro trend conditions.
@@ -182,6 +190,8 @@ class MacroTrendFilter(BaseFilter):
             bias: 'LONG' or 'SHORT'
             regime_mode: Current regime from RegimeClassifier ('TREND', 'RANGE', 'BREAKOUT')
                          In RANGE/BREAKOUT mode, slope never hard blocks
+            displacement_bypass: If True, skip hard veto (displacement = volatility shock)
+            anticipation_bypass: If True, skip hard veto (ANTICIPATION has own confirmation)
         """
         if current_price is None or bias is None:
             return FilterDecision.allow_default()
@@ -235,19 +245,43 @@ class MacroTrendFilter(BaseFilter):
             reasons.append(f"Size capped to {size_factor*100:.0f}% (against macro)")
             
             if slope_magnitude >= self.SLOPE_EXTREME_THRESHOLD:
-                # EXTREME slope - only hard block in TREND mode
-                if regime_mode in ('RANGE', 'BREAKOUT') or not self.hard_veto_on_slope:
-                    # In RANGE/BREAKOUT: heavy penalty but allow
+                # EXTREME slope - only hard block in TREND mode (and NOT during displacement or anticipation)
+                # 🔥 FIX (Feb 3): displacement_bypass = volatility shock, skip hard veto
+                # 🔥 FIX #46 (Feb 05): anticipation_bypass = ANTICIPATION has its own confirmation
+                any_bypass = displacement_bypass or anticipation_bypass
+                if regime_mode in ('RANGE', 'BREAKOUT') or not self.hard_veto_on_slope or any_bypass:
+                    # In RANGE/BREAKOUT or DISPLACEMENT/ANTICIPATION: heavy penalty but allow
                     score_adjust -= 3.0
-                    size_factor = 0.25  # Extra conservative
+                    # 🔥 FIX #46: ANTICIPATION gets 60% size (more confidence than displacement)
+                    if anticipation_bypass:
+                        size_factor = 0.60
+                        tags['anticipation_bypass'] = True
+                        tags['macro_size_cap'] = size_factor  # Update final size cap
+                        logger.info(f"[BYPASS] MACRO SLOPE: {bias} allowed via ANTICIPATION (slope={worst_slope*100:.3f}%) | Size: 60%")
+                    elif displacement_bypass:
+                        size_factor = 0.50
+                        tags['macro_size_cap'] = size_factor  # Update final size cap
+                        logger.info(f"[BYPASS] MACRO SLOPE: {bias} allowed via DISPLACEMENT (slope={worst_slope*100:.3f}%)")
+                    else:
+                        size_factor = 0.25
+                        tags['macro_size_cap'] = size_factor  # Update final size cap
+                        logger.debug(f"[WARN] MACRO EXTREME SLOPE ({veto_tf}={worst_slope*100:.3f}%)")
                     reasons.append(f"Extreme slope {veto_tf}: {worst_slope*100:.3f}% (penalty -3.0)")
                     tags['macro_slope_extreme_penalty'] = True
-                    logger.debug(f"[WARN] MACRO EXTREME SLOPE ({veto_tf}={worst_slope*100:.3f}%)")
+                    tags['displacement_bypass'] = displacement_bypass
                 else:
-                    # In TREND mode: hard block
+                    # In TREND mode without any bypass: hard block
                     tags['macro_slope_veto'] = True
                     tags['macro_veto_tf'] = veto_tf
-                    logger.warning(f"[BLOCK] MACRO SLOPE: {bias} blocked by {veto_tf} ({worst_slope*100:.3f}%)")
+                    
+                    # 🔥 FIX #47 (Feb 05): Rate-limit MACRO SLOPE block logs
+                    log_key = f'{bias}_{veto_tf}'
+                    now = datetime.utcnow()
+                    last_log = _last_macro_block_log.get(log_key)
+                    if last_log is None or (now - last_log) >= _macro_log_interval:
+                        _last_macro_block_log[log_key] = now
+                        logger.warning(f"[BLOCK] MACRO SLOPE: {bias} blocked by {veto_tf} ({worst_slope*100:.3f}%)")
+                    
                     return FilterDecision(
                         allow=False,
                         regime="MACRO_VETO",

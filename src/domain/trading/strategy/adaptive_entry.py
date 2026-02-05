@@ -285,9 +285,11 @@ class AdaptiveEntrySystem:
             vol_level = 4  # Extreme
         
         # ADX como confirmación
+        # 🔄 REFACTORED Feb 04: Use ADXThresholds for consistent thresholds
+        from src.config.trading_config import ADXThresholds
         if adx < 15:
             adx_level = 0
-        elif adx < 20:
+        elif adx < ADXThresholds.TREND:  # < 20
             adx_level = 1
         elif adx < 30:
             adx_level = 2

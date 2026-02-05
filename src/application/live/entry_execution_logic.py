@@ -169,7 +169,9 @@ class PreExecutionGuards:
                 ltf_adx = adx_5m[-1]
                 
                 # HTF shows trend but LTF is dead → wait
-                if htf_adx > 20 and ltf_adx < 12:
+                # 🔄 REFACTORED Feb 04: Use ADXThresholds.TREND for consistent threshold
+                from src.config.trading_config import ADXThresholds
+                if htf_adx > ADXThresholds.TREND and ltf_adx < 12:
                     result.can_proceed = False
                     result.block_reason = f"ADX divergence: HTF={htf_adx:.1f} trending but LTF={ltf_adx:.1f} dead"
                     result.should_return = True

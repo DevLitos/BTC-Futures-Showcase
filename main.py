@@ -817,6 +817,34 @@ class TradingSystemOrchestrator:
     
     async def start(self):
         """Start trading"""
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("                    FIDEI RATIO CAPITAL BTC")
+        logger.info("=" * 70)
+        logger.info("")
+        logger.info("                               ║║║║║ ")
+        logger.info("                               ║║║║║  ")
+        logger.info("                               ║║║║║   ")
+        logger.info("                               ║║║║║    ")
+        logger.info("                               ║║║║║     ")
+        logger.info("        ═══════════════════════╬╬╬╬╬═══════════════════════")
+        logger.info("        ═══════════════════════╬╬╬╬╬═══════════════════════ ")
+        logger.info("                               ║║║║║      ")
+        logger.info("                               ║║║║║       ")
+        logger.info("                               ║║║║║        ")
+        logger.info("                               ║║║║║         ")
+        logger.info("                               ║║║║║          ")
+        logger.info("                               ║║║║║           ")
+        logger.info("                               ║║║║║            ")
+        logger.info("                               ║║║║║             ")
+        logger.info("                               ║║║║║              ")
+        logger.info("                               ║║║║║               ")
+        logger.info("                               ║║║║║                ")
+        logger.info("                               ║║║║║                 ")
+        logger.info("                               ║║║║║                  ")
+        logger.info("                               ║║║║║                   ")
+        logger.info("                               ║║║║║                    ")
+        logger.info("")
         logger.info("=" * 70)
         logger.info("▶️  STARTING TRADING SYSTEM")
         logger.info("=" * 70)
@@ -1141,7 +1169,7 @@ class TradingSystemOrchestrator:
                 # 🔥 NEW (Jan 28, 2026): Balance info in 5min report
                 try:
                     if self.signal_engine and self.signal_engine.risk_engine:
-                        current_capital = self.signal_engine.risk_engine.current_capital
+                        current_capital = self.signal_engine.risk_engine.capital
                         
                         # Track session start capital (first report sets baseline)
                         if not hasattr(self, '_session_start_capital'):

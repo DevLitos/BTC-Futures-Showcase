@@ -1,6 +1,11 @@
 """
 Regime Detector - Context-Aware Market State Classification
 
+⚠️ PARTIAL DEPRECATION (Feb 05, 2026):
+RegimeConfig defined here is a DUPLICATE.
+Prefer using UnifiedRegimeConfig from src/config/unified_constants.py
+EntryRegime enum is still valid and actively used.
+
 "BTC no paga igual en todos los contextos"
 
 4 Regimes:
@@ -23,6 +28,9 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any
 
+# 🔥 NEW (Feb 05): Import unified config for future migration
+from src.config.unified_constants import UnifiedRegimeConfig, UNIFIED_REGIMES, get_unified_regime
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,9 +44,11 @@ class EntryRegime(Enum):
     CHAOS = "CHAOS"                          # No trade or minimum size (0.0x)
 
 
+# ⚠️ LEGACY (Feb 05): This RegimeConfig is LOCAL to this file.
+# For new code, prefer using UnifiedRegimeConfig from unified_constants.py
 @dataclass
 class RegimeConfig:
-    """Configuration for each regime"""
+    """Configuration for each regime - LOCAL LEGACY VERSION"""
     chasing_allowed: bool           # Can we chase price?
     chasing_penalty_multiplier: float  # How much to penalize chasing (0 = none)
     order_type: str                 # 'MARKET', 'LIMIT', 'LIMIT_FALLBACK', 'NONE'

@@ -1419,25 +1419,96 @@ class RESTExecutionEngine:
             position_size = abs(contracts)
             
             # 2. Place NEW SL first (position stays protected)
+            # 🔥 FIX (Feb 03, 2026): Added 3-attempt retry pattern matching place_initial_sl_tp
             sl_side = 'sell' if position_side == 'long' else 'buy'
             
-            sl_order = await asyncio.wait_for(
-                self.exchange.create_order(
-                    symbol=symbol,
-                    type='stop-loss',
-                    side=sl_side,
-                    amount=position_size,
-                    price=new_sl_price,
-                    params={
-                        'reduceOnly': True,
-                        'postOnly': False
-                    }
-                ),
-                timeout=EXCHANGE_TIMEOUT_MEDIUM
-            )
+            sl_order = None
+            new_sl_order_id = None
             
-            new_sl_order_id = sl_order.get('id')
-            logger.info(f"✅ New SL placed: {new_sl_price:.2f} (order: {new_sl_order_id})")
+            # ATTEMPT 1: Standard 'stop-loss' type (Kraken Futures standard)
+            logger.debug(f"[SL Update Attempt 1] Using 'stop-loss' type: {sl_side} {position_size:.8f} @ {new_sl_price:.2f}")
+            try:
+                sl_order = await asyncio.wait_for(
+                    self.exchange.create_order(
+                        symbol=symbol,
+                        type='stop-loss',
+                        side=sl_side,
+                        amount=position_size,
+                        price=new_sl_price,
+                        params={
+                            'reduceOnly': True,
+                            'postOnly': False
+                        }
+                    ),
+                    timeout=EXCHANGE_TIMEOUT_MEDIUM
+                )
+                new_sl_order_id = sl_order.get('id')
+                logger.info(f"✅ New SL (stop-loss) placed: {new_sl_price:.2f} (order: {new_sl_order_id})")
+                
+            except asyncio.TimeoutError:
+                logger.debug("[SL Update Attempt 1 TIMEOUT]")
+                raise
+            except Exception as e1:
+                logger.debug(f"[SL Update Attempt 1 FAILED]: {str(e1)[:100]}")
+                
+                # ATTEMPT 2: 'stop' type with triggerPrice
+                logger.debug(f"[SL Update Attempt 2] Using 'stop' type with triggerPrice")
+                try:
+                    sl_order = await asyncio.wait_for(
+                        self.exchange.create_order(
+                            symbol=symbol,
+                            type='stop',
+                            side=sl_side,
+                            amount=position_size,
+                            price=None,
+                            params={
+                                'triggerPrice': new_sl_price,
+                                'reduceOnly': True
+                            }
+                        ),
+                        timeout=EXCHANGE_TIMEOUT_MEDIUM
+                    )
+                    new_sl_order_id = sl_order.get('id')
+                    logger.info(f"✅ New SL (stop) placed with triggerPrice: {new_sl_price:.2f} (order: {new_sl_order_id})")
+                    
+                except asyncio.TimeoutError:
+                    logger.debug("[SL Update Attempt 2 TIMEOUT]")
+                    raise
+                except Exception as e2:
+                    logger.debug(f"[SL Update Attempt 2 FAILED]: {str(e2)[:100]}")
+                    
+                    # ATTEMPT 3: Last resort - 'limit' order at slightly worse price
+                    logger.debug(f"[SL Update Attempt 3] Using 'limit' as fallback")
+                    try:
+                        # For SL limit, use slightly worse price to ensure execution
+                        fallback_sl_price = new_sl_price * 0.998 if position_side == 'long' else new_sl_price * 1.002
+                        
+                        sl_order = await asyncio.wait_for(
+                            self.exchange.create_order(
+                                symbol=symbol,
+                                type='limit',
+                                side=sl_side,
+                                amount=position_size,
+                                price=fallback_sl_price,
+                                params={
+                                    'reduceOnly': True,
+                                    'postOnly': False
+                                }
+                            ),
+                            timeout=EXCHANGE_TIMEOUT_MEDIUM
+                        )
+                        new_sl_order_id = sl_order.get('id')
+                        logger.info(f"✅ New SL (limit fallback) placed at {fallback_sl_price:.2f}: {new_sl_order_id}")
+                        
+                    except asyncio.TimeoutError:
+                        logger.error("❌ SL Update Attempt 3 TIMEOUT")
+                        raise
+                    except Exception as e3:
+                        logger.error(f"❌ ALL SL UPDATE ATTEMPTS FAILED: {str(e3)[:150]}")
+                        raise
+            
+            if not new_sl_order_id:
+                raise RuntimeError("SL order placement failed - no order ID received")
             
             # 3. NOW cancel old SL orders (except the one we just placed)
             open_orders = await self.get_open_orders(symbol)
@@ -1737,6 +1808,31 @@ class RESTExecutionEngine:
             return None
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
+            return None
+    
+    async def get_ticker(self, symbol: str) -> Optional[Dict]:
+        """
+        Obtener ticker (precio actual) del símbolo.
+        
+        Returns:
+            Dict con 'last', 'bid', 'ask' o None si falla
+        """
+        if not self.exchange:
+            return None
+        
+        try:
+            async with self._exchange_lock:
+                ticker = await asyncio.wait_for(
+                    self.exchange.fetch_ticker(symbol),
+                    timeout=EXCHANGE_TIMEOUT_SHORT
+                )
+            return ticker
+        
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching ticker for {symbol}")
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching ticker: {e}")
             return None
     
     async def get_available_capital(self) -> float:

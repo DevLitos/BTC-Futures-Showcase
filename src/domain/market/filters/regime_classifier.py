@@ -1,6 +1,11 @@
 """
 Regime Classifier - Converts ADX from gate to mode selector
 
+⚠️ PARTIAL DEPRECATION (Feb 05, 2026):
+RegimeConfig defined here is a DUPLICATE. 
+Prefer using UnifiedRegimeConfig from src/config/unified_constants.py
+This file's RegimeConfig is kept for backward compatibility but should be migrated.
+
 🔥 FIX (Jan 22, 2026):
 ADX should NOT be a binary filter. It's a REGIME CLASSIFIER.
 
@@ -27,12 +32,17 @@ import logging
 
 from src.shared.indicators import calculate_adx, calculate_atr
 
+# 🔥 NEW (Feb 05): Import unified config for future migration
+from src.config.unified_constants import UnifiedRegimeConfig, UNIFIED_REGIMES, get_unified_regime
+
 logger = logging.getLogger(__name__)
 
 
+# ⚠️ LEGACY (Feb 05): This RegimeConfig is LOCAL to this file.
+# For new code, prefer using UnifiedRegimeConfig from unified_constants.py
 @dataclass
 class RegimeConfig:
-    """Configuration for each trading regime"""
+    """Configuration for each trading regime - LOCAL LEGACY VERSION"""
     mode: str  # 'TREND', 'RANGE', 'NO_TRADE'
     
     # Position sizing

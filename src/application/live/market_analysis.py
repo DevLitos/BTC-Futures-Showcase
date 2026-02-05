@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional, TYPE_CHECKING
 
@@ -251,6 +252,9 @@ class TrendExpansionDetector:
     
     def __init__(self, config: TrendExpansionConfig | None = None):
         self.config = config or TrendExpansionConfig()
+        # 🔥 FIX #41: Track last log time to prevent spam
+        self._last_expansion_log: datetime | None = None
+        self._log_interval = timedelta(minutes=2)
     
     def detect(
         self,
@@ -288,11 +292,19 @@ class TrendExpansionDetector:
             criteria_count = sum(criteria_met.values())
             is_expanding = criteria_count >= self.config.MIN_CRITERIA_FOR_EXPANSION
             
+            # 🔥 FIX #41: Rate limit expansion log to prevent spam
             if is_expanding:
-                logger.info(
-                    f"🚀 TREND EXPANSION DETECTED: "
-                    f"{criteria_count}/4 criteria met: {criteria_met}"
+                now = datetime.utcnow()
+                should_log = (
+                    self._last_expansion_log is None or
+                    (now - self._last_expansion_log) > self._log_interval
                 )
+                if should_log:
+                    self._last_expansion_log = now
+                    logger.info(
+                        f"🚀 TREND EXPANSION DETECTED: "
+                        f"{criteria_count}/4 criteria met: {criteria_met}"
+                    )
             
             return TrendExpansionResult(
                 is_expanding=is_expanding,
@@ -456,7 +468,9 @@ class ProbingCriteriaChecker:
                 "BLOCKED"
             )
         
-        if session_quality == 'poor':
+        # 🔄 REFACTORED Feb 04: Use SessionQuality for consistent quality checks
+        from src.config.trading_config import SessionQuality
+        if SessionQuality.is_quality_blocked(session_quality):
             return ProbingResult(0.0, "Poor session quality", 0, "BLOCKED")
         
         # Phase 2: Calculate metrics
@@ -685,12 +699,26 @@ class ShortObstinacyCalculator:
     """
     Calculates penalty for shorting in bullish context.
     
-    Checks:
-    1. Price above VWAP
-    2. VWAP slope positive
-    3. Price > VWAP + k*ATR
-    4. EMA20 > EMA50 on 5m
+    Checks (ALL LAGGING INDICATORS):
+    1. Price above VWAP - LAGGING (VWAP based on cumsum)
+    2. VWAP slope positive - LAGGING (uses last 10 candles)
+    3. Price > VWAP + k*ATR - LAGGING
+    4. EMA20 > EMA50 on 5m - LAGGING (slow crossover)
+    
+    🧠 STRUCTURAL SIGNALS (never ignored):
+    - Higher High confirmed
+    - BOS_up
+    - Reclaim de nivel clave
+    - Acceptance above value
+    
+    Note: All current signals are LAGGING. Structural signals would require
+    HTF analysis which is done elsewhere. The obstinacy SOFT mode check
+    uses the all_lagging flag to determine if we can relax the block.
     """
+    
+    # 🧠 FIX #20: Signal classification for SOFT mode
+    LAGGING_SIGNALS = {'price>VWAP', 'VWAP_slope+', 'EMA20>EMA50'}
+    # Note: price>X*ATR_above_VWAP is also lagging but has variable name
     
     def __init__(self, config: ShortObstinacyConfig | None = None):
         self.config = config or ShortObstinacyConfig()
@@ -699,15 +727,21 @@ class ShortObstinacyCalculator:
         self,
         df_5m: pd.DataFrame,
         current_price: float,
-        atr_5m: float
-    ) -> tuple[float, int, str]:
+        atr_5m: float,
+        df_1m: pd.DataFrame | None = None  # 🧠 FIX #20: For price impulse detection
+    ) -> tuple[float, int, str, bool, bool]:
         """
         Calculate penalty for shorting in bullish context.
         
-        Returns: (penalty, bullish_signals, reason_string)
+        Returns: (penalty, bullish_signals, reason_string, all_lagging, price_impulse_down)
+        
+        🧠 FIX #20 (Feb 03, 2026):
+        - all_lagging: True if all bullish signals are LAGGING indicators
+        - price_impulse_down: True if price is actively falling (leading indicator)
         """
         bullish_signals = 0
         reasons = []
+        all_lagging = True  # Assume all lagging until we find structural
         
         try:
             # Calculate VWAP
@@ -744,17 +778,54 @@ class ShortObstinacyCalculator:
             penalty = self.config.calculate_short_penalty(bullish_signals)
             reason_str = ", ".join(reasons) if reasons else "none"
             
+            # 🧠 FIX #20: Check if all signals are lagging
+            # All current checks are lagging by design - we don't have structural signals here
+            # The all_lagging flag allows SOFT mode when displacement memory is active
+            all_lagging = True  # All signals in this calculator are lagging
+            
+            # 🧠 FIX #20: Price impulse detection (LEADING indicator)
+            # If price is actively falling despite lagging indicators showing bullish,
+            # we may want to allow the SHORT with reduced size
+            price_impulse_down = False
+            if df_1m is not None and len(df_1m) >= 5:
+                try:
+                    closes = df_1m['close'].iloc[-5:].values
+                    opens = df_1m['open'].iloc[-5:].values
+                    atr_1m = atr_5m / 4  # Approximate 1m ATR
+                    
+                    # Condition 1: Persistent directional sequence (3 lower closes)
+                    lower_closes = closes[-1] < closes[-2] < closes[-3]
+                    
+                    # Condition 2: Energy/momentum (not just dojis)
+                    # Use absolute move over last 4 candles > 0.6 ATR_1m
+                    move_4_candles = abs(closes[-1] - closes[-4])
+                    has_energy = move_4_candles > 0.6 * atr_1m
+                    
+                    # Condition 3: Bearish body on last candle
+                    bearish_last = closes[-1] < opens[-1]
+                    
+                    price_impulse_down = lower_closes and has_energy and bearish_last
+                    
+                    if price_impulse_down:
+                        logger.debug(
+                            f"🧠 PRICE IMPULSE DOWN detected: 3 lower closes, "
+                            f"move ${move_4_candles:.0f} > {0.6 * atr_1m:.0f}, bearish last candle"
+                        )
+                except Exception as e:
+                    logger.debug(f"Price impulse detection error: {e}")
+            
             if penalty < 0:
                 logger.info(
                     f"⚠️ SHORT OBSTINACY: {bullish_signals} bullish signals "
-                    f"({reason_str}) → penalty {penalty}"
+                    f"({reason_str}) → penalty {penalty} | "
+                    f"all_lagging={all_lagging}, impulse_down={price_impulse_down}"
                 )
             
-            return penalty, bullish_signals, reason_str
+            return penalty, bullish_signals, reason_str, all_lagging, price_impulse_down
             
         except Exception as e:
             logger.debug(f"ShortObstinacy calculation error: {e}")
-            return 0.0, 0, "error"
+            return 0.0, 0, "error", True, False
 
 
 # ============================================================================

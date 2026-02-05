@@ -53,6 +53,7 @@ Date: January 27, 2026
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Tuple, Optional, Dict, Any, TYPE_CHECKING
 import logging
@@ -85,13 +86,16 @@ class SimplifiedSizingResult:
     should_trade: bool = True
     block_reason: Optional[str] = None
     
-    # The 5 core multipliers (+ edge mode)
+    # The 5 core multipliers (+ edge mode + adaptive filters)
     base_risk_pct: float = 0.01  # 1% always
     rr_mult: float = 1.0
     regime_mult: float = 1.0
     loss_streak_mult: float = 1.0
     session_mult: float = 1.0
-    edge_mult: float = 1.0  # 🔥 NEW: Edge mode multiplier (INSTITUTIONAL/INTRADAY)
+    edge_mult: float = 1.0  # Edge mode multiplier (INSTITUTIONAL/INTRADAY)
+    toxic_hour_mult: float = 1.0  # Toxic hour multiplier
+    toxic_combo_mult: float = 1.0  # 🔥 NEW: Toxic combo multiplier (REDUCE mode)
+    momentum_mult: float = 1.0  # Momentum predictor multiplier
     
     # Final
     combined_multiplier: float = 1.0
@@ -147,14 +151,21 @@ class RegimeMultiplier:
     
     OLD: Different mults for TRANSITION, RANGE_DAY, daily_regime_config...
     NEW: 2 states - TREND or RANGE
+    
+    🔄 REFACTORED Feb 04: Uses ADXThresholds from trading_config
     """
     TREND = 1.0
-    RANGE = 0.7  # ADX < 18
+    RANGE = 0.7  # ADX < ADXThresholds.RANGE (18)
     
     @classmethod
     def get_multiplier(cls, adx: Optional[float], regime_str: str = "NORMAL") -> float:
-        """Get regime multiplier based on ADX"""
-        if adx is not None and adx < 18:
+        """Get regime multiplier based on ADX.
+        
+        Uses centralized ADXThresholds for consistency.
+        """
+        from src.config.trading_config import ADXThresholds
+        
+        if adx is not None and adx < ADXThresholds.RANGE:
             return cls.RANGE
         if regime_str.upper() in ('RANGE', 'RANGING'):
             return cls.RANGE
@@ -166,19 +177,261 @@ class RegimeMultiplier:
 # =============================================================================
 class LossStreakMultiplier:
     """
-    Simplified loss streak handling.
+    🔥 ENHANCED (Feb 1, 2026): Graduated loss streak handling.
     
-    OLD: Graduated reduction per loss (0.9, 0.8, 0.7, 0.6...)
-    NEW: Binary - normal or reduced
+    OLD: Binary - normal or 0.5x after 2 losses
+    NEW: Progressive reduction to prevent revenge trading
+    
+    - 0-1 losses: 1.0x (normal)
+    - 2 losses: 0.6x 
+    - 3 losses: 0.4x
+    - 4 losses: 0.25x (minimal position)
+    - 5+ losses: 0.1x (token size - effectively just observing)
     """
     NORMAL = 1.0
-    AFTER_2_LOSSES = 0.5
+    AFTER_2_LOSSES = 0.6
+    AFTER_3_LOSSES = 0.4
+    AFTER_4_LOSSES = 0.25
+    AFTER_5_LOSSES = 0.1  # Token size - system is clearly in bad environment
     
     @classmethod
     def get_multiplier(cls, consecutive_losses: int) -> float:
+        if consecutive_losses >= 5:
+            return cls.AFTER_5_LOSSES
+        if consecutive_losses >= 4:
+            return cls.AFTER_4_LOSSES
+        if consecutive_losses >= 3:
+            return cls.AFTER_3_LOSSES
         if consecutive_losses >= 2:
             return cls.AFTER_2_LOSSES
         return cls.NORMAL
+
+
+# =============================================================================
+# LOSS STREAK COOLDOWN (Feb 2, 2026)
+# 🔄 DEPRECATED Feb 04: Use CooldownManager instead
+# Kept for backward compatibility - delegates to CooldownManager
+# =============================================================================
+class LossStreakCooldown:
+    """
+    Time-based cooldown after consecutive losses.
+    
+    ⚠️ DEPRECATED: Use src.application.live.cooldown_manager.CooldownManager instead.
+    This class is kept for backward compatibility and delegates to CooldownManager.
+    """
+    
+    @classmethod
+    def get_cooldown_minutes(cls, consecutive_losses: int) -> int:
+        """Get required cooldown time in minutes.
+        
+        DEPRECATED: Use CooldownManager.activate_loss_streak_cooldown() instead.
+        """
+        from src.config.trading_config import RiskManagement
+        
+        if not RiskManagement.LOSS_STREAK_COOLDOWN_ENABLED:
+            return 0
+        
+        if consecutive_losses >= 5:
+            return RiskManagement.LOSS_STREAK_5_COOLDOWN_MIN
+        if consecutive_losses >= 4:
+            return RiskManagement.LOSS_STREAK_4_COOLDOWN_MIN
+        if consecutive_losses >= 3:
+            return RiskManagement.LOSS_STREAK_3_COOLDOWN_MIN
+        return 0  # No cooldown
+    
+    @classmethod
+    def is_in_cooldown(cls, consecutive_losses: int, last_trade_time: Optional[datetime], current_time: datetime) -> Tuple[bool, int]:
+        """
+        Check if we're still in cooldown period.
+        
+        DEPRECATED: Use CooldownManager.check_can_trade() instead.
+        """
+        # Delegate to CooldownManager for consistent behavior
+        try:
+            from src.application.live.cooldown_manager import get_cooldown_manager
+            mgr = get_cooldown_manager()
+            mgr.activate_loss_streak_cooldown(consecutive_losses, current_time, last_trade_time)
+            result = mgr.check_can_trade(current_time)
+            if not result.can_trade:
+                return True, result.remaining_seconds
+            return False, 0
+        except ImportError:
+            # Fallback to legacy logic if CooldownManager not available
+            from src.config.trading_config import RiskManagement
+            
+            if not RiskManagement.LOSS_STREAK_COOLDOWN_ENABLED:
+                return False, 0
+            
+            if last_trade_time is None:
+                return False, 0
+            
+            cooldown_minutes = cls.get_cooldown_minutes(consecutive_losses)
+            if cooldown_minutes == 0:
+                return False, 0
+            
+            elapsed = (current_time - last_trade_time).total_seconds()
+            required = cooldown_minutes * 60
+            
+            if elapsed < required:
+                remaining = int(required - elapsed)
+                return True, remaining
+            
+            return False, 0
+
+
+# =============================================================================
+# TOXIC HOUR MULTIPLIER (Feb 2, 2026)
+# =============================================================================
+class ToxicHourMultiplier:
+    """
+    Reduce sizing during historically toxic hours.
+    
+    ⚠️ ADAPTIVE: Uses config from RiskManagement for easy recalibration.
+    Based on Jan 20 - Feb 1, 2026 analysis but should be monitored.
+    
+    Config (in trading_config.py):
+    - TOXIC_HOURS_ENABLED: bool
+    - TOXIC_HOURS_SET: set of UTC hours
+    - TOXIC_HOURS_MULT: sizing multiplier (default 0.5)
+    """
+    
+    @classmethod
+    def get_multiplier(cls, hour_utc: int) -> float:
+        """Get multiplier for current UTC hour."""
+        from src.config.trading_config import RiskManagement
+        
+        if not RiskManagement.TOXIC_HOURS_ENABLED:
+            return 1.0
+        
+        if hour_utc in RiskManagement.TOXIC_HOURS_SET:
+            mult = RiskManagement.TOXIC_HOURS_MULT
+            logger.info(f"⚠️ TOXIC HOUR: {hour_utc:02d}:00 UTC → {mult}x sizing")
+            return mult
+        return 1.0
+    
+    @classmethod
+    def from_datetime(cls, dt: datetime) -> float:
+        """Get multiplier from datetime object."""
+        return cls.get_multiplier(dt.hour)
+
+
+# =============================================================================
+# TOXIC COMBINATION HANDLER (Feb 2, 2026)
+# =============================================================================
+class ToxicCombinationBlock:
+    """
+    Handle session+direction combinations with historical negative edge.
+    
+    ⚠️ ADAPTIVE: Uses config from RiskManagement for easy recalibration.
+    
+    MODES:
+    - 'BLOCK': No trade allowed (original behavior)
+    - 'REDUCE': Reduce sizing but still trade (more adaptive)
+    
+    Config (in trading_config.py):
+    - TOXIC_COMBOS_ENABLED: bool
+    - TOXIC_COMBOS_MODE: 'BLOCK' or 'REDUCE'
+    - TOXIC_COMBOS_MULT: sizing multiplier if MODE='REDUCE'
+    - TOXIC_COMBOS_SET: set of (session, direction) tuples
+    """
+    
+    @classmethod
+    def is_blocked(cls, session_name: str, direction: str) -> Tuple[bool, str]:
+        """
+        Check if session+direction combination should be blocked.
+        
+        Returns:
+            (is_blocked, reason)
+        """
+        from src.config.trading_config import RiskManagement
+        
+        if not RiskManagement.TOXIC_COMBOS_ENABLED:
+            return False, ""
+        
+        # Normalize inputs
+        session_upper = session_name.upper()
+        direction_upper = direction.upper()
+        combo = (session_upper, direction_upper)
+        
+        if combo in RiskManagement.TOXIC_COMBOS_SET:
+            mode = RiskManagement.TOXIC_COMBOS_MODE
+            
+            if mode == 'BLOCK':
+                reason = f"🛑 TOXIC COMBO BLOCK: {session_upper} + {direction_upper} (historical negative edge)"
+                logger.warning(reason)
+                return True, reason
+            else:
+                # REDUCE mode - don't block, just log (reduction handled in get_multiplier)
+                logger.info(f"⚠️ TOXIC COMBO: {session_upper} + {direction_upper} → reduced sizing")
+                return False, ""
+        
+        return False, ""
+    
+    @classmethod
+    def get_multiplier(cls, session_name: str, direction: str) -> float:
+        """
+        Get sizing multiplier for session+direction combo.
+        
+        Returns 1.0 for normal combos, TOXIC_COMBOS_MULT for toxic combos in REDUCE mode.
+        """
+        from src.config.trading_config import RiskManagement
+        
+        if not RiskManagement.TOXIC_COMBOS_ENABLED:
+            return 1.0
+        
+        session_upper = session_name.upper()
+        direction_upper = direction.upper()
+        combo = (session_upper, direction_upper)
+        
+        if combo in RiskManagement.TOXIC_COMBOS_SET:
+            if RiskManagement.TOXIC_COMBOS_MODE == 'REDUCE':
+                return RiskManagement.TOXIC_COMBOS_MULT
+        
+        return 1.0
+
+
+# =============================================================================
+# MOMENTUM SIZING MULTIPLIER (Feb 2, 2026)
+# =============================================================================
+class MomentumSizingMultiplier:
+    """
+    Adjust sizing based on momentum score as a predictor.
+    
+    ⚠️ ADAPTIVE: Uses config from RiskManagement for easy recalibration.
+    
+    Config (in trading_config.py):
+    - MOMENTUM_SIZING_ENABLED: bool
+    - MOMENTUM_LOW_THRESHOLD: below this = low momentum
+    - MOMENTUM_HIGH_THRESHOLD: above this = high momentum
+    - MOMENTUM_LOW_MULT: sizing mult for low momentum
+    - MOMENTUM_HIGH_MULT: sizing mult for high momentum
+    """
+    
+    @classmethod
+    def get_multiplier(cls, momentum_score: float) -> float:
+        """
+        Get sizing multiplier based on momentum score.
+        
+        Args:
+            momentum_score: 0-2 momentum score from entry_scorer
+            
+        Returns:
+            Sizing multiplier
+        """
+        from src.config.trading_config import RiskManagement
+        
+        if not RiskManagement.MOMENTUM_SIZING_ENABLED:
+            return 1.0
+        
+        if momentum_score >= RiskManagement.MOMENTUM_HIGH_THRESHOLD:
+            mult = RiskManagement.MOMENTUM_HIGH_MULT
+            logger.debug(f"📈 MOMENTUM BOOST: score={momentum_score:.2f} >= {RiskManagement.MOMENTUM_HIGH_THRESHOLD} → {mult}x sizing")
+            return mult
+        elif momentum_score < RiskManagement.MOMENTUM_LOW_THRESHOLD:
+            mult = RiskManagement.MOMENTUM_LOW_MULT
+            logger.info(f"📉 MOMENTUM WEAK: score={momentum_score:.2f} < {RiskManagement.MOMENTUM_LOW_THRESHOLD} → {mult}x sizing")
+            return mult
+        return 1.0
 
 
 # =============================================================================
@@ -200,13 +453,16 @@ class SessionMultiplier:
     def get_multiplier(cls, session_quality: str) -> Tuple[float, bool]:
         """
         Returns (multiplier, should_block)
+        
+        🔄 REFACTORED Feb 04: Uses SessionQuality.is_quality_blocked for consistency.
         """
-        if session_quality == 'poor':
+        from src.config.trading_config import SessionQuality
+        
+        if SessionQuality.is_quality_blocked(session_quality):
             return 0.0, True  # HARD BLOCK
-        elif session_quality == 'moderate':
-            return cls.MODERATE, False
-        else:
-            return cls.GOOD, False
+        
+        mult = SessionQuality.get_quality_size_mult(session_quality)
+        return mult, False
 
 
 # =============================================================================
@@ -221,6 +477,8 @@ class SimplifiedSizer:
     🔥 NEW (Jan 28, 2026): Added edge_mode multiplier
     - INSTITUTIONAL: 1.0x - 1.5x (high conviction)
     - INTRADAY: 0.15x - 0.30x (low conviction, high frequency)
+    
+    🔥 NEW (Feb 2, 2026): Added toxic hour multiplier and combo blocks
     """
     
     @staticmethod
@@ -238,12 +496,24 @@ class SimplifiedSizer:
         edge_mode_multiplier: float = 1.0,  # From EdgeStateManager
         # 🔥 NEW (Jan 28): Liquidity event for R-validation
         liquidity_event: Optional[Any] = None,  # LiquidityEvent from edge_state_manager
+        # 🔥 NEW (Feb 2, 2026): Toxic combo and hour parameters
+        session_name: str = '',  # For toxic combo check (e.g., 'ASIA', 'LONDON')
+        direction: str = '',     # For toxic combo check ('LONG' or 'SHORT')
+        market_time: Optional[datetime] = None,  # For toxic hour check
+        last_trade_time: Optional[datetime] = None,  # For loss streak cooldown
+        # 🔥 NEW (Feb 2, 2026): Momentum predictor
+        momentum_score: float = 1.0,  # 0-2 score from entry_scorer
     ) -> SimplifiedSizingResult:
         """
         Calculate position size using simplified 5-multiplier system.
         
         🔥 CRITICAL (Jan 28, 2026): INTRADAY R < 0.3 REQUIRES liquidity_event
         Sin sweep/rejection → NO TRADE. Sin negociación.
+        
+        🔥 NEW (Feb 2, 2026): 
+        - Blocks toxic session+direction combos
+        - Reduces sizing 50% during toxic hours (0, 4, 21, 23 UTC)
+        - Enforces cooldown after 3+ consecutive losses
         
         Args:
             capital: Trading capital in USD
@@ -257,11 +527,71 @@ class SimplifiedSizer:
             edge_mode: 'INSTITUTIONAL' or 'INTRADAY'
             edge_mode_multiplier: From EdgeStateManager
             liquidity_event: Optional LiquidityEvent for R-validation (INTRADAY)
+            session_name: Session name for toxic combo check
+            direction: Direction for toxic combo check
+            market_time: Current time for toxic hour check
+            last_trade_time: Time of last trade exit (for cooldown)
         
         Returns:
             SimplifiedSizingResult with final size and breakdown
         """
         result = SimplifiedSizingResult()
+        
+        # =====================================================================
+        # 🔥 NEW (Feb 2, 2026): LOSS STREAK COOLDOWN
+        # Enforce waiting period after 3+ consecutive losses
+        # =====================================================================
+        if consecutive_losses >= 3 and market_time is not None:
+            in_cooldown, remaining = LossStreakCooldown.is_in_cooldown(
+                consecutive_losses, last_trade_time, market_time
+            )
+            if in_cooldown:
+                result.should_trade = False
+                result.block_reason = (
+                    f"⏳ LOSS STREAK COOLDOWN: {consecutive_losses} losses → "
+                    f"wait {remaining}s more"
+                )
+                result.tags['loss_streak_cooldown'] = True
+                result.tags['cooldown_remaining_s'] = remaining
+                return result
+        
+        # =====================================================================
+        # 🔥 NEW (Feb 2, 2026): TOXIC COMBINATION HANDLER
+        # In BLOCK mode: blocks trade entirely
+        # In REDUCE mode: applies sizing multiplier (more adaptive)
+        # =====================================================================
+        if session_name and direction:
+            is_toxic, toxic_reason = ToxicCombinationBlock.is_blocked(session_name, direction)
+            if is_toxic:
+                result.should_trade = False
+                result.block_reason = toxic_reason
+                result.tags['toxic_combo_blocked'] = True
+                result.tags['toxic_combo'] = f"{session_name}_{direction}"
+                return result
+            
+            # Apply REDUCE multiplier if in REDUCE mode
+            result.toxic_combo_mult = ToxicCombinationBlock.get_multiplier(session_name, direction)
+            if result.toxic_combo_mult < 1.0:
+                result.tags['toxic_combo_reduced'] = True
+                result.tags['toxic_combo'] = f"{session_name}_{direction}"
+                result.tags['toxic_combo_mult'] = result.toxic_combo_mult
+        
+        # =====================================================================
+        # 🔥 NEW (Feb 2, 2026): TOXIC HOUR MULTIPLIER
+        # Reduce size 50% during hours 0, 4, 21, 23 UTC
+        # =====================================================================
+        if market_time is not None:
+            result.toxic_hour_mult = ToxicHourMultiplier.from_datetime(market_time)
+            result.tags['toxic_hour_mult'] = result.toxic_hour_mult
+            result.tags['entry_hour_utc'] = market_time.hour
+        
+        # =====================================================================
+        # 🔥 NEW (Feb 2, 2026): MOMENTUM SIZING MULTIPLIER
+        # Boost high momentum (>=1.5) by 1.2x, reduce low (<0.5) by 0.5x
+        # =====================================================================
+        result.momentum_mult = MomentumSizingMultiplier.get_multiplier(momentum_score)
+        result.tags['momentum_score'] = momentum_score
+        result.tags['momentum_mult'] = result.momentum_mult
         
         # =====================================================================
         # 🔥 INTRADAY vs INSTITUTIONAL: Filtros diferentes
@@ -390,17 +720,18 @@ class SimplifiedSizer:
         result.tags['consecutive_losses'] = consecutive_losses
         
         # 4. SESSION - INTRADAY NO bloquea por poor session
+        # 🔄 REFACTORED Feb 04: Use SessionQuality centralized class
+        from src.config.trading_config import SessionQuality
+        
         if is_intraday:
-            # INTRADAY: no bloquea, solo reduce size
-            if session_quality == 'poor':
+            # INTRADAY: no bloquea, solo reduce size  
+            if SessionQuality.is_quality_blocked(session_quality):
                 session_mult = INTRADAY_SESSION_POOR_MULT  # 0.5x
                 session_block = False
                 logger.info(f"⚡ INTRADAY: Poor session - size reduced to 50%")
-            elif session_quality == 'moderate':
-                session_mult = 0.8
-                session_block = False
             else:
-                session_mult = 1.0
+                # Use centralized multiplier map
+                session_mult = SessionQuality.get_quality_size_mult(session_quality)
                 session_block = False
         else:
             # INSTITUTIONAL: poor session = BLOCK
@@ -430,13 +761,16 @@ class SimplifiedSizer:
         if result.is_provisional:
             result.tags['edge_mode_provisional'] = True
         
-        # 6. COMBINED MULTIPLIER (now includes edge mode)
+        # 6. COMBINED MULTIPLIER (includes all adaptive filters)
         result.combined_multiplier = (
             result.rr_mult *
             result.regime_mult *
             result.loss_streak_mult *
             result.session_mult *
-            result.edge_mult  # NEW: Edge mode multiplier
+            result.edge_mult *          # Edge mode multiplier
+            result.toxic_hour_mult *    # Toxic hour multiplier
+            result.toxic_combo_mult *   # Toxic combo multiplier (REDUCE mode)
+            result.momentum_mult        # Momentum predictor multiplier
         )
         
         # Calculate base size from risk
@@ -460,13 +794,17 @@ class SimplifiedSizer:
             result.tags['min_size_applied'] = True
         
         # Log the calculation
+        toxic_hour_log = f" × TOXIC_HR={result.toxic_hour_mult:.2f}" if result.toxic_hour_mult < 1.0 else ""
+        toxic_combo_log = f" × TOXIC_COMBO={result.toxic_combo_mult:.2f}" if result.toxic_combo_mult < 1.0 else ""
+        momentum_log = f" × MOM={result.momentum_mult:.2f}" if result.momentum_mult != 1.0 else ""
         logger.info(
             f"📊 SIMPLIFIED SIZING [{edge_mode}]: "
             f"RR={result.rr_mult:.2f} × "
             f"REG={result.regime_mult:.2f} × "
             f"LOSS={result.loss_streak_mult:.2f} × "
             f"SESS={result.session_mult:.2f} × "
-            f"EDGE={result.edge_mult:.2f} = "
+            f"EDGE={result.edge_mult:.2f}"
+            f"{toxic_hour_log}{toxic_combo_log}{momentum_log} = "
             f"{result.combined_multiplier:.2f} → "
             f"{result.final_size:.6f} BTC"
         )
@@ -523,7 +861,7 @@ class SimplifiedExitConfig:
     # Time Invalidation - Simplified
     TIME_INVALIDATION_MINUTES = 60  # 60 min flat (INSTITUTIONAL)
     TIME_INVALIDATION_INTRADAY_MIN = 5  # 5 min for INTRADAY
-    TIME_INVALIDATION_MAX_LOSS_R = -0.5  # Only close if losing
+    TIME_INVALIDATION_MAX_LOSS_R = -0.20  # 🔥 FIX: -0.20R (was -0.50R!)
     
     # Stop Loss - No change (structural)
     SL_STRUCTURAL = True  # Use structural SL always
@@ -557,7 +895,9 @@ class SimplifiedExitConfig:
         
         # 🔥 FIX: REGIME is primary, NOT edge_type
         # This prevents TP inconsistency between ticks
-        if regime_str.upper() in ('RANGE', 'RANGING') or (adx is not None and adx < 18):
+        # 🔄 REFACTORED Feb 04: Use ADXThresholds
+        from src.config.trading_config import ADXThresholds
+        if regime_str.upper() in ('RANGE', 'RANGING') or (adx is not None and adx < ADXThresholds.RANGE):
             # RANGE mode - conservative TP
             return cls.TP_R_RANGE  # 1.0R
         

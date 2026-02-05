@@ -83,11 +83,19 @@ class MomentumExhaustionDetector:
     ATR_CONTRACTION_PCT = 0.8     # ATR < 80% of peak
     VELOCITY_DECAY_PCT = 0.5      # Velocity < 50% of peak
     
+    # Rate-limiting for logging (Fix #8 - Feb 2, 2026)
+    LOG_INTERVAL_SECONDS = 30  # Only log every 30 seconds unless state changes
+    
     def __init__(self):
         self._last_state = ExhaustionState()
         self._move_start_time: Optional[datetime] = None
         self._peak_atr: float = 0.0
         self._peak_velocity: float = 0.0
+        # Rate-limiting state (Fix #8 - Feb 2, 2026)
+        self._last_log_time: Optional[datetime] = None
+        self._last_logged_level: Optional[ExhaustionLevel] = None
+        self._last_logged_action: Optional[str] = None
+        self._last_logged_signal_count: int = 0
     
     def _detect_volume_climax(self, df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
         """
@@ -444,10 +452,33 @@ class MomentumExhaustionDetector:
             exit_urgency=urgency
         )
         
+        # 🔥 FIX #8 (Feb 2, 2026): Rate-limited logging to reduce log spam
+        # Only log if: state changed OR 30 seconds elapsed since last log
+        should_log = False
+        now = datetime.now()
+        
         if signal_count > 0:
-            logger.info(f"⚡ EXHAUSTION [{level.value}]: {signal_count} signals | Action: {action}")
-            for sig in signals:
-                logger.info(f"   {sig}")
+            state_changed = (
+                level != self._last_logged_level or
+                action != self._last_logged_action or
+                signal_count != self._last_logged_signal_count
+            )
+            time_elapsed = (
+                self._last_log_time is None or
+                (now - self._last_log_time).total_seconds() >= self.LOG_INTERVAL_SECONDS
+            )
+            
+            should_log = state_changed or time_elapsed
+            
+            if should_log:
+                logger.info(f"⚡ EXHAUSTION [{level.value}]: {signal_count} signals | Action: {action}")
+                for sig in signals:
+                    logger.info(f"   {sig}")
+                # Update rate-limiting state
+                self._last_log_time = now
+                self._last_logged_level = level
+                self._last_logged_action = action
+                self._last_logged_signal_count = signal_count
         
         return self._last_state
     
@@ -461,6 +492,11 @@ class MomentumExhaustionDetector:
         self._peak_atr = 0.0
         self._peak_velocity = 0.0
         self._last_state = ExhaustionState()
+        # Reset rate-limiting state (Fix #8 - Feb 2, 2026)
+        self._last_log_time = None
+        self._last_logged_level = None
+        self._last_logged_action = None
+        self._last_logged_signal_count = 0
 
 
 # Singleton

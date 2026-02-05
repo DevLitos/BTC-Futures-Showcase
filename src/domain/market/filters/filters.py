@@ -159,12 +159,13 @@ class BlackSwanFilter:
     """
     Filter for extreme price movements (Cisne Negro)
     
-    IMPROVED VERSION:
+    IMPROVED VERSION (Feb 05, 2026):
     - Defensive mode at 3x ATR (reduce size, don't block)
     - Full cooldown only with spike + reversal (4x ATR + high wick)
     - Cooldown doesn't restart if already active
     - Uses ATR from higher timeframe when available
     - ALL time logic uses market_time parameter (same code for live and backtest)
+    - 🔥 NEW: Coordinates with regime blocks to avoid redundant defensive mode
     """
     
     def __init__(self):
@@ -174,10 +175,14 @@ class BlackSwanFilter:
         # 🔥 FIX (Jan 29, 2026): Throttle defensive mode reactivation logs
         self._last_defensive_activation: Optional[datetime] = None
         self._defensive_activation_min_interval = 120  # Seconds between log messages
+        # 🔥 FIX (Feb 05, 2026): Track suppression state
+        self._defensive_suppressed: bool = False
+        self._defensive_suppression_reason: str = ""
     
     def check(self, price_change: float, atr: float, market_time: datetime,
               candle_high: float | None = None, candle_low: float | None = None,
-              candle_open: float | None = None, candle_close: float | None = None) -> Tuple[bool, str]:
+              candle_open: float | None = None, candle_close: float | None = None,
+              regime_blocked: bool = False, regime_block_reason: str = "") -> Tuple[bool, str]:
         """
         Check for black swan conditions
         
@@ -186,6 +191,8 @@ class BlackSwanFilter:
             atr: ATR value (preferably 5m for stability)
             market_time: Current market time (REQUIRED - never use datetime.now())
             candle_high/low/open/close: For wick ratio calculation
+            regime_blocked: 🔥 NEW - If True, suppress defensive mode logs (regime already blocking)
+            regime_block_reason: 🔥 NEW - Reason for regime block (for logging)
         
         Returns: (is_black_swan: bool, reason: str)
         """
@@ -203,6 +210,7 @@ class BlackSwanFilter:
         if self.defensive_until and market_time >= self.defensive_until:
             self.defensive_mode = False
             self.defensive_until = None
+            self._defensive_suppressed = False
             # Only log if we were actually in defensive mode recently
             if self._last_defensive_activation and \
                (market_time - self._last_defensive_activation).total_seconds() < 600:
@@ -228,6 +236,14 @@ class BlackSwanFilter:
         defensive_threshold = KillConditions.DEFENSIVE_MODE_MULTIPLIER * atr
         
         if abs_change >= defensive_threshold:
+            # 🔥 FIX #28 (Feb 05, 2026): Suppress defensive mode if regime already blocking
+            # This avoids redundant logs like "DEFENSIVE MODE" when HARD BLOCK is active
+            if regime_blocked:
+                self._defensive_suppressed = True
+                self._defensive_suppression_reason = regime_block_reason
+                # Still track internally but don't activate/log
+                return False, f"DEFENSIVE (suppressed - {regime_block_reason})"
+            
             self._activate_defensive_mode(market_time)
             # Return False - not a full block, just defensive
             return False, f"DEFENSIVE MODE: {abs_change:.0f} >= {defensive_threshold:.0f} (3x ATR)"

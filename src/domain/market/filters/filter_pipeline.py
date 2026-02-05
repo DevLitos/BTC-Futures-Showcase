@@ -24,10 +24,14 @@ Updated: January 18, 2026 - Phase A sobreprotección fix
 import numpy as np
 import pandas as pd
 from typing import Optional, Dict, Any, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 
 from src.domain.market.filters.filter_interface import FilterDecision, FilterPipeline, BaseFilter
+
+# FIX #41: Rate limiting for filter log spam
+_last_filter_log: dict[str, datetime] = {}
+_filter_log_interval = timedelta(minutes=2)
 from src.domain.market.filters.bb_width_filter import BBWidthFilter, get_bb_width_filter
 from src.domain.market.filters.volatility_shock_filter import VolatilityShockFilter, get_volatility_shock_filter
 from src.domain.market.filters.macro_trend_filter import MacroTrendFilter, get_macro_trend_filter
@@ -120,6 +124,7 @@ class EntryFilterPipeline:
                  market_time: datetime | None = None,
                  regime_mode: str = 'TREND',  # 🔥 FIX (Jan 22): Added regime_mode parameter
                  displacement_bypass: bool = False,  # 🔥 FIX (Jan 29): Bypass sweep on displacement
+                 anticipation_bypass: bool = False,  # 🔥 FIX #46 (Feb 05): ANTICIPATION bypasses macro slope
                  
                  # Control
                  early_exit: bool = True) -> FilterDecision:
@@ -192,12 +197,16 @@ class EntryFilterPipeline:
         if self.macro_trend_filter.enabled and bias:
             # 🔥 FIX (Jan 22): Use regime_mode parameter directly
             # In RANGE mode, macro slope never hard-blocks (only penalizes)
+            # 🔥 FIX (Feb 3): Pass displacement_bypass to skip hard veto during volatility shocks
+            # 🔥 FIX #46 (Feb 05): ANTICIPATION bypasses macro slope (reduces size instead of blocking)
             decision = self.macro_trend_filter.evaluate(
                 df_15m=df_15m,
                 df_1h=df_1h,
                 current_price=current_price,
                 bias=bias,
-                regime_mode=regime_mode
+                regime_mode=regime_mode,
+                displacement_bypass=displacement_bypass,
+                anticipation_bypass=anticipation_bypass
             )
             decision.regime_source = 'macro_trend'  # Mark source for dedup
             self._last_decisions['macro_trend'] = decision
@@ -207,7 +216,13 @@ class EntryFilterPipeline:
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'macro_trend'
                 self._last_aggregate = aggregate
-                logger.warning(f"[BLOCK] FILTER [macro]: {decision.reasons[0] if decision.reasons else 'veto'}")
+                # 🔥 FIX #47 (Feb 05): Rate-limit macro block log to reduce spam
+                log_key = f'macro_{bias}'
+                now = datetime.utcnow()
+                last_log = _last_filter_log.get(log_key)
+                if last_log is None or (now - last_log) > _filter_log_interval:
+                    _last_filter_log[log_key] = now
+                    logger.warning(f"[BLOCK] FILTER [macro]: {decision.reasons[0] if decision.reasons else 'veto'}")
                 return aggregate
         
         # ===== 4. POST-SWEEP CONFIRMATION =====
@@ -230,7 +245,13 @@ class EntryFilterPipeline:
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'post_sweep'
                 self._last_aggregate = aggregate
-                logger.warning(f"[BLOCK] FILTER [sweep]: {decision.reasons[0] if decision.reasons else 'blocked'}")
+                # FIX #41: Rate-limit log spam
+                log_key = f'sweep_{bias}'
+                now = datetime.utcnow()
+                last_log = _last_filter_log.get(log_key)
+                if last_log is None or (now - last_log) > _filter_log_interval:
+                    _last_filter_log[log_key] = now
+                    logger.warning(f"[BLOCK] FILTER [sweep]: {decision.reasons[0] if decision.reasons else 'blocked'}")
                 return aggregate
         
         # ===== 5. COST FILTER (if we have SL/TP) =====

@@ -9,6 +9,247 @@ from datetime import datetime, UTC
 
 
 # ============================================================================
+# ADX THRESHOLDS (Feb 04, 2026 - AUDIT FIX)
+# SINGLE SOURCE OF TRUTH for all ADX-based decisions
+# ============================================================================
+class ADXThresholds:
+    """
+    Centralized ADX thresholds used throughout the system.
+    
+    USAGE:
+    - Import ADXThresholds and use class attributes instead of hardcoded values
+    - This prevents inconsistencies (18 vs 20 vs 25 scattered across files)
+    
+    REGIME CLASSIFICATION:
+    - RANGE: ADX < RANGE (18) → Choppy, mean-reversion trades only
+    - TRANSITION: ADX 18-20 → Cautious, reduced size
+    - TREND: ADX > TREND (20) → Trend-following strategies active
+    - STRONG_TREND: ADX > STRONG (25) → Full conviction, can hold runners
+    
+    PREVIOUSLY SCATTERED ACROSS:
+    - trading_config.py: 18, 20
+    - edge_state_manager.py: 25
+    - entry_orchestrator.py: 20, 25
+    - simplified_sizing.py: 18
+    - trading_app.py: 18, 20, 25
+    """
+    
+    # Core thresholds
+    RANGE = 18              # Below this = RANGE/CHOP mode
+    TRANSITION = 20         # Between RANGE and TREND
+    TREND = 20              # Above this = TREND mode
+    STRONG_TREND = 25       # Above this = STRONG TREND (runners OK)
+    
+    # Edge-specific thresholds
+    INTRADAY_EDGE_MIN = 25  # Minimum for intraday edge confirmation
+    DISPLACEMENT_EDGE = 20  # For displacement-based edges
+    
+    # 🔥 NEW (Feb 04): RANGE edge more flexible
+    # RANGE edge can activate when ADX < 25 (not just < 18)
+    # This allows mean-reversion trades in "soft trend" conditions
+    RANGE_EDGE_MAX = 25     # RANGE edge allowed when ADX < 25
+    
+    # Defaults for missing values
+    DEFAULT = 20.0          # Default ADX when unavailable
+    
+    @classmethod
+    def is_ranging(cls, adx: float) -> bool:
+        """Check if ADX indicates ranging market."""
+        return adx < cls.RANGE
+    
+    @classmethod
+    def is_trending(cls, adx: float) -> bool:
+        """Check if ADX indicates trending market."""
+        return adx >= cls.TREND
+    
+    @classmethod
+    def is_strong_trend(cls, adx: float) -> bool:
+        """Check if ADX indicates strong trend."""
+        return adx >= cls.STRONG_TREND
+    
+    @classmethod
+    def get_regime(cls, adx: float) -> str:
+        """Get regime name based on ADX value."""
+        if adx < cls.RANGE:
+            return 'RANGE'
+        elif adx < cls.TREND:
+            return 'TRANSITION'
+        elif adx < cls.STRONG_TREND:
+            return 'TREND'
+        else:
+            return 'STRONG_TREND'
+    
+    @classmethod
+    def get_size_mult(cls, adx: float) -> float:
+        """Get sizing multiplier based on ADX regime."""
+        if adx < cls.RANGE:
+            return 0.5  # Half size in range
+        elif adx < cls.TREND:
+            return 0.7  # 70% in transition
+        else:
+            return 1.0  # Full size in trend
+
+
+# ============================================================================
+# SCORE ADJUSTMENTS (Feb 04, 2026) - AUDIT FIX
+# Centralizes ALL score adjustments dispersed across multiple files
+# 
+# BEFORE: Penalties defined in 3+ places with inconsistent values
+# NOW: Single source of truth for all score modifications
+# ============================================================================
+class ScoreAdjustments:
+    """
+    Centralized score adjustment values and methods.
+    
+    Replaces scattered adjustments in:
+    - entry_orchestrator.py (SOFT_MODE_SCORE_PENALTY)
+    - entry_scorer.py (micro_trend_adj, filter_pipeline_adj, etc.)
+    - trading_config.py (DailyRegimeDetector.score_adjust)
+    - BiasStrengthConfig (SCORE_PENALTY_*)
+    
+    All adjustments are negative for penalties, positive for bonuses.
+    """
+    
+    # =========================================================================
+    # REGIME-BASED ADJUSTMENTS (from DailyRegimeDetector)
+    # =========================================================================
+    TREND_DAY_ADJUST = 0.0       # Normal threshold
+    RANGE_DAY_ADJUST = +1.0      # Stricter (need higher score in range)
+    TRANSITION_DAY_ADJUST = +0.5 # Slightly stricter
+    
+    # =========================================================================
+    # MODE-BASED PENALTIES (from entry_orchestrator)
+    # =========================================================================
+    SOFT_MODE_PENALTY = -1.5     # When in SOFT mode (borderline entries)
+    DISCOVERY_MODE_PENALTY = -0.5  # When in discovery mode
+    
+    # =========================================================================
+    # MICRO-TREND ADJUSTMENTS (from trading_app/micro_trend_filter)
+    # =========================================================================
+    MICRO_TREND_ALIGNED_BONUS = +0.5   # When micro-trend aligns with bias
+    MICRO_TREND_OPPOSE_PENALTY = -1.0  # When micro-trend opposes bias
+    MICRO_TREND_RANGE_CAP = 0.5        # Max adjustment in range markets
+    
+    # =========================================================================
+    # MOMENTUM PENALTIES (from BiasStrengthConfig)
+    # =========================================================================
+    BULLISH_CONTEXT_MILD = -0.15      # 1-2 bullish signals when shorting
+    BULLISH_CONTEXT_MODERATE = -0.25  # 3 bullish signals
+    BULLISH_CONTEXT_SEVERE = -0.5     # 4+ bullish signals
+    
+    # =========================================================================
+    # FILTER PIPELINE ADJUSTMENTS (from filter decisions)
+    # =========================================================================
+    FILTER_BLOCK_PENALTY = -2.0    # Hard block from filters
+    FILTER_WARNING_PENALTY = -0.5  # Warning from filters
+    
+    # =========================================================================
+    # LATE CONFIRMATION PENALTIES
+    # =========================================================================
+    LATE_CONFIRMATION_MILD = -0.3     # Slightly late entry
+    LATE_CONFIRMATION_SEVERE = -0.75  # Very late entry
+    
+    # =========================================================================
+    # VOLUME PENALTIES
+    # =========================================================================
+    LOW_VOLUME_PENALTY = -0.5     # rel_vol < 0.6
+    
+    # =========================================================================
+    # ADX SLOPE PENALTIES
+    # =========================================================================
+    ADX_DECLINING_PENALTY = -0.25  # ADX slope < -0.5 (momentum dying)
+    
+    @classmethod
+    def get_regime_adjustment(cls, regime: str) -> float:
+        """Get score adjustment for daily regime."""
+        adjustments = {
+            'TREND_DAY': cls.TREND_DAY_ADJUST,
+            'RANGE_DAY': cls.RANGE_DAY_ADJUST,
+            'TRANSITION_DAY': cls.TRANSITION_DAY_ADJUST,
+        }
+        return adjustments.get(regime, 0.0)
+    
+    @classmethod
+    def get_bullish_context_penalty(cls, bullish_signals: int) -> float:
+        """Get penalty for shorting in bullish context."""
+        if bullish_signals <= 1:
+            return 0.0
+        elif bullish_signals == 2:
+            return cls.BULLISH_CONTEXT_MILD
+        elif bullish_signals == 3:
+            return cls.BULLISH_CONTEXT_MODERATE
+        else:
+            return cls.BULLISH_CONTEXT_SEVERE
+    
+    @classmethod
+    def calculate_total_adjustment(
+        cls,
+        regime: str = 'TREND_DAY',
+        is_soft_mode: bool = False,
+        is_discovery: bool = False,
+        micro_trend_aligned: bool = False,
+        micro_trend_opposed: bool = False,
+        is_range: bool = False,
+        bullish_signals: int = 0,
+        filter_warning: bool = False,
+        is_late: bool = False,
+        is_very_late: bool = False,
+        low_volume: bool = False,
+        adx_declining: bool = False
+    ) -> float:
+        """
+        Calculate total score adjustment from all factors.
+        
+        Returns total adjustment (can be positive or negative).
+        """
+        total = 0.0
+        
+        # Regime adjustment
+        total += cls.get_regime_adjustment(regime)
+        
+        # Mode penalties
+        if is_soft_mode:
+            total += cls.SOFT_MODE_PENALTY
+        if is_discovery:
+            total += cls.DISCOVERY_MODE_PENALTY
+        
+        # Micro-trend adjustments
+        if micro_trend_aligned:
+            adj = cls.MICRO_TREND_ALIGNED_BONUS
+            if is_range:
+                adj = min(cls.MICRO_TREND_RANGE_CAP, adj)
+            total += adj
+        elif micro_trend_opposed:
+            adj = cls.MICRO_TREND_OPPOSE_PENALTY
+            if is_range:
+                adj = max(-cls.MICRO_TREND_RANGE_CAP, adj)
+            total += adj
+        
+        # Bullish context penalty (when shorting)
+        total += cls.get_bullish_context_penalty(bullish_signals)
+        
+        # Filter warnings
+        if filter_warning:
+            total += cls.FILTER_WARNING_PENALTY
+        
+        # Late confirmation
+        if is_very_late:
+            total += cls.LATE_CONFIRMATION_SEVERE
+        elif is_late:
+            total += cls.LATE_CONFIRMATION_MILD
+        
+        # Volume penalty
+        if low_volume:
+            total += cls.LOW_VOLUME_PENALTY
+        
+        # ADX declining
+        if adx_declining:
+            total += cls.ADX_DECLINING_PENALTY
+        
+        return total
+
+
+# ============================================================================
 # DAILY REGIME DETECTOR (Jan 23, 2026) - IMPRESCINDIBLE
 # Determina si hoy es "día de tendencia" o "día de rango" al inicio
 # Esto cambia TODO el comportamiento del bot para el día
@@ -39,8 +280,9 @@ class DailyRegimeDetector:
     # Classification thresholds
     RANGE_ATR_THRESHOLD = 1.0       # Daily range < 1.0x ATR = RANGE DAY
     TREND_ATR_THRESHOLD = 1.5       # Daily range > 1.5x ATR = TREND DAY
-    ADX_RANGE_THRESHOLD = 18        # Daily ADX < 18 = RANGE DAY
-    ADX_TREND_THRESHOLD = 20        # Daily ADX > 20 = TREND DAY
+    # 🔄 REFACTOR Feb 04: Use centralized ADXThresholds
+    ADX_RANGE_THRESHOLD = ADXThresholds.RANGE   # 18 - Daily ADX < 18 = RANGE DAY
+    ADX_TREND_THRESHOLD = ADXThresholds.TREND   # 20 - Daily ADX > 20 = TREND DAY
     
     # Behavior modifications per daily regime
     DAILY_REGIME_CONFIG = {
@@ -159,15 +401,17 @@ class AsymmetryConfig:
     MAX_STOP_R = 1.0                 # Stop máximo = 1.0R (igual que TP)
     
     # TIME_INVALIDATION: EXIT RÁPIDO SI NO FUNCIONA
-    # 🔥 FIX (Jan 25, 2026): 5 candles was too aggressive - cutting winners
-    # Data shows trades need 7-10 min to develop in RANGE regime
-    TIME_INVALIDATION_CANDLES = 8   # 8 velas 1m = 8 min (was 5 - too tight)
+    # 🔥 FIX (Feb 04, 2026): TIME_INVALIDATION_MAX_LOSS = -10.27R (27 trades)
+    # Avg loss was -0.38R when limit was -0.30R. Code allowed -0.50R/-0.60R for
+    # DISPLACEMENT/RANGE. This destroyed all gains (+8.56R from other trades).
+    # SOLUTION: Much stricter limits across the board.
+    TIME_INVALIDATION_CANDLES = 8   # 8 velas 1m = 8 min
     TIME_INVALIDATION_EXIT_R = 0.0  # Target: salir en breakeven o mejor
-    TIME_INVALIDATION_MAX_LOSS_R = -0.30  # 🔥 FIX: -0.30R max (was -0.25R)
+    TIME_INVALIDATION_MAX_LOSS_R = -0.20  # 🔥 FIX: -0.20R (was -0.30R) - cut faster!
     
     # === PÉRDIDA MÁXIMA ABSOLUTA ===
     # Si llegamos aquí, algo falló (slippage, gap, etc.)
-    ABSOLUTE_MAX_LOSS_R = -0.35     # NUNCA perder más de -0.35R
+    ABSOLUTE_MAX_LOSS_R = -0.25     # 🔥 FIX: NUNCA perder más de -0.25R (was -0.35R)
     
     # === RUNNERS (SOLO EN TREND DAYS) ===
     ALLOW_RUNNERS = False           # Default OFF
@@ -647,11 +891,48 @@ class OperatingMode:
     PRODUCTION: Full filters, dynamic sizing, strict gates
     
     NEVER mix logic with loose ifs - everything depends on MODE
+    
+    🔥 FIX (Feb 03, 2026): MODE is now DYNAMIC based on trade count
+    - First 100 trades: DISCOVERY (learning, conservative)
+    - After 100 trades: PRODUCTION (proven edge, full sizing)
+    This is an INTRADAY system - we learn fast.
     """
-    MODE = "DISCOVERY"  # "DISCOVERY" or "PRODUCTION"
+    _MODE_OVERRIDE = None  # Set to "DISCOVERY" or "PRODUCTION" to force
+    TRADE_THRESHOLD_FOR_PRODUCTION = 100  # Switch to PRODUCTION after this many trades
+    
+    @classmethod
+    def get_mode(cls) -> str:
+        """Get current operating mode - dynamic based on trade count."""
+        if cls._MODE_OVERRIDE:
+            return cls._MODE_OVERRIDE
+        
+        # Check trade count from storage
+        try:
+            from pathlib import Path
+            import json
+            trades_dir = Path('/home/trading/traderAgents/FideiRatioCapital/systems/btc/trade_logs')
+            total_trades = 0
+            for f in trades_dir.glob('trades_*.jsonl'):
+                with open(f) as fh:
+                    total_trades += sum(1 for _ in fh)
+            
+            if total_trades >= cls.TRADE_THRESHOLD_FOR_PRODUCTION:
+                return "PRODUCTION"
+            return "DISCOVERY"
+        except Exception:
+            return "DISCOVERY"
+    
+    # Legacy property for backward compatibility
+    MODE = property(lambda self: OperatingMode.get_mode())
     
     # Mode-specific thresholds
-    DISCOVERY_SCORE_THRESHOLD = 4   # More permissive (was 5 - too restrictive)
+    # 🔥 FIX (Feb 01, 2026): Data-driven threshold adjustment
+    # Analysis of 62 trades shows:
+    # - Score < 5: 16.7% win rate, -1.36R net (6 trades)
+    # - Score >= 5: ~50% win rate, positive edge
+    # - FAST_PATH (score=0): 37.5% win rate, +0.42R (separate edge, exempt)
+    # Optimal threshold from simulation: 5.0 saves +1.36R
+    DISCOVERY_SCORE_THRESHOLD = 5   # 🔥 Raised from 4 based on log analysis (Feb 01)
     PRODUCTION_SCORE_THRESHOLD = 7  # Stricter
     
     # Risk per trade by mode
@@ -758,14 +1039,19 @@ class OperatingMode:
     # =========================================================================
     # DAY OF WEEK SIZING - Reduce on riskier days
     # =========================================================================
+    # 🔥 FIX (Feb 01, 2026): Data-driven weekend reduction
+    # Data analysis: Weekend 29 trades, 37.9% win, -0.62R total (avg -0.021R/trade)
+    #                Weekday 33 trades, 42.4% win, +0.42R total (avg +0.013R/trade)
+    # TIME_INVALIDATION_MAX_LOSS on weekend: 11 trades, -3.98R (main loss driver)
+    # Solution: Reduce weekend sizing from 0.60 → 0.40 to limit exposure
     DAY_OF_WEEK_MULTIPLIERS = {
         0: 1.0,    # Monday - normal
         1: 1.0,    # Tuesday - good trends
         2: 1.0,    # Wednesday - normal
         3: 1.0,    # Thursday - normal
         4: 0.85,   # Friday - early close risk, reduce
-        5: 0.60,   # Saturday - weekend, low liquidity
-        6: 0.60,   # Sunday - weekend, low liquidity
+        5: 0.40,   # Saturday - weekend, low liquidity, high TIME_INV losses
+        6: 0.40,   # Sunday - weekend, low liquidity, high TIME_INV losses
     }
     
     @classmethod
@@ -835,7 +1121,7 @@ class OperatingMode:
     
     @classmethod
     def is_discovery(cls) -> bool:
-        return cls.MODE == "DISCOVERY"
+        return cls.get_mode() == "DISCOVERY"
     
     @classmethod
     def get_score_threshold(cls) -> int:
@@ -998,10 +1284,20 @@ class EntryGateConfig:
     
     # SCORE-BASED SIZING (replaces binary threshold)
     # Graduated sizing based on score quality
-    # FIX (Jan 24, 2026): Further lowered - bot was paralyzed with 0 trades in 9h
-    SCORE_BLOCK_FLOOR = 3.5          # Below this = block (was 4.0 - still too high)
-    SCORE_PROBE_MAX = 4.5            # 3.5-4.5 = probe (0.25x) (was 5.0)
-    SCORE_REDUCED_MAX = 5.5          # 4.5-5.5 = reduced (0.5x) (was 6.0)
+    # 
+    # 🔥 FIX (Feb 01, 2026): Data-driven score thresholds from 62 trade analysis
+    # Analysis results:
+    # - Score < 4.5: 4 trades, 0% win rate, -1.18R net → BLOCK
+    # - Score 4.5-5.0: 2 trades, 50% win rate, -0.18R net → PROBE only
+    # - Score >= 5.0: ~50% win rate, positive edge
+    # - FAST_PATH (score=0): 37.5% win rate, +0.42R (exempt, separate logic)
+    #
+    # CHANGE: Raised SCORE_BLOCK_FLOOR from 3.5 → 4.5 based on empirical data
+    # This blocks the 4 losing trades while keeping the 1 winner in probe
+    #
+    SCORE_BLOCK_FLOOR = 4.5          # 🔥 Raised from 3.5 based on log analysis
+    SCORE_PROBE_MAX = 5.0            # 4.5-5.0 = probe (0.25x) - marginal quality
+    SCORE_REDUCED_MAX = 5.5          # 5.0-5.5 = reduced (0.5x)
     # Above 5.5 = full size (1.0x)
     
     # RR-BASED SIZING
@@ -1195,10 +1491,14 @@ class RangeModeConfig:
     
     # =========================================================================
     # ADX THRESHOLDS FOR MODE CLASSIFICATION
+    # 🔥 FIX (Feb 04, 2026): Aligned with RiskManagement thresholds
+    # ADX < 18 = RANGE (no trend)
+    # ADX 18-22 = TRANSITION (weak trend developing)
+    # ADX > 22 = TREND (tradeable trend)
     # =========================================================================
     ADX_RANGE_MAX = 18              # ADX < 18 = RANGE
-    ADX_TRANSITION_MAX = 20         # ADX 18-20 = TRANSITION
-    # ADX > 20 = TREND
+    ADX_TRANSITION_MAX = 22         # ADX 18-22 = TRANSITION (was 20 - too narrow)
+    # ADX > 22 = TREND
     
     @classmethod
     def get_trading_mode(cls, adx: float) -> str:
@@ -1429,6 +1729,115 @@ class RiskManagement:
     # New: 50% TP1 + 30% TP2 + 20% runner con trailing estructural
     SMART_PARTIALS_ENABLED = True
     
+    # =========================================================================
+    # 🔥 EARLY PARTIAL - CALIBRADO PARA INTRADÍA BTC (Feb 2, 2026)
+    # =========================================================================
+    # FILOSOFÍA: Asegurar algo de profit sin cortar ganadores prematuramente
+    # 
+    # PROBLEMA ORIGINAL: Trades llegan a +0.5R y luego pierden
+    # PERO: +0.5R es MUY temprano - muchos trades buenos hacen pullback ahí
+    # 
+    # SOLUCIÓN CALIBRADA:
+    # - EARLY_PARTIAL_R = 0.7R (no 0.5R - dar más espacio)
+    # - EARLY_PARTIAL_PCT = 30% (no 50% - dejar más para runners)
+    # - EARLY_PARTIAL_MOVE_SL = False (no mover a BE aún - R_LOCK lo maneja)
+    # 
+    # Con estos settings:
+    # - A +0.7R, tomas 30% y aseguras +0.21R
+    # - El R_LOCK ya habrá movido stop a -0.20R (desde 0.5R MFE)
+    # - El 70% restante tiene espacio para continuar a +1R+
+    EARLY_PARTIAL_ENABLED = True
+    EARLY_PARTIAL_R = 0.7           # Take partial at +0.7R (not too early)
+    EARLY_PARTIAL_PCT = 30          # Close 30% (leave 70% for runners)
+    EARLY_PARTIAL_MOVE_SL = False   # Don't move to BE yet - let R_LOCK handle
+    
+    # =========================================================================
+    # 🔥 NEW (Feb 2, 2026): ADAPTIVE SIZING FILTERS
+    # =========================================================================
+    # These are based on Jan 20 - Feb 1 analysis but SHOULD BE RECALIBRATED
+    # periodically as market conditions change. 
+    # 
+    # ⚠️ IMPORTANT: These use small sample sizes (2-9 trades per bucket).
+    # Monitor effectiveness and adjust as needed.
+    # 
+    # To disable any filter, set ENABLED = False
+    # =========================================================================
+    
+    # --- TOXIC HOURS (hours with historical negative edge) ---
+    # 🔥 FIX (Feb 04, 2026): RELAXED - original hours included prime trading times (9, 13)
+    # Only truly dead/low-liquidity hours should be penalized:
+    # - 4-7 UTC: Dead zone between Asia close and London open
+    # - 21-23 UTC: Dead zone after NY close, before Asia
+    #
+    # Note: We use REDUCE (0.5x) not BLOCK - always allow trades
+    TOXIC_HOURS_ENABLED = True      # Keep enabled but relaxed
+    TOXIC_HOURS_SET = {4, 5, 6, 21, 22}  # 🔥 Only true dead hours
+    TOXIC_HOURS_MULT = 0.5          # 🔥 Increased from 0.25 to 0.5 (less aggressive)
+    
+    # --- TOXIC COMBOS (session+direction with negative edge) ---
+    # 🔥 FIX (Feb 04, 2026): DISABLED - blocking based on 7-8 trades is statistically meaningless
+    # The system was blocking 100% of trades during LONDON_NY_OVERLAP (5 hours/day!)
+    # This is over-optimization on noise. Better to trade and collect more data.
+    # 
+    # Original data (too small sample to draw conclusions):
+    # - LONDON_NY_OVERLAP + SHORT: -1.72R in 7 trades
+    # - LONDON_NY_OVERLAP + LONG: Unknown (added without data)
+    # - WEEKEND + LONG: -0.72R in 7 trades, 29% WR
+    #
+    # SOLUTION: Disable combo blocking entirely. Use REDUCE mode only if needed later.
+    # 🔥🔥🔥 TOXIC COMBOS COMPLETELY DISABLED (Feb 04, 2026) 🔥🔥🔥
+    # PROBLEM: Log showed "TOXIC COMBO BLOCK: LONDON_NY_OVERLAP + SHORT" blocking
+    # trades even with ENABLED=False. This cost us $30+ in a clear downtrend.
+    # SOLUTION: Triple-check disabled AND empty the set.
+    TOXIC_COMBOS_ENABLED = False    # MUST BE FALSE - NEVER BLOCK ON COMBOS
+    TOXIC_COMBOS_MODE = 'DISABLED'  # Changed from REDUCE to DISABLED
+    TOXIC_COMBOS_MULT = 1.0         # No reduction at all
+    TOXIC_COMBOS_SET = set()        # 🔥 EMPTY SET - no combos defined
+    
+    # --- WARMUP PERIOD (prevents trading immediately after startup) ---
+    # 🔥 NEW (Feb 04, 2026): System was entering trades on FIRST tick after startup
+    # This is dangerous - no market context gathered yet
+    WARMUP_ENABLED = True
+    WARMUP_MIN_TICKS = 60           # Minimum ticks before first trade (~60 seconds)
+    WARMUP_MIN_CANDLES = 3          # Minimum 1m candles to observe
+    
+    # --- DELTA CONTRADICT PENALTY ---
+    # 🔥🔥🔥 DISABLED (Feb 04, 2026): Delta is a LAGGING indicator!
+    # Log showed: Delta blocked SHORT at $72,657-$72,368 (during valid move)
+    #             Then allowed entry at $72,392 (the EXACT BOTTOM)
+    #             Result: -0.22R loss entering at minimum
+    # LESSON: Delta measures PAST volume, not FUTURE direction
+    # When price drops, buyers step in (positive delta) but price keeps falling
+    # This filter BLOCKS good entries and ALLOWS bad ones
+    DELTA_CONTRADICT_ENABLED = False           # 🔥 DISABLED - lagging indicator
+    DELTA_CONTRADICT_PENALTY_RANGE = 0.0       # No penalty
+    DELTA_CONTRADICT_PENALTY_TRANSITION = 0.0  # No penalty
+    DELTA_CONTRADICT_PENALTY_TREND = 0.0       # No penalty
+    DELTA_CONTRADICT_BLOCK_THRESHOLD = 999.0   # 🔥 Effectively disabled (was 1.5)
+    
+    # --- TRANSITION MODE REQUIREMENTS ---
+    # 🔥 REVISED (Feb 04, 2026): 6.0 was too high - blocking all TRANSITION trades
+    # TRANSITION with structural consensus should still trade, just with smaller size
+    TRANSITION_MIN_SCORE = 5.0      # Lowered from 6.0 - CONSENSUS means we CAN trade
+    TRANSITION_REQUIRE_LTF_3_OF_3 = False  # Require all 3 LTF confirmations? (relaxed)
+    TRANSITION_ALLOW_CONSENSUS = True  # Allow trades when structural=active even in TRANSITION
+    
+    # --- LOSS STREAK COOLDOWN ---
+    LOSS_STREAK_COOLDOWN_ENABLED = True
+    LOSS_STREAK_3_COOLDOWN_MIN = 15   # Minutes to wait after 3 losses
+    LOSS_STREAK_4_COOLDOWN_MIN = 30   # Minutes to wait after 4 losses
+    LOSS_STREAK_5_COOLDOWN_MIN = 60   # Minutes to wait after 5+ losses
+    
+    # --- MOMENTUM SIZING ---
+    MOMENTUM_SIZING_ENABLED = True
+    MOMENTUM_LOW_THRESHOLD = 0.5    # Below this = low momentum
+    MOMENTUM_HIGH_THRESHOLD = 1.5   # Above this = high momentum  
+    MOMENTUM_LOW_MULT = 0.5         # Sizing mult for low momentum
+    MOMENTUM_HIGH_MULT = 1.2        # Sizing mult for high momentum
+    
+    # --- TRAILING STOP IMPROVEMENT ---
+    TRAILING_STEP_07R_ENABLED = True  # Lock +0.3R at MFE >= 0.7R
+    
     # Distribución de parciales (debe sumar 100)
     PARTIAL_TP1_PCT = 50            # 50% → TP1 (bloqueas riesgo)
     PARTIAL_TP2_PCT = 30            # 30% → TP2 (estructura)
@@ -1452,6 +1861,46 @@ class RiskManagement:
     # Time filters - RELAXED to let trades run
     MAX_TRADE_DURATION_MINUTES = 90     # Max time in trade without TP1 (was 45)
     MIN_TRADE_DURATION_MINUTES = 60     # Minimum before considering time exit (was 30)
+    
+    # =========================================================================
+    # 🔥 NEW (Feb 2, 2026): FAST REVERSAL DETECTION
+    # =========================================================================
+    # Problem: System uses HH/HL/LL/LH scoring which requires 4+ candles to flip
+    # direction. When 5 bearish candles are followed by 1 strong bullish reversal,
+    # the system stays SHORT even though trend has reversed.
+    #
+    # Solution: Detect single-candle reversals based on:
+    # 1. Candle body size >= 1.5x ATR (strong conviction)
+    # 2. Candle direction opposes current bias
+    # 3. Engulfing pattern (covers previous candle)
+    # 4. Momentum shift (volume spike)
+    #
+    # When detected: Override micro_momentum to new direction
+    # =========================================================================
+    
+    FAST_REVERSAL_ENABLED = True        # Set False to disable
+    FAST_REVERSAL_MIN_BODY_ATR = 1.5    # 🔥 INCREASED from 1.2 - need stronger candle
+    FAST_REVERSAL_ENGULF_REQUIRED = True  # Require engulfing pattern
+    FAST_REVERSAL_VOLUME_MULT = 2.0     # 🔥 INCREASED from 1.5 - need stronger volume
+    FAST_REVERSAL_OVERRIDE_DURATION_TICKS = 15  # 🔥 REDUCED from 30 - shorter override
+    FAST_REVERSAL_REQUIRE_STRUCTURE_BREAK = True  # 🔥 NEW: Only flip if price breaks structure
+    
+    # =========================================================================
+    # 🔥 NEW (Feb 2, 2026): IMMEDIATE DIRECTION FLIP
+    # =========================================================================
+    # When a strong displacement occurs AGAINST current bias, immediately
+    # flip direction rather than waiting for EMA/structure to catch up.
+    #
+    # Criteria:
+    # - Price moves >= 0.5x ATR(5m) in opposite direction of current bias
+    # - Movement happens within 3 candles
+    # - Volume above average
+    # =========================================================================
+    
+    IMMEDIATE_FLIP_ENABLED = True        # Set False to disable
+    IMMEDIATE_FLIP_MIN_MOVE_ATR = 0.5    # Min move in ATR(5m) for immediate flip
+    IMMEDIATE_FLIP_MAX_CANDLES = 3       # Must happen within N candles
+    IMMEDIATE_FLIP_VOLUME_MULT = 1.2     # Min volume multiplier
 
 
 # ============================================================================
@@ -1653,9 +2102,12 @@ class FundingRateControl:
     # AUDITORÍA (Jan 9, 2026): RE-ENABLED with relaxed thresholds
     # Critical for live trading - protects from funding spikes
     # FIX (Jan 12, 2026): Raised thresholds - Kraken normal funding is ~0.10%
+    # 🔧 FIX #25 (Feb 02, 2026): Aumentar a 0.50% - funding de 0.12% bloqueaba casi todo
+    #    Kraken tiene funding rates más altos que Binance/Bybit
+    #    0.79% ocurre en mercados bullish y no debería bloquear completamente
     ENABLED = True
-    MAX_FUNDING_RATE_PCT = 0.12      # Entry threshold - block new LONGs above this
-    FORCE_EXIT_FUNDING_PCT = 0.20    # Force exit only at extreme funding (was 0.08 - too aggressive)
+    MAX_FUNDING_RATE_PCT = 0.50      # Entry threshold - block new LONGs above this (was 0.12)
+    FORCE_EXIT_FUNDING_PCT = 0.80    # Force exit only at extreme funding (was 0.20)
     CHECK_INTERVAL_MINUTES = 60      # Check funding rate every hour
     
     # =========================================================================
@@ -1817,10 +2269,41 @@ class SessionQuality:
         'OTHER': 0.75,             # Default reduced
     }
     
+    # =========================================================================
+    # QUALITY → MULTIPLIER MAP (Feb 04, 2026 - AUDIT FIX)
+    # Single source of truth for quality-based sizing
+    # Used by: entry_orchestrator.py, simplified_sizing.py, edge_state_manager.py
+    # =========================================================================
+    QUALITY_SIZE_MULT = {
+        'good': 1.0,       # Full size - LONDON, NY_OVERLAP, NY
+        'moderate': 0.80,  # Reduced - ASIA (was 0.85 in some places, now unified)
+        'poor': 0.0,       # BLOCKED - Dead hours, extreme times
+    }
+    
     @classmethod
     def get_session_size_mult(cls, session_name: str) -> float:
         """Get position size multiplier for current session."""
         return cls.SESSION_SIZE_MULT.get(session_name.upper(), 0.75)
+    
+    @classmethod
+    def get_quality_size_mult(cls, quality: str) -> float:
+        """
+        Get position size multiplier for session quality.
+        
+        SINGLE SOURCE OF TRUTH - use this instead of hardcoded dicts.
+        
+        Args:
+            quality: 'good', 'moderate', or 'poor'
+            
+        Returns:
+            Multiplier (0.0-1.0), where 0.0 means BLOCKED
+        """
+        return cls.QUALITY_SIZE_MULT.get(quality.lower(), 0.80)
+    
+    @classmethod
+    def is_quality_blocked(cls, quality: str) -> bool:
+        """Check if quality means trading is blocked."""
+        return cls.get_quality_size_mult(quality) <= 0.0
     
     # Legacy configs (not used for blocking anymore)
     MIN_ADX_BY_SESSION = {
@@ -2133,9 +2616,12 @@ class DynamicScoreThreshold:
     """
     # Base threshold by regime
     # FIX (Jan 24, 2026): Lowered all thresholds - bot was at 0 trades in 9h
+    # 🔥 FIX (Feb 04, 2026): Added TRANSITION explicitly with low threshold
+    # TRANSITION with structural consensus should be tradeable!
     REGIME_THRESHOLD = {
         "RANGE": 5.0,            # Was 6.5 - too strict for range trading
         "TREND": 4.5,            # Was 6.0 - let momentum carry us
+        "TRANSITION": 4.5,       # 🔥 NEW: Same as TREND - structural consensus allows
         "TREND_EXPANSION": 5.0,  # Was 6.5 - breakouts need fast entry
         "TREND_EXHAUSTION": 5.5, # Was 7.0 - still be careful
         "CONSOLIDATION": 5.0,    # Was 6.5
@@ -2199,21 +2685,23 @@ class SessionTradeLimits:
     ENABLED = True
     
     # Max trades per session (DEFAULT - adjusted by regime)
+    # 🔥 FIX #10: Increased base to 3 for Hot Hand system
     MAX_TRADES_PER_SESSION = {
-        "ASIA": 2,
+        "ASIA": 3,
         "LONDON": 3,
         "NY": 3,
         "LONDON_NY_OVERLAP": 4,
         "NY_OPEN_VOLATILE": 1,  # Just 1 in first 15 min
         "DEAD_HOURS": 1,
         "WEEKEND": 2,
-        "OTHER": 2,
+        "OTHER": 3,
     }
     
     # 🔥 NEW: Mode-based multipliers
+    # 🔥 FIX #10: RANGE mode cap increased to 3 (was 2)
     MODE_TRADE_LIMIT_CAP = {
         "TREND": 4,      # Max 4 trades per session in TREND
-        "RANGE": 2,      # 🔥 FIX: Max 2 trades per session in RANGE (was 3)
+        "RANGE": 3,      # 🔥 FIX #10: Max 3 trades base in RANGE (Hot Hand can extend)
         "BREAKOUT": 4,   # Max 4 trades per session in BREAKOUT
         "NO_TRADE": 0,   # No trades allowed
     }
@@ -2299,6 +2787,14 @@ class LossStreakConfig:
         "FUNDING_EXIT": 0.0,             # Funding-based exit (administrative)
         "DEFENSIVE_EXIT": 0.25,          # Defensive mode exit (small count)
         "STRUCTURE_BREAK_EXIT": 0.25,    # Structure changed (small count)
+        # 🔥 FIX (Feb 1, 2026): Administrative closes - NOT edge failures
+        # Must match state_machine.py behavior ("NOT counted as loss")
+        "EMERGENCY_ANOMALY": 0.0,        # System anomaly, not edge failure
+        "PRICE_GAP_ANOMALY": 0.0,        # Flash crash protection
+        "SPREAD_ANOMALY": 0.0,           # Liquidity protection
+        "FEED_STALE_ANOMALY": 0.0,       # Connection protection
+        "VOLATILITY_ANOMALY": 0.0,       # ATR explosion protection
+        "HARD_BACKSTOP": 0.25,           # Catastrophic protection (small count)
     }
     
     @classmethod

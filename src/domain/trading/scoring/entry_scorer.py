@@ -102,6 +102,10 @@ class TradeTags:
     # 🔥 NEW (Jan 24): Late confirmation penalty tracking
     late_confirmation_penalty: float = 0.0
     candles_since_bos: int = 0
+    # 🔥 NEW (Feb 2): BOS Quality tracking for post-trade analysis
+    bos_quality: str = "UNKNOWN"     # 'STRONG', 'NORMAL', 'WEAK'
+    bos_body_atr: float = 0.0        # BOS body size in ATR multiples
+    bos_volume_ratio: float = 0.0    # BOS volume vs average
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -642,9 +646,25 @@ class EntryScorer:
     ) -> Tuple[int, bool]:
         """
         TIMING SCORE (0-2)
-        +2 → BOS confirmed at CLOSE + clean reclaim
-        +1 → BOS + late timing
+        +2 → BOS confirmed at CLOSE + clean reclaim + STRONG BOS
+        +1 → BOS + late timing OR weak BOS
         0 → Signal intra-candle / ambiguous
+        
+        🔥 MEJORA (Feb 2, 2026): BOS QUALITY ASSESSMENT
+        
+        PROBLEMA: Antes un BOS débil (vela pequeña, bajo volumen) puntuaba igual
+        que un BOS fuerte (vela grande, volumen alto). Esto mezclaba trades malos
+        con buenos en el mismo bucket de score.
+        
+        SOLUCIÓN: Evaluar CALIDAD del BOS:
+        - Body size vs ATR (grande = convincente)
+        - Volume vs average (alto = institucional)
+        - Close position (cerca del extremo = fuerte)
+        
+        BOS Quality Score:
+        - STRONG: body >= 0.8 ATR AND volume >= 1.2x avg AND close in top/bottom 30%
+        - NORMAL: body >= 0.4 ATR OR volume >= 1.0x avg
+        - WEAK: body < 0.4 ATR AND volume < 1.0x avg
         
         Returns: (score, bos_confirmed)
         """
@@ -664,24 +684,98 @@ class EntryScorer:
         bos_confirmed = False
         clean_close = False
         
+        # =====================================================================
+        # 🔥 BOS QUALITY CALCULATION
+        # =====================================================================
+        # Calculate ATR for reference
+        ranges = (df_1m['high'] - df_1m['low']).tail(20)
+        atr_1m = ranges.mean() if len(ranges) >= 10 else ranges.iloc[-1]
+        
+        # Calculate average volume
+        volumes = df_1m['volume'].tail(20)
+        avg_volume = volumes.mean() if len(volumes) >= 10 else 1.0
+        
+        # BOS candle metrics
+        bos_body = abs(last_closed['close'] - last_closed['open'])
+        bos_range = last_closed['high'] - last_closed['low']
+        bos_volume = last_closed.get('volume', avg_volume)
+        
+        # Body ratio vs ATR (how "convincing" is the candle)
+        body_atr_ratio = bos_body / atr_1m if atr_1m > 0 else 0
+        
+        # Volume ratio vs average
+        volume_ratio = bos_volume / avg_volume if avg_volume > 0 else 1.0
+        
         if bias == 'LONG':
             # BOS: Close above recent high (not just wick)
             bos_confirmed = last_closed['close'] > recent_high
             # Clean: Close near high of candle (strong)
-            candle_range = last_closed['high'] - last_closed['low']
-            if candle_range > 0:
-                close_position = (last_closed['close'] - last_closed['low']) / candle_range
+            if bos_range > 0:
+                close_position = (last_closed['close'] - last_closed['low']) / bos_range
                 clean_close = close_position > 0.6  # Closed in upper 40%
         else:
             # BOS: Close below recent low
             bos_confirmed = last_closed['close'] < recent_low
-            candle_range = last_closed['high'] - last_closed['low']
-            if candle_range > 0:
-                close_position = (last_closed['high'] - last_closed['close']) / candle_range
+            if bos_range > 0:
+                close_position = (last_closed['high'] - last_closed['close']) / bos_range
                 clean_close = close_position > 0.6  # Closed in lower 40%
         
+        # =====================================================================
+        # 🔥 BOS QUALITY CLASSIFICATION
+        # =====================================================================
+        bos_quality = 'WEAK'  # Default
+        
+        if bos_confirmed:
+            # Count quality signals
+            quality_signals = 0
+            
+            # Signal 1: Strong body (>= 0.8 ATR)
+            if body_atr_ratio >= 0.8:
+                quality_signals += 1
+                
+            # Signal 2: Above average volume
+            if volume_ratio >= 1.2:
+                quality_signals += 1
+                
+            # Signal 3: Clean close (already calculated)
+            if clean_close:
+                quality_signals += 1
+            
+            # Classify based on signals
+            if quality_signals >= 3:
+                bos_quality = 'STRONG'
+            elif quality_signals >= 1:
+                bos_quality = 'NORMAL'
+            else:
+                bos_quality = 'WEAK'
+            
+            # Log BOS quality for analysis
+            logger.debug(
+                f"📊 BOS QUALITY: {bos_quality} | "
+                f"body_atr={body_atr_ratio:.2f}, vol_ratio={volume_ratio:.2f}, "
+                f"clean_close={clean_close}, signals={quality_signals}"
+            )
+            
+            # Store in trade tags for post-trade analysis
+            self._trade_tags.bos_quality = bos_quality
+            self._trade_tags.bos_body_atr = body_atr_ratio
+            self._trade_tags.bos_volume_ratio = volume_ratio
+        
+        # =====================================================================
+        # 🔥 SCORING WITH BOS QUALITY
+        # =====================================================================
         if bos_confirmed and clean_close:
-            return 2, True  # Perfect timing, BOS confirmed
+            if bos_quality == 'STRONG':
+                return 2, True  # Perfect timing + STRONG BOS = max score
+            elif bos_quality == 'NORMAL':
+                return 2, True  # Good timing + decent BOS = full score
+            else:  # WEAK
+                # BOS confirmed but weak - reduce by 0.5 (effectively 1.5)
+                logger.warning(
+                    f"⚠️ WEAK BOS detected: body={body_atr_ratio:.2f}ATR, "
+                    f"volume={volume_ratio:.2f}x avg | Score capped at 1"
+                )
+                return 1, True  # WEAK BOS = reduced score
         elif bos_confirmed:
             return 1, True  # BOS confirmed but timing not perfect
         
@@ -758,10 +852,12 @@ class EntryScorer:
             self._trade_tags.rsi = float(rsi[-1])
         
         # Base score based on ADX strength and slope
+        # 🔄 REFACTORED Feb 04: Use ADXThresholds for consistent thresholds
+        from src.config.trading_config import ADXThresholds
         base_score = 0.0
-        if adx_val > 25 and adx_slope > 0:
+        if ADXThresholds.is_strong_trend(adx_val) and adx_slope > 0:  # > 25
             base_score = 2.0  # Strong trend, strengthening
-        elif adx_val > 20 or (adx_val > 15 and adx_slope > 0):
+        elif ADXThresholds.is_trending(adx_val) or (adx_val > 15 and adx_slope > 0):  # > 20
             base_score = 1.0  # Moderate trend
         else:
             base_score = 0.0  # Weak (but doesn't block!)

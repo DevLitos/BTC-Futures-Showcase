@@ -28,6 +28,9 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, UTC
 
+# 🔥 FIX (Feb 05): Import TrendDirection from unified source
+from src.config.unified_constants import TrendDirection
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,11 +46,8 @@ class TrendPhase(Enum):
     RANGE_BOUND = "RANGE_BOUND"       # Sin tendencia clara
 
 
-class TrendDirection(Enum):
-    """Dirección de la tendencia"""
-    BULLISH = "BULLISH"
-    BEARISH = "BEARISH"
-    NEUTRAL = "NEUTRAL"
+# 🔥 NOTE: TrendDirection now imported from unified_constants.py
+# Previously defined here - now single source of truth
 
 
 @dataclass
@@ -319,7 +319,9 @@ class TrendIntelligence:
                     break
             elif current_phase == TrendPhase.ACCUMULATION:
                 # Accumulation: ADX very low, building
-                if adx_val < 18:
+                # 🔄 REFACTORED Feb 04: Use ADXThresholds.RANGE for consistent threshold
+                from src.config.trading_config import ADXThresholds
+                if adx_val < ADXThresholds.RANGE:
                     age += 1
                 else:
                     break
@@ -357,14 +359,16 @@ class TrendIntelligence:
             data_factor = 1.0  # Full confidence only with enough data
         
         # ADX clarity: how clear is the regime?
+        # 🔄 REFACTORED Feb 04: Use ADXThresholds for consistent thresholds
+        from src.config.trading_config import ADXThresholds
         adx = self._state.adx_current
         if adx > 30:
             adx_factor = 1.0  # Very clear trend
-        elif adx > 25:
+        elif ADXThresholds.is_strong_trend(adx):  # > 25
             adx_factor = 0.95  # Clear trend
         elif adx < 15:
             adx_factor = 0.90  # Clear range  
-        elif adx < 18:
+        elif ADXThresholds.is_ranging(adx):  # < 18
             adx_factor = 0.80  # Probably range
         else:
             adx_factor = 0.70  # Transition zone - less certain

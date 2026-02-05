@@ -244,7 +244,7 @@ class SpreadFilter:
         if spread_now > block_avg:
             return SpreadCheckResult(
                 allowed=False,
-                reason=f"Spread {spread_now:.1f} bps > {self.config.BLOCK_MULT_AVG}x avg ({block_avg:.1f} bps)",
+                reason=f"Spread {spread_now:.1f} bps > {self.config.BLOCK_MULT_AVG}x avg ({avg:.1f} bps = {block_avg:.1f} bps threshold)",
                 spread_now_bps=spread_now,
                 spread_avg_bps=avg,
                 spread_p95_bps=p95,

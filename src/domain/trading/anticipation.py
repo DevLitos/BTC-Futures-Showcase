@@ -56,6 +56,8 @@ class AnticipationState:
     expected_target: float = 0.0
     time_valid_until: Optional[datetime] = None
     reasons: List[str] | None = None
+    # 🔥 FIX #29 (Feb 04): Store structure level for breakout trigger
+    structure_level: float = 0.0  # The level from "Building X from Y"
     
     def __post_init__(self):
         if self.reasons is None:
@@ -454,13 +456,16 @@ class AnticipationEngine:
             stop_loss=stop_loss,
             expected_target=target,
             time_valid_until=valid_until,
-            reasons=reasons
+            reasons=reasons,
+            structure_level=base_level if has_structure else 0.0  # 🔥 FIX #29: Store for trigger
         )
         
-        if signal_type != AnticipationSignal.NONE:
-            logger.info(f"🔮 ANTICIPATION: {signal_type.value} {direction} | conf={confidence:.0%}")
-            for reason in reasons:
-                logger.info(f"   → {reason}")
+        # 🔥 FIX (Feb 02, 2026): REMOVED duplicate log here - already logged in idle_state_handlers
+        # The previous log caused duplicate "ANTICIPATION" messages in logs
+        # if signal_type != AnticipationSignal.NONE:
+        #     logger.info(f"🔮 ANTICIPATION: {signal_type.value} {direction} | conf={confidence:.0%}")
+        #     for reason in reasons:
+        #         logger.info(f"   → {reason}")
         
         return self._last_state
     

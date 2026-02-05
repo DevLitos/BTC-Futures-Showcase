@@ -135,14 +135,14 @@ class EntryGateEvaluator:
     
     # =========================================================================
     # SCORING THRESHOLDS FOR SOFT GATES
-    # FIX (Jan 24, 2026): Lowered to match config.py changes
-    # Bot was at 0 trades in 9h due to restrictive thresholds
+    # 🔥 FIX (Feb 01, 2026): Raised based on 62-trade empirical analysis
+    # Data shows score < 4.5 has 0% win rate → should be BLOCKED
     # =========================================================================
     
     # Score-based sizing (replaces binary threshold)
-    SCORE_BLOCK_FLOOR = 3.5           # Below this = block (was 4.5)
-    SCORE_PROBE_MAX = 4.5             # 3.5-4.5 = probe (0.25x) (was 5.5)
-    SCORE_REDUCED_MAX = 5.5           # 4.5-5.5 = reduced (0.5x) (was 6.5)
+    SCORE_BLOCK_FLOOR = 4.5           # 🔥 Raised from 3.5: score<4.5 = 0% win rate
+    SCORE_PROBE_MAX = 5.0             # 4.5-5.0 = probe (0.25x) - marginal edge
+    SCORE_REDUCED_MAX = 5.5           # 5.0-5.5 = reduced (0.5x)
     # Above 5.5 = full size
     
     # RR-based sizing

@@ -1,6 +1,12 @@
 """
 Trading Regime System - Enhanced regime classification with transitional states
 
+⚠️ PARTIAL DEPRECATION (Feb 05, 2026):
+- TrendDirection is now imported from unified_constants.py (SINGLE SOURCE)
+- get_regime_classifier() returns TradingRegimeClassifier but there are
+  3 different get_regime_classifier() functions across the codebase.
+  Prefer using RegimeContextManager from regime_context.py as the primary source.
+
 PRINCIPLE (Jan 20, 2026):
 Detect regime changes EARLIER, not later.
 The system should identify regime transitions BEFORE they fully materialize.
@@ -40,11 +46,16 @@ class TradingRegime(str, Enum):
     UNKNOWN = "UNKNOWN"                  # Insufficient data
 
 
-class TrendDirection(str, Enum):
-    """Trend direction when in TREND regime."""
-    BULLISH = "BULLISH"
-    BEARISH = "BEARISH"
-    NEUTRAL = "NEUTRAL"
+# 🔥 FIX (Feb 05): Import TrendDirection from unified source
+from src.config.unified_constants import TrendDirection
+
+# ⚠️ DEPRECATED: TrendDirection was previously defined here.
+# Now imported from unified_constants.py - SINGLE SOURCE OF TRUTH
+# Old definition kept commented for reference:
+# class TrendDirection(str, Enum):
+#     BULLISH = "BULLISH"
+#     BEARISH = "BEARISH"
+#     NEUTRAL = "NEUTRAL"
 
 
 @dataclass

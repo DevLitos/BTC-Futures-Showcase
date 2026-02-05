@@ -104,32 +104,54 @@ class HybridATRTrailing:
     """
     
     # R-Lock thresholds
-    # FIX (Jan 22, 2026): Punto 6 - Retrasar BE lock para no matar trades prematuramente
-    # Old: BE at 0.8R killed winners during normal pullbacks
-    # New: BE at 1.2R (after TP1), let trade breathe
+    # 🔥 FIX (Feb 2, 2026): MICRO-LOCKS PROGRESIVOS PARA INTRADÍA BTC
+    # 
+    # PROBLEMA IDENTIFICADO: Trades con MFE 0.2-0.4R no tienen NINGUNA protección
+    # - Trade muestra +0.25R → NO lock → termina en -0.80R (pérdida de 1.05R swing)
+    # - El trade DEMOSTRÓ que la dirección era correcta pero lo dejamos morir
+    # 
+    # FILOSOFÍA INTELIGENTE PARA INTRADÍA BTC:
+    # - BTC hace pullbacks de 0.3-0.5R constantemente en moves válidos
+    # - Locks MUY tempranos (BE a 0.5R) te sacan antes de que el trade funcione
+    # - BALANCE: Proteger capital sin cortar ganadores
+    #
+    # SISTEMA DE LOCKS CALIBRADO PARA INTRADÍA:
+    # - 0.3R MFE → lock at -0.4R (protección mínima - evita -1R completo)
+    # - 0.5R MFE → lock at -0.2R (trade mostró vida, limita downside)
+    # - 0.8R MFE → lock at BE (0.0R) - garantiza no pérdida (NO antes)
+    # - 1.0R MFE → lock at +0.3R (captura algo pero deja correr)
+    # - 1.3R MFE → lock at +0.5R (trade probado)
+    # - 1.5R MFE → lock at +0.8R (runner protection)
+    # - 2.0R MFE → lock at +1.2R (strong runner)
+    # - 3.0R MFE → lock at +2.0R (massive move)
+    # - 5.0R MFE → lock at +3.5R (black swan profit)
     R_LOCK_TIERS = [
-        (1.2, 0.0, 1),    # (MFE threshold, lock at R, tier) - BE after TP1 hit
-        (1.8, 0.6, 2),    # Lock 0.6R at 1.8R MFE (was 1.0→0.4)
-        (2.5, 1.2, 3),    # Lock 1.2R at 2.5R MFE (was 1.5→0.9)
-        (3.5, 2.0, 4),    # Lock 2.0R at 3.5R MFE (was 2.2→1.6)
-        (5.0, 3.5, 5),    # Lock 3.5R at 5.0R MFE (for runners)
+        (0.3, -0.40, 1),  # Mostró +0.3R → max loss -0.4R (vs -1R sin lock)
+        (0.5, -0.20, 2),  # Mostró +0.5R → max loss -0.2R 
+        (0.8, 0.0, 3),    # BE at 0.8R - NO ANTES (pullbacks normales en BTC)
+        (1.0, 0.3, 4),    # Lock +0.3R at 1.0R MFE
+        (1.3, 0.5, 5),    # Lock +0.5R at 1.3R MFE (trade probado)
+        (1.5, 0.8, 6),    # Lock +0.8R at 1.5R MFE
+        (2.0, 1.2, 7),    # Lock +1.2R at 2.0R MFE
+        (3.0, 2.0, 8),    # Lock +2.0R at 3.0R MFE
+        (5.0, 3.5, 9),    # Lock +3.5R at 5.0R MFE (for runners)
     ]
     
     # ATR K factors by regime
-    # NOTE: Adjusted per review (Jan 27, 2026):
-    # PROBLEM: Trade captured MFE 0.68R but closed at 0.29R - giving back 57% of profit!
-    # ROOT CAUSE: K factors too loose, trailing gives back too much during consolidation
+    # 🔥 FIX (Feb 2, 2026): K FACTORS MÁS AGRESIVOS
+    # PROBLEMA: Con K=2.0 ATR, se devuelve 60%+ del MFE
+    # DATOS: 9 trades TRAILING_STOP solo capturaron 37% del MFE en promedio
     # 
-    # NEW VALUES (tighter to capture more MFE):
-    # - RANGE: 1.5 (was 2.0 - range needs tighter trailing)
-    # - TREND: 2.0 (was 2.5 - even trends don't need 2.5 ATR room)
-    # - VOLATILITY: 2.8 (was 3.5 - still give room but not excessive)
-    # - CONSERVATIVE: 1.8 (was 2.2 - conservative = tighter trailing)
+    # SOLUCIÓN: K factors más ajustados para capturar más profit
+    # - TREND: 1.5 ATR (was 2.0 - pullbacks normales son ~1 ATR)
+    # - RANGE: 1.3 ATR (needs some room even in range)
+    # - VOLATILITY: 2.0 ATR (solo volatility merece espacio)
+    # - CONSERVATIVE: 1.2 ATR (was 1.8 - conservative = protect profit)
     K_FACTORS = {
-        TrailingRegime.TREND: 2.0,
-        TrailingRegime.RANGE: 1.5,
-        TrailingRegime.VOLATILITY: 2.8,
-        TrailingRegime.CONSERVATIVE: 1.8,
+        TrailingRegime.TREND: 1.5,
+        TrailingRegime.RANGE: 1.3,
+        TrailingRegime.VOLATILITY: 2.0,
+        TrailingRegime.CONSERVATIVE: 1.2,
     }
     
     # Swing reference lookback (candles)
@@ -142,7 +164,26 @@ class HybridATRTrailing:
     # This prevents killing winners too early
     ATR_TRAIL_ACTIVATION_MFE = 0.3  # Only start ATR trailing after +0.3R
     
-    def __init__(self):
+    # =========================================================================
+    # 🔥 BOS QUALITY DYNAMIC TRAILING (Feb 3, 2026)
+    # =========================================================================
+    # FILOSOFÍA: La calidad de ENTRADA predice probabilidad de runner
+    # - BOS STRONG → trailing más suelto → más chance de capturar runner
+    # - BOS NORMAL → trailing estándar
+    # - BOS WEAK → trailing más apretado → proteger rápido
+    # 
+    # ESTO NO ES SOBREPROTECCIÓN porque:
+    # - NO rechaza trades (todos entran igual)
+    # - Solo ajusta GESTIÓN post-entrada
+    # - BOS STRONG te da MÁS espacio, no menos
+    BOS_QUALITY_K_MULT = {
+        'STRONG': 1.15,  # +15% K = más espacio para runners
+        'NORMAL': 1.0,   # K estándar
+        'WEAK': 0.90,    # -10% K = protege profit más rápido
+        'UNKNOWN': 1.0,  # Default to normal
+    }
+    
+    def __init__(self, bos_quality: str = 'NORMAL'):
         self._state = TrailingState()
         self._entry_price: float = 0.0
         self._initial_stop: float = 0.0
@@ -150,6 +191,8 @@ class HybridATRTrailing:
         self._is_active: bool = False
         # 🔥 NEW (Jan 26): Track entry time for time_to_02r calculation
         self._entry_time: datetime | None = None
+        # 🔥 NEW (Feb 3): BOS Quality affects trailing tightness
+        self._bos_quality = bos_quality.upper() if bos_quality else 'NORMAL'
     
     def initialize(self,
                    entry_price: float,
@@ -230,7 +273,15 @@ class HybridATRTrailing:
         Returns:
             (trail_stop, swing_reference)
         """
-        k = self.K_FACTORS.get(regime, 2.5)
+        # Base K from regime
+        k_base = self.K_FACTORS.get(regime, 2.5)
+        
+        # 🔥 Apply BOS quality multiplier
+        # STRONG entry → more room to run (K * 1.15)
+        # WEAK entry → tighter protection (K * 0.90)
+        bos_mult = self.BOS_QUALITY_K_MULT.get(self._bos_quality, 1.0)
+        k = k_base * bos_mult
+        
         lookback = min(self.SWING_LOOKBACK, len(highs))
         
         if self._direction == "LONG":
@@ -409,7 +460,8 @@ class HybridATRTrailing:
 def create_hybrid_trailing(entry_price: float,
                           initial_stop: float,
                           direction: str,
-                          regime_str: str = "TREND") -> HybridATRTrailing:
+                          regime_str: str = "TREND",
+                          bos_quality: str = "NORMAL") -> HybridATRTrailing:
     """
     Factory to create and initialize a hybrid trailing stop.
     
@@ -418,6 +470,7 @@ def create_hybrid_trailing(entry_price: float,
         initial_stop: Initial stop loss
         direction: 'LONG' or 'SHORT'
         regime_str: Regime string ('TREND', 'RANGE', 'VOLATILITY')
+        bos_quality: BOS quality from entry ('STRONG', 'NORMAL', 'WEAK')
     
     Returns:
         Initialized HybridATRTrailing instance
@@ -427,7 +480,7 @@ def create_hybrid_trailing(entry_price: float,
     except ValueError:
         regime = TrailingRegime.TREND
     
-    trailing = HybridATRTrailing()
+    trailing = HybridATRTrailing(bos_quality=bos_quality)
     trailing.initialize(entry_price, initial_stop, direction, regime)
     
     return trailing

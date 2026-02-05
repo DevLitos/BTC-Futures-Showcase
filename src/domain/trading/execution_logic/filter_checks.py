@@ -121,7 +121,9 @@ def check_momentum_filter(
             issues.append("RSI overbought territory")
             momentum_quality = "WEAK"
     
-    if adx_val < 20:
+    # 🔄 REFACTORED Feb 04: Use ADXThresholds.TREND for consistent threshold
+    from src.config.trading_config import ADXThresholds
+    if adx_val < ADXThresholds.TREND:
         issues.append(f"ADX weak ({adx_val:.1f})")
         momentum_quality = "WEAK"
     

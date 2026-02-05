@@ -175,6 +175,41 @@ class MissedOpportunityTracker:
             score: The signal score
             atr: Current ATR for R calculations
         """
+        # =====================================================================
+        # 🔥 FIX (Feb 3, 2026): Filter categories that are NOT missed opportunities
+        # 
+        # These are CORRECT blocks, not "missed" opportunities:
+        # - delta_contradict: Market flow is against us, blocking is correct
+        # - chase_penalty: We're too late, blocking is correct  
+        # - displacement_expired: Edge is dead, not a real opportunity
+        # - obstinacy: Multiple conflicting signals, blocking is correct
+        #
+        # Only log as "MISSED" when we had a REAL opportunity blocked by:
+        # - spread: Liquidity issue but valid setup
+        # - session_limit: Hit daily limit but valid setup
+        # - funding: Funding too high but valid setup
+        # =====================================================================
+        
+        # Categories that are NOT real missed opportunities
+        PROTECTION_CATEGORIES = {
+            'delta_contradict',      # Market going against us
+            'chase_penalty',         # Too late to enter
+            'obstinacy',             # Conflicting signals
+            'quality_gate',          # Quality too low
+            'location_filter',       # Wrong location in structure
+            'forbidden_direction',   # Direction explicitly forbidden (bias flip)
+            'bias_flip',             # Bias has flipped against setup
+            'direction_lock',        # Direction is locked opposite
+        }
+        
+        # Skip logging for protection blocks (they're not missed opportunities)
+        if block_category in PROTECTION_CATEGORIES:
+            logger.debug(
+                f"[PROTECTED] {direction} @ {price:.2f} | "
+                f"{block_category}: {block_reason}"
+            )
+            return
+        
         opp = MissedOpportunity(
             timestamp=datetime.now(UTC),
             signal_direction=(direction or 'UNKNOWN').upper(),

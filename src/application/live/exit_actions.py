@@ -92,15 +92,27 @@ async def handle_partial_close(
         reason="PARTIAL"
     )
     
-    # Sync local size with exchange
-    await asyncio.sleep(0.5)
+    # 🔥 FIX (Feb 1, 2026): Robust size sync after partial close
+    # Wait for exchange to settle, then force local state to match
+    await asyncio.sleep(0.8)  # Increased from 0.5s for better settlement
     try:
         exchange_pos = await engine.execution.get_position(engine.symbol)
         if exchange_pos:
             exchange_size = abs(float(exchange_pos.get('contracts', 0) or 0))
-            if exchange_size > 0 and abs(exchange_size - position.size) > 0.00001:
-                logger.warning(f"🔄 Size sync after TP1: local={position.size:.6f} → exchange={exchange_size:.6f}")
-                position.size = exchange_size
+            if exchange_size > 0:
+                size_diff = abs(exchange_size - position.size)
+                if size_diff > 0.00001:
+                    logger.warning(f"🔄 Size sync after TP1: local={position.size:.6f} → exchange={exchange_size:.6f} (diff={size_diff:.6f})")
+                    # Force local to match exchange (exchange is truth)
+                    position.size = exchange_size
+                    
+                    # Also update position_store to prevent mismatch warnings
+                    if hasattr(engine, 'position_store') and engine.position_store:
+                        engine.position_store._update_position_record({
+                            'contracts': exchange_size,
+                            'side': exchange_pos.get('side', 'long'),
+                            'entryPrice': position.entry_price
+                        })
                 
                 # Update SL order after partial close
                 await _update_sl_after_size_change(engine, position, exchange_size)
@@ -195,6 +207,35 @@ async def handle_add_position(
             price=current_price,
         )
 
+        # 🔥 FIX (Feb 02, 2026): If POST-ONLY REJECTED, try IOC limit as fallback
+        # This prevents missed add-to-winner on fast-moving winners
+        if add_order is None:
+            logger.warning("🔄 ADD_POSITION POST-ONLY rejected, retrying with IOC limit...")
+            await asyncio.sleep(0.3)
+            
+            # Get fresh price for IOC retry (allow small slippage for adds)
+            fresh_data = await engine.execution.get_ticker(engine.symbol)
+            if fresh_data:
+                fresh_price = float(fresh_data.get('last', current_price))
+                # For adds, accept up to 0.03% slippage
+                slippage_bps = 3  # 0.03%
+                if side == 'buy':
+                    retry_price = fresh_price * (1 + slippage_bps / 10000)
+                else:
+                    retry_price = fresh_price * (1 - slippage_bps / 10000)
+                
+                add_order = await engine.execution.place_aggressive_order(
+                    symbol=engine.symbol,
+                    side=side,
+                    amount=add_size,
+                    limit_price=retry_price,
+                )
+                if add_order:
+                    logger.info(f"✅ ADD_POSITION IOC retry succeeded at {retry_price:.2f}")
+                else:
+                    logger.warning("🧊 ADD_POSITION IOC retry also failed - skipping scale-in")
+                    return True
+
         # If it doesn't fill quickly, cancel (do not chase)
         if add_order and add_order.get('id'):
             await asyncio.sleep(1.0)
@@ -234,6 +275,13 @@ async def handle_add_position(
                     
                     position.entry_price = new_entry_price
                     position.size = new_exchange_size
+                    
+                    # 🔥 FIX (Feb 1, 2026): Force position_store sync to avoid mismatch warning
+                    try:
+                        if hasattr(engine, 'position_store') and engine.position_store:
+                            engine.position_store._update_position_record(engine.symbol, position)
+                    except Exception:
+                        pass  # Non-critical
                     
                     # Cancel & replace SL/TP with new size
                     await _replace_sl_tp_after_add(engine, position, new_exchange_size, new_entry_price)
@@ -342,6 +390,32 @@ async def handle_full_close(
         engine._reached_tp2 = True
     if 'BE' in reason or 'breakeven' in reason.lower():
         engine._is_be_stop = True
+    
+    # =========================================================================
+    # 🔥 FIX (Feb 03, 2026): Record trade close for Hot Hand system
+    # =========================================================================
+    # PROBLEM: handle_full_close was NOT calling record_trade_closed, so the
+    # Activity Tracker never knew if the last trade was a WIN or LOSS.
+    # This broke the Hot Hand system - session_stopped was always triggered
+    # because _last_trade_was_win remained False.
+    # 
+    # SOLUTION: Calculate PnL and call record_trade_closed here.
+    # =========================================================================
+    try:
+        from src.domain.trading.activity_tracker import get_activity_tracker
+        pnl_r = position.calculate_r_realized(current_price)
+        get_activity_tracker().record_trade_closed(
+            market_time=market_time,
+            exit_reason=exit_reason,
+            pnl_r=pnl_r,
+            direction=position.direction
+        )
+        logger.info(
+            f"📊 Hot Hand: Trade closed with {pnl_r:.2f}R | "
+            f"Exit: {exit_reason}"
+        )
+    except Exception as tracker_e:
+        logger.warning(f"Could not record trade close for Hot Hand: {tracker_e}")
     
     # Verify position closed
     await asyncio.sleep(0.5)

@@ -1,0 +1,397 @@
+"""
+Regime Trading Rules - Centralized logic for RANGE/TRANSITION/TREND.
+
+⚠️ PARTIAL DEPRECATION (Feb 05, 2026):
+This module references UnifiedTradingIntelligence which is DEPRECATED (dead code).
+The RegimeContext defined here duplicates regime_context.py.
+Consider migrating to use RegimeContextManager from regime_context.py instead.
+
+Created: Feb 04, 2026
+Purpose: Extract ~500 lines of regime logic from trading_app.py
+
+REPLACES:
+- RANGE_MID logic (lines 4000-4100)
+- TRANSITION logic (lines 4150-4270)
+- TREND logic (lines 4280-4400)
+- All the scattered bypass/consensus checks
+
+USAGE:
+    regime_rules = RegimeTradingRules(intelligence)
+    result = regime_rules.evaluate(context)
+    if result.should_trade:
+        # proceed with trade
+"""
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional, Dict, Any, Tuple, TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
+
+if TYPE_CHECKING:
+    from src.domain.trading.unified_intelligence import UnifiedTradingIntelligence
+    from src.domain.trading.edge_state_manager import EdgeStateManager
+
+from src.domain.trading.edge_state_manager import EdgeState
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RegimeContext:
+    """Context needed for regime evaluation."""
+    current_price: float
+    regime_score: float           # 0.0 to 1.0
+    trading_mode: str             # 'RANGE', 'TRANSITION', 'TREND'
+    bias: str                     # Current bias from orchestrator
+    pct_60d: float = 50.0         # Percentile in 60d range
+    at_extreme: bool = False
+    extreme_type: Optional[str] = None  # 'HIGH', 'LOW'
+    extremity: float = 0.0        # How extreme (0.0 to 1.0)
+    atr_1m: float = 0.0
+    market_time: Optional[datetime] = None
+    candles_1m: list = field(default_factory=list)
+    
+    # Volatility adjustments
+    volatility_ratio: float = 1.0
+    
+    # Additional context
+    has_location_context: bool = True
+    volume_ratio: float = 1.0
+
+
+@dataclass
+class RegimeResult:
+    """Result of regime evaluation."""
+    should_trade: bool = False
+    size_multiplier: float = 1.0
+    reason: str = ""
+    edge_to_arm: Optional[str] = None  # Direction to arm edge
+    edge_reason: str = ""
+    blocked: bool = False
+    block_reason: str = ""
+    tags: Dict[str, Any] = field(default_factory=dict)
+
+
+class RegimeTradingRules:
+    """
+    Centralized regime trading rules.
+    
+    Consolidates ALL the logic for:
+    - RANGE mode (extremes, mid-range, bypass)
+    - TRANSITION mode (gradual size, consensus)
+    - TREND mode (full size, consensus)
+    """
+    
+    def __init__(self, intelligence: 'UnifiedTradingIntelligence'):
+        self.intelligence = intelligence
+        self._eval_count: int = 0
+    
+    def evaluate(self, 
+                 context: RegimeContext,
+                 edge_manager: Optional['EdgeStateManager'] = None) -> RegimeResult:
+        """
+        Evaluate regime rules and return trading decision.
+        
+        This is the SINGLE entry point for all regime logic.
+        """
+        self._eval_count += 1
+        result = RegimeResult()
+        result.tags['regime_mode'] = context.trading_mode
+        result.tags['regime_score'] = context.regime_score
+        
+        # Check for momentum bypass FIRST
+        if self.intelligence.has_momentum_override:
+            bypass_type = 'EXPANSION' if self.intelligence._expansion_mode else 'DISPLACEMENT'
+            result.should_trade = True
+            result.size_multiplier = 0.60  # Reduced for momentum trades
+            result.reason = f"{bypass_type} override active"
+            result.tags['bypass_type'] = bypass_type
+            return result
+        
+        # Route to appropriate handler
+        if context.trading_mode == 'RANGE':
+            return self._evaluate_range(context, edge_manager, result)
+        elif context.trading_mode == 'TRANSITION':
+            return self._evaluate_transition(context, edge_manager, result)
+        elif context.trading_mode == 'TREND':
+            return self._evaluate_trend(context, edge_manager, result)
+        else:
+            result.reason = f"Unknown mode: {context.trading_mode}"
+            return result
+    
+    def _evaluate_range(self, 
+                        context: RegimeContext,
+                        edge_manager: Optional['EdgeStateManager'],
+                        result: RegimeResult) -> RegimeResult:
+        """
+        Evaluate RANGE mode rules.
+        
+        RULES:
+        - At EXTREME: Trade reversals only
+        - At MID: Need CONSENSUS (structural == active)
+        - BYPASS: Momentum override
+        """
+        result.tags['range_mode'] = True
+        result.tags['pct_60d'] = context.pct_60d
+        
+        # Check for no location context
+        if not context.has_location_context:
+            result.blocked = True
+            result.block_reason = "No location context in RANGE"
+            result.reason = "RANGE: No location context"
+            return result
+        
+        # Check volume minimum (adaptive)
+        min_volume = 0.5 * (1.0 + (context.volatility_ratio - 1.0) * 0.2)
+        min_volume = max(0.3, min(0.7, min_volume))
+        
+        if context.volume_ratio < min_volume:
+            result.blocked = True
+            result.block_reason = f"Low volume: {context.volume_ratio:.0%} < {min_volume:.0%}"
+            result.reason = "RANGE: Volume too low"
+            return result
+        
+        # At extreme?
+        if context.at_extreme:
+            return self._evaluate_range_extreme(context, edge_manager, result)
+        else:
+            return self._evaluate_range_mid(context, edge_manager, result)
+    
+    def _evaluate_range_extreme(self,
+                                 context: RegimeContext,
+                                 edge_manager: Optional['EdgeStateManager'],
+                                 result: RegimeResult) -> RegimeResult:
+        """RANGE at extreme - trade reversals."""
+        result.tags['range_extreme'] = context.extreme_type
+        result.tags['range_extremity'] = context.extremity
+        
+        # Check direction matches extreme
+        if context.extreme_type == 'HIGH' and context.bias == 'LONG':
+            # Can't long at the top
+            result.blocked = True
+            result.block_reason = f"At HIGH extreme ({context.pct_60d:.0f}%), LONG blocked"
+            result.reason = "RANGE EXTREME: LONG blocked at HIGH"
+            return result
+        
+        if context.extreme_type == 'LOW' and context.bias == 'SHORT':
+            # Can't short at the bottom
+            result.blocked = True
+            result.block_reason = f"At LOW extreme ({context.pct_60d:.0f}%), SHORT blocked"
+            result.reason = "RANGE EXTREME: SHORT blocked at LOW"
+            return result
+        
+        # Valid reversal - trade with extremity-based sizing
+        result.should_trade = True
+        result.size_multiplier = 0.35 + context.extremity * 0.25  # 35-60%
+        result.reason = f"RANGE EXTREME: {context.extreme_type} reversal {context.bias}"
+        
+        if self._eval_count % 60 == 1:
+            logger.info(
+                f"📊 RANGE EXTREME: {context.extreme_type} | pct={context.pct_60d:.0f}% | "
+                f"extremity={context.extremity:.0%} | Size={result.size_multiplier:.0%}"
+            )
+        
+        return result
+    
+    def _evaluate_range_mid(self,
+                            context: RegimeContext,
+                            edge_manager: Optional['EdgeStateManager'],
+                            result: RegimeResult) -> RegimeResult:
+        """RANGE mid - need consensus."""
+        result.tags['range_mid'] = True
+        
+        # Get direction decision
+        direction_decision = self.intelligence.get_effective_direction()
+        result.tags.update(direction_decision.to_tags())
+        
+        # Need CONSENSUS or high confidence
+        if not direction_decision.is_valid:
+            result.blocked = True
+            result.block_reason = direction_decision.veto_reason or "No valid direction"
+            result.reason = "RANGE MID: No valid direction"
+            return result
+        
+        if direction_decision.source.value < 60:  # Below CONSENSUS priority
+            result.blocked = True
+            result.block_reason = f"Need consensus, got {direction_decision.source.name}"
+            result.reason = f"RANGE MID: Low confidence ({direction_decision.source.name})"
+            
+            if self._eval_count % 60 == 1:
+                logger.info(
+                    f"📊 RANGE MID: NO CONSENSUS | source={direction_decision.source.name} | "
+                    f"conf={direction_decision.confidence:.0%} | NO TRADE"
+                )
+            return result
+        
+        # Have consensus - check price confirms
+        if direction_decision.direction is None:
+            result.blocked = True
+            result.block_reason = "NO_DIRECTION"
+            result.reason = "RANGE MID: No direction"
+            return result
+            
+        price_confirms, confirm_reason = self.intelligence._check_price_confirms(
+            direction_decision.direction, context.candles_1m
+        )
+        
+        if not price_confirms:
+            result.blocked = True
+            result.block_reason = confirm_reason
+            result.reason = f"RANGE MID: Price contradicts"
+            logger.warning(
+                f"⚠️ RANGE MID: CONSENSUS BLOCKED | {confirm_reason}"
+            )
+            return result
+        
+        # All checks passed
+        result.should_trade = True
+        result.size_multiplier = 0.40
+        result.reason = f"RANGE MID: {direction_decision.source.name} confirmed"
+        
+        # Arm edge if needed
+        if edge_manager and edge_manager.state == EdgeState.NO_EDGE:
+            result.edge_to_arm = direction_decision.direction
+            result.edge_reason = f"RANGE_MID_CONSENSUS (Score={context.regime_score:.2f})"
+        
+        logger.info(
+            f"✅ RANGE MID: {direction_decision.source.name} | "
+            f"direction={direction_decision.direction} | {confirm_reason} | Size=40%"
+        )
+        
+        return result
+    
+    def _evaluate_transition(self,
+                              context: RegimeContext,
+                              edge_manager: Optional['EdgeStateManager'],
+                              result: RegimeResult) -> RegimeResult:
+        """
+        Evaluate TRANSITION mode rules.
+        
+        Same as RANGE_MID but with gradual sizing.
+        """
+        result.tags['transition_mode'] = True
+        
+        # Calculate gradual size
+        progress = (context.regime_score - 0.35) / 0.15
+        progress = max(0.0, min(1.0, progress))
+        gradual_size = 0.50 + (progress * 0.20)  # 50% to 70%
+        
+        result.tags['transition_progress'] = progress
+        
+        # Get direction decision
+        direction_decision = self.intelligence.get_effective_direction()
+        result.tags.update(direction_decision.to_tags())
+        
+        # Need CONSENSUS
+        if not direction_decision.is_valid:
+            result.blocked = True
+            result.block_reason = direction_decision.veto_reason or "No valid direction"
+            result.reason = "TRANSITION: No valid direction"
+            return result
+        
+        if direction_decision.source.value < 60:
+            result.blocked = True
+            result.block_reason = f"Need consensus, got {direction_decision.source.name}"
+            result.reason = f"TRANSITION: NO CONSENSUS"
+            
+            if self._eval_count % 30 == 1:
+                logger.info(
+                    f"📊 TRANSITION: NO CONSENSUS | source={direction_decision.source.name} | "
+                    f"Score={context.regime_score:.2f} | NO TRADE"
+                )
+            return result
+        
+        # Have consensus - check price
+        if direction_decision.direction is None:
+            result.blocked = True
+            result.block_reason = "NO_DIRECTION"
+            result.reason = "TRANSITION: No direction"
+            return result
+            
+        price_confirms, confirm_reason = self.intelligence._check_price_confirms(
+            direction_decision.direction, context.candles_1m
+        )
+        
+        if not price_confirms:
+            result.blocked = True
+            result.block_reason = confirm_reason
+            result.reason = "TRANSITION: Price contradicts"
+            logger.warning(f"⚠️ TRANSITION: CONSENSUS BLOCKED | {confirm_reason}")
+            return result
+        
+        # All checks passed
+        result.should_trade = True
+        result.size_multiplier = gradual_size
+        result.reason = f"TRANSITION: {direction_decision.source.name} confirmed"
+        
+        # Arm edge if needed
+        if edge_manager and edge_manager.state == EdgeState.NO_EDGE:
+            result.edge_to_arm = direction_decision.direction
+            result.edge_reason = f"TRANSITION_CONSENSUS (Score={context.regime_score:.2f})"
+        
+        logger.info(
+            f"✅ TRANSITION: {direction_decision.source.name} | direction={direction_decision.direction} | "
+            f"Score={context.regime_score:.2f} | Size={gradual_size:.0%}"
+        )
+        
+        return result
+    
+    def _evaluate_trend(self,
+                        context: RegimeContext,
+                        edge_manager: Optional['EdgeStateManager'],
+                        result: RegimeResult) -> RegimeResult:
+        """
+        Evaluate TREND mode rules.
+        
+        More permissive than RANGE/TRANSITION.
+        """
+        result.tags['trend_mode'] = True
+        
+        # Get direction decision
+        direction_decision = self.intelligence.get_effective_direction()
+        result.tags.update(direction_decision.to_tags())
+        
+        if not direction_decision.is_valid:
+            result.blocked = True
+            result.block_reason = direction_decision.veto_reason or "No valid direction"
+            result.reason = "TREND: No valid direction"
+            return result
+        
+        # In TREND, accept lower confidence (momentum is enough)
+        if direction_decision.confidence >= 0.5:
+            # Check price for CONSENSUS entries
+            if direction_decision.source.value >= 60 and direction_decision.direction is not None:
+                price_confirms, confirm_reason = self.intelligence._check_price_confirms(
+                    direction_decision.direction, context.candles_1m
+                )
+                
+                if not price_confirms:
+                    result.blocked = True
+                    result.block_reason = confirm_reason
+                    result.reason = "TREND: Price contradicts consensus"
+                    logger.warning(f"⚠️ TREND: CONSENSUS BLOCKED | {confirm_reason}")
+                    return result
+            
+            result.should_trade = True
+            result.size_multiplier = 1.0  # Full size in trend
+            result.reason = f"TREND: {direction_decision.source.name}"
+            
+            # Arm edge if needed
+            if edge_manager and edge_manager.state == EdgeState.NO_EDGE:
+                result.edge_to_arm = direction_decision.direction
+                result.edge_reason = f"TREND_CONSENSUS (Score={context.regime_score:.2f})"
+            
+            if self._eval_count % 30 == 1:
+                logger.info(
+                    f"✅ TREND: {direction_decision.source.name} | direction={direction_decision.direction} | "
+                    f"conf={direction_decision.confidence:.0%} | Size=100%"
+                )
+        else:
+            result.blocked = True
+            result.block_reason = f"Low confidence: {direction_decision.confidence:.0%}"
+            result.reason = "TREND: Low confidence"
+        
+        return result

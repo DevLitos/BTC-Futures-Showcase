@@ -216,10 +216,14 @@ class StateMachine:
         # Determine if this is a REAL trade loss (not administrative)
         # 🔥 FIX (Jan 20, 2026): Added EXCHANGE_STOP_LOSS and EXCHANGE_TAKE_PROFIT
         # These are exchange-executed orders that should count as real trades
+        # 🔥 FIX #15 (Feb 02, 2026): TIME_INVALIDATION debe contar como LOSS
+        #    TIME_INVALIDATION_MAX_LOSS es un trade que perdió dinero → LOSS
         REAL_LOSS_REASONS = {
             'SL_HIT', 'STOP_LOSS', 'MARKET_CLOSE', 'MANUAL_CLOSE',
             'EXCHANGE_STOP_LOSS',  # SL executed by exchange
             'TRAILING_STOP',       # Trailing stop hit
+            'TIME_INVALIDATION',   # 🔥 FIX #15: Trade stagnated at loss
+            'TIME_INVALIDATION_MAX_LOSS',  # 🔥 FIX #15: Trade timed out at loss
         }
         REAL_WIN_REASONS = {
             'EXCHANGE_TAKE_PROFIT', 'TP_HIT', 'TAKE_PROFIT', 'TP1', 'TP2'

@@ -107,6 +107,10 @@ def check_candle_gate(
     if engine._is_new_candle():
         engine._mark_candle_evaluated()
         _update_last_eval_price(engine, current_price)
+        
+        # 🔥 NEW (Feb 04, 2026): Track candles since startup for warmup
+        engine._candles_since_start = getattr(engine, '_candles_since_start', 0) + 1
+        
         logger.info(f"🕯️ NEW CANDLE CLOSE → EVALUATING | Price: ${current_price:.2f} | ATR: {atr_1m:.2f}")
         return True, new_count
     
@@ -406,25 +410,53 @@ def check_anticipation_signal(
         
         # =========================================================================
         # 🔥 FIX (Jan 28, 2026): VERIFICAR MOMENTUM EN TIEMPO REAL
+        # 🔥 FIX #25 (Feb 04): NO invalidar por ACTIVE_DIRECTION si edge EXPIRED
         # 
-        # Problema: Anticipation detecta compresión pero el precio ya se movió
-        # contra la dirección sugerida → entrada en la peor ubicación
+        # PROBLEMA ORIGINAL (Jan 28): Anticipation detecta compresión pero precio
+        # ya se movió contra la dirección sugerida → entrada en peor ubicación
         #
-        # Solución: Si hay displacement activo CONTRA la dirección de anticipation,
-        # invalidar la señal de anticipation
+        # PROBLEMA NUEVO (Feb 03): Anticipation (COMPRESSION_BREAKOUT) invalidada
+        # por ACTIVE_DIRECTION=SHORT cuando edge está EXPIRED y no hay posición.
+        # El ACTIVE_DIRECTION es "stale" (viejo) → crea dead zone.
+        #
+        # SOLUCIÓN MEJORADA:
+        # 1. Solo invalidar si displacement_bypass está ACTIVO (no stale)
+        # 2. Si edge está EXPIRED o NO_EDGE y no hay posición, ACTIVE_DIRECTION stale
+        # 3. En ese caso, no invalidar ANTICIPATION
         # =========================================================================
-        displacement_direction = getattr(engine, '_active_direction', None)
+        active_direction = getattr(engine, '_active_direction', None)
         displacement_bypass = getattr(engine, '_displacement_bypass', False)
         
-        if displacement_bypass and displacement_direction:
+        # Check if edge is still active or if it's stale
+        edge_is_active = False
+        if hasattr(engine, '_edge_manager'):
+            from src.domain.trading.edge_state_manager import EdgeState
+            edge_is_active = engine._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]
+        
+        # Check if we have a position (if so, ACTIVE_DIRECTION matters)
+        has_position = getattr(engine, '_position', None) is not None
+        
+        # 🔥 FIX #25: Only invalidate if edge is actually active OR we have a position
+        # If edge is EXPIRED/NO_EDGE and no position → ACTIVE_DIRECTION is stale, ignore it
+        direction_is_relevant = edge_is_active or has_position
+        
+        if displacement_bypass and active_direction and direction_is_relevant:
             # Hay displacement activo - verificar si contradice anticipation
-            if anticipation.direction and anticipation.direction != displacement_direction:
+            if anticipation.direction and anticipation.direction != active_direction:
                 logger.info(
                     f"⛔ ANTICIPATION INVALIDATED: {anticipation.direction} vs "
-                    f"DISPLACEMENT={displacement_direction} | Ignorando señal"
+                    f"ACTIVE_DIRECTION={active_direction} (displacement_bypass=True, edge_active={edge_is_active}) | Ignorando señal"
                 )
                 anticipation = AnticipationState()  # Reset to empty
                 engine._last_anticipation_state = anticipation
+        elif displacement_bypass and active_direction and not direction_is_relevant:
+            # Edge is stale - log but don't invalidate
+            if anticipation.direction and anticipation.direction != active_direction:
+                logger.info(
+                    f"📝 ANTICIPATION preserved: {anticipation.direction} differs from stale "
+                    f"ACTIVE_DIRECTION={active_direction} (edge={engine._edge_manager.state.value if hasattr(engine, '_edge_manager') else 'N/A'}, no_position) | "
+                    f"Stale direction ignored - new breakout allowed"
+                )
         
         # =========================================================================
         # 🔥 AJUSTE (Jan 27, 2026): ANTICIPATION = información, NO trigger
@@ -442,6 +474,10 @@ def check_anticipation_signal(
             tags['anticipation_signal'] = anticipation.signal.value
             tags['anticipation_confidence'] = anticipation.confidence
             tags['anticipation_direction'] = anticipation.direction
+            
+            # 🔥 FIX #29 (Feb 04): Store structure_level for breakout trigger
+            if anticipation.structure_level > 0:
+                tags['anticipation_structure_level'] = anticipation.structure_level
             
             # =====================================================================
             # 🔥 FIX (Jan 28, 2026): Extraer BB percentile y volume ratio de reasons
@@ -463,9 +499,13 @@ def check_anticipation_signal(
                         if vol_match:
                             tags['anticipation_volume_ratio'] = float(vol_match.group(1))
             
+            # 🔥 FIX (Feb 02, 2026): Only log anticipation here (removed duplicate in anticipation.py)
+            # Also add ADX context for debugging ADX vs RANGE_BOUND conflict
+            adx_5m = getattr(engine, '_last_effective_adx', 0.0)
+            trend_phase = getattr(engine, '_current_trend_phase', 'UNKNOWN')
             logger.info(
                 f"🔮 ANTICIPATION: {anticipation.signal.value} {anticipation.direction} | "
-                f"conf={anticipation.confidence:.0%}"
+                f"conf={anticipation.confidence:.0%} | ADX={adx_5m:.1f} | phase={trend_phase}"
             )
             if anticipation.reasons:
                 for reason in anticipation.reasons[:3]:
@@ -567,6 +607,16 @@ async def check_pre_trade_conditions(
     Returns:
         (can_trade, reason) tuple
     """
+    # 🔥 FIX (Feb 1, 2026): LOSS STREAK COOLDOWN + KILL SWITCH CHECK
+    # This was MISSING! _check_loss_cooldown was defined but never called
+    if hasattr(engine, '_check_loss_cooldown'):
+        can_enter, loss_reason = engine._check_loss_cooldown(market_time)
+        if not can_enter:
+            # Log clearly when blocked by kill switch or loss cooldown
+            if "KILL SWITCH" in loss_reason:
+                logger.warning(f"[BLOCKED] {loss_reason}")
+            return False, loss_reason
+    
     # Daily halt check
     is_halted, halt_reason = engine.state_machine.check_daily_halt()
     if is_halted:

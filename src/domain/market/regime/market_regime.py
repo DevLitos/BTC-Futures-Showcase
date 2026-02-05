@@ -1,6 +1,11 @@
 """
 Market Regime Engine (Context Engine) - V2.1
 
+⚠️ PARTIAL DEPRECATION (Feb 05, 2026):
+RegimeConfig defined here is a DUPLICATE.
+Prefer using UnifiedRegimeConfig from src/config/unified_constants.py
+ManagementRegime enum and ManagementRegimeClassifier are still valid.
+
 El sistema debe "sentir" el mercado antes de decidir cómo gestionar la posición.
 
 Definición Matemática de 3 Estados usando ADX + Análisis de Velas:
@@ -23,6 +28,9 @@ from typing import Dict, Any, Optional, Tuple, List
 from enum import Enum
 from datetime import datetime, UTC
 
+# 🔥 NEW (Feb 05): Import unified config for future migration
+from src.config.unified_constants import UnifiedRegimeConfig, UNIFIED_REGIMES, get_unified_regime
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,9 +45,11 @@ class ManagementRegime(Enum):
     CHOPPY_DEAD = "CHOPPY_DEAD"           # ADX < 15, low volume
 
 
+# ⚠️ LEGACY (Feb 05): This RegimeConfig is LOCAL to this file.
+# For new code, prefer using UnifiedRegimeConfig from unified_constants.py
 @dataclass
 class RegimeConfig:
-    """Configuration for regime classification."""
+    """Configuration for regime classification - LOCAL LEGACY VERSION."""
     
     # ADX thresholds
     ADX_TREND_THRESHOLD: float = 25.0     # Above this = trending

@@ -38,10 +38,15 @@ from src.config.trading_config import (
 from src.domain.market.regime import TrendPhase
 from src.domain.trading.state.state_machine import BotState
 from src.domain.market.regime import EntryRegime
+
+# FIX #41: Rate limiting for guard logs - don't spam same message
+_last_guard_log: dict[str, datetime] = {}  # guard_name -> last_log_time
+_guard_log_interval = timedelta(minutes=2)  # Only log same guard every 2 minutes
 from src.infrastructure.exchanges.kraken.slippage_model import OrderType
 from src.application.live.entry_executor import ExecutionGuards, LocationGuards
 from src.application.live.entry_validators import ChaseResult
 from src.domain.trading.execution_logic.entry_quality import GateDecision
+from src.application.live.direction_state_manager import DirectionStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +180,7 @@ class GuardOrchestrator:
             return result
         
         # 4. ADX coherence
+        # FIX (Feb 1, 2026): Less strict + DISPLACEMENT bypass
         if len(ctx.df_1h) >= 20 and len(ctx.df_5m) >= 20:
             adx_1h, _ = calculate_adx(ctx.df_1h['high'].to_numpy(), ctx.df_1h['low'].to_numpy(), ctx.df_1h['close'].to_numpy(), 14)
             adx_5m, _ = calculate_adx(ctx.df_5m['high'].to_numpy(), ctx.df_5m['low'].to_numpy(), ctx.df_5m['close'].to_numpy(), 14)
@@ -184,7 +190,17 @@ class GuardOrchestrator:
                 ltf_adx = adx_5m[-1]
                 ctx.adx_1h = htf_adx
                 
-                if htf_adx > 20 and ltf_adx < 12:
+                # 🔥 FIX: DISPLACEMENT BYPASS - si hay displacement activo, ignorar ADX divergence
+                # El displacement YA confirmó momentum - no necesitamos LTF ADX alto
+                has_displacement_bypass = getattr(engine, '_displacement_bypass', False)
+                
+                # 🔥 FIX: También bypass si HTF está MUY fuerte (> 35) - LTF puede estar consolidando
+                htf_very_strong = htf_adx > 35
+                
+                # 🔥 FIX: Threshold más bajo (10 en vez de 12) - 11.6 no es "dead"
+                # 🔄 REFACTORED Feb 04: Use ADXThresholds.TREND for consistent threshold
+                from src.config.trading_config import ADXThresholds
+                if htf_adx > ADXThresholds.TREND and ltf_adx < 10 and not has_displacement_bypass and not htf_very_strong:
                     result.passed = False
                     result.reason = f"ADX divergence: HTF={htf_adx:.1f} trending, LTF={ltf_adx:.1f} dead"
                     return result
@@ -229,12 +245,666 @@ class GuardOrchestrator:
         result.tags['spread_penalty'] = spread_result.score_penalty
         result.tags['spread_size_factor'] = spread_result.size_factor
         
-        # 9. Session limits (just flag - override checked later)
+        # =====================================================================
+        # 🚨 GUARD 9: DELTA CONTRADICT BLOCKER - 🔥🔥🔥 DISABLED (Feb 04, 2026) 🔥🔥🔥
+        # =====================================================================
+        # WHY DISABLED:
+        # Delta is a LAGGING indicator that caused CATASTROPHIC entry timing:
+        # 
+        # CASE (Feb 04, 2026 18:35-18:37):
+        # - Price falling $72,657 → $72,368 (clear SHORT opportunity)
+        # - Delta showed +6.06x (buyers stepping in during drop)
+        # - System BLOCKED 4 consecutive SHORT entries during the move
+        # - Finally allowed entry at $72,392 - THE EXACT LOCAL MINIMUM
+        # - Price immediately bounced to $72,754
+        # - Result: -0.22R loss (TIME_INVALIDATION)
+        #
+        # LESSON: Delta measures PAST volume flow, not FUTURE price direction
+        # During drops, buyers step in (positive delta) but price keeps falling
+        # The filter BLOCKS during valid moves and ALLOWS at reversals = worst timing
+        #
+        # SOLUTION: Completely disable delta blocking. Keep as INFO tag only.
+        # =====================================================================
+        delta_ratio = engine._current_trade_tags.get('volume_delta_ratio', 0)
+        
+        # 🔥 DISABLED - DO NOT BLOCK ON DELTA
+        # Only log for analysis, never block
+        if abs(delta_ratio) > 2.0:
+            logger.info(
+                f"[INFO] Delta contradict (NOT BLOCKING): {delta_ratio:+.2f}x vs {ctx.bias} | "
+                f"Logged for analysis only"
+            )
+            engine._current_trade_tags['delta_info_contradict'] = True
+            engine._current_trade_tags['delta_info_ratio'] = delta_ratio
+        
+        # Clear any delta_block flag from earlier code
+        engine._current_trade_tags['delta_block'] = False
+        
+        # =====================================================================
+        # 🚨 GUARD 10: SHORT OBSTINACY BLOCKER (Fix #13 - Feb 02, 2026)
+        # 🧠 FIX #20 (Feb 03, 2026): SOFT MODE for displacement memory
+        # =====================================================================
+        # PROBLEMA CRÍTICO DETECTADO (Feb 02):
+        # - Con 4 señales bullish, solo aplicaba -0.5 al score
+        # - El trade del SHORT (Feb 02) tenía 4 señales bullish pero se ejecutó
+        #
+        # SOLUCIÓN ORIGINAL: 3+ bullish signals en SHORT = HARD BLOCK
+        #
+        # 🧠 PROBLEMA NUEVO DETECTADO (Feb 03):
+        # - Displacement SHORT detectado, pero precio rebotó → BIAS FLIP
+        # - Indicadores lagging (VWAP, EMA) siguen mostrando "bullish"
+        # - OBSTINACY bloqueó 14 señales que habrían sido +11R
+        #
+        # 🧠 SOLUCIÓN: SOFT MODE cuando:
+        # 1. Displacement memory activo (hubo displacement reciente)
+        # 2. Todas las señales bullish son LAGGING (no estructurales)
+        # 3. Price impulse confirma movimiento bajista (leading indicator)
+        #
+        # SOFT MODE NO bloquea, pero aplica:
+        # - Size cap 0.5 (50% max position)
+        # - Score penalty -1.5
+        # =====================================================================
+        if ctx.bias == 'SHORT':
+            bullish_signals = engine._current_trade_tags.get('bullish_signals', 0)
+            obstinacy_reason = engine._current_trade_tags.get('obstinacy_reason', '')
+            
+            OBSTINACY_BLOCK_THRESHOLD = 3
+            if bullish_signals >= OBSTINACY_BLOCK_THRESHOLD:
+                # 🧠 FIX #20: Check if SOFT mode is eligible
+                soft_mode_eligible = engine._current_trade_tags.get('obstinacy_soft_mode_eligible', False)
+                displacement_memory_active = engine._current_trade_tags.get('displacement_memory_active', False)
+                all_lagging = engine._current_trade_tags.get('obstinacy_all_lagging', False)
+                price_impulse_down = engine._current_trade_tags.get('price_impulse_down', False)
+                
+                if soft_mode_eligible and displacement_memory_active:
+                    # 🧠 SOFT MODE: Allow trade with restrictions
+                    # Apply size cap and score penalty instead of blocking
+                    # 🔄 REFACTORED Feb 04: Use ScoreAdjustments centralized class
+                    from src.config.trading_config import ScoreAdjustments
+                    SOFT_MODE_SIZE_CAP = 0.5
+                    SOFT_MODE_SCORE_PENALTY = ScoreAdjustments.SOFT_MODE_PENALTY
+                    
+                    logger.warning(
+                        f"🧠 GUARD SOFT MODE: SHORT OBSTINACY | "
+                        f"{bullish_signals} bullish signals ({obstinacy_reason}) | "
+                        f"BUT displacement_memory=active, all_lagging={all_lagging}, impulse_down={price_impulse_down} | "
+                        f"Allowing with size_cap={SOFT_MODE_SIZE_CAP}, penalty={SOFT_MODE_SCORE_PENALTY}"
+                    )
+                    
+                    # Store SOFT mode restrictions in tags for later application
+                    engine._current_trade_tags['obstinacy_soft_mode'] = True
+                    engine._current_trade_tags['obstinacy_soft_size_cap'] = SOFT_MODE_SIZE_CAP
+                    engine._current_trade_tags['obstinacy_soft_score_penalty'] = SOFT_MODE_SCORE_PENALTY
+                    result.tags['obstinacy_soft_mode'] = True
+                    
+                    # Don't block - continue with restrictions applied later
+                else:
+                    # HARD BLOCK: Normal case without SOFT mode eligibility
+                    # 🔥 FIX #41: Rate-limit log spam
+                    log_key = 'SHORT_OBSTINACY'
+                    last_log = _last_guard_log.get(log_key)
+                    should_log = last_log is None or (ctx.market_time - last_log) > _guard_log_interval
+                    if should_log:
+                        _last_guard_log[log_key] = ctx.market_time
+                        logger.warning(
+                            f"🚫🚫🚫 GUARD BLOCKED: SHORT OBSTINACY | "
+                            f"{bullish_signals} bullish signals ({obstinacy_reason}) | "
+                            f"Market is BULLISH - don't short the bull"
+                        )
+                    result.passed = False
+                    result.reason = f"Short obstinacy: {bullish_signals} bullish signals ({obstinacy_reason})"
+                    result.tags['block_category'] = 'short_obstinacy'
+                    engine._current_trade_tags['guard_blocked_by_obstinacy'] = True
+                    
+                    # =========================================================
+                    # 🔥 FIX #37 (Feb 05, 2026): INVALIDATE EDGE AFTER 3 BLOCKS
+                    # If SHORT_OBSTINACY blocks 3+ times consecutively, the edge
+                    # is clearly wrong (bullish market, SHORT edge). Invalidate
+                    # the edge to allow system to re-evaluate and potentially
+                    # arm a LONG edge.
+                    # =========================================================
+                    engine._obstinacy_block_count = getattr(engine, '_obstinacy_block_count', 0) + 1
+                    OBSTINACY_INVALIDATE_THRESHOLD = 3
+                    
+                    if engine._obstinacy_block_count >= OBSTINACY_INVALIDATE_THRESHOLD:
+                        edge_mgr = getattr(engine, '_edge_manager', None)
+                        if edge_mgr is not None:
+                            from src.domain.trading.edge_state_manager import EdgeState
+                            if edge_mgr.state in [EdgeState.EDGE_ACTIVE, EdgeState.EDGE_ARMED]:
+                                logger.warning(
+                                    f"🔄 EDGE INVALIDATED by OBSTINACY: {engine._obstinacy_block_count}x consecutive blocks | "
+                                    f"Edge {edge_mgr.state.value} SHORT but market BULLISH ({bullish_signals} signals) | "
+                                    f"Resetting edge to allow direction change"
+                                )
+                                edge_mgr._transition_to(
+                                    EdgeState.NO_EDGE,
+                                    f"Obstinacy invalidation: {engine._obstinacy_block_count}x blocks, {bullish_signals} bullish signals",
+                                    ctx.market_time  # 🔥 FIX: Use ctx.market_time, not engine._last_tick_time
+                                )
+                                engine._obstinacy_block_count = 0  # Reset counter
+                                engine._current_trade_tags['edge_invalidated_by'] = 'obstinacy_consecutive'
+                    
+                    return result
+            else:
+                # 🔥 FIX #37: Reset counter if not blocked (bullish_signals < 3)
+                engine._obstinacy_block_count = 0
+        else:
+            # 🔥 FIX #37: Reset counter if not SHORT bias
+            engine._obstinacy_block_count = 0
+        
+        # =====================================================================
+        # 🚨 GUARD 11: DISPLACEMENT EXTREME ENTRY (Fix #14 - Feb 02, 2026)
+        # =====================================================================
+        # Check applies to displacement entries in REGULAR pipeline too
+        # (FAST PATH has its own check, but pipeline regular can reach PHASE 9
+        # with DISPLACEMENT DIRECT ENTRY enabled without this check)
+        # =====================================================================
+        edge_mgr = getattr(engine, '_edge_manager', None)
+        if edge_mgr is not None:
+            from src.domain.trading.edge_state_manager import EdgeState, EdgeType
+            is_displacement = (
+                edge_mgr.state == EdgeState.EDGE_ACTIVE and
+                edge_mgr.current_bos is not None and
+                edge_mgr.current_bos.edge_type == EdgeType.DISPLACEMENT
+            )
+            if is_displacement:
+                origin_price = edge_mgr.current_bos.origin_price or 0
+                # 🔧 FIX INTELIGENTE: Usar el displacement detectado como referencia
+                # El problema era que usábamos ATR_1m (~$100) pero el displacement
+                # se detecta con ATR_5m (~$400). Esto hacía imposible entrar.
+                # 
+                # NUEVA LÓGICA: Bloquear si el precio se movió >50% MÁS ALLÁ del
+                # displacement inicial. Si disp=$400, bloqueamos a partir de $600.
+                initial_displacement = edge_mgr.current_bos.initial_displacement_amount or 0
+                
+                if origin_price > 0 and initial_displacement > 0:
+                    if ctx.bias == 'LONG':
+                        distance = ctx.current_price - origin_price
+                    else:
+                        distance = origin_price - ctx.current_price
+                    
+                    # Si distance < 0, el precio retrocedió del origin → no hay chase
+                    if distance <= 0:
+                        pass  # OK to enter - we haven't chased beyond origin
+                    else:
+                        # Calcular cuánto más allá del displacement estamos
+                        # ratio = 1.0 significa que estamos exactamente en el displacement
+                        # ratio = 1.5 significa que estamos 50% más allá
+                        displacement_ratio = distance / initial_displacement
+                        
+                        # BLOCK si estamos >50% más allá del displacement inicial
+                        # Esto permite entrar cerca del displacement pero no perseguir
+                        MAX_CHASE_RATIO = 1.5
+                        
+                        if displacement_ratio > MAX_CHASE_RATIO:
+                            logger.warning(
+                                f"🚫🚫🚫 GUARD BLOCKED: DISPLACEMENT EXTREME ENTRY | "
+                                f"{ctx.bias} at {displacement_ratio:.1f}x displacement | "
+                                f"Origin=${origin_price:.0f}, Disp=${initial_displacement:.0f}, Current=${ctx.current_price:.0f} | "
+                                f"Don't chase - wait for pullback"
+                            )
+                            result.passed = False
+                            result.reason = f"Displacement extreme: {displacement_ratio:.1f}x beyond initial"
+                            result.tags['block_category'] = 'displacement_extreme'
+                            engine._current_trade_tags['guard_blocked_by_extreme'] = True
+                            engine._current_trade_tags['guard_displacement_ratio'] = displacement_ratio
+                            return result
+        
+        # =====================================================================
+        # 🚨 GUARD 12: LOCATION EXTREME BLOCK (Fix #16 - Feb 02, 2026)
+        # =====================================================================
+        # 🔄 REFACTOR Feb 04: Use centralized LocationFilters thresholds
+        # 🔥 FIX #38 (Feb 05): Also invalidate edge when location extreme blocks
+        # =====================================================================
+        from src.config.trading_config import LocationFilters
+        location_ctx = getattr(engine, '_location_context', None)
+        if location_ctx:
+            pct_60d = getattr(location_ctx, 'percentile_60d', 50)
+            # Use centralized thresholds instead of hardcoded 10/90
+            in_extreme_low = (
+                getattr(location_ctx, 'in_extreme_low', False) or 
+                pct_60d <= LocationFilters.EXTREME_LOW_PERCENTILE
+            )
+            in_extreme_high = (
+                getattr(location_ctx, 'in_extreme_high', False) or 
+                pct_60d >= LocationFilters.EXTREME_HIGH_PERCENTILE
+            )
+            
+            # 🔥 FIX #41: Check if we're in ACTIVE BREAKOUT (bear market scenario)
+            # If ADX is very high AND we're breaking down, allow shorts even at low percentile
+            is_breakout_down = getattr(location_ctx, 'is_breakout_down', False)
+            adx_current = getattr(location_ctx, 'adx_current', 0)
+            # Also check breakout score - higher score = more confident breakout
+            breakout_down_score = getattr(location_ctx, 'breakout_down_score', 0)
+            
+            # 🔥 FIX #45 (Feb 05, 2026): Also get ADX from engine (more reliable)
+            # LocationContext.adx_current might be stale or different timeframe
+            engine_adx = getattr(engine, '_current_adx', None) or adx_current
+            effective_adx = max(adx_current, engine_adx) if engine_adx else adx_current
+            
+            # BREAKOUT OVERRIDE: Allow shorts if strong downward breakout
+            # This handles bear market scenarios where we're always at "low" percentile
+            # 🔥 FIX #50 (Feb 05): ADX alone should NOT override location extreme
+            # ADX=57 means strong trend, but if percentile=2%, the move ALREADY HAPPENED
+            # Only allow breakout override if:
+            # 1. Multiple breakout confirmations (score >= 3) - market structure confirms
+            # 2. Breakout detected AND percentile not yet at extreme (<5% threshold)
+            # 3. Displacement active (volatility shock = chase allowed)
+            displacement_bypass = engine._current_trade_tags.get('fp_displacement_bypass', False)
+            
+            allow_short_breakout = (
+                breakout_down_score >= 3  # Multiple confirmations = structure break
+            ) or (
+                is_breakout_down and pct_60d > 5.0  # Breakout but NOT at floor yet
+            ) or (
+                displacement_bypass and effective_adx > 50  # Volatility shock + strong trend
+            )
+            
+            if ctx.bias == 'SHORT' and in_extreme_low and not allow_short_breakout:
+                # 🔥 FIX #41: Rate-limit log spam
+                now = ctx.market_time
+                log_key = 'LOCATION_EXTREME_SHORT'
+                last_log = _last_guard_log.get(log_key)
+                should_log = last_log is None or (now - last_log) > _guard_log_interval
+                
+                if should_log:
+                    _last_guard_log[log_key] = now
+                    logger.warning(
+                        f"🚫🚫🚫 GUARD BLOCKED: LOCATION EXTREME OVERSOLD | "
+                        f"Attempting SHORT at percentile {pct_60d:.1f}% | "
+                        f"Don't short the bottom"
+                    )
+                result.passed = False
+                result.reason = f"Location extreme: SHORT at {pct_60d:.0f}% percentile"
+                result.tags['block_category'] = 'location_extreme'
+                engine._current_trade_tags['guard_blocked_by_location_extreme'] = True
+                
+                # 🔥 FIX #38 + #39: Invalidate SHORT edge AND forbid re-arming
+                if edge_mgr is not None:
+                    from src.domain.trading.edge_state_manager import EdgeState
+                    if edge_mgr.state in [EdgeState.EDGE_ACTIVE, EdgeState.EDGE_ARMED]:
+                        if edge_mgr.current_bos and edge_mgr.current_bos.direction == 'SHORT':
+                            logger.warning(
+                                f"🔄 EDGE INVALIDATED: SHORT edge reached bottom ({pct_60d:.1f}%) | "
+                                f"Edge objective achieved - price moved to extreme"
+                            )
+                            edge_mgr._transition_to(
+                                EdgeState.EDGE_EXPIRED,
+                                f"Location extreme: SHORT reached {pct_60d:.0f}% percentile",
+                                ctx.market_time
+                            )
+                            engine._current_trade_tags['edge_invalidated_by'] = 'location_extreme_achieved'
+                            
+                            # 🔥 FIX #39: Forbid SHORT direction until price leaves extreme zone
+                            # This prevents the edge from re-arming immediately
+                            engine._forbidden_direction = 'SHORT'
+                            engine._current_trade_tags['forbidden_by_location_extreme'] = True
+                            logger.warning(
+                                f"🚫 SHORT FORBIDDEN: Price at bottom ({pct_60d:.1f}%) | "
+                                f"No shorts allowed until price leaves extreme zone"
+                            )
+                
+                return result
+            
+            # 🔥 FIX #41: Log when breakout override allows trading
+            if ctx.bias == 'SHORT' and in_extreme_low and allow_short_breakout:
+                log_key = 'BREAKOUT_OVERRIDE_SHORT'
+                last_log = _last_guard_log.get(log_key)
+                should_log = last_log is None or (ctx.market_time - last_log) > _guard_log_interval
+                if should_log:
+                    _last_guard_log[log_key] = ctx.market_time
+                    logger.info(
+                        f"✅ BREAKOUT OVERRIDE: SHORT allowed despite low percentile ({pct_60d:.1f}%) | "
+                        f"ADX={effective_adx:.1f} | Breakout_down={is_breakout_down} | Score={breakout_down_score}"
+                    )
+            
+            # 🔥 FIX #41/#45: Check breakout up for LONG override
+            is_breakout_up = getattr(location_ctx, 'is_breakout_up', False)
+            breakout_up_score = getattr(location_ctx, 'breakout_up_score', 0)
+            # 🔥 FIX #45/#50: LONG at ceiling needs PROOF of continuation, not just ADX
+            # ADX=60 at percentile 98% = move already happened, chasing tops
+            allow_long_breakout = (
+                breakout_up_score >= 3  # Multiple confirmations = structure break
+            ) or (
+                is_breakout_up and pct_60d < 95.0  # Breakout but NOT at ceiling yet
+            ) or (
+                displacement_bypass and effective_adx > 50  # Volatility shock + strong trend
+            )
+            
+            if ctx.bias == 'LONG' and in_extreme_high and not allow_long_breakout:
+                # Rate-limit log spam
+                now = ctx.market_time
+                log_key = 'LOCATION_EXTREME_LONG'
+                last_log = _last_guard_log.get(log_key)
+                should_log = last_log is None or (now - last_log) > _guard_log_interval
+                
+                if should_log:
+                    _last_guard_log[log_key] = now
+                    logger.warning(
+                        f"🚫🚫🚫 GUARD BLOCKED: LOCATION EXTREME OVERBOUGHT | "
+                        f"Attempting LONG at percentile {pct_60d:.1f}% | "
+                        f"Don't buy the top"
+                    )
+                result.passed = False
+                result.reason = f"Location extreme: LONG at {pct_60d:.0f}% percentile"
+                result.tags['block_category'] = 'location_extreme'
+                engine._current_trade_tags['guard_blocked_by_location_extreme'] = True
+                
+                # 🔥 FIX #38 + #39: Invalidate LONG edge AND forbid re-arming
+                if edge_mgr is not None:
+                    from src.domain.trading.edge_state_manager import EdgeState
+                    if edge_mgr.state in [EdgeState.EDGE_ACTIVE, EdgeState.EDGE_ARMED]:
+                        if edge_mgr.current_bos and edge_mgr.current_bos.direction == 'LONG':
+                            logger.warning(
+                                f"🔄 EDGE INVALIDATED: LONG edge reached top ({pct_60d:.1f}%) | "
+                                f"Edge objective achieved - price moved to extreme"
+                            )
+                            edge_mgr._transition_to(
+                                EdgeState.EDGE_EXPIRED,
+                                f"Location extreme: LONG reached {pct_60d:.0f}% percentile",
+                                ctx.market_time
+                            )
+                            engine._current_trade_tags['edge_invalidated_by'] = 'location_extreme_achieved'
+                            
+                            # 🔥 FIX #39: Forbid LONG direction until price leaves extreme zone
+                            # This prevents the edge from re-arming immediately
+                            engine._forbidden_direction = 'LONG'
+                            engine._current_trade_tags['forbidden_by_location_extreme'] = True
+                            logger.warning(
+                                f"🚫 LONG FORBIDDEN: Price at top ({pct_60d:.1f}%) | "
+                                f"No longs allowed until price leaves extreme zone"
+                            )
+                
+                return result
+        
+        # =====================================================================
+        # 🚨 GUARD 13: COUNTER-MOMENTUM BLOCK (Fix #17 - Feb 02, 2026)
+        # 🔄 REFACTOR Feb 04: Uses DirectionStateManager.validate_direction()
+        # SINGLE SOURCE OF TRUTH for direction validation
+        # =====================================================================
+        direction_mgr = getattr(engine, 'direction_state_mgr', None)
+        if direction_mgr is not None:
+            # Sync current state from engine to manager
+            direction_mgr.sync_from_app(
+                direction_lock=getattr(engine, '_direction_lock', None),
+                direction_lock_reason=getattr(engine, '_direction_lock_reason', None),
+                direction_lock_expires_at=getattr(engine, '_direction_lock_expires_at', None),
+                direction_lock_initial_move=getattr(engine, '_direction_lock_initial_move', 0.0),
+                expansion_mode=getattr(engine, '_expansion_mode', False),
+                expansion_direction=getattr(engine, '_expansion_direction', None),
+                expansion_start_time=getattr(engine, '_expansion_start_time', None),
+                expansion_initial_displacement=getattr(engine, '_expansion_initial_displacement', 0.0),
+                bias_high_since=getattr(engine, '_bias_high_since', 0.0),
+                bias_low_since=getattr(engine, '_bias_low_since', 0.0),
+                forbidden_direction=getattr(engine, '_forbidden_direction', None),
+            )
+            
+            # Unified direction validation
+            is_allowed, block_reason, block_category = direction_mgr.validate_direction(
+                proposed_direction=ctx.bias,
+                is_edge_active=(edge_mgr.is_edge_active() if edge_mgr else False)
+            )
+            
+            if not is_allowed:
+                logger.warning(
+                    f"🚫🚫🚫 GUARD BLOCKED: {block_category.upper().replace('_', ' ')} | "
+                    f"{block_reason}"
+                )
+                result.passed = False
+                result.reason = block_reason
+                result.tags['block_category'] = block_category
+                engine._current_trade_tags[f'guard_blocked_by_{block_category}'] = True
+                return result
+        else:
+            # Fallback: Legacy checks if DirectionStateManager not available
+            direction_lock = getattr(engine, '_direction_lock', None)
+            if direction_lock and direction_lock != ctx.bias:
+                logger.warning(
+                    f"🚫🚫🚫 GUARD BLOCKED: COUNTER-MOMENTUM | "
+                    f"Attempting {ctx.bias} but DIRECTION_LOCK={direction_lock}"
+                )
+                result.passed = False
+                result.reason = f"Counter-momentum: {ctx.bias} against lock {direction_lock}"
+                result.tags['block_category'] = 'counter_momentum'
+                return result
+            
+            forbidden_dir = getattr(engine, '_forbidden_direction', None)
+            if forbidden_dir == ctx.bias:
+                result.passed = False
+                result.reason = f"Forbidden direction: {ctx.bias}"
+                result.tags['block_category'] = 'forbidden_direction'
+                return result
+        
+        # =====================================================================
+        # 🚨 GUARD 14: FAKEOUT DETECTOR (Fix #18 - Feb 02, 2026)
+        # =====================================================================
+        # PROBLEMA: Este check solo existía en FAST PATH
+        # Si displacement ya retrocedió >40%, es un fakeout
+        # =====================================================================
+        if edge_mgr is not None and edge_mgr.current_bos is not None:
+            bos = edge_mgr.current_bos
+            origin_price = bos.origin_price or 0
+            initial_disp = bos.initial_displacement_amount or 0
+            
+            if initial_disp > 0 and origin_price > 0:
+                if ctx.bias == 'LONG':
+                    # En LONG: origin era el LOW, si price < origin + 60% disp → fakeout
+                    min_continuation = origin_price + (initial_disp * 0.60)
+                    if ctx.current_price < min_continuation:
+                        retracement = (origin_price + initial_disp - ctx.current_price) / initial_disp * 100
+                        logger.warning(
+                            f"🚫🚫🚫 GUARD BLOCKED: FAKEOUT DETECTED | "
+                            f"LONG displacement retrocedió {retracement:.0f}% | "
+                            f"Origin=${origin_price:.0f}, Disp=${initial_disp:.0f}, Current=${ctx.current_price:.0f}"
+                        )
+                        result.passed = False
+                        result.reason = f"Fakeout: displacement retraced {retracement:.0f}%"
+                        result.tags['block_category'] = 'fakeout'
+                        engine._current_trade_tags['guard_blocked_by_fakeout'] = True
+                        return result
+                else:
+                    # En SHORT: origin era el HIGH, si price > origin - 60% disp → fakeout
+                    max_continuation = origin_price - (initial_disp * 0.60)
+                    if ctx.current_price > max_continuation:
+                        retracement = (ctx.current_price - (origin_price - initial_disp)) / initial_disp * 100
+                        logger.warning(
+                            f"🚫🚫🚫 GUARD BLOCKED: FAKEOUT DETECTED | "
+                            f"SHORT displacement retrocedió {retracement:.0f}% | "
+                            f"Origin=${origin_price:.0f}, Disp=${initial_disp:.0f}, Current=${ctx.current_price:.0f}"
+                        )
+                        result.passed = False
+                        result.reason = f"Fakeout: displacement retraced {retracement:.0f}%"
+                        result.tags['block_category'] = 'fakeout'
+                        engine._current_trade_tags['guard_blocked_by_fakeout'] = True
+                        return result
+        
+        # =====================================================================
+        # 🚨 GUARD 15: MULTI-WARNING KILL CHECK (Fix #22 - Feb 02, 2026)
+        # =====================================================================
+        # PROBLEMA: Trades con MÚLTIPLES warnings igual fueron ejecutados
+        # Ejemplo: bias_invalidated + forbidden_direction + delta_contradicts = 3 red flags
+        # Si hay >=2 señales de peligro → HARD BLOCK
+        #
+        # 🔥 FIX #26 (Feb 04): Make kill check EdgeType and direction aware
+        # - forbidden_direction OPPOSITE to bias is NOT a danger signal for our trade
+        # - expansion_mode_activated for DISPLACEMENT edge is expected behavior
+        # - bias_invalidated before displacement is normal
+        # =====================================================================
+        danger_signals = 0
+        danger_reasons = []
+        
+        # Check all accumulated danger tags
+        current_tags = getattr(engine, '_current_trade_tags', {})
+        
+        # 🔥 FIX #26: Get current context for intelligent filtering
+        current_bias = ctx.bias
+        forbidden_dir = current_tags.get('forbidden_direction')
+        
+        # Get edge type if active
+        edge_mgr = getattr(engine, '_edge_manager', None)
+        current_edge_type = None
+        force_direct_entry = False
+        if edge_mgr and edge_mgr.current_bos:
+            current_edge_type = edge_mgr.current_bos.edge_type
+            force_direct_entry = getattr(edge_mgr.current_bos, 'force_direct_entry', False)
+        
+        # List of danger signals to count - with intelligent filtering
+        danger_tag_checks = [
+            ('bias_invalidated', 'Bias was invalidated'),
+            ('forbidden_direction', 'Direction is forbidden'),
+            ('delta_contradicts', 'Delta contradicts direction'),
+            ('fast_path_blocked_by_delta', 'Fast Path blocked by delta'),
+            ('expansion_mode_activated', 'Expansion against direction'),
+            ('structure_break_against', 'Structure broke against us'),
+            ('momentum_exhaustion', 'Momentum is exhausted'),
+        ]
+        
+        for tag_name, reason_text in danger_tag_checks:
+            if current_tags.get(tag_name):
+                # 🔥 FIX #26: Intelligent filtering by context
+                should_count = True
+                
+                # 🔥 FIX #4 (Feb 04): forbidden_direction OPPOSITE to our bias is NOT dangerous
+                # e.g., forbidden_direction='SHORT' when trading LONG is FINE for the LONG trade
+                if tag_name == 'forbidden_direction':
+                    if forbidden_dir and forbidden_dir != current_bias:
+                        should_count = False  # Opposite direction is forbidden, not ours
+                
+                # 🔥 FIX #5 (Feb 04): DISPLACEMENT edge context
+                if current_edge_type and current_edge_type.value == 'DISPLACEMENT':
+                    # expansion_mode_activated is EXPECTED for DISPLACEMENT - it's part of the event
+                    if tag_name == 'expansion_mode_activated':
+                        should_count = False  # Normal for displacement
+                    
+                    # bias_invalidated is NORMAL before displacement (displacement comes after invalidation)
+                    if tag_name == 'bias_invalidated' and force_direct_entry:
+                        should_count = False  # Expected - displacement overrides
+                
+                if should_count:
+                    danger_signals += 1
+                    danger_reasons.append(tag_name)
+        
+        # Also check result.tags accumulated so far
+        result_tag_checks = [
+            'bias_invalidated',
+            'forbidden_direction',
+            'delta_contradicts_direction',
+        ]
+        for tag_name in result_tag_checks:
+            if result.tags.get(tag_name) and tag_name not in danger_reasons:
+                # Apply same intelligent filtering
+                should_count = True
+                if tag_name == 'forbidden_direction':
+                    tag_value = result.tags.get(tag_name)
+                    if tag_value and tag_value != current_bias:
+                        should_count = False
+                
+                if should_count:
+                    danger_signals += 1
+                    danger_reasons.append(tag_name)
+        
+        # 🔥 KILL CHECK: 2 or more danger signals = HARD BLOCK
+        # 🔥 FIX #6 (Feb 04): For DISPLACEMENT with force_direct_entry, degrade to size cap
+        # 🔥 FIX #27 (Feb 04): Also degrade when displacement_memory_active (OBSTINACY SOFT mode)
+        # 🔥 FIX #49 (Feb 05): Also degrade when anticipation_bypass or displacement_bypass active
+        MULTI_WARNING_THRESHOLD = 2
+        if danger_signals >= MULTI_WARNING_THRESHOLD:
+            # Check if we should degrade instead of hard block
+            displacement_memory_active = current_tags.get('displacement_memory_active', False)
+            obstinacy_soft_mode = current_tags.get('obstinacy_soft_mode', False)
+            
+            # 🔥 FIX #49: Check filter bypass flags from filter_pipeline
+            fp_displacement_bypass = current_tags.get('fp_displacement_bypass', False)
+            fp_anticipation_bypass = current_tags.get('fp_anticipation_bypass', False)
+            
+            should_degrade_to_soft = (
+                (force_direct_entry and current_edge_type and current_edge_type.value == 'DISPLACEMENT') or
+                displacement_memory_active or
+                obstinacy_soft_mode or
+                fp_displacement_bypass or  # 🔥 FIX #49: Filter already approved via bypass
+                fp_anticipation_bypass     # 🔥 FIX #49: ANTICIPATION has its own confirmation
+            )
+            
+            if should_degrade_to_soft:
+                # SOFT MODE: Allow with restrictions instead of hard block
+                degrade_reason = []
+                if force_direct_entry:
+                    degrade_reason.append('force_direct_entry')
+                if displacement_memory_active:
+                    degrade_reason.append('displacement_memory')
+                if obstinacy_soft_mode:
+                    degrade_reason.append('obstinacy_soft_mode')
+                # 🔥 FIX #49: Add bypass reasons
+                if fp_displacement_bypass:
+                    degrade_reason.append('displacement_bypass')
+                if fp_anticipation_bypass:
+                    degrade_reason.append('anticipation_bypass')
+                
+                logger.warning(
+                    f"⚠️ GUARD SOFT MODE: MULTI-WARNING | "
+                    f"{danger_signals} signals ({', '.join(danger_reasons)}) | "
+                    f"SOFT mode active ({', '.join(degrade_reason)}) → degrading to 50% size cap instead of block"
+                )
+                engine._current_trade_tags['kill_check_soft_mode'] = True
+                engine._current_trade_tags['kill_check_size_cap'] = 0.5
+                result.tags['kill_check_degraded'] = True
+                # Don't block - continue with size cap
+            else:
+                logger.warning(
+                    f"🚫🚫🚫 GUARD BLOCKED: MULTI-WARNING KILL CHECK | "
+                    f"{danger_signals} danger signals detected: {', '.join(danger_reasons)} | "
+                    f"Threshold: {MULTI_WARNING_THRESHOLD}"
+                )
+                result.passed = False
+                result.reason = f"Kill check: {danger_signals} danger signals ({', '.join(danger_reasons)})"
+                result.tags['block_category'] = 'multi_warning_kill'
+                result.tags['danger_signal_count'] = danger_signals
+                result.tags['danger_reasons'] = danger_reasons
+                engine._current_trade_tags['guard_blocked_by_kill_check'] = True
+                return result
+        
+        # 15. Session limits (just flag - override checked later)
+        # 🔥 FIX (Feb 02, 2026): Apply mode-based cap to session limit
+        # 🔥 FIX #10: Hot Hand system - base guaranteed, bonus on wins after base
         session_trades = engine._session_trade_counts.get(ctx.session_name, 0)
-        session_limit = SessionTradeLimits.MAX_TRADES_PER_SESSION.get(ctx.session_name, 5)
+        base_limit = SessionTradeLimits.MAX_TRADES_PER_SESSION.get(ctx.session_name, 3)
+        
+        # Apply MODE_TRADE_LIMIT_CAP based on current regime
+        current_mode = getattr(engine, '_current_trade_regime', 'RANGE')
+        mode_cap = SessionTradeLimits.MODE_TRADE_LIMIT_CAP.get(current_mode, 5)
+        base_limit = min(base_limit, mode_cap)
+        
+        # 🔥 FIX #10: Hot Hand logic
+        # - If session_trades < base_limit: ALWAYS allowed (base guaranteed)
+        # - If session_trades >= base_limit: only if last trade was WIN
+        from src.domain.trading.activity_tracker import get_activity_tracker
+        tracker = get_activity_tracker()
+        
+        # Reset session state if session changed
+        tracker.reset_session_state(ctx.session_name)
+        
+        session_limit = base_limit  # Start with base
+        hot_hand_bonus = 0
+        session_stopped = False
+        
+        if session_trades >= base_limit:
+            # Beyond base - check Hot Hand
+            if tracker.last_trade_was_win():
+                # Last trade was WIN → allow +1 bonus
+                hot_hand_bonus = 1
+                session_limit = session_trades + 1  # Always allow one more after a win
+                result.tags['hot_hand_bonus'] = hot_hand_bonus
+            else:
+                # Last trade was LOSS → session STOPPED
+                session_stopped = True
+                result.tags['session_stopped'] = True
+                result.tags['session_limit_reason'] = 'HOT_HAND_LOSS_AFTER_BASE'
+        
         result.tags['session_at_limit'] = session_trades >= session_limit
         result.tags['session_trades'] = session_trades
         result.tags['session_limit'] = session_limit
+        result.tags['session_base_limit'] = base_limit
+        result.tags['session_mode_cap'] = mode_cap
         
         return result
 
@@ -318,6 +988,15 @@ class ScoreOrchestrator:
             result.score = max(0, result.score + obstinacy_penalty)
             result.tags['obstinacy_adjusted'] = True
         
+        # 🧠 FIX #20: OBSTINACY SOFT MODE additional penalty
+        # When SOFT mode allows a trade that would normally be blocked,
+        # apply extra score penalty as additional risk control
+        soft_mode_penalty = engine._current_trade_tags.get('obstinacy_soft_score_penalty', 0)
+        if soft_mode_penalty < 0:
+            result.score = max(0, result.score + soft_mode_penalty)
+            result.tags['obstinacy_soft_penalty'] = soft_mode_penalty
+            logger.info(f"🧠 OBSTINACY SOFT MODE: Applied score penalty {soft_mode_penalty}")
+        
         # 5. Location penalty
         location_penalty = engine._current_trade_tags.get('location_penalty_applied', 0)
         if location_penalty < 0:
@@ -357,7 +1036,9 @@ class ScoreOrchestrator:
         except (TypeError, ValueError, IndexError):
             current_adx = 20.0
         
-        is_trend = current_adx > 25 or ctx.volatility_regime in [VolatilityRegime.HIGH, VolatilityRegime.SPIKE, 'HIGH', 'SPIKE']
+        # 🔄 REFACTORED Feb 04: Use ADXThresholds for consistent threshold
+        from src.config.trading_config import ADXThresholds
+        is_trend = ADXThresholds.is_strong_trend(current_adx) or ctx.volatility_regime in [VolatilityRegime.HIGH, VolatilityRegime.SPIKE, 'HIGH', 'SPIKE']
         regime_str = 'TREND' if is_trend else 'RANGE'
         
         # Base threshold
@@ -370,6 +1051,15 @@ class ScoreOrchestrator:
         # Trend phase adjustment
         trend_adj = ScoreOrchestrator._get_trend_phase_adjustment(ctx.trend_phase, ctx.bias, engine)
         threshold += trend_adj
+        
+        # 🔥 FIX (Feb 04, 2026): TRANSITION mode requires higher threshold
+        # Reason: TRANSITION (0.35-0.50 score) is ambiguous territory - need more confirmation
+        trading_mode = engine._current_trade_tags.get('trading_mode', '') if hasattr(engine, '_current_trade_tags') else ''
+        if trading_mode == 'TRANSITION':
+            transition_min = RiskManagement.TRANSITION_MIN_SCORE
+            if threshold < transition_min:
+                logger.info(f"📊 TRANSITION MODE: Raising threshold from {threshold:.1f} to {transition_min:.1f}")
+                threshold = transition_min
         
         # 🔥 FIX (Jan 27, 2026): Anti-paralysis DISABLED
         # The system was accepting garbage trades due to incorrect activity tracking
@@ -460,146 +1150,48 @@ class SizingOrchestrator:
         adx = ctx.adx_1h if hasattr(ctx, 'adx_1h') else None
         
         # =====================================================================
-        # 🔥 NEW (Jan 28, 2026): EDGE MODE DETECTION
+        # 🔥 REFACTORED (Feb 05, 2026): Simplified Edge Sizing
         # 
-        # INSTITUTIONAL: Low frequency, high conviction (BREAKOUT, TREND with BOS)
-        #   - Size: 1.0x - 1.5x
-        #   - Activates when: EdgeStateManager has ACTIVE edge with high RR
-        #
-        # INTRADAY: High frequency, low conviction (micro-moves)
-        #   - Size: 0.15x - 0.30x
-        #   - Activates when: INSTITUTIONAL not active, but market is moving
+        # Uses EdgeType-based sizing from get_edge_size_multiplier()
+        # Replaces old INSTITUTIONAL/INTRADAY mode logic
         # =====================================================================
-        edge_mode = 'INSTITUTIONAL'  # Default to INSTITUTIONAL
-        edge_mode_multiplier = 1.0
+        edge_mode = 'EDGE_BASED'  # New unified mode
+        edge_mode_multiplier = 0.60  # Default conservative
+        edge_info = 'NO_EDGE'
         
         if hasattr(engine, '_edge_manager') and engine._edge_manager is not None:
             edge_manager = engine._edge_manager
             
-            # Check if INSTITUTIONAL edge is active
-            if edge_manager.is_institutional_active():
-                edge_mode = 'INSTITUTIONAL'
-                edge_mode_multiplier = edge_manager.get_institutional_size_multiplier()
-                logger.info(f"🏛️ INSTITUTIONAL MODE | Size mult: {edge_mode_multiplier:.2f}x")
+            # Get sizing from new unified API
+            min_mult, max_mult, edge_info = edge_manager.get_edge_size_multiplier(
+                session_quality=session_quality
+            )
+            
+            # Use max multiplier as the edge_mode_multiplier
+            edge_mode_multiplier = max_mult
+            edge_mode = edge_info  # DISPLACEMENT, BREAKOUT, RANGE, TREND_BOS, TREND_CONSENSUS, NO_EDGE
+            
+            if edge_info != 'NO_EDGE':
+                logger.info(f"📊 EDGE SIZING | Type: {edge_info} | Range: {min_mult:.2f}x-{max_mult:.2f}x | Using: {max_mult:.2f}x")
             else:
-                # Check for INTRADAY edge opportunity
-                market_time = ctx.market_time if hasattr(ctx, 'market_time') else datetime.now()
-                
-                # Get ATR/Volume data from trade tags (calculated in main loop)
-                atr_current = engine._current_trade_tags.get('atr_1m', ctx.atr_1m if hasattr(ctx, 'atr_1m') else 100.0)
-                atr_average = engine._current_trade_tags.get('atr_1m_avg', atr_current)
-                volume_current = engine._current_trade_tags.get('volume_current', 1.0)
-                volume_average = engine._current_trade_tags.get('volume_average', 1.0)
-                
-                # Swing direction from trade tags (calculated in main loop)
-                swing_direction = engine._current_trade_tags.get('swing_direction', 'NEUTRAL')
-                swing_count = engine._current_trade_tags.get('swing_count', 0)
-                
-                # Session quality already available
-                
-                intraday_edge = edge_manager.check_for_intraday_edge(
-                    current_price=ctx.current_price,
-                    atr_current=atr_current,
-                    atr_average=atr_average,
-                    volume_current=volume_current,
-                    volume_average=volume_average,
-                    swing_direction=swing_direction,
-                    swing_count=swing_count,
-                    session_quality=session_quality,
-                    market_time=market_time
-                )
-                
-                if intraday_edge:
-                    edge_mode = 'INTRADAY'
-                    # Calculate ratios for size multiplier
-                    atr_ratio = atr_current / atr_average if atr_average > 0 else 1.0
-                    vol_ratio = volume_current / volume_average if volume_average > 0 else 1.0
-                    edge_mode_multiplier = edge_manager.get_intraday_size_multiplier(atr_ratio, vol_ratio)
-                    logger.info(f"⚡ INTRADAY MODE | Size mult: {edge_mode_multiplier:.2f}x")
-                else:
-                    # No edge active at all - block or use minimal size
-                    logger.debug("📊 NO EDGE MODE active - using default sizing")
+                logger.debug("📊 NO EDGE active - using conservative sizing 0.60x")
         
-        # =====================================================================
-        # 🔥 NEW (Jan 28, 2026): LIQUIDITY EVENT DETECTION FOR INTRADAY
-        # 
-        # Si INTRADAY y R < 0.30 → NECESITA liquidity event
-        # Detectar sweep, rejection, o failure_test ANTES de sizing
-        # =====================================================================
-        liquidity_event = None
-        
-        if edge_mode == 'INTRADAY' and worst_case_rr < 0.30:
-            try:
-                # Import detection functions
-                from src.domain.trading.edge_state_manager import (
-                    detect_any_liquidity_event, LiquidityEvent
-                )
-                import pandas as pd
-                
-                # Get candles from market_data
-                candles_1m = None
-                if hasattr(engine, 'market_data') and engine.market_data is not None:
-                    candles_1m = engine.market_data.get_candles('1m')
-                
-                df_1m = None
-                if candles_1m and len(candles_1m) >= 10:
-                    df_1m = pd.DataFrame(candles_1m[-30:])  # Last 30 candles
-                
-                if df_1m is not None and len(df_1m) >= 5:
-                    # Get direction from edge manager
-                    direction = 'LONG'
-                    if hasattr(engine, '_edge_manager') and engine._edge_manager._current_bos:
-                        direction = engine._edge_manager._current_bos.direction
-                    
-                    # Get ATR
-                    atr = ctx.atr_1m if hasattr(ctx, 'atr_1m') else engine._current_trade_tags.get('atr_1m', 100.0)
-                    
-                    # Get swing level (last micro swing)
-                    swing_level = None
-                    if direction == 'LONG':
-                        # Looking for swing low
-                        recent_lows = df_1m['low'].tail(10)
-                        swing_level = recent_lows.min()
-                    else:
-                        # Looking for swing high
-                        recent_highs = df_1m['high'].tail(10)
-                        swing_level = recent_highs.max()
-                    
-                    # Detect liquidity event
-                    liquidity_event = detect_any_liquidity_event(
-                        df=df_1m,
-                        direction=direction,
-                        atr=atr,
-                        swing_level=swing_level,
-                        test_level=swing_level,
-                        lookback_candles=5
-                    )
-                    
-                    if liquidity_event.is_valid():
-                        logger.info(
-                            f"🌊 LIQUIDITY EVENT DETECTED: {liquidity_event.event_type.value} "
-                            f"(conf: {liquidity_event.confidence:.2f}) - R={worst_case_rr:.2f} permitido"
-                        )
-                    else:
-                        logger.warning(
-                            f"⚠️ NO LIQUIDITY EVENT for R={worst_case_rr:.2f} - "
-                            f"trade may be blocked by sizing filter"
-                        )
-                else:
-                    logger.warning("⚠️ No 1m DataFrame available for liquidity detection")
-            except Exception as e:
-                logger.error(f"Error detecting liquidity event: {e}")
-                liquidity_event = None
-        
-        # Store edge mode in trade tags for analysis
+        # Store edge info in trade tags for analysis
         if hasattr(engine, '_current_trade_tags'):
             engine._current_trade_tags['edge_mode'] = edge_mode
             engine._current_trade_tags['edge_mode_multiplier'] = edge_mode_multiplier
-            if liquidity_event and hasattr(liquidity_event, 'event_type'):
-                engine._current_trade_tags['liquidity_event'] = getattr(liquidity_event.event_type, 'value', 'NONE')
-                engine._current_trade_tags['liquidity_confidence'] = getattr(liquidity_event, 'confidence', 0.0)
+            engine._current_trade_tags['edge_info'] = edge_info
         
-        # Calculate using simplified system WITH edge mode AND liquidity event
+        # 🔥 FIX (Feb 2, 2026): Use last LOSS time for cooldown (not last trade time)
+        # Cooldown should wait after a loss, not after any trade
+        from src.domain.trading.activity_tracker import get_last_loss_time
+        last_loss_time = get_last_loss_time()
+        
+        # 🔥 NEW (Feb 2, 2026): Get momentum score for sizing predictor
+        score_breakdown = getattr(engine, '_score_breakdown', {})
+        momentum_score = float(score_breakdown.get('momentum', 1.0))  # Default to neutral
+        
+        # Calculate using simplified system WITH edge mode
         sizing_result = SimplifiedSizer.calculate(
             capital=capital,
             entry_price=ctx.current_price,
@@ -611,7 +1203,13 @@ class SizingOrchestrator:
             session_quality=session_quality,
             edge_mode=edge_mode,
             edge_mode_multiplier=edge_mode_multiplier,
-            liquidity_event=liquidity_event,  # 🔥 NEW: Pass liquidity event for R-validation
+            liquidity_event=None,  # Liquidity events handled at edge level now
+            # 🔥 NEW (Feb 2, 2026): Toxic combo, hour, and cooldown parameters
+            session_name=ctx.session_name,
+            direction=ctx.bias,  # Use ctx.bias for direction
+            market_time=ctx.market_time,
+            last_trade_time=last_loss_time,  # 🔥 FIX: Use last LOSS time for cooldown
+            momentum_score=momentum_score,  # 🔥 NEW (Feb 2): For momentum sizing predictor
         )
         
         # Map to OrchestrationSizingResult
@@ -634,7 +1232,10 @@ class SizingOrchestrator:
             'regime': sizing_result.regime_mult,
             'loss_streak': sizing_result.loss_streak_mult,
             'session': sizing_result.session_mult,
-            'edge_mode': sizing_result.edge_mult,  # 🔥 NEW: Edge mode multiplier
+            'edge_mode': sizing_result.edge_mult,
+            'toxic_hour': sizing_result.toxic_hour_mult,
+            'toxic_combo': sizing_result.toxic_combo_mult,  # Toxic combo (REDUCE mode)
+            'momentum': sizing_result.momentum_mult,
         }
         result.final_multiplier = sizing_result.combined_multiplier
         
@@ -709,8 +1310,10 @@ class SizingOrchestrator:
         result.multipliers['volatility'] = vol_mult
         
         # 5. Session quality
+        # 🔄 REFACTOR Feb 04: Use centralized SessionQuality.get_quality_size_mult
+        from src.config.trading_config import SessionQuality
         session_quality = engine._current_trade_tags.get('session_quality', 'moderate')
-        session_mult = {'good': 1.0, 'moderate': 0.85, 'poor': 0.7}.get(session_quality, 0.85)
+        session_mult = SessionQuality.get_quality_size_mult(session_quality)
         result.multipliers['session'] = session_mult
         
         # 6. Loss streak
@@ -726,6 +1329,13 @@ class SizingOrchestrator:
         # 8. Countertrend
         ct_mult = engine._current_trade_tags.get('ct_size_mult', 1.0)
         result.multipliers['countertrend'] = ct_mult
+        
+        # 🧠 FIX #20: OBSTINACY SOFT MODE size cap
+        # When SOFT mode is active, cap the size to prevent overexposure
+        obstinacy_soft_cap = engine._current_trade_tags.get('obstinacy_soft_size_cap', 1.0)
+        if obstinacy_soft_cap < 1.0:
+            logger.info(f"🧠 OBSTINACY SOFT MODE: Applying size cap {obstinacy_soft_cap:.0%}")
+        result.multipliers['obstinacy_soft'] = obstinacy_soft_cap
         
         # 9. Day-of-week
         dow = ctx.market_time.weekday()
@@ -959,6 +1569,87 @@ async def _displacement_fast_path(
         return None
     
     # =====================================================================
+    # 🔥 CHECK 1.5: ANTICIPATION EDGE PRIORITY (FIX #29)
+    # =====================================================================
+    # Si hay un BREAKOUT edge armado (de ANTICIPATION) con structure_level,
+    # NO hacer DISPLACEMENT fast_path - esperar a que el precio rompa el
+    # structure_level para una entrada más precisa.
+    #
+    # Ejemplo del log:
+    # - ANTICIPATION detectó SHORT @ $76,672 (structure level)
+    # - DISPLACEMENT quiere entrar @ $76,480 
+    # - Mejor esperar ruptura de $76,672 para entrada más temprana
+    # =====================================================================
+    breakout_edge_armed = False
+    breakout_has_structure = False
+    
+    # Get DISPLACEMENT direction from current_bos (available at this point)
+    displacement_direction = current_bos.direction
+    
+    # Check si hay un BREAKOUT edge armado en algún edge manager
+    # (puede estar pendiente de confirmación)
+    structure_level_for_log: float = 0.0  # Initialize for logging
+    anticipation_direction: str = ''
+    anticipation_armed_time: Optional[datetime] = None
+    
+    if hasattr(engine, '_edge_manager') and engine._edge_manager:
+        alt_edge_mgr = engine._edge_manager
+        from src.domain.trading.edge_state_manager import EdgeState, EdgeType
+        
+        # Si el edge actual es BREAKOUT (de ANTICIPATION) y está ARMED
+        if alt_edge_mgr.state == EdgeState.EDGE_ARMED:
+            alt_bos = alt_edge_mgr.current_bos
+            if alt_bos and alt_bos.edge_type == EdgeType.BREAKOUT:
+                breakout_edge_armed = True
+                anticipation_direction = alt_bos.direction
+                anticipation_armed_time = alt_bos.timestamp  # timestamp = when edge was created
+                # Check if it has a real structure_level (not just squeeze level)
+                structure_level = alt_bos.bos_level
+                squeeze_level = alt_bos.price
+                if abs(structure_level - squeeze_level) > 0.3 * atr_1m:
+                    breakout_has_structure = True
+                    structure_level_for_log = structure_level
+    
+    # 🧠 SMART DEFERRAL: Solo diferir si las direcciones COINCIDEN
+    # Si ANTICIPATION=SHORT y DISPLACEMENT=LONG, son setups diferentes - no diferir
+    same_direction = (anticipation_direction == displacement_direction)
+    
+    # 🧠 TIMEOUT: No diferir si ANTICIPATION lleva más de 10 min sin confirmar
+    # Después de 10 min, el edge está "stale" - mejor entrar con DISPLACEMENT
+    MAX_DEFER_MINUTES = 10
+    defer_timeout_exceeded = False
+    minutes_armed: float = 0.0
+    if anticipation_armed_time:
+        minutes_armed = (market_time - anticipation_armed_time).total_seconds() / 60
+        defer_timeout_exceeded = minutes_armed > MAX_DEFER_MINUTES
+    
+    if breakout_edge_armed and breakout_has_structure and same_direction and not defer_timeout_exceeded:
+        # ANTICIPATION tiene un edge más preciso esperando Y es la misma dirección
+        logger.info(
+            f"⏸️ FAST PATH DEFERRED: ANTICIPATION EDGE ARMED | "
+            f"BREAKOUT {anticipation_direction} structure=${structure_level_for_log:.0f} waiting for break | "
+            f"DISPLACEMENT @ ${current_price:.0f} deferred"
+        )
+        engine._current_trade_tags['fast_path_deferred_anticipation'] = True
+        engine._current_trade_tags['anticipation_structure_level'] = structure_level_for_log
+        # Don't return None completely - allow pipeline to check BREAKOUT edge
+        # But skip the DISPLACEMENT fast path
+        return None
+    elif breakout_edge_armed and breakout_has_structure and not same_direction:
+        # Direcciones opuestas - log pero NO diferir
+        logger.debug(
+            f"🔀 ANTICIPATION {anticipation_direction} vs DISPLACEMENT {displacement_direction} | "
+            f"Different directions - proceeding with DISPLACEMENT"
+        )
+    elif breakout_edge_armed and defer_timeout_exceeded:
+        # Timeout - el ANTICIPATION edge está stale
+        logger.warning(
+            f"⏰ ANTICIPATION TIMEOUT: Edge armed for {minutes_armed:.1f} min > {MAX_DEFER_MINUTES} min | "
+            f"Proceeding with DISPLACEMENT"
+        )
+        engine._current_trade_tags['anticipation_timeout'] = True
+    
+    # =====================================================================
     # CHECK 2: Validaciones MÍNIMAS (solo las críticas)
     # =====================================================================
     
@@ -970,6 +1661,42 @@ async def _displacement_fast_path(
             f"DISPLACEMENT={disp_direction} vs BIAS={ctx.bias}"
         )
         return None
+    
+    # =====================================================================
+    # 🔥 CHECK 2a.5: LOCATION EXTREME BLOCK (Feb 01, 2026)
+    # =====================================================================
+    # BUG CRÍTICO: FAST_PATH bypasaba todas las protecciones de location
+    # Trade real: SHORT en percentil 3.8% (sobreventa extrema) → -0.51R
+    #
+    # REGLA: No shorteamos en sobreventa extrema, no longeamos en sobrecompra
+    # =====================================================================
+    location_ctx = getattr(engine, '_location_context', None)
+    if location_ctx:
+        pct_60d = location_ctx.percentile_60d
+        in_extreme_low = location_ctx.in_extreme_low or pct_60d <= 10
+        in_extreme_high = location_ctx.in_extreme_high or pct_60d >= 90
+        
+        # Block SHORT in extreme oversold
+        if disp_direction == 'SHORT' and in_extreme_low:
+            logger.warning(
+                f"🚫 FAST PATH BLOCKED: EXTREME OVERSOLD | "
+                f"Attempting SHORT at percentile {pct_60d:.1f}% | "
+                f"Don't short the bottom"
+            )
+            engine._current_trade_tags['fast_path_blocked_extreme'] = True
+            engine._current_trade_tags['fast_path_extreme_pct'] = pct_60d
+            return None
+        
+        # Block LONG in extreme overbought
+        if disp_direction == 'LONG' and in_extreme_high:
+            logger.warning(
+                f"🚫 FAST PATH BLOCKED: EXTREME OVERBOUGHT | "
+                f"Attempting LONG at percentile {pct_60d:.1f}% | "
+                f"Don't buy the top"
+            )
+            engine._current_trade_tags['fast_path_blocked_extreme'] = True
+            engine._current_trade_tags['fast_path_extreme_pct'] = pct_60d
+            return None
     
     # 2b. No en cooldown global
     # 🔧 FIX: El método es is_in_cooldown(), no in_cooldown()
@@ -985,7 +1712,104 @@ async def _displacement_fast_path(
         return None
     
     # =====================================================================
-    # � CHECK 3: DELTA CONTRADICT BLOCKER (CRÍTICO - Jan 30)
+    # 🚨 CHECK 2.5: COUNTER-MOMENTUM BLOCKER (CRÍTICO - Feb 01, 2026)
+    # =====================================================================
+    # PROBLEMA DETECTADO: 35% de trades terminan en TIME_INVALIDATION_MAX_LOSS
+    # porque son entradas CONTRA el impulso dominante.
+    #
+    # Casos reales:
+    # - LONG cuando active_direction=SHORT (forbidden_direction activo)
+    # - "protected_bounce" en medio de strong displacement SHORT
+    # - "bias_invalidated" pero intentando fade el movimiento
+    #
+    # REGLA INSTITUCIONAL: "Never fight the tape"
+    # Si hay STRONG displacement en dirección X, NO tradear dirección opuesta
+    # hasta que displacement se invalide.
+    # =====================================================================
+    
+    # Check 2.5a: Si hay direction_lock opuesto → BLOCK
+    direction_lock = getattr(engine, '_direction_lock', None)
+    if direction_lock and direction_lock != disp_direction:
+        logger.warning(
+            f"🚫 FAST PATH BLOCKED: COUNTER-MOMENTUM | "
+            f"Attempting {disp_direction} but DIRECTION_LOCK={direction_lock} | "
+            f"Never fight the tape"
+        )
+        engine._current_trade_tags['fast_path_blocked_counter_momentum'] = True
+        engine._current_trade_tags['fast_path_block_reason'] = 'direction_lock_opposite'
+        return None
+    
+    # Check 2.5b: Si forbidden_direction = nuestra dirección → BLOCK
+    forbidden_dir = getattr(engine, '_forbidden_direction', None)
+    if forbidden_dir == disp_direction:
+        logger.warning(
+            f"🚫 FAST PATH BLOCKED: FORBIDDEN DIRECTION | "
+            f"Attempting {disp_direction} but FORBIDDEN={forbidden_dir} | "
+            f"Bias was invalidated - this direction is blocked"
+        )
+        engine._current_trade_tags['fast_path_blocked_counter_momentum'] = True
+        engine._current_trade_tags['fast_path_block_reason'] = 'forbidden_direction'
+        return None
+    
+    # Check 2.5c: Si expansion_direction es opuesto y aún activo → BLOCK
+    expansion_mode = getattr(engine, '_expansion_mode', False)
+    expansion_dir = getattr(engine, '_expansion_direction', None)
+    if expansion_mode and expansion_dir and expansion_dir != disp_direction:
+        # Solo bloquear si el expansion es reciente (< 15 min)
+        exp_start = getattr(engine, '_expansion_start_time', None)
+        if exp_start and (datetime.now() - exp_start).total_seconds() < 900:  # 15 min
+            logger.warning(
+                f"🚫 FAST PATH BLOCKED: COUNTER-EXPANSION | "
+                f"Attempting {disp_direction} but EXPANSION_MODE={expansion_dir} (active) | "
+                f"Wait for expansion to expire"
+            )
+            engine._current_trade_tags['fast_path_blocked_counter_momentum'] = True
+            engine._current_trade_tags['fast_path_block_reason'] = 'active_expansion_opposite'
+            return None
+
+    # =====================================================================
+    # 🚨 CHECK 2.5d: BTC COUNTER-TREND BLOCKER (Feb 03, 2026)
+    # =====================================================================
+    # PROBLEMA: FAST PATH ignora BTC trend → entra LONG cuando BTC es BEARISH
+    # CASO REAL: LONG @ $78,214 con BTC BEARISH → -0.33R (TIME_INVALIDATION)
+    #
+    # REGLA: Si BTC trend es OPUESTO a nuestra dirección → BLOCK FAST PATH
+    # "Never fight the broader market"
+    # =====================================================================
+    # 🔧 FIX: Access btc_correlation_filter through filter_pipeline, not engine directly
+    filter_pipeline = getattr(engine, 'filter_pipeline', None)
+    btc_correlation_filter = getattr(filter_pipeline, 'btc_correlation_filter', None) if filter_pipeline else None
+    if btc_correlation_filter:
+        btc_feed = getattr(btc_correlation_filter, 'btc_feed', None)
+        if btc_feed and btc_feed.is_ready():
+            btc_context = btc_feed.get_context()
+            if not btc_context.is_stale:
+                btc_trend = btc_context.trend_bias  # 'BULLISH', 'BEARISH', 'NEUTRAL'
+                btc_strength = btc_context.trend_strength
+                
+                # Check counter-trend: LONG vs BEARISH, SHORT vs BULLISH
+                is_counter_btc = (
+                    (disp_direction == 'LONG' and btc_trend == 'BEARISH') or
+                    (disp_direction == 'SHORT' and btc_trend == 'BULLISH')
+                )
+                
+                if is_counter_btc and btc_strength >= 0.2:  # Mínima fuerza para considerar
+                    logger.warning(
+                        f"🚫 FAST PATH BLOCKED: BTC COUNTER-TREND | "
+                        f"Attempting {disp_direction} but BTC={btc_trend} (strength={btc_strength:.2f}) | "
+                        f"Never fight the broader market"
+                    )
+                    engine._current_trade_tags['fast_path_blocked_btc_counter'] = True
+                    engine._current_trade_tags['fast_path_btc_trend'] = btc_trend
+                    engine._current_trade_tags['fast_path_btc_strength'] = btc_strength
+                    return None
+                
+                # Log alignment for context
+                engine._current_trade_tags['fast_path_btc_trend'] = btc_trend
+                engine._current_trade_tags['fast_path_btc_aligned'] = not is_counter_btc
+
+    # =====================================================================
+    # 🚨 CHECK 3: DELTA CONTRADICT BLOCKER (CRÍTICO - Jan 30)
     # =====================================================================
     # Si el volumen fluye FUERTEMENTE contra nuestra dirección = FAKEOUT
     # 
@@ -1032,7 +1856,53 @@ async def _displacement_fast_path(
         )
     
     # =====================================================================
-    # 🚨 CHECK 4: PRECIO YA REVIRTIÓ? (FAKEOUT DETECTOR)
+    # 🚨 CHECK 4: ENTRY AT EXTREME (Fix #14 - Feb 02, 2026)
+    # =====================================================================
+    # PROBLEMA CRÍTICO DETECTADO:
+    # - LONG entró DESPUÉS de que el precio subiera $560
+    # - El displacement origin era $77,658, entry fue en $78,214
+    # - Esto es entrar en el TOP del movimiento → MFE 0.03R → loss
+    #
+    # CASO REAL (Feb 02, 2026):
+    # - Displacement LONG detectado con origin $77,658
+    # - Precio actual $78,214 (ya subió $560 = 2.4 ATR desde origin)
+    # - Sistema entró en el EXTREMO → reversión inmediata → -0.30R
+    #
+    # 🔧 FIX INTELIGENTE (Fix #26): Usar displacement-ratio, no ATR
+    # El problema era que ATR_1m (~$100) hacía que un disp de $400 ya fuera 4 ATR
+    # Ahora: bloqueamos solo si perseguimos >50% MÁS ALLÁ del displacement inicial
+    # =====================================================================
+    origin_for_extreme_check = current_bos.origin_price or 0
+    initial_disp_for_check = current_bos.initial_displacement_amount or 0
+    
+    if origin_for_extreme_check > 0 and initial_disp_for_check > 0:
+        # Calcular distancia desde origin al precio actual
+        if disp_direction == 'LONG':
+            distance_from_origin = current_price - origin_for_extreme_check
+        else:
+            distance_from_origin = origin_for_extreme_check - current_price
+        
+        # Si retrocedimos (distance < 0), no hay chase
+        if distance_from_origin > 0:
+            # Ratio: 1.0 = exactamente en el displacement, 1.5 = 50% más allá
+            displacement_ratio = distance_from_origin / initial_disp_for_check
+            
+            # BLOCK si >50% más allá del displacement inicial
+            MAX_CHASE_RATIO = 1.5
+            if displacement_ratio > MAX_CHASE_RATIO:
+                logger.warning(
+                    f"🚫 FAST PATH BLOCKED: ENTRY AT EXTREME | "
+                    f"{disp_direction} entry at {displacement_ratio:.1f}x displacement | "
+                    f"Origin=${origin_for_extreme_check:.0f}, Disp=${initial_disp_for_check:.0f}, "
+                    f"Current=${current_price:.0f}, Distance=${distance_from_origin:.0f} | "
+                    f"Don't chase - wait for pullback"
+                )
+                engine._current_trade_tags['fast_path_blocked_by_extreme_entry'] = True
+                engine._current_trade_tags['fast_path_displacement_ratio'] = displacement_ratio
+                return None
+    
+    # =====================================================================
+    # 🚨 CHECK 5: PRECIO YA REVIRTIÓ? (FAKEOUT DETECTOR)
     # =====================================================================
     # Si el precio ya retrocedió >40% del displacement inicial = FAKEOUT
     # 
@@ -1077,31 +1947,212 @@ async def _displacement_fast_path(
                 return None
     
     # =====================================================================
-    # 🚀 FAST PATH ACTIVADO - ENTRAR AHORA
+    # � FIX (Feb 02): SCORE INFORMATIVO PARA FAST_PATH
+    # =====================================================================
+    # PROBLEMA: FAST_PATH no calculaba score → score=0 en logs → imposible analizar
+    # 
+    # SOLUCIÓN: Calcular score INFORMATIVO (no bloquea, solo para análisis)
+    # Esto permite:
+    # 1. Distinguir "FAST_PATH buenos" de "FAST_PATH malos"
+    # 2. Aplicar TIME_INVALIDATION correctamente basado en score real
+    # 3. Análisis post-trade para mejorar criterios
+    #
+    # El score se calcula pero NO bloquea la entrada (FAST_PATH siempre ejecuta)
+    # =====================================================================
+    fast_path_score = 0.0
+    fast_path_breakdown = {}
+    
+    try:
+        # Obtener entry_scorer si está disponible
+        entry_scorer = getattr(engine, '_entry_scorer', None)
+        if entry_scorer and ctx.df_1h is not None and ctx.df_5m is not None and ctx.df_1m is not None:
+            # Calcular score con la firma correcta del método
+            score, breakdown, structure_blocked = entry_scorer.calculate_entry_score(
+                df_1h=ctx.df_1h,
+                df_5m=ctx.df_5m,
+                df_1m=ctx.df_1m,
+                bias=disp_direction,
+                current_price=current_price,
+                market_time=market_time,
+                micro_trend_state=getattr(engine, '_micro_trend_state', None),
+                filter_pipeline=getattr(engine, '_entry_filter_pipeline', None),
+                displacement_edge_active=True,  # FAST_PATH = displacement activo
+            )
+            fast_path_score = score
+            fast_path_breakdown = breakdown
+            
+            # Guardar en tags para logging y análisis
+            engine._current_trade_tags['entry_score'] = fast_path_score
+            engine._current_trade_tags['score_breakdown'] = fast_path_breakdown
+            
+            # También guardar componentes individuales para análisis
+            for key, val in fast_path_breakdown.items():
+                if key.startswith('score_') or key in ('structure', 'timing', 'momentum', 'context', 'synergy'):
+                    engine._current_trade_tags[f'score_{key}' if not key.startswith('score_') else key] = val
+            
+            # Guardar en engine._entry_score para TIME_INVALIDATION fix
+            engine._entry_score = fast_path_score
+            engine._score_breakdown = fast_path_breakdown
+            
+            logger.info(
+                f"📊 FAST PATH INFORMATIVE SCORE: {fast_path_score:.1f} | "
+                f"breakdown={fast_path_breakdown}"
+            )
+        else:
+            # Fallback: score = 0 porque no hay scorer o DataFrames disponibles
+            missing = []
+            if not entry_scorer:
+                missing.append('scorer')
+            if ctx.df_1h is None:
+                missing.append('df_1h')
+            if ctx.df_5m is None:
+                missing.append('df_5m')
+            if ctx.df_1m is None:
+                missing.append('df_1m')
+            
+            engine._current_trade_tags['entry_score'] = 0
+            engine._current_trade_tags['score_not_calculated'] = f"missing_{','.join(missing)}"
+            engine._entry_score = 0
+            engine._score_breakdown = {}
+            logger.warning(
+                f"⚠️ FAST PATH: Score=0 (missing: {missing}) - proceeding anyway"
+            )
+            
+    except Exception as e:
+        # Si falla el scoring, no bloqueamos FAST_PATH - solo logueamos
+        logger.warning(f"⚠️ FAST PATH: Score calculation failed: {e} - continuing without score")
+        engine._current_trade_tags['entry_score'] = 0
+        engine._current_trade_tags['score_calculation_error'] = str(e)
+        engine._entry_score = 0
+        engine._score_breakdown = {}
+    
+    # =====================================================================
+    # CHECK 2.5e: SCORE MÍNIMO PARA FAST PATH (Feb 03, 2026)
+    # =====================================================================
+    # 🔥 FIX (Feb 04, 2026): Score mínimo 7 (antes 5) = MÁS CONSERVADOR
+    # Análisis de 49 trades FAST PATH: expectancy -0.012R, 35% TIME_INVALIDATION
+    # Problema: Entraba con scores 5-6 en setups mediocres
+    # Solución: Score >= 7 requiere buena estructura+timing+momentum
+    # El trade de 15:29 tenía Score=4.0 y perdió -1R
+    FAST_PATH_MIN_SCORE = 7.0
+    if fast_path_score < FAST_PATH_MIN_SCORE:
+        logger.warning(
+            f"🛑 FAST PATH BLOCKED: Score {fast_path_score:.1f} < {FAST_PATH_MIN_SCORE} minimum (conservative) | "
+            f"direction={disp_direction} | breakdown={engine._score_breakdown}"
+        )
+        return None
+    
+    # =====================================================================
+    # CHECK 2.5f: REAL-TIME STALE CHECK (Feb 04, 2026)
+    # =====================================================================
+    # PROBLEMA: El tag 'stale_displacement' se pone en trading_app.py
+    # cuando se DETECTA el displacement, pero el FAST PATH se ejecuta en
+    # ticks POSTERIORES cuando el tag puede no estar.
+    #
+    # CASO REAL (Feb 04, 2026):
+    #   09:24:33 - STALE detectado (precio = low)
+    #   09:26-27 - Precio baja a nuevo low $75,977
+    #   09:28:16 - Precio rebota a $76,074 - FAST PATH ejecuto SHORT
+    #
+    # FIX: RECALCULAR STALE en tiempo real dentro del FAST PATH
+    #      Para SHORT: distance = current_price - _bias_low_since
+    #      Para LONG: distance = _bias_high_since - current_price
+    #      Si distance < 0.5 * ATR_5m -> STALE (momentum agotado)
+    #
+    # Regla: "No vendas el low, no compres el high"
+    # =====================================================================
+    STALE_ATR_MULTIPLIER = 0.5
+    stale_threshold = ctx.atr_5m * STALE_ATR_MULTIPLIER
+    is_stale_realtime = False
+    stale_distance = 0.0
+    stale_extreme = 0.0
+    
+    if disp_direction == 'SHORT':
+        bias_low = getattr(engine, '_bias_low_since', None)
+        if bias_low and bias_low > 0:
+            stale_distance = current_price - bias_low
+            stale_extreme = bias_low
+            if stale_distance < stale_threshold:
+                is_stale_realtime = True
+    else:
+        bias_high = getattr(engine, '_bias_high_since', None)
+        if bias_high and bias_high > 0:
+            stale_distance = bias_high - current_price
+            stale_extreme = bias_high
+            if stale_distance < stale_threshold:
+                is_stale_realtime = True
+    
+    if is_stale_realtime:
+        extreme_type = 'Low' if disp_direction == 'SHORT' else 'High'
+        logger.warning(
+            f"🚫 FAST PATH BLOCKED: STALE (REAL-TIME) | "
+            f"Direction={disp_direction} | Price=${current_price:.0f} | "
+            f"{extreme_type}=${stale_extreme:.0f} | "
+            f"Distance=${stale_distance:.0f} < threshold=${stale_threshold:.0f} (0.5 ATR) | "
+            f"Momentum exhausted - only PULLBACK entry allowed"
+        )
+        engine._current_trade_tags['fast_path_blocked_stale_realtime'] = True
+        engine._current_trade_tags['fast_path_stale_distance'] = stale_distance
+        return None
+    
+    # =====================================================================
+    # CHECK 2.5g: MOMENTUM == 0 -> BLOCK FAST PATH (Feb 04, 2026)
+    # =====================================================================
+    # Score puede ser alto (8.0) pero si momentum=0, el tren ya paro.
+    # FAST PATH es para "subirse al tren en movimiento".
+    # Sin momentum = sin urgencia = usar pipeline normal.
+    # =====================================================================
+    momentum_score = fast_path_breakdown.get('momentum', 1)
+    
+    if momentum_score == 0:
+        logger.warning(
+            f"🚫 FAST PATH BLOCKED: MOMENTUM=0 | "
+            f"Score={fast_path_score:.1f} but momentum=0 | "
+            f"breakdown={fast_path_breakdown} | "
+            f"No momentum = no urgency - use normal pipeline"
+        )
+        engine._current_trade_tags['fast_path_blocked_no_momentum'] = True
+        return None
+
+    # =====================================================================
+    # FAST PATH ACTIVADO - ENTRAR AHORA
     # =====================================================================
     origin_log = current_bos.origin_price or 0
     disp_log = current_bos.initial_displacement_amount or 0
     logger.warning(
         f"🚀🚀🚀 DISPLACEMENT FAST PATH ACTIVATED 🚀🚀🚀 | "
         f"bars_since={bars_since} | direction={disp_direction} | "
-        f"origin=${origin_log:.0f} | "
-        f"displacement=${disp_log:.0f}"
+        f"origin=${origin_log:.0f} | displacement=${disp_log:.0f} | "
+        f"INFO_SCORE={fast_path_score:.1f}"
     )
     
     # =====================================================================
-    # SIZING: Conservador en fast path (25-30% base)
-    # No queremos all-in en el primer tick
+    # SIZING: Basado en score calculado (Feb 01, 2026)
+    # PROBLEMA: Buenos trades tenían 0.25x sizing, malos también 0.25x
+    # SOLUCIÓN: Usar el score informativo para sizing proporcional
     # =====================================================================
-    # 🔧 FIX: No existe engine.risk_config - usar 0.01 (1%) hardcodeado
     base_risk_pct = 0.01  # 1% of capital - industry standard
-    fast_path_size_mult = DisplacementEdgeCriteria.EARLY_IMPULSE_SIZE_MIN  # 0.25
     
-    if bars_since == 0:
-        # Bar 0: más conservador aún
-        fast_path_size_mult = 0.25
+    # 🔥 FIX (Feb 04, 2026): Sizing CONSERVADOR - MAX 50%
+    # Análisis: FAST PATH tiene expectancy -0.012R vs Normal -0.004R
+    # Reducir sizing hasta que la estrategia sea net-positive
+    # BEFORE: Score 7+ = 100% (demasiado agresivo para expectancy negativa)
+    # AFTER: Score 8+ = 50% MAX (reducir pérdidas mientras optimizamos)
+    if fast_path_score >= 9:
+        fast_path_size_mult = 0.50  # Excellent score = 50% MAX
+    elif fast_path_score >= 8:
+        fast_path_size_mult = 0.40  # Very good score = 40%
+    elif fast_path_score >= 7:
+        fast_path_size_mult = 0.30  # Good score = 30%
     else:
-        # Bar 1: un poco más size si confirmó
-        fast_path_size_mult = 0.35
+        fast_path_size_mult = 0.25  # Minimum = 25%
+    
+    # Bar 0 aún más conservador (chasing risk)
+    if bars_since == 0:
+        fast_path_size_mult = min(fast_path_size_mult, 0.30)
+    
+    engine._current_trade_tags['fast_path_size_mult'] = fast_path_size_mult
+    engine._current_trade_tags['fast_path_size_reason'] = f'score={fast_path_score:.1f}'
     
     # =====================================================================
     # STOP LOSS: Estructural basado en origen del displacement
@@ -1161,45 +2212,244 @@ async def _displacement_fast_path(
     logger.warning(
         f"🚀 FAST PATH ENTRY | {disp_direction} {size:.6f} BTC @ ${current_price:.2f} | "
         f"SL=${stop_loss:.2f} ({risk:.2f} risk) | TP=${take_profit:.2f} ({tp_r}R) | "
-        f"Size mult: {fast_path_size_mult:.0%}"
+        f"Size mult: {fast_path_size_mult:.0%} [IOC]"
     )
     
     # =====================================================================
     # EJECUTAR: IOC/Aggressive (taker permitido)
+    # Nota: momentum=0 ya fue bloqueado arriba, aquí siempre hay momentum
     # =====================================================================
     engine._current_trade_tags['entry_type'] = 'FAST_PATH_DISPLACEMENT'
     engine._current_trade_tags['fast_path_bars_since'] = bars_since
     engine._current_trade_tags['fast_path_origin'] = origin_price
     engine._current_trade_tags['fast_path_size_mult'] = fast_path_size_mult
+    engine._current_trade_tags['fast_path_order_type'] = 'IOC_AGGRESSIVE'
     
-    result = await OrderExecutor.place_order(
-        engine=engine,
-        ctx=ctx,
-        size=size,
+    from src.domain.trading.state.state_machine import BotState
+    from src.domain.trading.strategy.pullback_short import TradeType
+    
+    result = EntryResult()
+    
+    # Llamar place_aggressive_order directamente para tener acceso al fill info
+    order_result = await engine.execution.place_aggressive_order(
+        symbol=engine.symbol,
+        side='buy' if disp_direction == 'LONG' else 'sell',
+        amount=size,
+        price=current_price,
         stop_loss=stop_loss,
-        take_profit=take_profit,
-        use_market=False,
-        aggressive_execution=True,  # IOC + taker allowed
-        entry_data={
-            'bias': disp_direction,
-            'entry_price': current_price,
-            'position_size': size,
-            'stop_loss': stop_loss,
-            'take_profit': take_profit,
-            'atr_1m': atr_1m,
-            'order_type': 'FAST_PATH_IOC',
-            'tags': engine._current_trade_tags.copy(),
-        }
+        take_profit=take_profit
     )
     
-    if result.success:
+    if order_result and order_result.get('filled', 0) > 0:
+        # =====================================================================
+        # 🎯 IOC FILLED IMMEDIATELY - CREATE POSITION DIRECTLY
+        # =====================================================================
+        result.success = True
+        result.order_id = order_result.get('id')
+        
+        fill_price = float(order_result.get('average', current_price))
+        fill_size = float(order_result.get('filled', size))
+        
         logger.warning(
-            f"✅ FAST PATH ORDER PLACED | ID: {result.order_id}"
+            f"✅ FAST PATH IOC FILLED | ID: {result.order_id} | "
+            f"{fill_size:.6f} @ ${fill_price:.2f}"
         )
-        # Marcar que usamos fast path para no volver a intentar
+        
+        # Marcar que usamos fast path
         current_bos.force_direct_entry = False
+        
+        # Store order tracking
+        engine.pending_order_id = result.order_id
+        engine.entry_order_time = market_time
+        
+        # Notify reconciler
+        if result.order_id:
+            engine.reconciler.notify_order_placed(result.order_id)
+        
+        # =====================================================================
+        # 1. Record fill in position_store
+        # =====================================================================
+        try:
+            fill_side = 'buy' if disp_direction == 'LONG' else 'sell'
+            await engine._position_store.record_fill(
+                order_id=result.order_id or 'fast_path_ioc',
+                symbol=engine.symbol,
+                side=fill_side,
+                size=fill_size,
+                price=fill_price,
+                fee=0.0,
+                fill_type='TAKER',  # IOC is taker
+                fill_id=f"{result.order_id}_fill",
+            )
+            logger.info(f"✅ PositionStore updated: {fill_side.upper()} {fill_size:.6f} @ {fill_price:.2f}")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not update position_store on fast path fill: {e}")
+        
+        # =====================================================================
+        # 2. Create Position in risk_engine WITH FULL METADATA
+        # =====================================================================
+        trade_type = engine._current_trade_type or (
+            TradeType.LONG_MAIN if disp_direction == 'LONG' else TradeType.SHORT_STRUCTURAL
+        )
+        
+        # 🔥 CRITICAL: Pass edge_type and entry_score for TIME_INVALIDATION
+        entry_score = engine._current_trade_tags.get('entry_score', None)
+        edge_type = engine._current_trade_tags.get('edge_type', 'DISPLACEMENT')
+        bos_quality = engine._current_trade_tags.get('bos_quality', 'NORMAL')
+        is_weekend = market_time.weekday() >= 5 if market_time else False
+        
+        engine.risk_engine.create_position(
+            symbol=engine.symbol,
+            direction=disp_direction,
+            entry_price=fill_price,
+            position_size=fill_size,
+            stop_loss=stop_loss,
+            atr_1m=atr_1m,
+            market_time=market_time,
+            trade_type=trade_type,
+            regime_mode=getattr(engine, '_current_trade_regime', 'RANGE'),
+            edge_type=edge_type,
+            entry_score=entry_score,
+            is_weekend=is_weekend,
+            bos_quality=bos_quality
+        )
+        
+        logger.info(
+            f"🎯 Position created: {disp_direction} {fill_size:.6f} @ {fill_price:.2f} | "
+            f"edge_type={edge_type}, entry_score={entry_score}"
+        )
+        
+        # =====================================================================
+        # 3. Start exhaustion tracking and reset state
+        # =====================================================================
+        engine.exhaustion_detector.start_tracking(market_time)
+        engine._exhaustion_tightened = False
+        engine._gap_history = []
+        engine._prev_tick_price = fill_price
+        
+        # Record trade open
+        engine.state_machine.record_trade_open(result.order_id or "FAST_PATH")
+        
+        # Record trade price for duplicate zone filter
+        engine._record_trade_price(fill_price)
+        
+        # =====================================================================
+        # 4. Start trade logging
+        # =====================================================================
+        try:
+            session_name = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
+            trade_type_name = trade_type.value if hasattr(trade_type, 'value') else str(trade_type)
+            
+            engine._current_trade_id = engine.trade_logger.start_trade(
+                symbol=engine.symbol,
+                direction=disp_direction,
+                entry_price=fill_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                position_size=fill_size,
+                entry_score=entry_score or 0,
+                entry_tags=list(engine._current_trade_tags.keys()),
+                regime=str(ctx.volatility_regime) if ctx.volatility_regime else 'NORMAL',
+                volatility_regime=str(ctx.volatility_regime) if ctx.volatility_regime else 'NORMAL',
+                session=session_name,
+                trade_type=trade_type_name,
+                score_breakdown={},
+                metadata={'fast_path': True, 'bars_since': bars_since},
+                feature_snapshot=engine._build_ml_feature_snapshot() if hasattr(engine, '_build_ml_feature_snapshot') else {},
+                entry_trading_mode=engine._current_trade_tags.get('trading_mode', ''),
+                entry_daily_regime=getattr(engine, '_daily_regime', '')
+            )
+        except Exception as e:
+            logger.error(f"TradeLogger.start_trade() failed: {e}")
+            engine._current_trade_id = None
+        
+        # =====================================================================
+        # 5. 🔥 CRITICAL: SET SL/TP ON EXCHANGE
+        # =====================================================================
+        # The position is opened but WITHOUT protective orders!
+        # We MUST set them now or we have unlimited risk exposure.
+        try:
+            logger.info(f"📍 FAST PATH: Setting SL/TP on exchange...")
+            stops_set = await engine.execution.set_position_stops(
+                symbol=engine.symbol,
+                stop_loss=stop_loss,
+                take_profit=take_profit
+            )
+            if stops_set:
+                logger.info(f"✅ FAST PATH SL/TP set: SL={stop_loss:.2f}, TP={take_profit:.2f}")
+                engine._stops_set = True
+                if engine.risk_engine.position:
+                    engine.risk_engine.position.mark_reduce_only_validated()
+                    engine.risk_engine.position.mark_exchange_sl_active()
+            else:
+                # 🚨 CRITICAL: SL failed to set - we have a position without SL!
+                logger.error(f"🚨🚨🚨 FAST PATH CRITICAL: SL/TP FAILED TO SET! Position open without SL!")
+                # Try one more time with just SL
+                retry_sl = await engine.execution.set_position_stops(
+                    symbol=engine.symbol,
+                    stop_loss=stop_loss,
+                    take_profit=None  # At least get SL
+                )
+                if retry_sl:
+                    logger.warning(f"⚠️ FAST PATH: SL set on retry (no TP)")
+                    engine._stops_set = True
+                    if engine.risk_engine.position:
+                        engine.risk_engine.position.mark_exchange_sl_active()
+                else:
+                    # Log critical error but don't crash - position will be managed locally
+                    logger.critical(
+                        f"🚨🚨🚨 FAST PATH DANGER: Position {disp_direction} {fill_size:.6f} @ {fill_price:.2f} "
+                        f"HAS NO EXCHANGE SL! Local SL at {stop_loss:.2f} will be used (RISKY)"
+                    )
+                    engine._stops_set = False
+        except Exception as e:
+            logger.error(f"🚨 FAST PATH SL/TP exception: {e}")
+            engine._stops_set = False
+        
+        # =====================================================================
+        # 6. Clear pending state & transition to MANAGE
+        # =====================================================================
+        engine.pending_order_id = None
+        engine.entry_order_time = None
+        engine._last_entry_data = None
+        
+        engine.state_machine.transition_to(BotState.MANAGE, "Fast path IOC filled")
+        logger.warning(f"🚀 FAST PATH COMPLETE → MANAGE | Position active")
+        
+        # =====================================================================
+        # 7. Send Telegram notification
+        # =====================================================================
+        if engine.output_manager:
+            try:
+                from src.application.live.trading_app import _create_safe_task
+                _create_safe_task(engine.output_manager.send_entry_notification({
+                    'symbol': engine.symbol,
+                    'direction': disp_direction,
+                    'entry_price': fill_price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'size': fill_size,
+                    'score': entry_score,
+                    'regime': getattr(engine, '_current_regime', None),
+                    'risk_usd': engine._current_trade_tags.get('risk_usd'),
+                    'timestamp': market_time.isoformat() if hasattr(market_time, 'isoformat') else str(market_time),
+                    'entry_type': 'FAST_PATH_DISPLACEMENT'
+                }), "send_entry_notification")
+            except Exception as e:
+                logger.debug(f"Entry notification error: {e}")
+        
     else:
-        logger.error(f"❌ FAST PATH FAILED: {result.reason}")
+        # =====================================================================
+        # IOC NOT FILLED - Market moved too fast or no liquidity
+        # =====================================================================
+        result.success = False
+        result.reason = "IOC not filled - price gap too large or no liquidity"
+        current_bos.force_direct_entry = False  # Don't retry
+        
+        logger.warning(
+            f"🚫 FAST PATH IOC NOT FILLED | No position created | "
+            f"Reason: IOC expired (spread too wide or slippage)"
+        )
     
     return result
 
@@ -1218,11 +2468,70 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         EntryResult with success status and any required state transitions
     """
     result = EntryResult()
+    
+    # =========================================================================
+    # 🔥 NEW (Feb 04, 2026): WARMUP PERIOD CHECK
+    # Prevents trading immediately after startup when no market context exists
+    # =========================================================================
+    from src.config.trading_config import RiskManagement
+    
+    if RiskManagement.WARMUP_ENABLED and not getattr(engine, '_warmup_complete', False):
+        idle_count = getattr(engine, '_idle_eval_count', 0)
+        candles_count = getattr(engine, '_candles_since_start', 0)
+        
+        if idle_count < RiskManagement.WARMUP_MIN_TICKS or candles_count < RiskManagement.WARMUP_MIN_CANDLES:
+            result.reason = f"⏳ WARMUP: {idle_count}/{RiskManagement.WARMUP_MIN_TICKS} ticks, {candles_count}/{RiskManagement.WARMUP_MIN_CANDLES} candles"
+            logger.warning(f"🔥 {result.reason} - waiting for market context")
+            return result
+        else:
+            # Warmup complete - mark it
+            engine._warmup_complete = True
+            logger.info(f"✅ WARMUP COMPLETE: {idle_count} ticks, {candles_count} candles observed")
+    
     bias = engine.current_bias
     
     if not bias:
         result.reason = "No bias set"
         return result
+    
+    # =========================================================================
+    # 🔥🔥🔥 PRICE DIRECTION VALIDATION - BACKUP CHECK (Feb 04, 2026) 🔥🔥🔥
+    # =========================================================================
+    # NOTE: La validación PRINCIPAL está ahora en trading_app.py _price_confirms_direction()
+    # que bloquea CONSENSUS entries cuando el precio contradice la dirección.
+    #
+    # Este check es una SEGUNDA CAPA de protección con threshold más alto (0.4%)
+    # para casos donde el movimiento es especialmente fuerte.
+    #
+    # PROBLEMA ORIGINAL: Sistema entraba SHORT cuando precio SUBÍA
+    # SOLUCIÓN: Validar que el precio NO contradiga la dirección de forma extrema
+    # =========================================================================
+    candles_1m_check = engine.market_data.get_candles('1m')
+    if candles_1m_check and len(candles_1m_check) >= 4:
+        # Check last 3 candles price movement
+        recent_candles = candles_1m_check[-4:]  # 4 candles = 3 price changes
+        price_start = recent_candles[0]['close']
+        price_end = recent_candles[-1]['close']
+        price_change_pct = (price_end - price_start) / price_start * 100
+        
+        # Threshold: 0.4% move in 3 minutes - BACKUP check (main check is in trading_app.py at 0.25%)
+        PRICE_DIRECTION_THRESHOLD = 0.40
+        
+        price_direction_block = False
+        block_reason = ""
+        if bias == 'SHORT' and price_change_pct > PRICE_DIRECTION_THRESHOLD:
+            price_direction_block = True
+            block_reason = f"SHORT blocked (backup): price UP {price_change_pct:.2f}% in last 3min (${price_start:.0f}→${price_end:.0f})"
+        elif bias == 'LONG' and price_change_pct < -PRICE_DIRECTION_THRESHOLD:
+            price_direction_block = True
+            block_reason = f"LONG blocked (backup): price DOWN {abs(price_change_pct):.2f}% in last 3min (${price_start:.0f}→${price_end:.0f})"
+        
+        if price_direction_block:
+            result.reason = block_reason
+            engine._current_trade_tags['price_direction_block'] = True
+            engine._current_trade_tags['price_direction_change_pct'] = price_change_pct
+            logger.warning(f"🚫 PRICE DIRECTION BLOCK (BACKUP): {block_reason}")
+            return result
     
     # Get market data
     candles_5m = engine.market_data.get_candles('5m')
@@ -1239,7 +2548,9 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     
     # Build context
     df_5m = pd.DataFrame(candles_5m)
-    df_1m = pd.DataFrame(candles_1m) if candles_1m and len(candles_1m) >= 200 else None
+    # 🔧 FIX (Feb 03): Reducido de 200 a 30 velas - el scorer solo necesita ~20-30
+    # PROBLEMA: df_1m=None causaba Score=0 en FAST PATH → sizing mínimo en buenos trades
+    df_1m = pd.DataFrame(candles_1m) if candles_1m and len(candles_1m) >= 30 else None
     df_1h = pd.DataFrame(candles_1h)
     session_name = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
     
@@ -1321,9 +2632,26 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         return result
     
     # Session limit check (with override for high scores)
+    # 🔥 FIX #10: Handle Hot Hand stopped (loss occurred)
+    if guard_result.tags.get('session_stopped', False):
+        result.reason = f"Session STOPPED (loss after {guard_result.tags['session_trades']} trades)"
+        engine.missed_tracker.log_blocked_signal(
+            direction=bias,
+            price=current_price,
+            block_reason=result.reason,
+            block_category='session_limit',
+            score=score_result.score,
+            atr=engine._last_momentum_atr
+        )
+        return result
+    
     if guard_result.tags.get('session_at_limit', False):
+        hot_hand_bonus = guard_result.tags.get('hot_hand_bonus', 0)
         if score_result.score < SessionTradeLimits.OVERRIDE_IF_SCORE_GTE:
-            result.reason = f"Session limit ({guard_result.tags['session_trades']}/{guard_result.tags['session_limit']})"
+            if hot_hand_bonus > 0:
+                result.reason = f"Session limit ({guard_result.tags['session_trades']}/{guard_result.tags['session_limit']}) [+{hot_hand_bonus} hot hand]"
+            else:
+                result.reason = f"Session limit ({guard_result.tags['session_trades']}/{guard_result.tags['session_limit']})"
             engine.missed_tracker.log_blocked_signal(
                 direction=bias,
                 price=current_price,
@@ -1451,6 +2779,92 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     else:
         take_profit = current_price - (risk * tp_mult)
     
+    # =========================================================================
+    # 🔥 NEW (Feb 04, 2026): TP CAPPED BY HISTORICAL RANGE (ANCHOR LEVELS)
+    # =========================================================================
+    # PROBLEM: System puts TP at 71k when price is already at 60-day lows (73k).
+    #          This is IMPOSSIBLE to reach - TP becomes meaningless.
+    #
+    # SOLUTION: Cap TP to historical range with a small buffer:
+    # - SHORT TP cannot be below (range_low_60d - 0.5% buffer)
+    # - LONG TP cannot be above (range_high_60d + 0.5% buffer)
+    #
+    # EXCEPTION: If we're in BREAKOUT mode (breaking out of range), allow more room
+    # =========================================================================
+    location_ctx = getattr(engine, '_location_context', None)
+    if location_ctx and risk > 0:
+        is_breakout = location_ctx.is_breakout_up or location_ctx.is_breakout_down
+        
+        # Buffer: 0.5% in normal mode, 2% in breakout mode
+        buffer_pct = 0.02 if is_breakout else 0.005
+        
+        if bias == 'SHORT':
+            # For SHORT, TP is below current price
+            # Cap at historical low minus small buffer
+            historical_floor = location_ctx.range_low_60d * (1 - buffer_pct)
+            
+            if take_profit < historical_floor:
+                original_tp = take_profit
+                take_profit = historical_floor
+                # Recalculate actual R:R we'll get
+                actual_r = (current_price - take_profit) / risk if risk > 0 else 0
+                logger.warning(
+                    f"⚠️ TP CAPPED BY RANGE: SHORT TP {original_tp:.0f} → {take_profit:.0f} | "
+                    f"60d-low={location_ctx.range_low_60d:.0f} | "
+                    f"Effective R:R = {actual_r:.2f}R (was {tp_mult:.2f}R) | "
+                    f"pct_60d={location_ctx.percentile_60d:.1f}%"
+                )
+                engine._current_trade_tags['tp_capped_by_range'] = True
+                engine._current_trade_tags['tp_original'] = original_tp
+                engine._current_trade_tags['tp_capped_to'] = take_profit
+                engine._current_trade_tags['effective_tp_r'] = actual_r
+                
+        elif bias == 'LONG':
+            # For LONG, TP is above current price
+            # Cap at historical high plus small buffer
+            historical_ceiling = location_ctx.range_high_60d * (1 + buffer_pct)
+            
+            if take_profit > historical_ceiling:
+                original_tp = take_profit
+                take_profit = historical_ceiling
+                # Recalculate actual R:R we'll get
+                actual_r = (take_profit - current_price) / risk if risk > 0 else 0
+                logger.warning(
+                    f"⚠️ TP CAPPED BY RANGE: LONG TP {original_tp:.0f} → {take_profit:.0f} | "
+                    f"60d-high={location_ctx.range_high_60d:.0f} | "
+                    f"Effective R:R = {actual_r:.2f}R (was {tp_mult:.2f}R) | "
+                    f"pct_60d={location_ctx.percentile_60d:.1f}%"
+                )
+                engine._current_trade_tags['tp_capped_by_range'] = True
+                engine._current_trade_tags['tp_original'] = original_tp
+                engine._current_trade_tags['tp_capped_to'] = take_profit
+                engine._current_trade_tags['effective_tp_r'] = actual_r
+    
+    # =========================================================================
+    # 🔥 NEW (Feb 04, 2026): BLOCK if TP cap results in R:R too low
+    # =========================================================================
+    # If we had to cap the TP and the effective R:R is now < 0.5R, 
+    # the trade is not worth taking - no edge at historical extremes.
+    MIN_EFFECTIVE_RR_WHEN_CAPPED = 0.5
+    if engine._current_trade_tags.get('tp_capped_by_range', False) and location_ctx is not None:
+        effective_rr = engine._current_trade_tags.get('effective_tp_r', 0)
+        if effective_rr < MIN_EFFECTIVE_RR_WHEN_CAPPED:
+            result.reason = (
+                f"🛑 HARD BLOCK: TP capped to historical range but effective R:R={effective_rr:.2f}R < "
+                f"{MIN_EFFECTIVE_RR_WHEN_CAPPED}R minimum | Price at {location_ctx.percentile_60d:.0f}% of 60d range | "
+                f"No edge available at this location"
+            )
+            logger.warning(result.reason)
+            engine.missed_tracker.log_blocked_signal(
+                direction=bias,
+                price=current_price,
+                block_reason=result.reason,
+                block_category='tp_range_cap_low_rr',
+                score=final_score,
+                atr=engine._last_momentum_atr
+            )
+            return result
+
     # ========== PHASE 5.5: HARD ENTRY BLOCKS (Jan 27, 2026) ==========
     # These are NON-NEGOTIABLE. NO bypass. NO exceptions.
     # Must be checked BEFORE RR validation which allows bypasses.
@@ -1605,22 +3019,34 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         return result
 
     # =====================================================================
-    # ✅ PASO 4 — TAMAÑO MÍNIMO DE POSICIÓN
-    # expected_profit_usd (NET) < $1.20 → NO TRADE (hard block)
+    # ✅ PASO 4 — TAMAÑO MÍNIMO DE POSICIÓN (FIX #45 - Feb 05)
+    # expected_profit_usd (NET) debe ser proporcional al capital
+    # Para cuentas pequeñas (<$500), el mínimo es 0.15% del capital
+    # Para cuentas grandes (>$500), el mínimo absoluto es $0.75
     # =====================================================================
-    MIN_EXPECTED_PROFIT_USD = 1.20
-    if cost_result.expected_profit_usd_net < MIN_EXPECTED_PROFIT_USD:
+    capital = engine.risk_engine.capital if hasattr(engine, 'risk_engine') else 500.0
+    
+    # FIX #45: Minimum profit scales with capital
+    # - $256 capital → min profit = $0.38 (0.15%)
+    # - $500 capital → min profit = $0.75 (floor)
+    # - $1000 capital → min profit = $1.50 (0.15%)
+    MIN_PROFIT_PERCENT = 0.0015  # 0.15% of capital
+    MIN_PROFIT_FLOOR = 0.30     # Absolute minimum $0.30 (covers fees)
+    
+    min_expected_profit = max(capital * MIN_PROFIT_PERCENT, MIN_PROFIT_FLOOR)
+    
+    if cost_result.expected_profit_usd_net < min_expected_profit:
         logger.warning(
-            f"🚫 HARD BLOCK: profit_net=${cost_result.expected_profit_usd_net:.2f} < ${MIN_EXPECTED_PROFIT_USD:.2f} "
+            f"🚫 HARD BLOCK: profit_net=${cost_result.expected_profit_usd_net:.2f} < ${min_expected_profit:.2f} (0.15% of ${capital:.0f}) "
             f"| size={sizing_result.size:.6f} | TP={take_profit:.2f}"
         )
         result.reason = (
-            f"HARD BLOCK: expected_profit_usd_net=${cost_result.expected_profit_usd_net:.2f} < ${MIN_EXPECTED_PROFIT_USD:.2f}"
+            f"HARD BLOCK: expected_profit_usd_net=${cost_result.expected_profit_usd_net:.2f} < ${min_expected_profit:.2f}"
         )
         engine.missed_tracker.log_blocked_signal(
             direction=bias,
             price=current_price,
-            block_reason=f"profit_net=${cost_result.expected_profit_usd_net:.2f} < ${MIN_EXPECTED_PROFIT_USD}",
+            block_reason=f"profit_net=${cost_result.expected_profit_usd_net:.2f} < ${min_expected_profit:.2f}",
             block_category='profitability',
             score=final_score,
             atr=engine._last_momentum_atr
@@ -1757,6 +3183,17 @@ async def _handle_instant_fill(
     
     # Create position in risk engine
     trade_type = engine._current_trade_type or (TradeType.LONG_MAIN if ctx.bias == 'LONG' else TradeType.SHORT_STRUCTURAL)
+    
+    # 🔥 FIX (Feb 01): Get entry_score for TIME_INVALIDATION strictness
+    entry_score = engine._current_trade_tags.get('entry_score', None)
+    edge_type = engine._current_trade_tags.get('edge_type', None)
+    
+    # 🔥 NEW (Feb 03): Get BOS quality for dynamic trailing
+    bos_quality = engine._current_trade_tags.get('bos_quality', 'NORMAL')
+    
+    # 🔥 FIX (Feb 01): Detect weekend for stricter exits
+    is_weekend = ctx.market_time.weekday() >= 5 if ctx.market_time else False
+    
     engine.risk_engine.create_position(
         symbol=engine.symbol,
         direction=ctx.bias,
@@ -1766,12 +3203,23 @@ async def _handle_instant_fill(
         atr_1m=ctx.atr_1m,
         market_time=ctx.market_time,
         trade_type=trade_type,
-        regime_mode=getattr(engine, '_current_trade_regime', 'RANGE')  # 🔥 FIX: Default to string
+        regime_mode=getattr(engine, '_current_trade_regime', 'RANGE'),  # 🔥 FIX: Default to string
+        edge_type=edge_type,  # 🔥 FIX (Feb 01): Pass edge type
+        entry_score=entry_score,  # 🔥 FIX (Feb 01): Pass entry score for stricter TIME_INVALIDATION
+        is_weekend=is_weekend,  # 🔥 FIX (Feb 01): Pass is_weekend for stricter exits
+        bos_quality=bos_quality  # 🔥 NEW (Feb 03): Pass BOS quality for dynamic trailing
     )
     
     # Start exhaustion tracking
     engine.exhaustion_detector.start_tracking(ctx.market_time)
     engine._exhaustion_tightened = False
+    
+    # 🔥 FIX (Feb 01): Reset gap history for new trade
+    engine._gap_history = []
+    
+    # 🔥 FIX (Feb 02, 2026): Also reset _prev_tick_price to avoid false PRICE_GAP_ANOMALY
+    # Bug: Gap was calculated between OLD _prev_tick_price and NEW entry price → false positives
+    engine._prev_tick_price = ctx.current_price
     
     # Record trade open
     engine.state_machine.record_trade_open(engine.pending_order_id or "UNKNOWN")

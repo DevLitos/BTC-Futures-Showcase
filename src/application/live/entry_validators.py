@@ -972,7 +972,9 @@ class HardEntryBlockValidator:
         Returns:
             Minimum worst-case RR required
         """
-        if session_quality.lower() == 'poor':
+        # 🔄 REFACTORED Feb 04: Use SessionQuality for consistent checks
+        from src.config.trading_config import SessionQuality
+        if SessionQuality.is_quality_blocked(session_quality):
             return float('inf')  # Never enter
         elif session_quality.lower() == 'moderate':
             return 0.65  # Need slightly better RR

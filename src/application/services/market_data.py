@@ -451,7 +451,17 @@ class SynchronizedMultiTimeframeBuffer:
         - Observation mode duration
         - Position duration
         - Any time comparison
+        
+        🔥 FIX (Feb 1, 2026): In live mode, if current_time is too stale (>2 min),
+        fallback to real time to avoid cooldowns being calculated in the past.
         """
+        if not self.backtest_mode:
+            real_now = datetime.now(UTC)
+            staleness = (real_now - self.current_time).total_seconds()
+            # If market time is more than 2 minutes stale, use real time
+            if staleness > 120:
+                logger.warning(f"⚠️ Market time stale by {staleness:.0f}s - using real time")
+                return real_now
         return self.current_time
     
     def get_cvd(self) -> float:

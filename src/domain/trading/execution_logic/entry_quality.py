@@ -224,8 +224,10 @@ class EntryQualityGate:
         # =====================================================================
         # RULE 3: SESSION QUALITY + ADX - SIZE REDUCTION
         # Poor session + ADX < 15 → reduce size 50%
+        # 🔄 REFACTORED Feb 04: Use SessionQuality for consistent checks
         # =====================================================================
-        if session_quality == 'poor' and htf_adx < self.WEAK_SESSION_ADX_THRESHOLD:
+        from src.config.trading_config import SessionQuality
+        if SessionQuality.is_quality_blocked(session_quality) and htf_adx < self.WEAK_SESSION_ADX_THRESHOLD:
             logger.info(
                 f"📊 GATE: Poor session + ADX {htf_adx:.1f} < {self.WEAK_SESSION_ADX_THRESHOLD} "
                 f"- reduce size to {self.WEAK_SESSION_SIZE_FACTOR:.0%}"

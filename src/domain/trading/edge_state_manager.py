@@ -81,31 +81,92 @@ def _edge_log(state: str, edge_type: str, direction: str, msg: str, level: str =
 
 
 # =============================================================================
-# �🎯 EDGE MODE: INSTITUTIONAL vs INTRADAY (Jan 28, 2026)
+# =============================================================================
+# 🎯 EDGE PRIORITY SYSTEM (Feb 05, 2026)
+# Jerarquía clara de edges - el de mayor prioridad SIEMPRE gana
+# =============================================================================
+class EdgePriority:
+    """
+    Prioridades de edges - mayor número = mayor prioridad.
+    
+    Un edge de mayor prioridad puede OVERRIDE uno de menor prioridad.
+    Esto soluciona el problema de BREAKOUT bloqueado por CONSENSUS.
+    """
+    DISPLACEMENT = 100   # Sovereign authority - bypasses everything
+    BREAKOUT = 80        # Pre-expansion - alta convicción
+    RANGE = 60           # Mean reversion en extremos
+    TREND_BOS = 40       # Break of Structure - espera pullback
+    TREND_CONSENSUS = 20 # Alineación directa - menor convicción
+    
+    @classmethod
+    def get_priority(cls, edge_type: 'EdgeType', trend_path: 'TrendEdgePath | None' = None) -> int:
+        """Obtiene la prioridad de un edge type"""
+        if edge_type == EdgeType.DISPLACEMENT:
+            return cls.DISPLACEMENT
+        elif edge_type == EdgeType.BREAKOUT:
+            return cls.BREAKOUT
+        elif edge_type == EdgeType.RANGE:
+            return cls.RANGE
+        elif edge_type == EdgeType.TREND:
+            if trend_path == TrendEdgePath.BOS_PULLBACK:
+                return cls.TREND_BOS
+            else:
+                return cls.TREND_CONSENSUS
+        return 0
+
+
+# =============================================================================
+# 🎯 TREND EDGE PATH (Feb 05, 2026)
+# Dos caminos para TREND edge - BOS es mejor que CONSENSUS
+# =============================================================================
+class TrendEdgePath(Enum):
+    """
+    Path de entrada para TREND edge.
+    
+    BOS_PULLBACK: BOS detectado → espera pullback → mejor entry, mayor size
+    CONSENSUS_DIRECT: Solo alineación → entrada directa → peor entry, menor size
+    """
+    BOS_PULLBACK = "BOS_PULLBACK"          # Size 0.60-0.80x
+    CONSENSUS_DIRECT = "CONSENSUS_DIRECT"  # Size 0.40-0.60x
+
+
+# =============================================================================
+# 🚨 DEPRECATED: EdgeMode (Feb 05, 2026)
+# Mantenido por compatibilidad - el sizing ahora es por EdgeType
 # =============================================================================
 class EdgeMode(Enum):
     """
+    ⚠️ DEPRECATED (Feb 05, 2026): Use EdgeType with sizing profiles instead.
+    
     Modo de operación del edge - determina frequencia y sizing.
-    
-    INSTITUTIONAL: Low frequency, high conviction (1-5/semana)
-    INTRADAY: High frequency, low conviction (5-20/día)
-    
-    NO compiten. NO se solapan. NO se contradicen.
+    Mantenido solo por compatibilidad con código legacy.
     """
-    INSTITUTIONAL = "INSTITUTIONAL"  # BREAKOUT/RANGE extremo - Size 1.0x-1.5x
-    INTRADAY = "INTRADAY"            # Micro-ineficiencias - Size 0.15x-0.30x
+    INSTITUTIONAL = "INSTITUTIONAL"  # DEPRECATED - use EdgeType sizing
+    INTRADAY = "INTRADAY"            # DEPRECATED - absorbed into TREND_CONSENSUS
 
 
 # =============================================================================
-# 🎯 EDGE TYPE: Distinguir entre TREND y RANGE edges
+# 🎯 EDGE TYPE: 4 tipos principales (simplificado Feb 05, 2026)
 # =============================================================================
 class EdgeType(Enum):
-    """Tipo de edge - determina reglas de activación y gestión"""
-    TREND = "TREND"    # BOS + Pullback
-    RANGE = "RANGE"    # Extremo + Mean Reversion
-    BREAKOUT = "BREAKOUT"  # Compresión + Ruptura confirmada
-    INTRADAY = "INTRADAY"  # Micro-ineficiencias intradía
-    DISPLACEMENT = "DISPLACEMENT"  # 🔥 NEW (Jan 30, 2026): Strong displacement edge
+    """
+    Tipo de edge - determina reglas de activación, gestión y sizing.
+    
+    Jerarquía de prioridad: DISPLACEMENT > BREAKOUT > RANGE > TREND
+    
+    Cada tipo tiene su propio sizing profile:
+    - DISPLACEMENT: 0.30-0.60x (adaptativo por zona de entrada)
+    - BREAKOUT: 0.50-0.80x (alta convicción, pre-expansion)
+    - RANGE: 0.50-0.80x (mean reversion en extremos)
+    - TREND: 0.40-0.80x (depende del path: BOS vs CONSENSUS)
+    """
+    DISPLACEMENT = "DISPLACEMENT"  # Movimiento fuerte ≥1.5x ATR - PRIORIDAD 1
+    BREAKOUT = "BREAKOUT"          # Compresión BB + ruptura - PRIORIDAD 2
+    RANGE = "RANGE"                # Extremo 85/15% + sweep - PRIORIDAD 3
+    TREND = "TREND"                # BOS/Consensus alignment - PRIORIDAD 4 (fallback)
+    
+    # 🚨 DEPRECATED - Mantener por compatibilidad, nunca usar para nuevo código
+    INTRADAY = "INTRADAY"  # ⚠️ DEPRECATED: Absorbed into TREND with CONSENSUS_DIRECT path
 
 
 class EdgeState(Enum):
@@ -225,10 +286,13 @@ class ProvisionalEdgeConfig:
     """
     # =========================================================================
     # 🔥 CRITERIOS RELAJADOS PARA PROVISIONAL (entrada barata)
+    # 🔄 REFACTORED Feb 04: Use ADXThresholds for consistency
     # =========================================================================
     MIN_TIMING = 0                   # timing >= 0 (no >= 1)
     MIN_R = 0.20                     # R >= 0.20 (no 0.30)
-    MIN_ADX_5M = 25                  # ADX 5m >= 25 (bias claro)
+    # MIN_ADX_5M uses ADXThresholds.STRONG_TREND (25) for bias claro
+    # Import at runtime to avoid circular imports
+    MIN_ADX_5M = 25                  # ADX 5m >= 25 (bias claro) - See ADXThresholds.STRONG_TREND
     REQUIRES_LIQUIDITY_EVENT = False # NO requiere LiquidityEvent
     
     # =========================================================================
@@ -659,7 +723,10 @@ class BOSEvent:
     htf_bias: str | None  # HTF alignment (None if not determined)
     bos_level: float  # Nivel que se rompió
     atr_at_bos: float
-    edge_type: EdgeType = EdgeType.TREND  # 🔥 NEW: Tipo de edge
+    edge_type: EdgeType = EdgeType.TREND  # Tipo de edge
+    
+    # 🔥 NEW (Feb 05, 2026): Path para TREND edge
+    trend_path: Optional['TrendEdgePath'] = None  # BOS_PULLBACK o CONSENSUS_DIRECT
     
     # Tracking
     trades_attempted: int = 0
@@ -697,6 +764,10 @@ class BOSEvent:
     bars_since_displacement: int = 0                  # Velas transcurridas desde displacement
     entry_window_open: bool = True                    # Si aún estamos en ventana de entrada
     force_direct_entry: bool = False                  # Si se debe forzar entrada directa (primeras barras)
+    
+    def get_priority(self) -> int:
+        """Obtiene la prioridad de este edge usando EdgePriority"""
+        return EdgePriority.get_priority(self.edge_type, self.trend_path)
     
     def is_burned(self) -> bool:
         """Edge quemado si ya se intentaron 2 trades o 2 pérdidas"""
@@ -1424,16 +1495,16 @@ class EdgeStateManager:
         """Modo actual: INSTITUTIONAL o INTRADAY"""
         return self._current_edge_mode
     
-    def is_institutional_active(self) -> bool:
-        """¿Hay un edge INSTITUTIONAL activo? Si sí, INTRADAY debe estar OFF"""
-        if self._state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
-            if self._current_bos and self._current_bos.edge_type in [EdgeType.BREAKOUT, EdgeType.RANGE, EdgeType.TREND]:
-                return True
-        return False
-    
     def is_provisional(self) -> bool:
         """¿Estamos en estado PROVISIONAL (starter position)?"""
         return self._state == EdgeState.EDGE_PROVISIONAL
+    
+    def is_edge_active(self) -> bool:
+        """
+        ¿Está el edge en estado activo para trading?
+        EDGE_ARMED o EDGE_ACTIVE permiten trading.
+        """
+        return self._state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]
     
     def can_evaluate_entry(self) -> bool:
         """
@@ -2235,7 +2306,8 @@ class EdgeStateManager:
         volume_ratio: float,
         direction: str,  # Dirección del anticipation
         atr: float,
-        market_time: datetime
+        market_time: datetime,
+        structure_level: float = 0.0  # 🔥 FIX #29: Structure level for trigger
     ) -> bool:
         """
         Detecta edge de BREAKOUT (compresión).
@@ -2243,32 +2315,70 @@ class EdgeStateManager:
         Llamado cuando Anticipation detecta COMPRESSION_BREAKOUT.
         Arma el edge, esperando confirmación de ruptura.
         
+        🔥 FIX #29 (Feb 04): structure_level is the "Building X from Y" level.
+        When price breaks this level, the edge is confirmed.
+        
+        🔥 FIX #31 (Feb 05): BREAKOUT tiene PRIORIDAD sobre TREND edge.
+        Si hay un TREND edge activo, BREAKOUT puede OVERRIDE porque tiene
+        mayor convicción (compresión + anticipation vs solo consensus).
+        
         Returns: True si se armó edge
         """
         # Check context cooldown
         if self.is_context_in_cooldown(EdgeType.BREAKOUT, market_time):
             return False
         
-        # No crear nuevo edge si ya hay uno
+        # =====================================================================
+        # 🔥 FIX #31 (Feb 05): BREAKOUT OVERRIDE LOGIC
+        # BREAKOUT tiene prioridad 80, TREND tiene 20-40
+        # Si hay TREND activo, lo reemplazamos (mayor convicción)
+        # =====================================================================
         if self._state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
-            return False
+            if self._current_bos:
+                current_priority = EdgePriority.get_priority(self._current_bos.edge_type)
+                breakout_priority = EdgePriority.BREAKOUT
+                
+                if current_priority >= breakout_priority:
+                    # Edge actual tiene igual o mayor prioridad - no override
+                    logger.debug(
+                        f"[BREAKOUT_BLOCKED] Current edge {self._current_bos.edge_type.value} "
+                        f"has priority {current_priority} >= {breakout_priority}"
+                    )
+                    return False
+                else:
+                    # BREAKOUT tiene mayor prioridad - OVERRIDE
+                    logger.info(
+                        f"🔥 BREAKOUT OVERRIDE: Replacing {self._current_bos.edge_type.value} "
+                        f"(priority {current_priority}) with BREAKOUT (priority {breakout_priority})"
+                    )
+                    self._expire_edge(f"BREAKOUT override {self._current_bos.edge_type.value}")
         
         # Reset si estábamos expirados
         if self._state == EdgeState.EDGE_EXPIRED:
             self._transition_to(EdgeState.NO_EDGE, "reset from expired", market_time)
         
+        # 🔥 FIX #29: More relaxed criteria when we have structure_level
+        # With structure level, we already have a clear breakout level to watch
+        has_structure = structure_level > 0
+        
         # Verificar criterios de compresión
         is_squeezed = bb_width_percentile <= BreakoutEdgeCriteria.BB_WIDTH_PERCENTILE_MAX
         vol_declining = volume_ratio <= BreakoutEdgeCriteria.VOLUME_DECLINE_RATIO
         
-        if is_squeezed and vol_declining:
+        # 🔥 FIX #29: Allow edge with structure_level even if volume not declining
+        criteria_met = (is_squeezed and vol_declining) or (has_structure and is_squeezed)
+        
+        if criteria_met:
+            # 🔥 FIX #29: Use structure_level as bos_level if available
+            bos_level = structure_level if has_structure else current_price
+            
             # Armar edge de breakout (esperar confirmación)
             self._current_bos = BOSEvent(
                 timestamp=market_time,
                 price=current_price,
                 direction=direction,
                 htf_bias=direction,
-                bos_level=current_price,
+                bos_level=bos_level,  # 🔥 FIX #29: Structure level as trigger
                 atr_at_bos=atr,
                 edge_type=EdgeType.BREAKOUT,
                 bb_width_percentile=bb_width_percentile,
@@ -2280,9 +2390,10 @@ class EdgeStateManager:
             self._stats.breakout_edges += 1
             
             # Transición fluida
+            level_info = f"level=${bos_level:.0f}" if has_structure else ""
             self._transition_to(
                 EdgeState.EDGE_ARMED,
-                f"BB%={bb_width_percentile:.0f} Vol={volume_ratio:.2f}",
+                f"BB%={bb_width_percentile:.0f} {level_info}",
                 market_time
             )
             return True
@@ -2303,10 +2414,11 @@ class EdgeStateManager:
         """
         Confirma ruptura del breakout con criterios INSTITUCIONALES.
         
-        Criterios:
-        1. Close FUERA de Bollinger Bands (no solo mecha)
-        2. Dirección coincide con anticipation
-        3. Expansión de BB comenzando (ratio > 1.0)
+        🔥 FIX #29: ANTICIPATION EDGE TRIGGER
+        Criterios (en orden de prioridad):
+        1. STRUCTURE LEVEL BREAK: Price breaks bos_level (from ANTICIPATION)
+        2. Close FUERA de Bollinger Bands (fallback)
+        3. Dirección coincide con anticipation
         """
         if self._state != EdgeState.EDGE_ARMED:
             return False
@@ -2319,7 +2431,42 @@ class EdgeStateManager:
             self._expire_edge(f"dir mismatch: {breakout_direction} ≠ {self._current_bos.direction}")
             return False
         
-        # CRITERIO 1: Close FUERA de Bollinger Bands
+        # 🔥 FIX #29: PRIMARY TRIGGER - Structure level break
+        # When ANTICIPATION provides structure_level, use it as trigger
+        structure_level = self._current_bos.bos_level
+        has_structure_trigger = False
+        structure_broken = False
+        
+        # Check if we have a real structure level (not just current_price)
+        if abs(structure_level - self._current_bos.price) > 0.5 * atr:
+            # bos_level is different from squeeze level = we have structure
+            has_structure_trigger = True
+            
+            # 🧠 SMART CONFIRMATION: Require MOMENTUM, not just touch
+            # Price must be at least 0.1 ATR BEYOND the level (not just touching)
+            momentum_buffer = 0.1 * atr
+            
+            if breakout_direction == 'SHORT' and current_price < (structure_level - momentum_buffer):
+                structure_broken = True
+            elif breakout_direction == 'LONG' and current_price > (structure_level + momentum_buffer):
+                structure_broken = True
+        
+        # CRITERIO 1: Structure level break WITH MOMENTUM (ANTICIPATION trigger)
+        if has_structure_trigger and structure_broken:
+            # 🎯 INSTANT TRIGGER: Price broke structure level from ANTICIPATION
+            self._current_bos.pullback_detected_at = market_time
+            self._current_bos.breakout_confirmation_price = current_price
+            self._current_bos.breakout_bb_upper = bb_upper
+            self._current_bos.breakout_bb_lower = bb_lower
+            
+            self._transition_to(
+                EdgeState.EDGE_ACTIVE,
+                f"STRUCTURE BREAK ${structure_level:.0f} → ${current_price:.0f}",
+                market_time
+            )
+            return True
+        
+        # CRITERIO 2: Close FUERA de Bollinger Bands (fallback for non-structure)
         close_outside_bb = False
         if bb_upper > 0 and bb_lower > 0 and close_price > 0:
             if breakout_direction == 'LONG' and close_price > bb_upper:
@@ -2336,9 +2483,6 @@ class EdgeStateManager:
         
         if not close_outside_bb:
             return False  # Still waiting for confirmation
-        
-        # CRITERIO 2: Expansión de BB (optional)
-        # ratio > 1.0 = BB expanding = real breakout (logged but not blocking)
         
         # Guardar datos para invalidación lógica
         self._current_bos.pullback_detected_at = market_time
@@ -2371,9 +2515,11 @@ class EdgeStateManager:
         
         Diferencia: SL protege capital, invalidación protege expectancy.
         
+        🔥 FIX #29: ANTICIPATION EDGE INVALIDATION
         Invalidación:
-        1. Close de vuelta DENTRO de BB (fake breakout)
-        2. Pérdida del nivel de breakout + buffer ATR
+        1. Price moves against direction by > 0.3 ATR from structure_level
+        2. Close de vuelta DENTRO de BB (fake breakout) - fallback
+        3. Pérdida del nivel de breakout + buffer ATR - fallback
         
         Returns: (invalidated, reason)
         """
@@ -2385,6 +2531,22 @@ class EdgeStateManager:
         
         bos = self._current_bos
         direction = bos.direction
+        
+        # =================================================================
+        # 🔥 FIX #29: ANTICIPATION INVALIDATION - Structure level reversal
+        # If edge was armed via structure_level, invalidate if price reverses
+        # =================================================================
+        structure_level = bos.bos_level
+        squeeze_level = bos.price
+        has_structure = abs(structure_level - squeeze_level) > 0.3 * atr
+        
+        if has_structure:
+            # Edge was armed with ANTICIPATION structure_level
+            # Invalidate if price reverses past structure_level
+            if direction == 'SHORT' and current_price > structure_level + 0.3 * atr:
+                return True, f"ANTICIPATION INVALID: Price ${current_price:.0f} > structure ${structure_level:.0f} + 0.3ATR"
+            elif direction == 'LONG' and current_price < structure_level - 0.3 * atr:
+                return True, f"ANTICIPATION INVALID: Price ${current_price:.0f} < structure ${structure_level:.0f} - 0.3ATR"
         
         # =================================================================
         # INVALIDACIÓN 1: Close de vuelta dentro de BB
@@ -2436,7 +2598,9 @@ class EdgeStateManager:
         displacement_amount: float,
         atr: float,
         market_time: datetime,
-        initial_price: float = 0.0
+        initial_price: float = 0.0,
+        is_stale: bool = False,
+        stale_distance: float = 0.0
     ) -> bool:
         """
         Arma un DISPLACEMENT_EDGE cuando se detecta movimiento fuerte.
@@ -2454,8 +2618,26 @@ class EdgeStateManager:
         - En las primeras barras, forzar entrada directa (no esperar pullback)
         - Si pasa la ventana de entrada, NO perseguir
         
+        🔥 FIX (Feb 4, 2026): STALE DISPLACEMENT BLOCKING
+        - Si is_stale=True, NO armar edge (momentum exhausted)
+        - STALE = precio cerca del extremo reciente (< 0.5 ATR)
+        
+        Args:
+            is_stale: True si el displacement está agotado (precio cerca del extremo)
+            stale_distance: Distancia al extremo (para logging)
+        
         Returns: True si se armó el edge
         """
+        # 🔥 FIX (Feb 4, 2026): STALE CHECK FIRST
+        # If displacement is stale (price near extreme), do NOT arm edge
+        if is_stale:
+            logger.warning(
+                f"🚫 DISPLACEMENT EDGE BLOCKED (STALE): {direction} | "
+                f"Price only ${stale_distance:.0f} from extreme (< 0.5 ATR) | "
+                f"Momentum exhausted → NOT arming"
+            )
+            return False
+        
         # Check context cooldown
         if self.is_context_in_cooldown(EdgeType.DISPLACEMENT, market_time):
             logger.debug(f"[DISPLACEMENT_EDGE] Cooldown activo - no armar")
@@ -2677,10 +2859,23 @@ class EdgeStateManager:
         # =====================================================================
         # 🔥 KILL LATE EDGE (NO PERSEGUIR)
         # Si pasó demasiado tiempo sin entrada, matar el edge
+        # 
+        # FIX (Feb 1, 2026): Expirar edge después de KILL threshold
+        # SIEMPRE, no solo si trades_attempted == 0.
+        # Si ya hubo 1+ trade y estamos >5 barras, el edge está muerto.
+        #
+        # FIX (Feb 3, 2026): Si entry_window_open = False, el edge está funcionalmente
+        # muerto para nuevas entradas. Matarlo para evitar evaluaciones zombie
+        # que generan spam de "MISSED" cuando el precio se mueve contra la dirección.
         # =====================================================================
         if bos.bars_since_displacement > DisplacementEdgeCriteria.KILL_EDGE_AFTER_BARS:
-            if bos.trades_attempted == 0:  # Solo si no ha entrado
+            # Si no ha entrado, matar inmediatamente
+            if bos.trades_attempted == 0:
                 return True, f"LATE DISPLACEMENT: {bos.bars_since_displacement} bars > {DisplacementEdgeCriteria.KILL_EDGE_AFTER_BARS} - NO CHASE"
+            # Si ya entró Y la ventana está cerrada, matar también
+            # Esto evita que el edge siga evaluando y generando MISSED spam
+            elif not bos.entry_window_open:
+                return True, f"DISPLACEMENT WINDOW CLOSED: {bos.bars_since_displacement} bars, {bos.trades_attempted} trades taken"
         
         if elapsed_min > DisplacementEdgeCriteria.KILL_EDGE_AFTER_MIN:
             if bos.trades_attempted == 0:  # Solo si no ha entrado
@@ -2777,6 +2972,102 @@ class EdgeStateManager:
         return False, ""
     
     # =========================================================================
+    # 🔥 CONSENSUS EDGE (Feb 05, 2026)
+    # Cuando hay consenso entre structural y active direction en TREND mode,
+    # creamos un edge directamente sin necesitar BOS.
+    # 
+    # FILOSOFÍA: Si dos fuentes independientes (HTF structure + momentum)
+    # coinciden en dirección, hay suficiente evidencia para tradear.
+    #
+    # 🔥 FIX #31 (Feb 05, 2026): CONSENSUS es el fallback de menor prioridad
+    # Si hay un edge de mayor prioridad pendiente (BREAKOUT, DISPLACEMENT),
+    # NO armar CONSENSUS para no bloquear el edge mejor.
+    # =========================================================================
+    
+    def arm_consensus_edge(
+        self,
+        direction: str,
+        current_price: float,
+        atr: float,
+        market_time: datetime,
+        reason: str = "CONSENSUS"
+    ) -> bool:
+        """
+        Arma un CONSENSUS_EDGE cuando structural == active en TREND mode.
+        
+        🔥 FIX #31 (Feb 05): CONSENSUS tiene la MENOR prioridad (20).
+        
+        Este edge NO requiere:
+        - BOS (el consenso ES la señal)
+        - Sweep/rejection (no es mean reversion)
+        - Compresión (no es breakout)
+        
+        Solo requiere:
+        - structural_bias == active_direction
+        - ADX >= 20 (confirmado por trading_mode='TREND')
+        
+        Sizing: 0.40-0.60x (menor que BOS_PULLBACK por ser entrada directa)
+        
+        Returns: True si se armó el edge
+        """
+        # =====================================================================
+        # 🔥 FIX #31: CONSENSUS es el FALLBACK más bajo
+        # Si ya hay edge de cualquier tipo, NO reemplazar
+        # (edges de mayor prioridad pueden override CONSENSUS, no al revés)
+        # =====================================================================
+        if self._state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
+            if self._current_bos and self._current_bos.direction == direction:
+                # Mismo edge, ya armado - no hacer nada
+                return False
+            # Edge diferente activo - CONSENSUS NO puede override nada
+            logger.debug(
+                f"[CONSENSUS_BLOCKED] Edge {self._current_bos.edge_type.value if self._current_bos else 'unknown'} "
+                f"already active - CONSENSUS has lowest priority"
+            )
+            return False
+        
+        # 🔥 FIX #36 (Feb 05): Reset from EXPIRED state to allow re-arming
+        # Without this, once an edge expires, CONSENSUS can never arm again
+        if self._state == EdgeState.EDGE_EXPIRED:
+            self._transition_to(EdgeState.NO_EDGE, "reset from expired for consensus", market_time)
+        
+        # Crear BOSEvent para consensus con trend_path=CONSENSUS_DIRECT
+        self._current_bos = BOSEvent(
+            timestamp=market_time,
+            price=current_price,
+            direction=direction,
+            htf_bias=direction,  # En consensus, htf ya está alineado
+            bos_level=current_price,  # Nivel de entrada
+            atr_at_bos=atr,
+            edge_type=EdgeType.TREND,
+            trend_path=TrendEdgePath.CONSENSUS_DIRECT,  # 🔥 Path específico
+            # Consensus-specific: entrada directa permitida
+            force_direct_entry=True,
+            entry_window_open=True
+        )
+        
+        # Stats
+        self._stats.total_bos_events += 1
+        if direction == 'LONG':
+            self._stats.long_bos_events += 1
+        else:
+            self._stats.short_bos_events += 1
+        
+        # Transición directa a ACTIVE (como displacement)
+        self._transition_to(
+            EdgeState.EDGE_ACTIVE,
+            f"CONSENSUS_DIRECT {direction} | {reason} | Size 0.40-0.60x",
+            market_time
+        )
+        
+        _edge_log(
+            "EDGE_ACTIVE", "TREND", direction,
+            f"Consensus edge (path=DIRECT) | {reason} | Size reduced to 0.40-0.60x"
+        )
+        
+        return True
+    
+    # =========================================================================
     # DETECCIÓN DE BOS (TREND - original)
     # =========================================================================
     
@@ -2861,9 +3152,20 @@ class EdgeStateManager:
         bos_level: float,
         atr: float,
         edge_type: EdgeType = EdgeType.TREND,
-        break_distance: float = 0.0
+        break_distance: float = 0.0,
+        trend_path: Optional[TrendEdgePath] = None  # 🔥 NEW: Path para TREND
     ):
-        """Armar el edge tras detectar BOS"""
+        """
+        Armar el edge tras detectar BOS.
+        
+        🔥 FIX #31 (Feb 05): Para TREND edge, especificar el path:
+        - BOS_PULLBACK: BOS detectado, esperar pullback (mejor entry)
+        - CONSENSUS_DIRECT: Solo alineación, entrada directa
+        """
+        # 🔥 Para BOS, siempre usar BOS_PULLBACK path (mejor sizing)
+        if edge_type == EdgeType.TREND and trend_path is None:
+            trend_path = TrendEdgePath.BOS_PULLBACK
+        
         self._current_bos = BOSEvent(
             timestamp=timestamp,
             price=price,
@@ -2871,7 +3173,8 @@ class EdgeStateManager:
             htf_bias=htf_bias,
             bos_level=bos_level,
             atr_at_bos=atr,
-            edge_type=edge_type
+            edge_type=edge_type,
+            trend_path=trend_path  # 🔥 NEW: Path específico
         )
         
         # Stats
@@ -2885,9 +3188,10 @@ class EdgeStateManager:
             self._stats.trend_edges += 1
         
         # Transición fluida NO_EDGE → ARMED
+        path_info = f" path={trend_path.value}" if trend_path else ""
         self._transition_to(
             EdgeState.EDGE_ARMED,
-            f"BOS@{bos_level:.0f} dist={break_distance:.2f}ATR",
+            f"BOS@{bos_level:.0f} dist={break_distance:.2f}ATR{path_info}",
             timestamp
         )
     
@@ -3186,149 +3490,105 @@ class EdgeStateManager:
             self._expire_edge(f"max trades reached ({bos.trades_attempted})")
     
     # =========================================================================
-    # INTRADAY EDGE DETECTION - High freq, low conviction
+    # 📏 UNIFIED EDGE SIZING (Feb 04 Architecture)
     # =========================================================================
     
-    def check_for_intraday_edge(
-        self,
-        current_price: float,
-        atr_current: float,
-        atr_average: float,
-        volume_current: float,
-        volume_average: float,
-        swing_direction: str,  # 'BULLISH' (HH/HL) or 'BEARISH' (LL/LH)
-        swing_count: int,
-        session_quality: str,  # 'good', 'moderate', 'poor'
-        market_time: datetime
-    ) -> bool:
-        """
-        Detecta edge INTRADAY - micro-ineficiencias cuando mercado activo.
-        
-        NO se activa si hay INSTITUTIONAL edge.
-        
-        Criterios:
-        1. Mercado ACTIVO: ATR expanding + Volume > avg
-        2. Dirección clara: Swing sequence (HH/HL or LL/LH)
-        3. Session no poor
-        """
-        # EXCLUSIÓN MUTUA: Si INSTITUTIONAL activo → INTRADAY OFF
-        if self.is_institutional_active():
-            return False
-        
-        # No crear nuevo edge si ya hay uno
-        if self._state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
-            return False
-        
-        # Reset si estábamos expirados
-        if self._state == EdgeState.EDGE_EXPIRED:
-            self._transition_to(EdgeState.NO_EDGE, "reset from expired", market_time)
-        
-        # LIMITES DE FRECUENCIA
-        if self._last_hour_reset is None or (market_time - self._last_hour_reset).total_seconds() >= 3600:
-            self._intraday_trades_this_hour = 0
-            self._last_hour_reset = market_time
-        
-        if self._intraday_trades_this_hour >= IntradayEdgeCriteria.MAX_TRADES_PER_HOUR:
-            return False
-        
-        if self._last_intraday_trade_time:
-            minutes_since_last = (market_time - self._last_intraday_trade_time).total_seconds() / 60
-            if minutes_since_last < IntradayEdgeCriteria.MIN_BETWEEN_TRADES_MIN:
-                return False
-        
-        # CRITERIO 1: Session no poor
-        if IntradayEdgeCriteria.REQUIRE_ACTIVE_SESSION and session_quality == 'poor':
-            return False
-        
-        # CRITERIO 2: Mercado ACTIVO
-        atr_ratio = atr_current / atr_average if atr_average > 0 else 0
-        volume_ratio = volume_current / volume_average if volume_average > 0 else 0
-        
-        if atr_ratio < IntradayEdgeCriteria.ATR_EXPANSION_RATIO_MIN:
-            return False
-        
-        if volume_ratio < IntradayEdgeCriteria.VOLUME_RATIO_MIN:
-            return False
-        
-        # CRITERIO 3: Dirección clara
-        if swing_count < IntradayEdgeCriteria.MIN_SWING_SEQUENCE:
-            return False
-        
-        if swing_direction not in ['BULLISH', 'BEARISH']:
-            return False
-        
-        # ACTIVAR INTRADAY EDGE - directo a ACTIVE (no ARMED)
-        direction = 'LONG' if swing_direction == 'BULLISH' else 'SHORT'
-        
-        self._current_bos = BOSEvent(
-            timestamp=market_time,
-            price=current_price,
-            direction=direction,
-            htf_bias=direction,
-            bos_level=current_price,
-            atr_at_bos=atr_current,
-            edge_type=EdgeType.INTRADAY
-        )
-        
-        self._current_edge_mode = EdgeMode.INTRADAY
-        
-        # Transición directa NO_EDGE → ACTIVE (INTRADAY no pasa por ARMED)
-        self._transition_to(
-            EdgeState.EDGE_ACTIVE,
-            f"ATR={atr_ratio:.2f} Vol={volume_ratio:.2f} swings={swing_count}",
-            market_time
-        )
-        return True
-    
-    def record_intraday_trade(self, market_time: datetime):
-        """Registra trade intraday para control de frecuencia"""
-        self._intraday_trades_this_hour += 1
-        self._last_intraday_trade_time = market_time
-    
-    def get_intraday_size_multiplier(
-        self,
-        atr_expansion_ratio: float = 1.0,
-        volume_ratio: float = 1.0
-    ) -> float:
-        """
-        Retorna multiplicador de size para INTRADAY: 0.15x - 0.30x
-        Mayor ATR/Vol → más hacia 0.30x
-        """
-        base = IntradayEdgeCriteria.SIZE_MIN
-        max_size = IntradayEdgeCriteria.SIZE_MAX
-        activity_factor = min(atr_expansion_ratio, 2.0) * min(volume_ratio, 2.0) / 4.0
-        return min(base + (max_size - base) * activity_factor, max_size)
-    
-    def get_institutional_size_multiplier(
+    def get_edge_size_multiplier(
         self,
         percentile: float = 50.0,
         bb_percentile: float = 50.0,
         session_quality: str = 'moderate'
-    ) -> float:
+    ) -> tuple[float, float, str]:
         """
-        Retorna multiplicador de size para INSTITUTIONAL: 1.0x - 1.5x
+        Retorna (min_mult, max_mult, edge_info) basado en EdgeType actual.
         
-        HIGH_CONVICTION (1.5x) si 2+ de:
-        - Percentil extremo (≥95 o ≤5)
-        - BB squeeze extremo (<5%)
-        - Session óptima (LONDON, NY_OVERLAP)
+        SIZING BY EDGE TYPE (New Architecture Feb 04):
+        - DISPLACEMENT: 0.30x - 0.60x (macro reversals, lower conviction till confirmed)
+        - BREAKOUT:     0.50x - 0.80x (structure break with confirmation)  
+        - RANGE:        0.50x - 0.80x (mean reversion, reliable)
+        - TREND/BOS:    0.60x - 0.80x (confirmed pullback entry)
+        - TREND/CONSENSUS: 0.40x - 0.60x (no BOS, just trend alignment)
+        
+        Returns:
+            (min_mult, max_mult, edge_info): Size range and description
         """
-        high_conviction_count = 0
+        if self._current_bos is None:
+            return (0.40, 0.60, "NO_EDGE")  # Conservative default
         
-        if percentile >= InstitutionalEdgeConfig.HIGH_CONVICTION_PERCENTILE_EXTREME or \
-           percentile <= (100 - InstitutionalEdgeConfig.HIGH_CONVICTION_PERCENTILE_EXTREME):
-            high_conviction_count += 1
+        edge_type = self._current_bos.edge_type
+        trend_path = getattr(self._current_bos, 'trend_path', None)
         
-        if bb_percentile <= InstitutionalEdgeConfig.HIGH_CONVICTION_BB_SQUEEZE:
-            high_conviction_count += 1
+        # Determine sizing by EdgeType
+        if edge_type == EdgeType.DISPLACEMENT:
+            # Macro reversal - start conservative
+            base_min, base_max = 0.30, 0.60
+            edge_info = "DISPLACEMENT"
+            
+        elif edge_type == EdgeType.BREAKOUT:
+            # Structure break - higher conviction
+            base_min, base_max = 0.50, 0.80
+            edge_info = "BREAKOUT"
+            
+        elif edge_type == EdgeType.RANGE:
+            # Mean reversion - reliable
+            base_min, base_max = 0.50, 0.80
+            edge_info = "RANGE"
+            
+        elif edge_type == EdgeType.TREND:
+            if trend_path == TrendEdgePath.BOS_PULLBACK:
+                # Confirmed BOS entry
+                base_min, base_max = 0.60, 0.80
+                edge_info = "TREND_BOS"
+            else:  # CONSENSUS_DIRECT or None
+                # No BOS, just alignment
+                base_min, base_max = 0.40, 0.60
+                edge_info = "TREND_CONSENSUS"
+                
+        else:
+            # Unknown edge type - conservative
+            base_min, base_max = 0.40, 0.60
+            edge_info = f"UNKNOWN_{edge_type.value}"
         
-        if session_quality == 'good':
-            high_conviction_count += 1
+        # Apply session quality boost for high conviction scenarios
+        from src.config.trading_config import SessionQuality
+        session_mult = SessionQuality.get_quality_size_mult(session_quality)
         
-        if high_conviction_count >= 2:
-            return InstitutionalEdgeConfig.SIZE_MULTIPLIER_HIGH_CONVICTION  # 1.5x
+        # Boost toward max if good session
+        if session_mult >= 1.0:
+            # Good session: can use up to max
+            final_min = base_min
+            final_max = base_max
+        else:
+            # Poor session: reduce max
+            final_min = base_min
+            final_max = base_min + (base_max - base_min) * 0.7  # 30% reduction on max
         
-        return InstitutionalEdgeConfig.SIZE_MULTIPLIER_BASE  # 1.0x
+        return (final_min, final_max, edge_info)
+    
+    def get_edge_info_for_sizing(self) -> dict:
+        """
+        Returns comprehensive edge info for sizing decisions.
+        Used by entry_orchestrator to determine sizing parameters.
+        """
+        if self._current_bos is None:
+            return {
+                'has_edge': False,
+                'edge_type': 'NONE',
+                'trend_path': None,
+                'priority': 0,
+                'direction': None,
+                'can_trade': False
+            }
+        
+        return {
+            'has_edge': True,
+            'edge_type': self._current_bos.edge_type.value,
+            'trend_path': getattr(self._current_bos, 'trend_path', None),
+            'priority': self._current_bos.get_priority(),
+            'direction': self._current_bos.direction,
+            'can_trade': self.can_trade(),
+            'trades_remaining': self.MAX_TRADES_PER_EDGE - self._current_bos.trades_attempted
+        }
     
     # =========================================================================
     # 🌊 STATUS AND UTILITIES
