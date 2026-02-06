@@ -16,7 +16,6 @@ from src.domain.market.filters.filters import (
     BlackSwanFilter,
     HTFFilter,
     LTFTriggerFilter,
-    MTFStructureFilter,
     ImpulseTracker,
 )
 
@@ -53,7 +52,6 @@ __all__ = [
     'BlackSwanFilter', 
     'HTFFilter',
     'LTFTriggerFilter',
-    'MTFStructureFilter',
     'ImpulseTracker',
     # Interface
     'FilterDecision',

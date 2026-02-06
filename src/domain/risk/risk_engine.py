@@ -259,13 +259,18 @@ class Position:
             # 🔥 FIX: Use regime_mode passed from SignalEngine (SINGLE SOURCE OF TRUTH)
             # Map regime_mode string to TrailingRegime enum
             # Handles both simplified (TREND/RANGE) and EdgeRegime values
+            # 🔥 FIX #64 (Feb 6, 2026): TREND_EXHAUSTION → TREND
+            # PROBLEMA: Trade con TrendPhase=TREND_EXHAUSTION tenía Edge=TREND
+            # pero trailing usaba RANGE tiers (muy agresivos), causando exit prematuro
+            # SOLUCIÓN: TREND_EXHAUSTION debería usar TREND tiers porque
+            # aunque el trend está agotándose, todavía hay momentum para pullbacks normales
             regime_map = {
                 # Simplified values
                 'TREND': TrailingRegime.TREND,
                 'TREND_EXPANSION': TrailingRegime.TREND,
                 'BREAKOUT': TrailingRegime.TREND,
                 'RANGE': TrailingRegime.RANGE,
-                'TREND_EXHAUSTION': TrailingRegime.RANGE,
+                'TREND_EXHAUSTION': TrailingRegime.TREND,  # 🔥 FIX #64: was RANGE → TREND
                 'MEAN_REVERSION': TrailingRegime.RANGE,
                 'CHOPPY_DEAD': TrailingRegime.RANGE,
                 # EdgeRegime values (from EdgeRegimeClassifier)
@@ -996,19 +1001,32 @@ class Position:
         - MFE >= 0.2R: 47 trades → P&L = +7.49R (WR 70%)
         - MFE < 0.2R:  33 trades → P&L = -9.20R (WR 0%)
         
-        CONCLUSION: If trade doesn't show momentum in first 4 minutes,
-        it NEVER becomes a winner. Cut it early to minimize loss.
+        CONCLUSION: If trade doesn't show momentum in first N candles,
+        it's less likely to become a winner. Cut it early to minimize loss.
         
-        RULE: After 4 candles (4 min), if MFE < 0.15R → CLOSE at current price
-        This catches trades before they become -0.30R to -0.60R losses.
+        🔥 FIX (Feb 05, 2026): BE WATER - Adapt to regime
+        TREND trades need MORE time because:
+        - They target larger moves (1.2-1.5R)
+        - Pullbacks are normal and expected
+        - ADX high = trend developing, give it time
+        
+        RANGE trades can cut earlier because:
+        - They target smaller moves (0.8-1.0R)
+        - Should see momentum quickly
         """
         # Skip adopted positions
         if self.is_adopted:
             return None
         
-        # Only check at 4 candles
-        EARLY_CHECK_CANDLES = 4
-        EARLY_MFE_THRESHOLD = 0.15  # Minimum MFE required
+        # 🔥 FIX (Feb 05, 2026): Adapt thresholds to regime
+        # TREND: More patient (10 candles, 0.15R threshold)
+        # RANGE: Less patient (6 candles, 0.25R threshold)
+        if self.regime_mode == 'TREND':
+            EARLY_CHECK_CANDLES = 10  # 10 minutes in trend
+            EARLY_MFE_THRESHOLD = 0.15  # Lower bar - just need SOME movement
+        else:
+            EARLY_CHECK_CANDLES = 6   # 6 minutes in range
+            EARLY_MFE_THRESHOLD = 0.25  # Higher bar - need clear momentum
         
         if self.candle_count != EARLY_CHECK_CANDLES:
             return None

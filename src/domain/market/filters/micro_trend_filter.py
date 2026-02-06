@@ -332,25 +332,36 @@ class MicroTrendFilter:
     # =========================================================================
     # SIGNAL WEIGHTS - Importancia de cada señal (total normalizado a 1.0)
     # =========================================================================
+    # 🔥 REFACTOR (Feb 05, 2026): REDUCED ALL WEIGHTS BY 50%
+    # 
+    # PROBLEM: MicroTrend was a "dictator" - its 16+ points of lagging indicators
+    # dominated everything. In violent reversals:
+    #   - Displacement detected SHORT (real, fast)
+    #   - MicroTrend still showed BULLISH (EMA lagging)
+    #   - System entered conflict or blocked valid entries
+    #
+    # SOLUTION: Cut all weights in half. MicroTrend becomes ADVISORY, not VETO.
+    # Structure (swings) gets relatively more weight than lagging EMAs.
+    # =========================================================================
     WEIGHTS = {
-        # Estructura EMA (más confiable, peso alto)
-        'ema_cross': 3.0,           # EMA20 vs EMA50 - MUY importante
-        'ema_slope_alignment': 2.5,  # Ambas EMAs con pendiente en misma dirección
+        # Estructura EMA (LAGGING - reduced significantly)
+        'ema_cross': 1.5,           # Was 3.0 → too dominant in reversals
+        'ema_slope_alignment': 1.0,  # Was 2.5 → both EMAs lag together
         
-        # Estructura de swings (muy informativo)
-        'swing_lows': 2.0,          # LL vs HL
-        'swing_highs': 1.5,         # LH vs HH
+        # Estructura de swings (LEADING - keep relatively higher)
+        'swing_lows': 1.5,          # Was 2.0 → still important
+        'swing_highs': 1.0,         # Was 1.5
         
-        # Posición precio (puede ser ruido en pullbacks)
-        'price_vs_ema20': 1.0,      # Peso reducido - pullbacks normales
-        'price_vs_ema50': 1.5,      # Más importante que EMA20
+        # Posición precio (NOISE in pullbacks - minimal weight)
+        'price_vs_ema20': 0.5,      # Was 1.0 → pullbacks cause false signals
+        'price_vs_ema50': 0.75,     # Was 1.5
         
-        # Momentum RSI
-        'rsi_zone': 1.0,            # RSI en zona bull/bear
-        'rsi_slope': 1.5,           # Dirección del RSI
+        # Momentum RSI (LAGGING - reduced)
+        'rsi_zone': 0.5,            # Was 1.0
+        'rsi_slope': 0.75,          # Was 1.5
         
-        # 1m confirmation (bonus)
-        'ltf_confirmation': 2.0,    # 1m confirma dirección
+        # 1m confirmation (keep - this is actual timing)
+        'ltf_confirmation': 1.5,    # Was 2.0 → still important for timing
     }
     
     # =========================================================================
@@ -377,19 +388,21 @@ class MicroTrendFilter:
     # Score adjustments
     # 🔥 FIX (Jan 26, 2026): Reduced penalties - were too aggressive
     # -3.0 was destroying any reasonable score (5 base - 3 = 2)
-    SCORE_HARD_PENALTY = -1.5      # Was -3.0 → too aggressive
-    SCORE_SOFT_PENALTY = -1.0      # Was -2.0
-    SCORE_WARNING_PENALTY = -0.5   # Was -1.0
-    SCORE_ALIGNMENT_BONUS = 1.0
+    # 🔥 REFACTOR (Feb 05, 2026): Further reduced - MicroTrend should ADVISE, not VETO
+    SCORE_HARD_PENALTY = -1.0      # Was -1.5 → still too aggressive
+    SCORE_SOFT_PENALTY = -0.5      # Was -1.0
+    SCORE_WARNING_PENALTY = -0.25  # Was -0.5
+    SCORE_ALIGNMENT_BONUS = 0.5    # Was 1.0 → bonus also reduced proportionally
     
     # Strength thresholds (applied AFTER hysteresis)
-    # Reduced (Jan 15, 2026) to catch trends faster with confluence boost
-    # 🔥 FIX (Jan 22, 2026): Strength threshold for hard block raised
-    # RANGE mode: only hard block if strength > 60% AND ADX < 14
-    STRENGTH_HARD_BLOCK = 0.55     # Reduced from 0.65 (confluence boost adds confidence)
-    STRENGTH_HARD_BLOCK_RANGE = 0.60  # 🔥 NEW: Higher threshold for RANGE mode
-    STRENGTH_SOFT_BLOCK = 0.40     # Reduced from 0.45
-    STRENGTH_WARNING = 0.25
+    # 🔥 REFACTOR (Feb 05, 2026): RAISED ALL THRESHOLDS
+    # With reduced weights, strength values will be lower.
+    # But also: MicroTrend should need OVERWHELMING evidence to hard block.
+    # If edge is active, MicroTrend should NOT be the one deciding.
+    STRENGTH_HARD_BLOCK = 0.70     # Was 0.55 → need very strong contradiction
+    STRENGTH_HARD_BLOCK_RANGE = 0.75  # Was 0.60 → even higher for RANGE
+    STRENGTH_SOFT_BLOCK = 0.55     # Was 0.40 → raised
+    STRENGTH_WARNING = 0.35        # Was 0.25 → raised
     
     # Minimum score for RSI override to work
     RSI_OVERRIDE_MIN_BASE_SCORE = 5  # Only override if base score >= 5

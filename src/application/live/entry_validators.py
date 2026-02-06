@@ -397,6 +397,20 @@ class GraduatedSizer:
             result.tags['location_size_cap_applied'] = location_size_cap
             result.combined_defensive *= location_size_cap
         
+        # 🔥 FIX #56: LOCATION EXTREME SOFT MODE SIZE CAP
+        # When in extreme location but NOT in panic mode, reduce size to 40%
+        location_extreme_soft_mode = trade_tags.get('location_extreme_soft_mode', False)
+        if location_extreme_soft_mode:
+            extreme_size_cap = trade_tags.get('location_extreme_size_cap', 0.40)
+            extreme_pct = trade_tags.get('location_extreme_percentile', 50)
+            logger.warning(
+                f"⚠️ LOCATION EXTREME SOFT MODE: Size→{extreme_size_cap:.0%} | "
+                f"Percentile={extreme_pct:.0f}% | TightStops=ON"
+            )
+            result.tags['location_extreme_soft_mode_applied'] = True
+            result.tags['location_extreme_size_cap_applied'] = extreme_size_cap
+            result.combined_defensive *= extreme_size_cap
+        
         # ANTICIPATION PROBE SIZING
         anticipation_probe_size = trade_tags.get('anticipation_probe_size', 1.0)
         if anticipation_probe_size < 1.0:

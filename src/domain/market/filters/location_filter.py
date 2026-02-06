@@ -241,6 +241,35 @@ class LocationFilter:
             context.range_high_60d = float(np.max(highs_1h))
             context.range_low_60d = float(np.min(lows_1h))
         
+        # =============================================================
+        # 🔥 FIX (Feb 05, 2026): DYNAMIC RANGE EXPANSION
+        # =============================================================
+        # PROBLEM: When price breaks 60d extremes, percentile becomes negative
+        #          or very low (<5%), which blocks ALL trades via location_extreme.
+        #          The system lost 100R+ potential on 2026-02-05 due to this bug.
+        #
+        # SOLUTION: If current price is OUTSIDE the historical range, expand
+        #           the range dynamically to include current price + buffer.
+        #           This keeps percentile in valid 0-100% range.
+        # =============================================================
+        if current_price < context.range_low_60d:
+            old_low = context.range_low_60d
+            # Expand range to current price minus 0.2% buffer
+            context.range_low_60d = current_price * 0.998
+            logger.info(
+                f"🔥 RANGE EXPANSION (LOW): Price {current_price:.0f} broke 60d-low {old_low:.0f} "
+                f"| New range_low={context.range_low_60d:.0f} | This is a BREAKDOWN"
+            )
+        
+        if current_price > context.range_high_60d:
+            old_high = context.range_high_60d
+            # Expand range to current price plus 0.2% buffer
+            context.range_high_60d = current_price * 1.002
+            logger.info(
+                f"🔥 RANGE EXPANSION (HIGH): Price {current_price:.0f} broke 60d-high {old_high:.0f} "
+                f"| New range_high={context.range_high_60d:.0f} | This is a BREAKOUT"
+            )
+        
         # 20-day range
         context.range_high_20d = float(np.max(highs_1h[-bars_20d:]))
         context.range_low_20d = float(np.min(lows_1h[-bars_20d:]))

@@ -8,6 +8,18 @@ Extracted from SignalEngine to enable:
 
 These are convenience wrappers around the core indicators module
 with additional calculations specific to the trading system.
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ 📝 REFACTORED - Feb 05, 2026                                                 ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ CHANGES:                                                                     ║
+║ - CachedIndicators class REMOVED (use application/live/indicator_cache.py)  ║
+║ - calculate_atr_1m/calculate_atr_5m consolidated to aliases of _generic     ║
+║ - get_indicator_cache() and singleton REMOVED (use app/live/indicator_cache)║
+║ - ts_to_int() moved to src/shared/utils.py (SINGLE SOURCE)                  ║
+║                                                                              ║
+║ This module now contains ONLY pure helper functions for indicators.         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from dataclasses import dataclass, field
@@ -22,45 +34,17 @@ from src.shared.indicators import (
     calculate_rsi, calculate_bollinger_bands
 )
 
-
-@dataclass
-class CachedIndicators:
-    """Container for cached indicator values."""
-    timestamp_1m: int = 0
-    timestamp_5m: int = 0
-    timestamp_1h: int = 0
-    
-    # DataFrames
-    df_1m: Optional[pd.DataFrame] = None
-    df_5m: Optional[pd.DataFrame] = None
-    df_1h: Optional[pd.DataFrame] = None
-    
-    # Calculated values
-    atr_1m: Optional[float] = None
-    atr_5m: Optional[float] = None
-    atr_1h: Optional[float] = None
-    atr_ratio: Optional[float] = None
-    
-    adx_1h: Optional[float] = None
-    adx_5m: Optional[float] = None
-    
-    ema20_5m: Optional[float] = None
-    ema50_1h: Optional[float] = None
-    ema200_1h: Optional[float] = None
-    
-    rsi_1m: Optional[float] = None
-    rsi_5m: Optional[float] = None
-    
-    bb_width: Optional[float] = None
-    bb_avg: Optional[float] = None
-    bb_upper: Optional[float] = None
-    bb_lower: Optional[float] = None
-    
-    vpoc: Optional[float] = None
-
+# =============================================================================
+# TIMESTAMP UTILITIES (import from utils for compatibility)
+# =============================================================================
 
 def ts_to_int(ts) -> int:
-    """Convert any timestamp (pd.Timestamp, int, float, datetime) to int (epoch ms)."""
+    """
+    Convert any timestamp (pd.Timestamp, int, float, datetime) to int (epoch ms).
+    
+    NOTE: This is kept here for backward compatibility.
+    New code should import from src.shared.utils
+    """
     if ts is None:
         return 0
     if hasattr(ts, 'value'):
@@ -72,34 +56,17 @@ def ts_to_int(ts) -> int:
     return int(ts) if ts else 0
 
 
-def calculate_atr_1m(df_1m: pd.DataFrame, period: int = 14) -> float:
-    """Calculate ATR on 1-minute timeframe."""
-    if df_1m is None or len(df_1m) < period + 1:
-        return 0.0
-    
-    highs = df_1m['high'].to_numpy()
-    lows = df_1m['low'].to_numpy()
-    closes = df_1m['close'].to_numpy()
-    
-    atr = calculate_atr(highs, lows, closes, period)
-    return float(atr[-1]) if not np.isnan(atr[-1]) else 0.0
-
-
-def calculate_atr_5m(df_5m: pd.DataFrame, period: int = 14) -> float:
-    """Calculate ATR on 5-minute timeframe."""
-    if df_5m is None or len(df_5m) < period + 1:
-        return 0.0
-    
-    highs = df_5m['high'].to_numpy()
-    lows = df_5m['low'].to_numpy()
-    closes = df_5m['close'].to_numpy()
-    
-    atr = calculate_atr(highs, lows, closes, period)
-    return float(atr[-1]) if not np.isnan(atr[-1]) else 0.0
-
+# =============================================================================
+# ATR CALCULATIONS
+# =============================================================================
 
 def calculate_atr_generic(df: pd.DataFrame, period: int = 14) -> float:
-    """Calculate ATR on any timeframe DataFrame."""
+    """
+    Calculate ATR on any timeframe DataFrame.
+    
+    This is the PRIMARY function - calculate_atr_1m and calculate_atr_5m
+    are now aliases to this function for backward compatibility.
+    """
     if df is None or len(df) < period + 1:
         return 0.0
     
@@ -109,6 +76,11 @@ def calculate_atr_generic(df: pd.DataFrame, period: int = 14) -> float:
     
     atr = calculate_atr(highs, lows, closes, period)
     return float(atr[-1]) if not np.isnan(atr[-1]) else 0.0
+
+
+# Aliases for backward compatibility - both call calculate_atr_generic
+calculate_atr_1m = calculate_atr_generic
+calculate_atr_5m = calculate_atr_generic
 
 
 def calculate_atr_ratio(df_1m: pd.DataFrame, df_5m: pd.DataFrame) -> float:
@@ -251,89 +223,13 @@ def find_tp2_target(
         return float(df_5m['low'].min())
 
 
-def get_cached_indicators(
-    cache: CachedIndicators,
-    candles_1m: list,
-    candles_5m: list,
-    candles_1h: list
-) -> CachedIndicators:
-    """
-    Update indicator cache if candle timestamps changed.
-    
-    This implements lazy recalculation - only compute indicators
-    when the underlying data has changed.
-    
-    Args:
-        cache: Existing cache to update
-        candles_1m: 1-minute candle list
-        candles_5m: 5-minute candle list
-        candles_1h: 1-hour candle list
-        
-    Returns:
-        Updated CachedIndicators
-    """
-    # Get current timestamps
-    ts_1m = ts_to_int(candles_1m[-1]['timestamp']) if candles_1m else 0
-    ts_5m = ts_to_int(candles_5m[-1]['timestamp']) if candles_5m else 0
-    ts_1h = ts_to_int(candles_1h[-1]['timestamp']) if candles_1h else 0
-    
-    # Update 1m indicators if changed
-    if ts_1m != cache.timestamp_1m and candles_1m:
-        cache.timestamp_1m = ts_1m
-        cache.df_1m = pd.DataFrame(candles_1m)
-        cache.atr_1m = calculate_atr_1m(cache.df_1m)
-        cache.rsi_1m = calculate_rsi_value(cache.df_1m)
-    
-    # Update 5m indicators if changed
-    if ts_5m != cache.timestamp_5m and candles_5m:
-        cache.timestamp_5m = ts_5m
-        cache.df_5m = pd.DataFrame(candles_5m)
-        cache.atr_5m = calculate_atr_5m(cache.df_5m)
-        cache.adx_5m = calculate_adx_value(cache.df_5m)
-        
-        emas = calculate_ema_values(cache.df_5m)
-        cache.ema20_5m = emas['ema20']
-        
-        bb = calculate_bb_values(cache.df_5m)
-        cache.bb_width = bb['width']
-        cache.bb_avg = bb['middle']
-        cache.bb_upper = bb['upper']
-        cache.bb_lower = bb['lower']
-    
-    # Update 1h indicators if changed
-    if ts_1h != cache.timestamp_1h and candles_1h:
-        cache.timestamp_1h = ts_1h
-        cache.df_1h = pd.DataFrame(candles_1h)
-        cache.atr_1h = calculate_atr_generic(cache.df_1h)
-        cache.adx_1h = calculate_adx_value(cache.df_1h)
-        
-        emas = calculate_ema_values(cache.df_1h)
-        cache.ema50_1h = emas['ema50']
-        cache.ema200_1h = emas['ema200']
-    
-    # Update ratio if both timeframes available
-    if cache.df_1m is not None and cache.df_5m is not None:
-        cache.atr_ratio = calculate_atr_ratio(cache.df_1m, cache.df_5m)
-    
-    return cache
-
-
 # =============================================================================
-# SINGLETON INSTANCE
+# ⛔ DEPRECATED CACHE FUNCTIONS - Use application/live/indicator_cache.py
 # =============================================================================
+# NOTE: get_cached_indicators, get_indicator_cache, reset_indicator_cache
+# have been REMOVED. Use src/application/live/indicator_cache.py instead.
+# CachedIndicators class has also been removed from this file.
+#
+# For backward compatibility, import from shared/indicator_cache.py which
+# will issue a DeprecationWarning.
 
-_indicator_cache: Optional[CachedIndicators] = None
-
-
-def get_indicator_cache() -> CachedIndicators:
-    """Get or create the global indicator cache."""
-    global _indicator_cache
-    if _indicator_cache is None:
-        _indicator_cache = CachedIndicators()
-    return _indicator_cache
-
-
-def reset_indicator_cache():
-    """Reset the indicator cache (for testing)."""
-    global _indicator_cache
-    _indicator_cache = CachedIndicators()

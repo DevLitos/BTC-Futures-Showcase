@@ -125,6 +125,7 @@ class EntryFilterPipeline:
                  regime_mode: str = 'TREND',  # 🔥 FIX (Jan 22): Added regime_mode parameter
                  displacement_bypass: bool = False,  # 🔥 FIX (Jan 29): Bypass sweep on displacement
                  anticipation_bypass: bool = False,  # 🔥 FIX #46 (Feb 05): ANTICIPATION bypasses macro slope
+                 bias_flip_bypass: bool = False,  # 🔥 FIX #67 (Feb 06): Bypass sweep on BIAS FLIP
                  
                  # Control
                  early_exit: bool = True) -> FilterDecision:
@@ -230,12 +231,14 @@ class EntryFilterPipeline:
         if self.post_sweep_filter.enabled and bias:
             # Use df_1m if available, otherwise df_5m (can't use 'or' with DataFrames)
             df_short_tf = df_1m if df_1m is not None and not df_1m.empty else df_5m
+            # 🔥 FIX #67 (Feb 06): BIAS FLIP also bypasses sweep (market structure changed)
+            effective_bypass = displacement_bypass or bias_flip_bypass
             decision = self.post_sweep_filter.evaluate(
                 df=df_short_tf,
                 current_price=current_price,
                 atr=atr,
                 bias=bias,
-                displacement_bypass=displacement_bypass  # 🔥 FIX (Jan 29): Pass through
+                displacement_bypass=effective_bypass  # 🔥 FIX (Jan 29): Pass through
             )
             decision.regime_source = 'post_sweep'
             self._last_decisions['post_sweep'] = decision
@@ -319,13 +322,13 @@ class EntryFilterPipeline:
         # ===== FINAL AGGREGATE =====
         self._last_aggregate = aggregate
         
-        # Log summary - only at INFO if significant adjustment
+        # 🔥 FIX (Feb 05, 2026): Only log significant adjustments
+        # +1.5 is common, only log >= 2.0 or blocks
         if aggregate.score_adjust != 0:
             adj_str = f"{aggregate.score_adjust:+.1f}"
-            if abs(aggregate.score_adjust) >= 1.5:
+            if abs(aggregate.score_adjust) >= 2.0 or not aggregate.allow:
                 logger.info(f"[DATA] FILTER: adj={adj_str}, {aggregate.reasons[0] if aggregate.reasons else 'ok'}")
-            else:
-                logger.debug(f"FILTER: adj={adj_str}, {aggregate.reasons[:2]}")
+            # else: too common, skip logging
         
         return aggregate
     

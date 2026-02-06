@@ -1,6 +1,27 @@
 """
 Regime Context - SINGLE SOURCE OF TRUTH for market regime
 
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ ⛔ DEPRECATED - Feb 05, 2026                                                 ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ REASON: Despite being designed as "SINGLE SOURCE OF TRUTH", this module     ║
+║         was NEVER integrated with application/live/ code.                   ║
+║                                                                              ║
+║ ANALYSIS:                                                                    ║
+║ - RegimeContextManager: Never imported in application layer                 ║
+║ - get_regime_context_manager(): Never called from live trading code         ║
+║ - RegimeContext: Good design, but superseded by TrendIntelligence           ║
+║                                                                              ║
+║ REPLACEMENT:                                                                 ║
+║ - Use TrendIntelligence.get_state() for regime context                      ║
+║ - Use EdgeRegimeClassifier for edge-specific regime                         ║
+║ - Trailing logic now embedded in trailing_stop.py directly                  ║
+║                                                                              ║
+║ MIGRATION: File kept for backward compatibility. Will be removed in v2.2.0  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+OLD DESCRIPTION:
+----------------
 🔥 FIX (Jan 22, 2026):
 "Tu bot ya sabe cuándo una entrada es mediocre,
 pero todavía no alinea todos los módulos para tratarla como tal de forma consistente."
@@ -27,6 +48,13 @@ All modules query this context instead of computing their own.
 
 Created: January 22, 2026
 """
+
+import warnings
+warnings.warn(
+    "regime_context.py is DEPRECATED. Use TrendIntelligence.get_state() instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 import logging
 from dataclasses import dataclass, field

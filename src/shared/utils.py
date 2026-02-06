@@ -57,6 +57,42 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 
 # =============================================================================
+# TIMESTAMP UTILITIES - SINGLE SOURCE OF TRUTH
+# =============================================================================
+
+def ts_to_int(ts) -> int:
+    """
+    Convert any timestamp (pd.Timestamp, int, float, datetime) to int (epoch ms).
+    
+    This is the SINGLE SOURCE OF TRUTH for timestamp conversion.
+    Other modules should import this function from here.
+    
+    Args:
+        ts: Timestamp in any format (pd.Timestamp, datetime, int, float, None)
+        
+    Returns:
+        Integer timestamp in milliseconds since epoch
+        
+    Examples:
+        >>> ts_to_int(pd.Timestamp('2026-01-01'))
+        1767225600000
+        >>> ts_to_int(datetime.now())
+        1770320000000
+        >>> ts_to_int(1770320000)  # Already int
+        1770320000
+    """
+    if ts is None:
+        return 0
+    if hasattr(ts, 'value'):
+        # pd.Timestamp.value is in nanoseconds, convert to ms
+        return int(ts.value // 1_000_000)
+    if hasattr(ts, 'timestamp'):
+        # datetime object
+        return int(ts.timestamp() * 1000)
+    return int(ts) if ts else 0
+
+
+# =============================================================================
 # SAFE ARRAY ACCESS - Prevent IndexError on empty/short sequences
 # =============================================================================
 

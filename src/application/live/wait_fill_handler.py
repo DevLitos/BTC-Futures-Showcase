@@ -518,6 +518,9 @@ class WaitFillHandler:
                 trade_type_for_log = entry_data.get('trade_type', TradeType.LONG_MAIN if entry_data['bias'] == 'LONG' else TradeType.SHORT_STRUCTURAL)
                 trade_type_name = trade_type_for_log.value if hasattr(trade_type_for_log, 'value') else str(trade_type_for_log)
                 
+                # 🔥 EDGE TYPE (Feb 05, 2026): Get edge_type from tags
+                edge_type_for_log = trade_tags.get('edge_type', '') if isinstance(trade_tags, dict) else ''
+                
                 result.current_trade_id = ctx.trade_logger.start_trade(
                     symbol=ctx.symbol,
                     direction=entry_data['bias'],
@@ -535,7 +538,8 @@ class WaitFillHandler:
                     metadata={'worst_case_rr': trade_tags.get('rr_worst_case')},
                     feature_snapshot=ctx.build_ml_feature_snapshot(),
                     entry_trading_mode=trade_tags.get('trading_mode', ''),
-                    entry_daily_regime=trade_tags.get('daily_regime', '')
+                    entry_daily_regime=trade_tags.get('daily_regime', ''),
+                    edge_type=edge_type_for_log
                 )
                 
                 # Record trade executed

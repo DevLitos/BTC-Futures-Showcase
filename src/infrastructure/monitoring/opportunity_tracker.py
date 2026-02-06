@@ -7,11 +7,13 @@ This module logs every blocked entry with:
 - Hypothetical entry price
 - Block reason (filter, HARD_LOCK, etc.)
 - What happened to price after (missed edge calculation)
+- 🔥 FIX Feb 06: TIMING CLASSIFICATION (early vs late detection)
 
 Purpose:
 - Tune filters by seeing their false positive rate
 - Detect if system is too conservative
 - Quantify opportunity cost of safety measures
+- 🔥 NEW: Distinguish REAL MISSED (early detection blocked) from FAKE MISSED (late detection)
 """
 
 import logging
@@ -19,6 +21,7 @@ from datetime import datetime, UTC, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from collections import deque
+from enum import Enum, auto
 import json
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,15 @@ logger = logging.getLogger(__name__)
 # Minimum R threshold to consider a blocked trade as a "missed winner"
 # A trade that only reaches 0.5R MFE before hitting 0.4R MAE is marginal at best
 MIN_R_FOR_WINNER = 1.0  # Must reach at least 1R favorable excursion
+
+
+class SignalTimingCategory(Enum):
+    """🔥 FIX Feb 06: Categoría de timing de la señal"""
+    EARLY = "early"           # Antes de movimiento significativo (< 0.3%)
+    ON_TIME = "on_time"       # Durante inicio de movimiento (< 0.8%)
+    LATE = "late"             # Después de movimiento significativo (< 1.5%)
+    VERY_LATE = "very_late"   # Persiguiendo precio (> 1.5%)
+    UNKNOWN = "unknown"       # No se pudo determinar
 
 
 @dataclass
@@ -39,6 +51,11 @@ class MissedOpportunity:
     block_category: str  # Category: 'filter', 'hard_lock', 'penalty', 'funding', 'session'
     signal_score: float = 0.0  # The score that would have triggered
     atr_at_signal: float = 0.0  # ATR for R calculation
+    
+    # 🔥 FIX Feb 06: Timing classification
+    timing_category: SignalTimingCategory = SignalTimingCategory.UNKNOWN
+    move_at_detection_pct: float = 0.0  # % price moved before we detected
+    setup_price: float = 0.0  # Price when setup originally formed
     
     # Filled post-hoc
     price_5min_later: Optional[float] = None
@@ -77,6 +94,39 @@ class MissedOpportunity:
         return True
     
     @property
+    def is_real_missed(self) -> bool:
+        """🔥 FIX Feb 06: True if this was a REAL missed opportunity (early detection)"""
+        return (
+            self.was_good_trade and 
+            self.timing_category in [SignalTimingCategory.EARLY, SignalTimingCategory.ON_TIME]
+        )
+    
+    @property
+    def is_fake_missed(self) -> bool:
+        """🔥 FIX Feb 06: True if this was a FAKE missed (late detection, not real opportunity)"""
+        return (
+            self.was_good_trade and 
+            self.timing_category in [SignalTimingCategory.LATE, SignalTimingCategory.VERY_LATE]
+        )
+    
+    @property
+    def missed_classification(self) -> str:
+        """🔥 FIX Feb 06: Classify the miss type"""
+        if not self.was_good_trade:
+            return "DODGED_LOSER"
+        
+        if self.timing_category == SignalTimingCategory.EARLY:
+            return "REAL_MISSED_EARLY"
+        elif self.timing_category == SignalTimingCategory.ON_TIME:
+            return "REAL_MISSED_ONTIME"
+        elif self.timing_category == SignalTimingCategory.LATE:
+            return "FAKE_MISSED_LATE"
+        elif self.timing_category == SignalTimingCategory.VERY_LATE:
+            return "FAKE_MISSED_CHASE"
+        else:
+            return "UNKNOWN"
+    
+    @property
     def hypothetical_r_at_mfe(self) -> float:
         """What R would we have reached at MFE?"""
         if self.atr_at_signal <= 0:
@@ -99,7 +149,13 @@ class MissedOpportunity:
             'mae': self.max_adverse_excursion,
             'hypothetical_r': self.hypothetical_r,
             'was_good': self.was_good_trade,
-            'resolved': self.resolved
+            'resolved': self.resolved,
+            # 🔥 FIX Feb 06: Timing classification
+            'timing_category': self.timing_category.value,
+            'move_at_detection_pct': self.move_at_detection_pct,
+            'missed_classification': self.missed_classification,
+            'is_real_missed': self.is_real_missed,
+            'is_fake_missed': self.is_fake_missed
         }
 
 
@@ -153,6 +209,12 @@ class MissedOpportunityTracker:
         self._block_counts: Dict[str, int] = {}
         self._block_good_missed: Dict[str, int] = {}
         
+        # 🔥 FIX Feb 06: Timing classification statistics
+        self._real_missed_early = 0
+        self._real_missed_ontime = 0
+        self._fake_missed_late = 0
+        self._fake_missed_chase = 0
+        
         logger.info("MissedOpportunityTracker initialized")
     
     def log_blocked_signal(
@@ -162,7 +224,11 @@ class MissedOpportunityTracker:
         block_reason: str,
         block_category: str,
         score: float = 0.0,
-        atr: float = 0.0
+        atr: float = 0.0,
+        # 🔥 FIX Feb 06: Timing classification
+        timing_category: SignalTimingCategory = SignalTimingCategory.UNKNOWN,
+        move_at_detection_pct: float = 0.0,
+        setup_price: float = 0.0
     ):
         """
         Log a signal that was blocked.
@@ -174,6 +240,9 @@ class MissedOpportunityTracker:
             block_category: Category (filter, hard_lock, penalty, funding, session)
             score: The signal score
             atr: Current ATR for R calculations
+            timing_category: 🔥 NEW - EARLY/ON_TIME/LATE/VERY_LATE
+            move_at_detection_pct: 🔥 NEW - % price moved before detection
+            setup_price: 🔥 NEW - Price when setup originally formed
         """
         # =====================================================================
         # 🔥 FIX (Feb 3, 2026): Filter categories that are NOT missed opportunities
@@ -191,15 +260,19 @@ class MissedOpportunityTracker:
         # =====================================================================
         
         # Categories that are NOT real missed opportunities
+        # 🔥 FIX (Feb 05, 2026): Added location_extreme - NOT a missed trade
+        # when we're at bottom/top and correctly refusing to trade into it
         PROTECTION_CATEGORIES = {
             'delta_contradict',      # Market going against us
             'chase_penalty',         # Too late to enter
             'obstinacy',             # Conflicting signals
             'quality_gate',          # Quality too low
             'location_filter',       # Wrong location in structure
+            'location_extreme',      # 🔥 At top/bottom - CORRECT block, not missed
             'forbidden_direction',   # Direction explicitly forbidden (bias flip)
             'bias_flip',             # Bias has flipped against setup
             'direction_lock',        # Direction is locked opposite
+            'warmup',                # System still warming up
         }
         
         # Skip logging for protection blocks (they're not missed opportunities)
@@ -217,7 +290,11 @@ class MissedOpportunityTracker:
             block_reason=block_reason,
             block_category=block_category,
             signal_score=score,
-            atr_at_signal=atr
+            atr_at_signal=atr,
+            # 🔥 FIX Feb 06: Timing classification
+            timing_category=timing_category,
+            move_at_detection_pct=move_at_detection_pct,
+            setup_price=setup_price if setup_price > 0 else price
         )
         
         self._pending.append(opp)
@@ -226,7 +303,9 @@ class MissedOpportunityTracker:
         # Track by reason
         self._block_counts[block_reason] = self._block_counts.get(block_reason, 0) + 1
         
-        logger.info(f"📊 MISSED: {direction} @ {price:.2f} blocked by {block_category}: {block_reason}")
+        # 🔥 FIX Feb 06: Log with timing info
+        timing_str = f" [TIMING: {timing_category.value}, moved {move_at_detection_pct:.2f}%]" if move_at_detection_pct > 0 else ""
+        logger.info(f"📊 MISSED: {direction} @ {price:.2f} blocked by {block_category}: {block_reason}{timing_str}")
     
     def update_pending(self, current_price: float, current_time: datetime | None = None):
         """
@@ -315,11 +394,39 @@ class MissedOpportunityTracker:
             # Track by reason
             self._block_good_missed[opp.block_reason] = \
                 self._block_good_missed.get(opp.block_reason, 0) + 1
-            logger.warning(
-                f"❌ MISSED WINNER [{signal_time_str}]: {opp.signal_direction} entry={opp.hypothetical_entry:.2f} "
-                f"→ best={best_price:.2f} (MFE {opp.hypothetical_r_at_mfe:.2f}R) worst={worst_price:.2f} "
-                f"| Blocked by: {opp.block_reason}"
-            )
+            
+            # 🔥 FIX Feb 06: Track timing classification
+            classification = opp.missed_classification
+            if classification == "REAL_MISSED_EARLY":
+                self._real_missed_early += 1
+                logger.warning(
+                    f"❌ REAL MISSED (EARLY) [{signal_time_str}]: {opp.signal_direction} @ ${opp.hypothetical_entry:.0f} "
+                    f"→ MFE {opp.hypothetical_r_at_mfe:.2f}R | Detected early but blocked by: {opp.block_reason}"
+                )
+            elif classification == "REAL_MISSED_ONTIME":
+                self._real_missed_ontime += 1
+                logger.warning(
+                    f"❌ REAL MISSED (ON-TIME) [{signal_time_str}]: {opp.signal_direction} @ ${opp.hypothetical_entry:.0f} "
+                    f"→ MFE {opp.hypothetical_r_at_mfe:.2f}R | Blocked by: {opp.block_reason}"
+                )
+            elif classification == "FAKE_MISSED_LATE":
+                self._fake_missed_late += 1
+                logger.info(
+                    f"⏰ FAKE MISSED (LATE) [{signal_time_str}]: {opp.signal_direction} @ ${opp.hypothetical_entry:.0f} "
+                    f"→ Already moved {opp.move_at_detection_pct:.1f}% before detection | Not a real opportunity"
+                )
+            elif classification == "FAKE_MISSED_CHASE":
+                self._fake_missed_chase += 1
+                logger.info(
+                    f"⏰ FAKE MISSED (CHASE) [{signal_time_str}]: {opp.signal_direction} @ ${opp.hypothetical_entry:.0f} "
+                    f"→ Moved {opp.move_at_detection_pct:.1f}% before detection | Would be chasing"
+                )
+            else:
+                logger.warning(
+                    f"❌ MISSED WINNER [{signal_time_str}]: {opp.signal_direction} entry={opp.hypothetical_entry:.2f} "
+                    f"→ best={best_price:.2f} (MFE {opp.hypothetical_r_at_mfe:.2f}R) worst={worst_price:.2f} "
+                    f"| Blocked by: {opp.block_reason}"
+                )
         else:
             self._bad_trades_avoided += 1
             logger.info(
@@ -359,6 +466,11 @@ class MissedOpportunityTracker:
                 'false_positive_rate': good_missed / total if total > 0 else 0.0
             }
         
+        # 🔥 FIX Feb 06: Timing classification stats
+        real_missed = self._real_missed_early + self._real_missed_ontime
+        fake_missed = self._fake_missed_late + self._fake_missed_chase
+        total_missed = real_missed + fake_missed
+        
         return {
             'total_blocked': self._total_blocked,
             'pending_tracking': len(self._pending),
@@ -366,7 +478,18 @@ class MissedOpportunityTracker:
             'good_trades_missed': self._good_trades_missed,
             'bad_trades_avoided': self._bad_trades_avoided,
             'miss_rate': self._good_trades_missed / total_resolved if total_resolved > 0 else 0.0,
-            'filter_effectiveness': filter_stats
+            'filter_effectiveness': filter_stats,
+            # 🔥 FIX Feb 06: Real vs Fake missed breakdown
+            'timing_analysis': {
+                'real_missed': real_missed,
+                'real_missed_early': self._real_missed_early,
+                'real_missed_ontime': self._real_missed_ontime,
+                'fake_missed': fake_missed,
+                'fake_missed_late': self._fake_missed_late,
+                'fake_missed_chase': self._fake_missed_chase,
+                'real_missed_pct': real_missed / total_missed if total_missed > 0 else 0.0,
+                'fake_missed_pct': fake_missed / total_missed if total_missed > 0 else 0.0,
+            }
         }
     
     def get_worst_filters(self, top_n: int = 5) -> List[Dict]:
@@ -397,10 +520,11 @@ class MissedOpportunityTracker:
     def log_summary(self):
         """Log a summary of missed opportunities"""
         stats = self.get_statistics()
+        timing = stats.get('timing_analysis', {})
         
-        logger.info("=" * 50)
+        logger.info("=" * 60)
         logger.info("📊 MISSED OPPORTUNITY SUMMARY")
-        logger.info("=" * 50)
+        logger.info("=" * 60)
         logger.info(f"Total signals blocked: {stats['total_blocked']}")
         logger.info(f"Currently tracking: {stats['pending_tracking']}")
         logger.info(f"Resolved: {stats['resolved']}")
@@ -408,9 +532,24 @@ class MissedOpportunityTracker:
         logger.info(f"  ✅ Bad trades avoided: {stats['bad_trades_avoided']}")
         logger.info(f"Miss rate: {stats['miss_rate']:.1%}")
         
+        # 🔥 FIX Feb 06: Timing analysis
+        if timing:
+            logger.info("")
+            logger.info("📊 TIMING ANALYSIS (Real vs Fake Missed):")
+            logger.info(f"  🎯 REAL MISSED (detected early but blocked):")
+            logger.info(f"     Early: {timing.get('real_missed_early', 0)}")
+            logger.info(f"     On-time: {timing.get('real_missed_ontime', 0)}")
+            logger.info(f"     Total: {timing.get('real_missed', 0)} ({timing.get('real_missed_pct', 0):.0%} of winners)")
+            logger.info(f"  ⏰ FAKE MISSED (detected late - not real opportunities):")
+            logger.info(f"     Late: {timing.get('fake_missed_late', 0)}")
+            logger.info(f"     Chase: {timing.get('fake_missed_chase', 0)}")
+            logger.info(f"     Total: {timing.get('fake_missed', 0)} ({timing.get('fake_missed_pct', 0):.0%} of winners)")
+        
         # Show worst filters
         worst = self.get_worst_filters(3)
         if worst:
-            logger.info("\n⚠️ FILTERS WITH HIGHEST FALSE POSITIVE RATE:")
+            logger.info("")
+            logger.info("⚠️ FILTERS WITH HIGHEST FALSE POSITIVE RATE:")
             for f in worst:
                 logger.info(f"  {f['filter']}: {f['false_positive_rate']:.0%} ({f['good_missed']}/{f['total_blocks']} good trades blocked)")
+        logger.info("=" * 60)

@@ -82,8 +82,11 @@ class AnticipationEngine:
     """
     
     # Thresholds
+    # 🔥 FIX #60 (Feb 06): Use centralized ADXThresholds
+    from src.config.trading_config import ADXThresholds
+    
     BB_SQUEEZE_PERCENTILE = 20  # Width below this = squeezed
-    ADX_LOW_THRESHOLD = 20
+    ADX_LOW_THRESHOLD = ADXThresholds.TREND  # 20 - Use centralized value
     ADX_RISING_MIN_SLOPE = 0.3
     VOLUME_DECLINE_RATIO = 0.7  # Current vol < 70% of avg
     STRUCTURE_MIN_POINTS = 3    # Need 3 HLs or LHs
@@ -472,6 +475,422 @@ class AnticipationEngine:
     def get_state(self) -> AnticipationState:
         """Get current anticipation state"""
         return self._last_state
+
+    # =========================================================================
+    # 🔥 FIX #58 (Feb 06, 2026): MÉTODOS ADICIONALES DE ANTICIPACIÓN
+    # 
+    # El método evaluate() original detecta COMPRESSION_BREAKOUT.
+    # Estos métodos complementarios detectan otros patrones PRE-MOVE:
+    # 
+    # 1. TREND_PULLBACK - Pullback a EMA en tendencia fuerte
+    # 2. FAILED_TEST - Rechazo de nivel clave → reversión
+    # 3. DIVERGENCE - RSI divergence → agotamiento
+    # 4. MOMENTUM_EXHAUSTION - ADX cayendo + precio en extremo
+    # =========================================================================
+
+    def detect_trend_pullback(
+        self,
+        df_5m: pd.DataFrame,
+        current_price: float,
+        atr: float,
+        htf_bias: Optional[str] = None,
+        adx_1h: float = 0.0
+    ) -> Optional[AnticipationState]:
+        """
+        Detecta pullback a zona de valor en tendencia establecida.
+        
+        CONDICIONES:
+        - Tendencia clara (ADX 1H >= 25)
+        - Precio retrocede a EMA20/50 en 5m
+        - RSI no en extremo (30-70)
+        - Volumen bajo durante pullback
+        
+        ENTRY: En el pullback, ANTES de que retome la tendencia
+        """
+        if len(df_5m) < 60 or adx_1h < 25:
+            return None
+        
+        closes = df_5m['close'].to_numpy()
+        highs = df_5m['high'].to_numpy()
+        lows = df_5m['low'].to_numpy()
+        
+        # EMAs
+        ema20 = pd.Series(closes).ewm(span=20, adjust=False).mean().iloc[-1]
+        ema50 = pd.Series(closes).ewm(span=50, adjust=False).mean().iloc[-1]
+        
+        # RSI simple
+        delta = pd.Series(closes).diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean().iloc[-1]
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean().iloc[-1]
+        rsi = 100 - (100 / (1 + gain / loss)) if loss > 0 else 50
+        
+        # Determinar dirección de tendencia
+        trend_up = ema20 > ema50 and closes[-1] > ema50
+        trend_down = ema20 < ema50 and closes[-1] < ema50
+        
+        if not (trend_up or trend_down):
+            return None
+        
+        # Verificar pullback a EMA
+        ema_zone_upper = max(ema20, ema50) + atr * 0.3
+        ema_zone_lower = min(ema20, ema50) - atr * 0.3
+        in_ema_zone = ema_zone_lower <= current_price <= ema_zone_upper
+        
+        if not in_ema_zone:
+            return None
+        
+        # RSI no en extremo
+        if rsi < 30 or rsi > 70:
+            return None
+        
+        # Volumen bajo (pullback silencioso)
+        if 'volume' in df_5m.columns:
+            recent_vol = float(np.mean(df_5m['volume'].to_numpy()[-5:]))
+            avg_vol = float(np.mean(df_5m['volume'].to_numpy()[-30:]))
+            if avg_vol > 0 and recent_vol / avg_vol > 0.8:
+                return None  # Volumen alto = no es pullback tranquilo
+        
+        # Dirección y niveles
+        direction = 'LONG' if trend_up else 'SHORT'
+        
+        # Conflicto con HTF bias
+        if htf_bias and htf_bias != direction:
+            return None
+        
+        if direction == 'LONG':
+            entry = current_price
+            stop_loss = min(ema20, ema50) - atr * 0.5
+            target = current_price + atr * 2
+            structure_level = float(np.min(lows[-10:]))  # Swing low reciente
+        else:
+            entry = current_price
+            stop_loss = max(ema20, ema50) + atr * 0.5
+            target = current_price - atr * 2
+            structure_level = float(np.max(highs[-10:]))  # Swing high reciente
+        
+        confidence = 0.60
+        # Boost si ADX muy fuerte
+        if adx_1h >= 35:
+            confidence += 0.10
+        # Boost si RSI cerca de 50 (neutral = mejor timing)
+        if 45 <= rsi <= 55:
+            confidence += 0.05
+        
+        return AnticipationState(
+            signal=AnticipationSignal.STRUCTURE_BUILD,  # Reusa enum existente
+            direction=direction,
+            confidence=min(0.85, confidence),
+            entry_price=entry,
+            stop_loss=stop_loss,
+            expected_target=target,
+            time_valid_until=datetime.now() + timedelta(minutes=15),
+            reasons=[
+                f"TREND_PULLBACK: {direction} trend (ADX={adx_1h:.1f})",
+                f"Price at EMA zone ({ema20:.0f}/{ema50:.0f})",
+                f"RSI neutral ({rsi:.1f})"
+            ],
+            structure_level=structure_level
+        )
+
+    def detect_failed_test(
+        self,
+        df_5m: pd.DataFrame,
+        current_price: float,
+        atr: float,
+        key_levels: Optional[List[float]] = None
+    ) -> Optional[AnticipationState]:
+        """
+        Detecta rechazo de nivel clave → anticipar reversión.
+        
+        CONDICIONES:
+        - Precio tocó nivel clave en últimas 5 velas
+        - Mecha larga en dirección del test (rechazo)
+        - Cierre lejos del nivel (no rompió)
+        - Volumen spike en el test (institucional rechazando)
+        
+        ENTRY: Después del rechazo, dirección opuesta al test
+        """
+        if len(df_5m) < 20 or not key_levels or len(key_levels) == 0:
+            return None
+        
+        closes = df_5m['close'].to_numpy()
+        highs = df_5m['high'].to_numpy()
+        lows = df_5m['low'].to_numpy()
+        
+        # Buscar test reciente de nivel
+        for level in key_levels:
+            distance_to_level = abs(current_price - level)
+            
+            # Nivel debe estar cerca pero no tocándolo ahora
+            if distance_to_level < atr * 0.2 or distance_to_level > atr * 1.5:
+                continue
+            
+            # Verificar si testeamos el nivel en últimas 5 velas
+            level_tested_high = any(h >= level - atr * 0.1 and h <= level + atr * 0.1 
+                                    for h in highs[-5:])
+            level_tested_low = any(l >= level - atr * 0.1 and l <= level + atr * 0.1 
+                                   for l in lows[-5:])
+            
+            if not (level_tested_high or level_tested_low):
+                continue
+            
+            # Determinar dirección del test
+            if level_tested_high and current_price < level:
+                # Testeó resistencia, rechazó hacia abajo → SHORT
+                direction = 'SHORT'
+                # Verificar mecha superior (rechazo)
+                wick_ratios = [(highs[i] - max(closes[i], closes[i-1] if i > 0 else closes[i])) / 
+                              (highs[i] - lows[i] + 0.01) for i in range(-5, 0)]
+                has_rejection_wick = any(r > 0.4 for r in wick_ratios)
+                
+                if not has_rejection_wick:
+                    continue
+                
+                entry = current_price
+                stop_loss = level + atr * 0.3
+                target = current_price - atr * 2
+                structure_level = level
+                
+            elif level_tested_low and current_price > level:
+                # Testeó soporte, rechazó hacia arriba → LONG
+                direction = 'LONG'
+                # Verificar mecha inferior (rechazo)
+                wick_ratios = [(min(closes[i], closes[i-1] if i > 0 else closes[i]) - lows[i]) / 
+                              (highs[i] - lows[i] + 0.01) for i in range(-5, 0)]
+                has_rejection_wick = any(r > 0.4 for r in wick_ratios)
+                
+                if not has_rejection_wick:
+                    continue
+                
+                entry = current_price
+                stop_loss = level - atr * 0.3
+                target = current_price + atr * 2
+                structure_level = level
+            else:
+                continue
+            
+            # Calcular confianza
+            confidence = 0.55
+            # Boost por distancia del nivel (más lejos = más confirmación)
+            dist_atr = distance_to_level / atr
+            if dist_atr >= 0.5:
+                confidence += 0.10
+            # Boost por wick grande
+            if any(r > 0.6 for r in wick_ratios):
+                confidence += 0.10
+            
+            return AnticipationState(
+                signal=AnticipationSignal.FAILED_TEST,
+                direction=direction,
+                confidence=min(0.80, confidence),
+                entry_price=entry,
+                stop_loss=stop_loss,
+                expected_target=target,
+                time_valid_until=datetime.now() + timedelta(minutes=10),
+                reasons=[
+                    f"FAILED_TEST: {direction} after rejection @ {level:.0f}",
+                    f"Distance from level: {dist_atr:.2f} ATR",
+                    f"Rejection wick detected"
+                ],
+                structure_level=structure_level
+            )
+        
+        return None
+
+    def detect_momentum_exhaustion(
+        self,
+        df_5m: pd.DataFrame,
+        current_price: float,
+        atr: float,
+        adx_5m: float = 0.0
+    ) -> Optional[AnticipationState]:
+        """
+        Detecta agotamiento de momentum → anticipar reversión/pausa.
+        
+        CONDICIONES:
+        - ADX 5m fue alto (>30) pero ahora cayendo
+        - RSI en extremo (>70 o <30)
+        - Precio en extremo de rango reciente
+        - Divergencia RSI vs precio (opcional pero potente)
+        
+        ENTRY: Contra la tendencia agotada, con SL ajustado
+        """
+        if len(df_5m) < 50 or adx_5m < 15:
+            return None
+        
+        closes = df_5m['close'].to_numpy()
+        highs = df_5m['high'].to_numpy()
+        lows = df_5m['low'].to_numpy()
+        
+        # RSI
+        delta = pd.Series(closes).diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / (loss + 1e-10)
+        rsi_series = 100 - (100 / (1 + rs))
+        rsi_now = rsi_series.iloc[-1]
+        rsi_5_ago = rsi_series.iloc[-5] if len(rsi_series) >= 5 else rsi_now
+        
+        # ADX slope (necesitamos historial)
+        from src.shared.indicators import calculate_adx
+        adx_arr, _ = calculate_adx(highs, lows, closes, 14)
+        if len(adx_arr) < 10:
+            return None
+        
+        adx_now = adx_arr[-1]
+        adx_5_ago = adx_arr[-5]
+        adx_falling = adx_now < adx_5_ago - 2  # ADX cayendo significativamente
+        
+        if not adx_falling:
+            return None
+        
+        # Rango reciente
+        range_high = float(np.max(highs[-20:]))
+        range_low = float(np.min(lows[-20:]))
+        range_size = range_high - range_low
+        
+        if range_size <= 0:
+            return None
+        
+        price_position = (current_price - range_low) / range_size
+        
+        # Detectar exhaustion
+        direction = None
+        reasons = []
+        
+        # Exhaustion alcista (RSI alto + precio cerca de máximos + ADX cayendo)
+        if rsi_now > 65 and price_position > 0.75 and adx_falling:
+            direction = 'SHORT'
+            # Divergencia bearish? (precio sube, RSI baja)
+            price_rising = closes[-1] > closes[-5]
+            rsi_falling = rsi_now < rsi_5_ago
+            if price_rising and rsi_falling:
+                reasons.append("BEARISH DIVERGENCE detected")
+        
+        # Exhaustion bajista (RSI bajo + precio cerca de mínimos + ADX cayendo)
+        elif rsi_now < 35 and price_position < 0.25 and adx_falling:
+            direction = 'LONG'
+            # Divergencia bullish? (precio baja, RSI sube)
+            price_falling = closes[-1] < closes[-5]
+            rsi_rising = rsi_now > rsi_5_ago
+            if price_falling and rsi_rising:
+                reasons.append("BULLISH DIVERGENCE detected")
+        
+        if not direction:
+            return None
+        
+        # Niveles
+        if direction == 'LONG':
+            entry = current_price
+            stop_loss = range_low - atr * 0.3
+            target = current_price + atr * 1.5  # Target conservador en reversal
+            structure_level = range_low
+        else:
+            entry = current_price
+            stop_loss = range_high + atr * 0.3
+            target = current_price - atr * 1.5
+            structure_level = range_high
+        
+        # Confianza base
+        confidence = 0.50
+        if len(reasons) > 0:  # Tiene divergencia
+            confidence += 0.15
+        if adx_now < adx_5_ago - 5:  # ADX cayendo fuerte
+            confidence += 0.10
+        
+        reasons.insert(0, f"EXHAUSTION: ADX falling ({adx_5_ago:.1f}→{adx_now:.1f})")
+        reasons.append(f"RSI={rsi_now:.1f}, Price position={price_position:.0%}")
+        
+        return AnticipationState(
+            signal=AnticipationSignal.DIVERGENCE_UNWIND,
+            direction=direction,
+            confidence=min(0.75, confidence),
+            entry_price=entry,
+            stop_loss=stop_loss,
+            expected_target=target,
+            time_valid_until=datetime.now() + timedelta(minutes=10),
+            reasons=reasons,
+            structure_level=structure_level
+        )
+
+    def evaluate_all(
+        self,
+        df_5m: pd.DataFrame,
+        current_price: float,
+        atr: float,
+        market_time: datetime,
+        htf_bias: Optional[str] = None,
+        important_levels: Optional[List[float]] = None,
+        regime: Optional[str] = None,
+        adx_1h: float = 0.0,
+        adx_5m: float = 0.0
+    ) -> AnticipationState:
+        """
+        Evalúa TODOS los métodos de anticipación y retorna el mejor.
+        
+        Prioridad:
+        1. COMPRESSION_BREAKOUT (método original) - mejor timing
+        2. TREND_PULLBACK - alta probabilidad en tendencias
+        3. FAILED_TEST - buen R:R en niveles
+        4. MOMENTUM_EXHAUSTION - contra-tendencia, más riesgoso
+        
+        Retorna el de mayor confianza entre los detectados.
+        """
+        candidates: List[AnticipationState] = []
+        
+        # 1. Original COMPRESSION_BREAKOUT (evaluate)
+        compression_state = self.evaluate(
+            df_5m=df_5m,
+            current_price=current_price,
+            atr=atr,
+            market_time=market_time,
+            htf_bias=htf_bias,
+            important_levels=important_levels,
+            regime=regime
+        )
+        if compression_state.signal != AnticipationSignal.NONE:
+            candidates.append(compression_state)
+        
+        # 2. TREND_PULLBACK (nuevo)
+        pullback_state = self.detect_trend_pullback(
+            df_5m=df_5m,
+            current_price=current_price,
+            atr=atr,
+            htf_bias=htf_bias,
+            adx_1h=adx_1h
+        )
+        if pullback_state:
+            candidates.append(pullback_state)
+        
+        # 3. FAILED_TEST (nuevo)
+        failed_test_state = self.detect_failed_test(
+            df_5m=df_5m,
+            current_price=current_price,
+            atr=atr,
+            key_levels=important_levels
+        )
+        if failed_test_state:
+            candidates.append(failed_test_state)
+        
+        # 4. MOMENTUM_EXHAUSTION (nuevo) - solo si no hay otras señales
+        if not candidates:
+            exhaustion_state = self.detect_momentum_exhaustion(
+                df_5m=df_5m,
+                current_price=current_price,
+                atr=atr,
+                adx_5m=adx_5m
+            )
+            if exhaustion_state:
+                candidates.append(exhaustion_state)
+        
+        # Retornar el de mayor confianza
+        if not candidates:
+            self._last_state = AnticipationState()
+            return self._last_state
+        
+        best = max(candidates, key=lambda s: s.confidence)
+        self._last_state = best
+        return best
 
 
 # Singleton

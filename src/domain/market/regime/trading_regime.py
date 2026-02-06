@@ -1,12 +1,27 @@
 """
 Trading Regime System - Enhanced regime classification with transitional states
 
-⚠️ PARTIAL DEPRECATION (Feb 05, 2026):
-- TrendDirection is now imported from unified_constants.py (SINGLE SOURCE)
-- get_regime_classifier() returns TradingRegimeClassifier but there are
-  3 different get_regime_classifier() functions across the codebase.
-  Prefer using RegimeContextManager from regime_context.py as the primary source.
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ ⛔ DEPRECATED - Feb 05, 2026                                                 ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ REASON: This entire module is UNUSED in production (application/live/).     ║
+║                                                                              ║
+║ ANALYSIS:                                                                    ║
+║ - TradingRegimeClassifier: Never imported in application layer              ║
+║ - get_regime_classifier(): Conflicts with 2 other functions with same name  ║
+║ - REGIME_CHARACTERISTICS: Only used by frequency_controller.py (also dead)  ║
+║ - TrendDirection: Moved to unified_constants.py (SINGLE SOURCE)             ║
+║                                                                              ║
+║ REPLACEMENT:                                                                 ║
+║ - Use TrendIntelligence for trend cycle detection (trend_intelligence.py)   ║
+║ - Use EdgeRegimeClassifier for edge validity (edge_regime_classifier.py)    ║
+║ - Use DailyRegimeDetector for daily regime (trading_config.py)              ║
+║                                                                              ║
+║ MIGRATION: File kept for backward compatibility. Will be removed in v2.2.0  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 
+OLD DESCRIPTION:
+----------------
 PRINCIPLE (Jan 20, 2026):
 Detect regime changes EARLIER, not later.
 The system should identify regime transitions BEFORE they fully materialize.
@@ -25,6 +40,13 @@ FREQUENCY CONTROL BY REGIME:
 - EXHAUSTION: Very limited (high risk of reversal)
 - TRANSITIONAL: Minimal (wait for clarity)
 """
+
+import warnings
+warnings.warn(
+    "trading_regime.py is DEPRECATED. Use TrendIntelligence or EdgeRegimeClassifier instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 from enum import Enum
 from dataclasses import dataclass, field

@@ -397,13 +397,43 @@ def check_anticipation_signal(
         if engine.regime_classifier and engine.regime_classifier.current_regime:
             current_regime = engine.regime_classifier.current_regime.value
         
-        anticipation = engine.anticipation_engine.evaluate(
+        # =========================================================================
+        # 🔥 FIX #58 (Feb 06, 2026): Usar evaluate_all() para detectar TODOS los
+        # patrones de anticipación, no solo COMPRESSION_BREAKOUT
+        # 
+        # Patrones detectados:
+        # 1. COMPRESSION_BREAKOUT - BB squeeze (original)
+        # 2. TREND_PULLBACK - Pullback a EMA en tendencia
+        # 3. FAILED_TEST - Rechazo de nivel clave
+        # 4. MOMENTUM_EXHAUSTION - Agotamiento con divergencia
+        # =========================================================================
+        
+        # Get ADX values for extended anticipation methods
+        adx_1h_val = getattr(engine, '_last_htf_adx', 0.0)
+        adx_5m_val = getattr(engine, '_last_effective_adx', 0.0)
+        
+        # Get important levels from location filter if available
+        important_levels = None
+        if hasattr(engine, '_location_filter') and engine._location_filter:
+            lf = engine._location_filter
+            levels = []
+            if hasattr(lf, '_range_high') and lf._range_high > 0:
+                levels.append(lf._range_high)
+            if hasattr(lf, '_range_low') and lf._range_low > 0:
+                levels.append(lf._range_low)
+            if levels:
+                important_levels = levels
+        
+        anticipation = engine.anticipation_engine.evaluate_all(
             df_5m=df_5m,
             current_price=current_price,
             atr=atr_5m_val,
             market_time=market_time,
             htf_bias=htf_bias_hint,
-            regime=current_regime
+            important_levels=important_levels,
+            regime=current_regime,
+            adx_1h=adx_1h_val,
+            adx_5m=adx_5m_val
         )
         
         engine._last_anticipation_state = anticipation
@@ -429,19 +459,24 @@ def check_anticipation_signal(
         
         # Check if edge is still active or if it's stale
         edge_is_active = False
+        direction_is_stale = False
         if hasattr(engine, '_edge_manager'):
             from src.domain.trading.edge_state_manager import EdgeState
             edge_is_active = engine._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]
+            # 🔥 FIX #59 (Feb 06, 2026): Use edge_manager's stale detection
+            direction_is_stale = engine._edge_manager.is_direction_stale(stale_threshold_minutes=5)
         
         # Check if we have a position (if so, ACTIVE_DIRECTION matters)
         has_position = getattr(engine, '_position', None) is not None
         
-        # 🔥 FIX #25: Only invalidate if edge is actually active OR we have a position
+        # 🔥 FIX #25 + #59: Only invalidate if:
+        # - Edge is actually active OR we have a position
+        # - AND direction is NOT stale
         # If edge is EXPIRED/NO_EDGE and no position → ACTIVE_DIRECTION is stale, ignore it
-        direction_is_relevant = edge_is_active or has_position
+        direction_is_relevant = (edge_is_active or has_position) and not direction_is_stale
         
         if displacement_bypass and active_direction and direction_is_relevant:
-            # Hay displacement activo - verificar si contradice anticipation
+            # Hay displacement activo Y dirección es relevante - verificar si contradice anticipation
             if anticipation.direction and anticipation.direction != active_direction:
                 logger.info(
                     f"⛔ ANTICIPATION INVALIDATED: {anticipation.direction} vs "
@@ -449,13 +484,13 @@ def check_anticipation_signal(
                 )
                 anticipation = AnticipationState()  # Reset to empty
                 engine._last_anticipation_state = anticipation
-        elif displacement_bypass and active_direction and not direction_is_relevant:
-            # Edge is stale - log but don't invalidate
+        elif active_direction and (not direction_is_relevant or direction_is_stale):
+            # Edge is stale o no hay edge - dirección es obsoleta, permitir anticipation
             if anticipation.direction and anticipation.direction != active_direction:
                 logger.info(
                     f"📝 ANTICIPATION preserved: {anticipation.direction} differs from stale "
-                    f"ACTIVE_DIRECTION={active_direction} (edge={engine._edge_manager.state.value if hasattr(engine, '_edge_manager') else 'N/A'}, no_position) | "
-                    f"Stale direction ignored - new breakout allowed"
+                    f"ACTIVE_DIRECTION={active_direction} (stale={direction_is_stale}, edge={engine._edge_manager.state.value if hasattr(engine, '_edge_manager') else 'N/A'}) | "
+                    f"New signal allowed"
                 )
         
         # =========================================================================
@@ -503,19 +538,87 @@ def check_anticipation_signal(
             # Also add ADX context for debugging ADX vs RANGE_BOUND conflict
             adx_5m = getattr(engine, '_last_effective_adx', 0.0)
             trend_phase = getattr(engine, '_current_trend_phase', 'UNKNOWN')
-            logger.info(
-                f"🔮 ANTICIPATION: {anticipation.signal.value} {anticipation.direction} | "
-                f"conf={anticipation.confidence:.0%} | ADX={adx_5m:.1f} | phase={trend_phase}"
-            )
-            if anticipation.reasons:
-                for reason in anticipation.reasons[:3]:
-                    logger.info(f"   → {reason}")
             
-            # 🔥 DESHABILITADO: No usar ANTICIPATION como trigger directo
-            # Solo loguear como información para breakout posterior
-            # if anticipation.confidence >= 0.75 and anticipation.direction:
-            #     tags['anticipation_entry'] = True
-            #     tags['anticipation_probe_size'] = 0.30
+            # 🔥 FIX (Feb 05, 2026): Include current price to show context changes
+            # Also detect if structure is invalidated by current price
+            structure_invalidated = False
+            if anticipation.structure_level > 0 and anticipation.direction:
+                if anticipation.direction == 'LONG' and current_price < anticipation.structure_level:
+                    structure_invalidated = True
+                elif anticipation.direction == 'SHORT' and current_price > anticipation.structure_level:
+                    structure_invalidated = True
+            
+            if structure_invalidated:
+                # Structure broken - invalidate anticipation
+                logger.warning(
+                    f"⛔ ANTICIPATION INVALIDATED: {anticipation.direction} structure broken | "
+                    f"Price {current_price:.0f} vs level {anticipation.structure_level:.0f}"
+                )
+                anticipation = AnticipationState()  # Reset to empty
+                engine._last_anticipation_state = anticipation
+            else:
+                logger.info(
+                    f"🔮 ANTICIPATION: {anticipation.signal.value} {anticipation.direction} @ ${current_price:.0f} | "
+                    f"conf={anticipation.confidence:.0%} | ADX={adx_5m:.1f} | phase={trend_phase}"
+                )
+                if anticipation.reasons:
+                    for reason in anticipation.reasons[:3]:
+                        logger.info(f"   → {reason}")
+            
+            # =========================================================================
+            # 🔥 FIX #58 (Feb 06, 2026): RE-HABILITAR ANTICIPATION COMO TRIGGER
+            # 
+            # PROBLEMA: Sistema siempre detecta TARDE porque:
+            # - Solo entra por BOS (ya movió 0.5-1.5%)
+            # - ANTICIPATION detecta ANTES pero estaba deshabilitado
+            #
+            # SOLUCIÓN: Habilitar ANTICIPATION como trigger con:
+            # - Umbral de confianza 65% (era 75% - muy restrictivo)
+            # - Probe size 0.35x (pequeño pero útil)
+            # - Solo si tiene structure_level válido (no a ciegas)
+            #
+            # Esto permite ENTRAR ANTES DEL MOVIMIENTO:
+            # - Anticipation detecta compresión → entra pequeño
+            # - Si breakout confirma → edge upgrades to ACTIVE → añade
+            # - Si falla → sale con pérdida pequeña (0.35x)
+            # =========================================================================
+            ANTICIPATION_TRIGGER_CONFIDENCE = 0.65  # Bajado de 0.75
+            ANTICIPATION_PROBE_SIZE = 0.35          # Tamaño pequeño para probar
+            
+            # =========================================================================
+            # 🔥 FIX #59 (Feb 06, 2026): Evitar duplicación BREAKOUT edge vs ANTICIPATION
+            # 
+            # Si ya hay un BREAKOUT edge activo, COMPRESSION_BREAKOUT anticipation es
+            # redundante - ambos detectan el mismo patrón (BB squeeze).
+            # En ese caso, NO activar anticipation como trigger - el edge ya lo maneja.
+            # =========================================================================
+            anticipation_redundant = False
+            if anticipation.signal == AnticipationSignal.COMPRESSION_BREAKOUT:
+                if hasattr(engine, '_edge_manager'):
+                    from src.domain.trading.edge_state_manager import EdgeType
+                    edge_mgr = engine._edge_manager
+                    if (edge_mgr.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE] and
+                        edge_mgr.current_bos and 
+                        edge_mgr.current_bos.edge_type == EdgeType.BREAKOUT):
+                        anticipation_redundant = True
+                        logger.debug(
+                            f"📝 ANTICIPATION redundant: BREAKOUT edge already {edge_mgr.state.value} | "
+                            f"Edge dir={edge_mgr.current_bos.direction} vs Antic dir={anticipation.direction}"
+                        )
+            
+            if (anticipation.confidence >= ANTICIPATION_TRIGGER_CONFIDENCE 
+                and anticipation.direction
+                and anticipation.structure_level > 0
+                and not anticipation_redundant):  # 🔥 FIX #59: No duplicar
+                
+                tags['anticipation_entry'] = True
+                tags['anticipation_probe_size'] = ANTICIPATION_PROBE_SIZE
+                
+                logger.info(
+                    f"⚡ ANTICIPATION TRIGGER ENABLED: {anticipation.direction} @ ${current_price:.0f} | "
+                    f"conf={anticipation.confidence:.0%} | probe={ANTICIPATION_PROBE_SIZE:.0%} | "
+                    f"structure={anticipation.structure_level:.0f}"
+                )
     
     except Exception as e:
         logger.warning(f"⚠️ Anticipation engine error (non-fatal): {e}")

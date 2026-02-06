@@ -42,7 +42,7 @@ except ImportError:
 
 # Integration with Market Regime
 try:
-    from src.domain.market.regime.market_regime import ManagementRegime, get_regime_classifier
+    from src.domain.market.regime.management_regime import ManagementRegime, get_regime_classifier
     _MARKET_REGIME_AVAILABLE = True
 except ImportError:
     ManagementRegime = None  # type: ignore[misc, assignment]

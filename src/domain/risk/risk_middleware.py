@@ -32,7 +32,7 @@ from enum import Enum
 import json
 from pathlib import Path
 
-from src.domain.market.regime.market_regime import (
+from src.domain.market.regime.management_regime import (
     ManagementRegime, get_regime_classifier, get_regime_risk_multiplier,
     RegimeGuidance, REGIME_GUIDANCE
 )

@@ -6,25 +6,16 @@ Clean Architecture Layer: DOMAIN
 - Regime detection, trend intelligence, filters
 - No infrastructure dependencies
 
-Migration Status: ALIAS (re-exports from src.engine.regime)
-Target: Move logic here, make engine/ re-export from here
-
 Components:
-- RegimeContext: SINGLE SOURCE OF TRUTH for regime
 - TrendIntelligence: Trend cycle detection (BIRTH → ACCEL → MATURE → EXHAUST → DEATH)
 - RegimeDetector: Entry-time regime classification
+- ManagementRegime: Position management guidance (used by risk_middleware)
 - Filters: Market condition filters
-"""
 
-# Regime Context - SINGLE SOURCE OF TRUTH
-from src.domain.market.regime.regime_context import (
-    RegimeMode,
-    RegimeContext,
-    RegimeContextManager,
-    get_regime_context_manager,
-    get_current_regime_context,
-    get_trailing_regime,
-)
+DELETED Feb 05, 2026:
+- trading_regime.py (TradingRegimeClassifier)
+- regime_context.py (RegimeContextManager)
+"""
 
 # Trend Intelligence - Cycle Detection
 from src.domain.market.regime.trend_intelligence import (
@@ -46,10 +37,9 @@ from src.domain.market.regime.regime_detector import (
     calculate_chase_atr,
 )
 
-# Position management regime
-from src.domain.market.regime.market_regime import (
+# Position management regime (used by risk_middleware.py)
+from src.domain.market.regime.management_regime import (
     ManagementRegime,
-    ManagementRegimeClassifier,
     RegimeGuidance,
     REGIME_GUIDANCE,
     get_regime_classifier,
@@ -71,21 +61,7 @@ from src.domain.market.regime.activity_regime import (
     ActivityMetrics,
 )
 
-# Trading regime
-from src.domain.market.regime.trading_regime import (
-    TradingRegime,
-    TradingRegimeClassifier,
-    TrendDirection,
-)
-
 __all__ = [
-    # Regime Context - SINGLE SOURCE OF TRUTH
-    'RegimeMode',
-    'RegimeContext',
-    'RegimeContextManager',
-    'get_regime_context_manager',
-    'get_current_regime_context',
-    'get_trailing_regime',
     # Entry regime
     'RegimeDetector',
     'EntryRegime',
@@ -102,7 +78,6 @@ __all__ = [
     'reset_trend_intelligence',
     # Management regime
     'ManagementRegime',
-    'ManagementRegimeClassifier',
     'RegimeGuidance',
     'REGIME_GUIDANCE',
     'get_regime_classifier',
@@ -116,8 +91,4 @@ __all__ = [
     'ActivityRegimeAnalyzer',
     'EnforcementMode',
     'ActivityMetrics',
-    # Trading regime
-    'TradingRegime',
-    'TradingRegimeClassifier',
-    'TrendDirection',
 ]

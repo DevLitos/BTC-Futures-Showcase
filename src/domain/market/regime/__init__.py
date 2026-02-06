@@ -1,26 +1,26 @@
 """
 Market Regime Module - Market state classification and regime detection.
 
-This module provides:
-- RegimeContext: SINGLE SOURCE OF TRUTH for regime
-- TrendIntelligence: Trend cycle detection
-- RegimeDetector: Entry-time regime classification
-- EdgeRegimeClassifier: Edge validity per regime
-- ActivityRegime: 24/7 market activity analysis
-- TradingRegime: High-level trading regime
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ 📦 ACTIVE COMPONENTS                                                         ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ • TrendIntelligence (trend_intelligence.py) - Trend cycle detection          ║
+║ • EdgeRegimeClassifier (edge_regime_classifier.py) - Edge validity           ║
+║ • RegimeDetector (regime_detector.py) - Entry-time regime                    ║
+║ • ActivityRegimeAnalyzer (activity_regime.py) - 24/7 activity analysis       ║
+║ • ManagementRegime (market_regime.py) - Position management guidance         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+DELETED Feb 05, 2026:
+- trading_regime.py (TradingRegimeClassifier) → Use TrendIntelligence
+- regime_context.py (RegimeContextManager) → Use TrendIntelligence
 """
 
-# Regime Context - SINGLE SOURCE OF TRUTH
-from src.domain.market.regime.regime_context import (
-    RegimeMode,
-    RegimeContext,
-    RegimeContextManager,
-    get_regime_context_manager,
-    get_current_regime_context,
-    get_trailing_regime,
-)
+# =============================================================================
+# ✅ ACTIVE COMPONENTS
+# =============================================================================
 
-# Trend Intelligence - Cycle Detection
+# Trend Intelligence - Cycle Detection (PRIMARY for trend analysis)
 from src.domain.market.regime.trend_intelligence import (
     TrendIntelligence,
     TrendPhase,
@@ -31,7 +31,14 @@ from src.domain.market.regime.trend_intelligence import (
     reset_trend_intelligence,
 )
 
-# Entry-time regime detection
+# Edge Regime - Edge validity classification (PRIMARY for edge analysis)
+from src.domain.market.regime.edge_regime_classifier import (
+    EdgeRegimeClassifier,
+    EdgeRegime,
+    RegimeMetrics,
+)
+
+# Entry-time regime detection (PRIMARY for entry decisions)
 from src.domain.market.regime.regime_detector import (
     RegimeDetector,
     EntryRegime,
@@ -40,10 +47,16 @@ from src.domain.market.regime.regime_detector import (
     calculate_chase_atr,
 )
 
-# Position management regime
-from src.domain.market.regime.market_regime import (
+# Activity regime for 24/7 markets (used via edge enforcement)
+from src.domain.market.regime.activity_regime import (
+    ActivityRegimeAnalyzer,
+    EnforcementMode,
+    ActivityMetrics,
+)
+
+# Position management regime - Used by risk_middleware.py
+from src.domain.market.regime.management_regime import (
     ManagementRegime,
-    ManagementRegimeClassifier,
     RegimeGuidance,
     REGIME_GUIDANCE,
     get_regime_classifier,
@@ -51,42 +64,11 @@ from src.domain.market.regime.market_regime import (
     classify_market_regime,
 )
 
-# Edge-based regime
-from src.domain.market.regime.edge_regime_classifier import (
-    EdgeRegimeClassifier,
-    EdgeRegime,
-    RegimeMetrics,
-)
-
-# Activity regime for 24/7 markets
-from src.domain.market.regime.activity_regime import (
-    ActivityRegimeAnalyzer,
-    EnforcementMode,
-    ActivityMetrics,
-)
-
-# Trading regime
-from src.domain.market.regime.trading_regime import (
-    TradingRegime,
-    TradingRegimeClassifier,
-    TrendDirection,
-    REGIME_CHARACTERISTICS,
-)
+# =============================================================================
+# EXPORTS
+# =============================================================================
 
 __all__ = [
-    # Regime Context - SINGLE SOURCE OF TRUTH
-    'RegimeMode',
-    'RegimeContext',
-    'RegimeContextManager',
-    'get_regime_context_manager',
-    'get_current_regime_context',
-    'get_trailing_regime',
-    # Entry regime
-    'RegimeDetector',
-    'EntryRegime',
-    'RegimeConfig', 
-    'REGIME_CONFIGS',
-    'calculate_chase_atr',
     # Trend Intelligence
     'TrendIntelligence',
     'TrendPhase',
@@ -95,25 +77,25 @@ __all__ = [
     'TrendTransition',
     'get_trend_intelligence',
     'reset_trend_intelligence',
-    # Management regime
+    # Edge Regime
+    'EdgeRegimeClassifier',
+    'EdgeRegime',
+    'RegimeMetrics',
+    # Entry regime
+    'RegimeDetector',
+    'EntryRegime',
+    'RegimeConfig', 
+    'REGIME_CONFIGS',
+    'calculate_chase_atr',
+    # Activity regime
+    'ActivityRegimeAnalyzer',
+    'EnforcementMode',
+    'ActivityMetrics',
+    # Management regime (used by risk_middleware)
     'ManagementRegime',
-    'ManagementRegimeClassifier',
     'RegimeGuidance',
     'REGIME_GUIDANCE',
     'get_regime_classifier',
     'get_regime_risk_multiplier',
     'classify_market_regime',
-    # Edge regime
-    'EdgeRegimeClassifier',
-    'EdgeRegime',
-    'RegimeMetrics',
-    # Activity regime
-    'ActivityRegimeAnalyzer',
-    'EnforcementMode',
-    'ActivityMetrics',
-    # Trading regime
-    'TradingRegime',
-    'TradingRegimeClassifier',
-    'TrendDirection',
-    'REGIME_CHARACTERISTICS',
 ]

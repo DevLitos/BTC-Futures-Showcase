@@ -1,6 +1,26 @@
 """
 Trade Frequency Controller - Regime-aware trade frequency management
 
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ ⛔ DEPRECATED - Feb 05, 2026                                                 ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ REASON: This entire module is UNUSED in production (application/live/).     ║
+║                                                                              ║
+║ ANALYSIS:                                                                    ║
+║ - TradeFrequencyController: Never imported in application layer             ║
+║ - get_frequency_controller(): Never called from live trading code           ║
+║ - Depends on trading_regime.py which is also deprecated                     ║
+║ - Trade limiting is handled by DailyRegimeDetector.max_trades instead       ║
+║                                                                              ║
+║ REPLACEMENT:                                                                 ║
+║ - DailyRegimeDetector.max_trades (trading_config.py)                        ║
+║ - CooldownManager (cooldown_manager.py)                                     ║
+║                                                                              ║
+║ MIGRATION: File kept for backward compatibility. Will be removed in v2.2.0  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+OLD DESCRIPTION:
+----------------
 PRINCIPLE (Jan 20, 2026):
 Different regimes allow different trade frequencies:
 - TREND: More trades (riding momentum, multiple entries)
@@ -15,6 +35,13 @@ This prevents:
 3. Revenge trading after losses
 4. Clustering trades in short windows
 """
+
+import warnings
+warnings.warn(
+    "frequency_controller.py is DEPRECATED. Use DailyRegimeDetector or CooldownManager instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, UTC

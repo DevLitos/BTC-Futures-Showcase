@@ -1,10 +1,18 @@
 """
 Market Regime Engine (Context Engine) - V2.1
 
-⚠️ PARTIAL DEPRECATION (Feb 05, 2026):
-RegimeConfig defined here is a DUPLICATE.
-Prefer using UnifiedRegimeConfig from src/config/unified_constants.py
-ManagementRegime enum and ManagementRegimeClassifier are still valid.
+Position Management Regime Classification.
+
+USED BY:
+- src/domain/risk/risk_middleware.py (ManagementRegime, get_regime_classifier, etc.)
+- src/infrastructure/monitoring/advanced_analytics.py (ManagementRegime)
+
+Contains:
+- ManagementRegime: Enum for regime states (TREND_EXPANSION, MEAN_REVERSION, CHOPPY_DEAD)
+- RegimeGuidance: Trading guidance per regime (risk mult, TP1%, trailing, etc.)
+- ManagementRegimeClassifier: ATR + price action based classifier
+- get_regime_classifier(): Singleton accessor
+- get_regime_risk_multiplier(): Helper for risk sizing
 
 El sistema debe "sentir" el mercado antes de decidir cómo gestionar la posición.
 
@@ -20,6 +28,13 @@ Implementación sin "Lag":
 - Usa Volatilidad Relativa: ATR_ratio = ATR_current / ATR_baseline
 - Si ATR_ratio > 2.0: régimen de expansión o pánico → reduce apalancamiento
 """
+
+import warnings
+warnings.warn(
+    "market_regime.py is DEPRECATED. Use TrendIntelligence or EdgeRegimeClassifier instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 import logging
 import numpy as np

@@ -1,6 +1,25 @@
 """
 Indicator Cache - Centralized caching for technical indicators
 
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ ⛔ DEPRECATED - Feb 05, 2026                                                 ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ REASON: Duplicated by src/application/live/indicator_cache.py               ║
+║                                                                              ║
+║ ANALYSIS:                                                                    ║
+║ - trading_app.py imports from application/live/indicator_cache.py (L172)    ║
+║ - This shared version is only used for backwards compatibility import (L195)║
+║ - The application/live version is more actively maintained                  ║
+║                                                                              ║
+║ REPLACEMENT:                                                                 ║
+║ - Use src/application/live/indicator_cache.py for IndicatorCache            ║
+║ - Use src/shared/indicator_helpers.py for pure helper functions             ║
+║                                                                              ║
+║ MIGRATION: File kept for backward compatibility. Will be removed in v2.2.0  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+OLD DESCRIPTION:
+----------------
 Created: Jan 27, 2026 (AUDIT REFACTOR - Point 3)
 
 Problem: ATR, ADX, RSI, EMA calculated 7+ times per tick instead of once.
@@ -9,6 +28,13 @@ Solution: Cache by timeframe, invalidate only when NEW candle CLOSES.
 Key insight: Use candles[-2] timestamp (last CLOSED candle) as cache key,
 not candles[-1] (still forming candle).
 """
+
+import warnings
+warnings.warn(
+    "src/shared/indicator_cache.py is DEPRECATED. Use src/application/live/indicator_cache.py instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 import logging
 import numpy as np

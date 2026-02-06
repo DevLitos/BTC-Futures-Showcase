@@ -206,11 +206,15 @@ class BiasInvalidationHandler:
         else:
             if current_forbidden and can_clear_forbidden:
                 ticks_since = tick_count - self._forbidden_set_at_tick
-                if self._previous_forbidden:
-                    logger.info(
-                        f"🔓 FORBIDDEN {self._previous_forbidden} CLEARED "
+                # 🔥 FIX (Feb 05, 2026): Only log ONCE when actually clearing
+                # The previous code logged every tick which spammed logs
+                if self._previous_forbidden and result.forbidden_direction is None:
+                    # Actually clearing - log this
+                    logger.debug(  # Changed to DEBUG - not actionable info
+                        f"FORBIDDEN {self._previous_forbidden} cleared "
                         f"after {ticks_since} ticks (hysteresis)"
                     )
+                    self._previous_forbidden = None  # Clear so we don't log again
                 result.forbidden_direction = None
         
         return result

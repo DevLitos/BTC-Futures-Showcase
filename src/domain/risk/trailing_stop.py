@@ -104,38 +104,44 @@ class HybridATRTrailing:
     """
     
     # R-Lock thresholds
-    # 🔥 FIX (Feb 2, 2026): MICRO-LOCKS PROGRESIVOS PARA INTRADÍA BTC
+    # 🔥 FIX (Feb 6, 2026): R-LOCK TIERS POR RÉGIMEN
     # 
-    # PROBLEMA IDENTIFICADO: Trades con MFE 0.2-0.4R no tienen NINGUNA protección
-    # - Trade muestra +0.25R → NO lock → termina en -0.80R (pérdida de 1.05R swing)
-    # - El trade DEMOSTRÓ que la dirección era correcta pero lo dejamos morir
-    # 
-    # FILOSOFÍA INTELIGENTE PARA INTRADÍA BTC:
-    # - BTC hace pullbacks de 0.3-0.5R constantemente en moves válidos
-    # - Locks MUY tempranos (BE a 0.5R) te sacan antes de que el trade funcione
-    # - BALANCE: Proteger capital sin cortar ganadores
+    # PROBLEMA: Trade llegó a +0.36R MFE pero trailing sacó en -0.20R
+    # porque tier 1 (MFE 0.3 → lock -0.20R) se activó y un pullback
+    # normal de 0.36R → 0.16R tocó el stop.
     #
-    # SISTEMA DE LOCKS CALIBRADO PARA INTRADÍA:
-    # - 0.3R MFE → lock at -0.4R (protección mínima - evita -1R completo)
-    # - 0.5R MFE → lock at -0.2R (trade mostró vida, limita downside)
-    # - 0.8R MFE → lock at BE (0.0R) - garantiza no pérdida (NO antes)
-    # - 1.0R MFE → lock at +0.3R (captura algo pero deja correr)
-    # - 1.3R MFE → lock at +0.5R (trade probado)
-    # - 1.5R MFE → lock at +0.8R (runner protection)
-    # - 2.0R MFE → lock at +1.2R (strong runner)
-    # - 3.0R MFE → lock at +2.0R (massive move)
-    # - 5.0R MFE → lock at +3.5R (black swan profit)
-    R_LOCK_TIERS = [
-        (0.3, -0.40, 1),  # Mostró +0.3R → max loss -0.4R (vs -1R sin lock)
-        (0.5, -0.20, 2),  # Mostró +0.5R → max loss -0.2R 
-        (0.8, 0.0, 3),    # BE at 0.8R - NO ANTES (pullbacks normales en BTC)
+    # SOLUCIÓN: TIERS DIFERENCIADOS POR RÉGIMEN
+    # - TREND: Pullbacks de 0.4-0.6R son normales, locks más holgados
+    # - RANGE/SCALP: Necesita protección temprana, locks más ajustados
+    #
+    # 🔥 FIX #64: RANGE/SCALP - Tiers agresivos (proteger rápido)
+    R_LOCK_TIERS_RANGE = [
+        (0.2, -0.25, 0),  # +0.2R MFE → max loss -0.25R 
+        (0.3, -0.20, 1),  # +0.3R → max loss -0.20R
+        (0.5, -0.10, 2),  # +0.5R → max loss -0.10R
+        (0.8, 0.0, 3),    # BE at 0.8R
         (1.0, 0.3, 4),    # Lock +0.3R at 1.0R MFE
-        (1.3, 0.5, 5),    # Lock +0.5R at 1.3R MFE (trade probado)
+        (1.3, 0.5, 5),    # Lock +0.5R at 1.3R MFE
         (1.5, 0.8, 6),    # Lock +0.8R at 1.5R MFE
         (2.0, 1.2, 7),    # Lock +1.2R at 2.0R MFE
-        (3.0, 2.0, 8),    # Lock +2.0R at 3.0R MFE
-        (5.0, 3.5, 9),    # Lock +3.5R at 5.0R MFE (for runners)
     ]
+    
+    # 🔥 FIX #64: TREND - Tiers más holgados (dejar correr)
+    R_LOCK_TIERS_TREND = [
+        # En TREND, no bloquear hasta que MFE sea significativo
+        # Los pullbacks de 0.3-0.5R son NORMALES y saludables
+        (0.5, -0.40, 0),  # Solo proteger de full loss en +0.5R MFE
+        (0.8, -0.20, 1),  # +0.8R → max loss -0.20R (antes era BE!)
+        (1.0, 0.0, 2),    # BE at 1.0R (no antes!)
+        (1.3, 0.3, 3),    # Lock +0.3R at 1.3R MFE
+        (1.5, 0.5, 4),    # Lock +0.5R at 1.5R MFE
+        (2.0, 0.8, 5),    # Lock +0.8R at 2.0R MFE
+        (3.0, 1.5, 6),    # Lock +1.5R at 3.0R MFE
+        (5.0, 3.0, 7),    # Lock +3.0R at 5.0R MFE (runners)
+    ]
+    
+    # Fallback (usado si régimen no está definido)
+    R_LOCK_TIERS = R_LOCK_TIERS_RANGE  # Default conservador
     
     # ATR K factors by regime
     # 🔥 FIX (Feb 2, 2026): K FACTORS MÁS AGRESIVOS
@@ -162,7 +168,8 @@ class HybridATRTrailing:
     
     # CRITICAL: Only activate ATR trailing after this MFE threshold
     # This prevents killing winners too early
-    ATR_TRAIL_ACTIVATION_MFE = 0.3  # Only start ATR trailing after +0.3R
+    # 🔥 FIX (Feb 05, 2026): Reduced from 0.3 to 0.2 for SCALPING INTELIGENTE
+    ATR_TRAIL_ACTIVATION_MFE = 0.2  # Start ATR trailing at +0.2R (was 0.3)
     
     # =========================================================================
     # 🔥 BOS QUALITY DYNAMIC TRAILING (Feb 3, 2026)
@@ -241,9 +248,13 @@ class HybridATRTrailing:
         
         return favorable / risk
     
-    def get_r_locked_stop(self, mfe_r: float) -> Tuple[float, int]:
+    def get_r_locked_stop(self, mfe_r: float, regime: TrailingRegime = None) -> Tuple[float, int]:
         """
-        Get the R-locked stop level based on MFE.
+        Get the R-locked stop level based on MFE and regime.
+        
+        🔥 FIX #64 (Feb 6, 2026): Use different tiers by regime
+        - TREND: More lenient tiers (pullbacks of 0.3-0.5R are normal)
+        - RANGE/SCALP: Tighter tiers (protect profits faster)
         
         Returns:
             (stop_level, tier)
@@ -252,7 +263,13 @@ class HybridATRTrailing:
         locked_stop = self._initial_stop
         tier = 0
         
-        for mfe_threshold, lock_r, lock_tier in self.R_LOCK_TIERS:
+        # 🔥 FIX #64: Select tiers based on regime
+        if regime == TrailingRegime.TREND:
+            tiers = self.R_LOCK_TIERS_TREND
+        else:
+            tiers = self.R_LOCK_TIERS_RANGE  # RANGE, VOLATILITY, CONSERVATIVE
+        
+        for mfe_threshold, lock_r, lock_tier in tiers:
             if mfe_r >= mfe_threshold:
                 if self._direction == "LONG":
                     locked_stop = self._entry_price + (lock_r * risk)
@@ -335,8 +352,8 @@ class HybridATRTrailing:
             self._state.time_to_02r_sec = (now - self._entry_time).total_seconds()
             logger.info(f"⏱️ TIME TO +0.2R: {self._state.time_to_02r_sec:.1f}s (MFE={mfe_r:.2f}R)")
         
-        # 1. Get R-locked stop
-        r_stop, r_tier = self.get_r_locked_stop(mfe_r)
+        # 1. Get R-locked stop (🔥 FIX #64: Use regime-specific tiers)
+        r_stop, r_tier = self.get_r_locked_stop(mfe_r, regime)
         
         # Only update if improved
         if self._direction == "LONG":

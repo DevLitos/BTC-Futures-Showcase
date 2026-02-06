@@ -80,8 +80,9 @@ class EntryQualityGate:
     # =========================================================================
     
     # Microtrend contradiction
-    MICROTREND_BLOCK_STRENGTH = 85  # If >= 85% contradiction, hard block
-    MICROTREND_PROBE_STRENGTH = 70  # If >= 70% contradiction, probe only
+    # 🔥 REFACTOR (Feb 05, 2026): Raised thresholds - MicroTrend should not veto easily
+    MICROTREND_BLOCK_STRENGTH = 90  # Was 85 → only block at 90%+ (overwhelming evidence)
+    MICROTREND_PROBE_STRENGTH = 80  # Was 70 → raised to 80%
     
     # Chase in RANGE
     RANGE_CHASE_BLOCK_FULL = 1.3     # > 1.3 ATR in RANGE = block FULL entry
@@ -110,12 +111,16 @@ class EntryQualityGate:
         has_rsi_divergence: bool = False,
         near_vpoc: bool = False,
         near_anchor_level: bool = False,
+        # 🔥 NEW (Feb 05, 2026): Edge context - MicroTrend should NOT veto active edges
+        edge_active: bool = False,
+        edge_type: str | None = None,  # 'DISPLACEMENT', 'BREAKOUT', 'TREND', 'RANGE'
     ) -> GateResult:
         """
         Check all hard rules and return gate decision.
         
         Order of checks:
         1. Microtrend contradiction (hardest block)
+           🔥 FIX: If edge is active, MicroTrend can only WARN, not BLOCK.
         2. Chase in RANGE (block/limit)
         3. Session + ADX (size reduction)
         
@@ -124,9 +129,16 @@ class EntryQualityGate:
         
         # =====================================================================
         # RULE 1: MICROTREND CONTRADICTION KILL-SWITCH
-        # If microtrend contradicts entry with >= 85% strength → BLOCK
+        # If microtrend contradicts entry with >= 90% strength → BLOCK
+        # 🔥 EXCEPTION (Feb 05, 2026): If edge is active, MicroTrend CANNOT block.
+        # Rationale: The edge has "sovereign authority". MicroTrend is lagging.
+        # Displacement/Breakout/Trend edges detected direction BEFORE MicroTrend caught up.
         # =====================================================================
         micro_contradicts = self._microtrend_contradicts(micro_trend, entry_direction)
+        
+        # 🔥 NEW (Feb 05, 2026): If edge is active, MicroTrend CANNOT hard block
+        # It can only reduce size, not veto entirely
+        can_hard_block = not edge_active
         
         if micro_contradicts and micro_strength >= self.MICROTREND_BLOCK_STRENGTH:
             # Check for special confirmations that might allow probe entry
@@ -135,7 +147,21 @@ class EntryQualityGate:
                 (near_vpoc and near_anchor_level)               # VPOC + anchor confluence
             )
             
-            if has_extra_confirmations:
+            # 🔥 NEW: Edge active = treat as if we have confirmations
+            if edge_active:
+                logger.info(
+                    f"🛡️ EDGE PROTECTS: Microtrend {micro_strength:.0f}% contradiction BUT "
+                    f"edge {edge_type or 'ACTIVE'} has sovereign authority - allowing with size reduction"
+                )
+                return GateResult(
+                    decision=GateDecision.PROBE_ONLY,  # Allow but reduced size
+                    reason=f"Microtrend contradiction {micro_strength:.0f}% but edge {edge_type} active - reduced size",
+                    max_size_multiplier=0.50,  # 50% size (not 10%)
+                    sl_multiplier=0.85,        # Slightly tighter SL
+                    require_limit=False,       # Allow market order if needed
+                    microtrend_blocked=False,  # Not really blocked
+                )
+            elif has_extra_confirmations:
                 # Allow micro-probe with very tight SL
                 logger.warning(
                     f"⚠️ GATE: Microtrend contradiction {micro_strength:.0f}% BUT "
@@ -150,7 +176,7 @@ class EntryQualityGate:
                     microtrend_blocked=True,
                 )
             else:
-                # HARD BLOCK - no entry
+                # HARD BLOCK - no entry (only if no edge active)
                 logger.warning(
                     f"⛔ GATE BLOCK: Microtrend {micro_trend} contradicts {entry_direction} "
                     f"at {micro_strength:.0f}% >= {self.MICROTREND_BLOCK_STRENGTH}%"
@@ -162,7 +188,17 @@ class EntryQualityGate:
                 )
         
         elif micro_contradicts and micro_strength >= self.MICROTREND_PROBE_STRENGTH:
-            # 70-85%: Allow probe only
+            # 80-90%: Allow probe only (or full if edge active)
+            if edge_active:
+                logger.info(
+                    f"🛡️ EDGE PROTECTS: Microtrend {micro_strength:.0f}% moderate contradiction - "
+                    f"edge {edge_type} allows full entry with caution"
+                )
+                return GateResult(
+                    decision=GateDecision.ALLOW_FULL,
+                    reason=f"Microtrend contradiction {micro_strength:.0f}% but edge active",
+                    max_size_multiplier=0.70,  # 70% size
+                )
             logger.info(
                 f"⚠️ GATE: Microtrend contradiction {micro_strength:.0f}% - probe only"
             )

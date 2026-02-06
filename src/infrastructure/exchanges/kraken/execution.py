@@ -105,6 +105,10 @@ class PositionMismatchError(ExecutionError):
     pass
 
 
+# =============================================================================
+# TIMEOUTS CONFIGURATION
+# =============================================================================
+
 # Timeouts para operaciones de exchange (segundos)
 # These can be overridden via Settings if needed
 EXCHANGE_TIMEOUT_SHORT = 10.0   # Para consultas simples
@@ -128,6 +132,58 @@ def get_exchange_timeouts():
         )
     except Exception:
         return EXCHANGE_TIMEOUT_SHORT, EXCHANGE_TIMEOUT_MEDIUM, EXCHANGE_TIMEOUT_LONG
+
+
+# =============================================================================
+# HELPER: Execute with Timeout + Lock
+# =============================================================================
+# 🔧 REFACTORED Feb 05, 2026: Centralized timeout+lock pattern
+# Previously duplicated ~15 times in this file
+
+async def execute_with_timeout(
+    coro,
+    lock: asyncio.Lock,
+    timeout: float,
+    operation: str,
+    default: Any = None,
+    raise_on_timeout: bool = False
+) -> Any:
+    """
+    Execute a coroutine with timeout and optional lock.
+    
+    This helper consolidates the repeated pattern of:
+        async with self._exchange_lock:
+            try:
+                result = await asyncio.wait_for(coro, timeout=N)
+            except asyncio.TimeoutError:
+                logger.error("...")
+                return None
+    
+    Args:
+        coro: The coroutine to execute
+        lock: The asyncio.Lock to acquire (can be None for no lock)
+        timeout: Timeout in seconds
+        operation: Name of the operation (for logging)
+        default: Value to return on timeout (if raise_on_timeout=False)
+        raise_on_timeout: If True, raise ExchangeTimeoutError instead of returning default
+    
+    Returns:
+        Result of the coroutine, or default on timeout
+    
+    Raises:
+        ExchangeTimeoutError: If raise_on_timeout=True and timeout occurs
+    """
+    try:
+        if lock:
+            async with lock:
+                return await asyncio.wait_for(coro, timeout=timeout)
+        else:
+            return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.error(f"⏰ TIMEOUT after {timeout}s in {operation}")
+        if raise_on_timeout:
+            raise ExchangeTimeoutError(f"Timeout in {operation}")
+        return default
 
 
 # CRITICAL: Threshold for float comparison of position sizes

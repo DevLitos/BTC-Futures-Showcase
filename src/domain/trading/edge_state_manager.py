@@ -287,12 +287,14 @@ class ProvisionalEdgeConfig:
     # =========================================================================
     # 🔥 CRITERIOS RELAJADOS PARA PROVISIONAL (entrada barata)
     # 🔄 REFACTORED Feb 04: Use ADXThresholds for consistency
+    # 🔥 FIX #58 (Feb 06): Reducir ADX de 25→20 para entradas más tempranas
     # =========================================================================
     MIN_TIMING = 0                   # timing >= 0 (no >= 1)
     MIN_R = 0.20                     # R >= 0.20 (no 0.30)
-    # MIN_ADX_5M uses ADXThresholds.STRONG_TREND (25) for bias claro
-    # Import at runtime to avoid circular imports
-    MIN_ADX_5M = 25                  # ADX 5m >= 25 (bias claro) - See ADXThresholds.STRONG_TREND
+    # 🔥 FIX #58: ADX reducido para permitir entradas PRE-TREND
+    # Antes: 25 (STRONG_TREND) - muy restrictivo, perdía compresiones
+    # Ahora: 20 (MODERATE_TREND) - permite entradas con bias en desarrollo
+    MIN_ADX_5M = 20                  # ADX 5m >= 20 (bias en desarrollo)
     REQUIRES_LIQUIDITY_EVENT = False # NO requiere LiquidityEvent
     
     # =========================================================================
@@ -376,7 +378,9 @@ class RangeEdgeCriteria:
     RANGE_SIZE_MAX = 0.30     # 30% size en rango (subido de 25%)
     
     # Timeouts
-    RANGE_EDGE_TIMEOUT_MIN = 10  # 10 min ventana en rango
+    # 🔥 REFACTOR (Feb 05, 2026): Extended from 10 min to 20 min
+    # Range edges at extremes can take time to develop rejection
+    RANGE_EDGE_TIMEOUT_MIN = 20  # Was 10 min → extended
 
 
 @dataclass
@@ -392,7 +396,9 @@ class BreakoutEdgeCriteria:
     BB_WIDTH_PERCENTILE_MAX = 10  # BB width < percentil 10
     VOLUME_DECLINE_RATIO = 0.50   # Vol actual / Vol medio < 0.5
     BREAKOUT_CONFIRMATION_CANDLES = 2  # 2 velas para confirmar ruptura
-    BREAKOUT_TIMEOUT_MIN = 15  # 15 min después de compresión detectada
+    # 🔥 REFACTOR (Feb 05, 2026): Extended from 15 min to 30 min
+    # Breakouts often require consolidation after initial impulse
+    BREAKOUT_TIMEOUT_MIN = 30  # Was 15 min → extended
     
     # 🔥 NEW (Jan 28, 2026): Criterios R mínimo y invalidación
     MIN_TARGET_R = 2.0   # BREAKOUT debe apuntar a mínimo 2.0R
@@ -476,22 +482,29 @@ class DisplacementEdgeCriteria:
     
     # ZONA 2 (bars 2-5) - Pullback Entry (si perdiste FAST PATH)
     PULLBACK_ENTRY_MIN_BARS = 2       # Mínimo 2 velas para considerar pullback
-    PULLBACK_ENTRY_MAX_BARS = 5       # Máximo 5 velas para pullback
+    PULLBACK_ENTRY_MAX_BARS = 10      # 🔥 Was 5 → extended to allow more pullback time
     PULLBACK_ENTRY_SIZE_MIN = 0.40    # Size mínimo 40% en pullback
     PULLBACK_ENTRY_SIZE_MAX = 0.60    # Size máximo 60% en pullback
     
-    # ZONA 3 (bars >5) - Chase Block
-    CHASE_BLOCK_AFTER_BARS = 5        # No trade después de 5 barras
-    CHASE_BLOCK_EXTENSION_MULT = 1.5  # No trade si movió >1.5x displacement
+    # ZONA 3 (bars >10) - Chase Block
+    # 🔥 REFACTOR (Feb 05, 2026): Extended chase window
+    # In BTC, trends can persist for 20-30 minutes before pullback.
+    # Killing edge after 5 bars was destroying valid setups.
+    CHASE_BLOCK_AFTER_BARS = 15       # Was 5 → extended to 15 bars (~15 min on 1m)
+    CHASE_BLOCK_EXTENSION_MULT = 2.0  # Was 1.5 → allow more extension before chase block
     
     # Timeouts
-    EDGE_TIMEOUT_MIN = 60             # 60 min ventana (movimientos fuertes duran)
-    CONFIRMATION_TIMEOUT_MIN = 20     # 20 min para confirmación
+    # 🔥 REFACTOR (Feb 05, 2026): Extended all timeouts
+    # BTC moves in 30-60 minute waves, not 10 minute bursts.
+    EDGE_TIMEOUT_MIN = 90             # Was 60 → extended to 90 min
+    CONFIRMATION_TIMEOUT_MIN = 30     # Was 20 → extended to 30 min
     
     # 🔥 KILL LATE EDGE (Jan 30, 2026)
     # Si pasa la ventana de entrada, NO perseguir
-    KILL_EDGE_AFTER_BARS = 5          # Matar edge si > 5 barras sin entrada
-    KILL_EDGE_AFTER_MIN = 10          # O si > 10 min sin entrada
+    # 🔥 REFACTOR (Feb 05, 2026): Extended significantly
+    # The original 5 bars / 10 min was killing trends before they developed.
+    KILL_EDGE_AFTER_BARS = 20         # Was 5 → extended to 20 bars
+    KILL_EDGE_AFTER_MIN = 30          # Was 10 → extended to 30 min
     
     # Size multiplier (agresivo en momentum)
     SIZE_MULTIPLIER_BASE = 0.8        # 80% size base (conservador inicio)
@@ -764,6 +777,12 @@ class BOSEvent:
     bars_since_displacement: int = 0                  # Velas transcurridas desde displacement
     entry_window_open: bool = True                    # Si aún estamos en ventana de entrada
     force_direct_entry: bool = False                  # Si se debe forzar entrada directa (primeras barras)
+    
+    # =========================================================================
+    # 🔥 FIX Feb 06: Signal Timing Classification
+    # =========================================================================
+    move_at_detection_pct: float = 0.0                # % price moved before we detected the signal
+    setup_origin_price: Optional[float] = None        # Price when the setup pattern started forming
     
     def get_priority(self) -> int:
         """Obtiene la prioridad de este edge usando EdgePriority"""
@@ -1183,13 +1202,15 @@ def detect_any_liquidity_event(
     return best_event
 
 
+# ⚠️ DEPRECATED (Feb 05, 2026): This function is never called - INTRADAY absorbed into TREND
 def validate_intraday_r_with_liquidity(
     estimated_r: float,
     liquidity_event: Optional[LiquidityEvent],
     direction: str
 ) -> Tuple[bool, str, float]:
     """
-    🔥 VALIDACIÓN INTRADAY - LiquidityEvent como BOOST, no GATE.
+    🔥 DEPRECATED (Feb 05, 2026): INTRADAY mode absorbed into TREND with CONSENSUS path.
+    This function is preserved for backwards compatibility but is not called.
     
     FILOSOFÍA (Jan 28, 2026):
     - LiquidityEvent NO bloquea trades, pero mejora sizing
@@ -1317,14 +1338,39 @@ class EdgeTransition:
         return True, "Direct ACTIVE allowed: all criteria met"
     
     def log(self):
-        """Log transition with unified format"""
+        """
+        Log transition with unified format.
+        
+        🔥 FIX (Feb 05, 2026): INTELLIGENT LOGGING
+        - Only INFO for SIGNIFICANT transitions (direction/type changes, new edges)
+        - DEBUG for redundant transitions (re-arming same edge repeatedly)
+        """
         edge_type_str = self.edge_type.value if self.edge_type else "UNKNOWN"
         direction_str = self.direction or "?"
+        
+        # 🔥 SIGNIFICANT transitions → INFO
+        # Everything else → DEBUG (reduces log spam 90%+)
+        is_significant = (
+            # New edge armed or activated
+            self.to_state in (EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE) and 
+            self.from_state == EdgeState.NO_EDGE
+        ) or (
+            # Edge expired due to price invalidation (not location)
+            self.to_state == EdgeState.EDGE_EXPIRED and
+            "location" not in self.reason.lower()
+        ) or (
+            # Trade taken
+            "trade" in self.reason.lower()
+        )
+        
+        level = "info" if is_significant else "debug"
+        
         _edge_log(
             self.to_state.value,
             edge_type_str,
             direction_str,
-            f"{self.from_state.value}→{self.to_state.value} | {self.reason}"
+            f"{self.from_state.value}→{self.to_state.value} | {self.reason}",
+            level=level
         )
 
 
@@ -1400,6 +1446,24 @@ class EdgeStateManager:
         self._current_regime: str = "UNKNOWN"
         self._current_adx: float = 20.0
         
+        # 🔥 FIX (Feb 05, 2026): Location extreme cooldown
+        # Prevents infinite edge re-arm cycle when at price extreme
+        # When edge expires due to location_extreme, don't re-arm until cooldown expires
+        self._location_extreme_cooldown_until: Optional[datetime] = None
+        self._location_extreme_cooldown_direction: Optional[str] = None  # 'SHORT' or 'LONG'
+        
+        # =========================================================================
+        # 🔥 FIX #59 (Feb 06, 2026): Direction staleness tracking
+        # 
+        # PROBLEMA: Cuando edge expira, _active_direction en trading_app queda
+        # "congelada" y puede bloquear nuevas señales ANTICIPATION válidas.
+        # 
+        # SOLUCIÓN: Marcar cuándo la dirección necesita refresh.
+        # trading_app.py debe consultar este flag y resetear _active_direction.
+        # =========================================================================
+        self._direction_stale_since: Optional[datetime] = None  # Cuando se volvió stale
+        self._last_valid_direction: Optional[str] = None  # Última dirección válida
+        
         _edge_log("NO_EDGE", "TREND", "-", "EdgeStateManager initialized | BE WATER MY FRIEND")
     
     # =========================================================================
@@ -1446,6 +1510,21 @@ class EdgeStateManager:
         # Execute transition
         self._state = new_state
         self._transition_history.append(transition)
+        
+        # =========================================================================
+        # 🔥 FIX #59 (Feb 06, 2026): Mark direction as stale on expiry
+        # 
+        # Cuando el edge expira o se resetea, la dirección asociada se vuelve
+        # "stale" (obsoleta). trading_app.py debe consultar is_direction_stale()
+        # y considerar resetear _active_direction para permitir nuevas señales.
+        # =========================================================================
+        if new_state in [EdgeState.EDGE_EXPIRED, EdgeState.NO_EDGE]:
+            if direction:  # Solo si había dirección
+                self._direction_stale_since = market_time or datetime.utcnow()
+                self._last_valid_direction = direction
+        elif new_state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
+            # Nueva edge activa - dirección ya no es stale
+            self._direction_stale_since = None
         
         # Keep history bounded
         if len(self._transition_history) > 100:
@@ -1495,6 +1574,44 @@ class EdgeStateManager:
         """Modo actual: INSTITUTIONAL o INTRADAY"""
         return self._current_edge_mode
     
+    # =========================================================================
+    # 🔥 FIX #59 (Feb 06, 2026): Direction staleness API
+    # =========================================================================
+    
+    def is_direction_stale(self, stale_threshold_minutes: int = 5) -> bool:
+        """
+        ¿La dirección del último edge está "stale" (obsoleta)?
+        
+        Se considera stale si:
+        - El edge expiró/reseteó hace más de `stale_threshold_minutes`
+        - No hay edge activo actualmente
+        
+        Uso: trading_app.py debe consultar esto y considerar resetear
+        _active_direction para permitir nuevas señales ANTICIPATION.
+        """
+        if self._direction_stale_since is None:
+            return False
+        
+        if self._state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
+            return False  # Hay edge activo, no es stale
+        
+        stale_duration = datetime.utcnow() - self._direction_stale_since
+        return stale_duration > timedelta(minutes=stale_threshold_minutes)
+    
+    def get_stale_direction_info(self) -> Dict[str, Any]:
+        """Retorna info sobre dirección stale para debugging"""
+        return {
+            'is_stale': self.is_direction_stale(),
+            'stale_since': self._direction_stale_since.isoformat() if self._direction_stale_since else None,
+            'last_valid_direction': self._last_valid_direction,
+            'current_state': self._state.value
+        }
+    
+    def clear_stale_direction(self):
+        """Limpia el flag de dirección stale (llamado cuando se toma nueva dirección)"""
+        self._direction_stale_since = None
+        self._last_valid_direction = None
+    
     def is_provisional(self) -> bool:
         """¿Estamos en estado PROVISIONAL (starter position)?"""
         return self._state == EdgeState.EDGE_PROVISIONAL
@@ -1538,6 +1655,68 @@ class EdgeStateManager:
             if self._current_bos and self._current_bos.is_burned():
                 return f"BURNED:{self._current_bos.trades_attempted}att"
         return None
+    
+    # =========================================================================
+    # 🔥 LOCATION EXTREME COOLDOWN (Feb 05, 2026)
+    # Prevents infinite edge re-arm cycle when at price extreme
+    # =========================================================================
+    
+    def set_location_extreme_cooldown(
+        self,
+        direction: str,
+        market_time: datetime,
+        cooldown_minutes: int = 1
+    ) -> None:
+        """
+        Set SHORT cooldown to reduce log spam when at location extreme.
+        
+        🌊 BE WATER MY FRIEND: This is NOT a hard block - just prevents
+        the infinite ARM → BLOCK → ARM → BLOCK log spam cycle.
+        
+        The cooldown is SHORT (1 min) - just enough to:
+        - Reduce log spam from every tick to once per minute
+        - Let the system "breathe" and wait for price to move
+        - NOT prevent legitimate re-evaluation when conditions change
+        
+        Args:
+            direction: 'SHORT' or 'LONG' - the direction that was blocked
+            market_time: Current timestamp
+            cooldown_minutes: How long to wait (default 1 min - VERY short)
+        """
+        self._location_extreme_cooldown_until = market_time + timedelta(minutes=cooldown_minutes)
+        self._location_extreme_cooldown_direction = direction
+        # Only log at DEBUG - this is noise reduction, not a significant event
+        logger.debug(
+            f"🔒 LOCATION EXTREME: {direction} muted for {cooldown_minutes}min | "
+            f"Waiting for price to leave extreme zone"
+        )
+    
+    def is_location_extreme_cooldown_active(self, direction: str, market_time: datetime) -> bool:
+        """
+        Check if location extreme cooldown is active for given direction.
+        
+        Returns True if we should NOT arm an edge in this direction.
+        """
+        if self._location_extreme_cooldown_until is None:
+            return False
+        if self._location_extreme_cooldown_direction != direction:
+            return False
+        if market_time >= self._location_extreme_cooldown_until:
+            # Cooldown expired - clear it
+            self._location_extreme_cooldown_until = None
+            self._location_extreme_cooldown_direction = None
+            logger.debug(f"🔓 LOCATION EXTREME COOLDOWN expired for {direction}")
+            return False
+        return True
+    
+    def clear_location_extreme_cooldown(self, direction: str) -> None:
+        """
+        Clear location extreme cooldown (called when price leaves extreme zone).
+        """
+        if self._location_extreme_cooldown_direction == direction:
+            self._location_extreme_cooldown_until = None
+            self._location_extreme_cooldown_direction = None
+            logger.debug(f"🔓 LOCATION EXTREME COOLDOWN manually cleared for {direction}")
     
     # =========================================================================
     # 🌊 PROVISIONAL STATE METHODS - Starter positions
@@ -1829,7 +2008,8 @@ class EdgeStateManager:
         return ProvisionalEdgeConfig()
     
     # =========================================================================
-    # 🔥 INTRADAY BASE EDGE - Simple, repetible, frecuente
+    # ⚠️ DEPRECATED (Feb 05, 2026): INTRADAY absorbed into TREND with CONSENSUS path
+    # This method is preserved for backwards compatibility but is not called
     # =========================================================================
     
     def check_intraday_base_edge(
@@ -1845,7 +2025,8 @@ class EdgeStateManager:
         liquidity_event: Optional[LiquidityEvent] = None
     ) -> Tuple[bool, str, float]:
         """
-        🔥 EDGE BASE INTRADAY - Simple, repetible, ocurre varias veces al día.
+        ⚠️ DEPRECATED (Feb 05, 2026): This method is never called.
+        INTRADAY mode has been absorbed into TREND with CONSENSUS_DIRECT path.
         
         Criterios simples:
         - ADX_5m >= 25 (bias claro)
@@ -2171,15 +2352,12 @@ class EdgeStateManager:
                 return False
         
         # =================================================================
-        # 🔥 MUTUAL EXCLUSION: Si PROVISIONAL INTRADAY activo → RANGE bloqueado
-        # RANGE en chop + PROVISIONAL = muerte lenta por correlación oculta
+        # ⚠️ DEPRECATED (Feb 05, 2026): INTRADAY no longer used, this check is dead code
         # =================================================================
-        if self._state == EdgeState.EDGE_PROVISIONAL and self._current_bos:
-            if self._current_bos.edge_type == EdgeType.INTRADAY:
-                logger.debug(
-                    "[RANGE_BLOCKED] PROVISIONAL INTRADAY activo - RANGE bloqueado (correlación oculta)"
-                )
-                return False
+        # if self._state == EdgeState.EDGE_PROVISIONAL and self._current_bos:
+        #     if self._current_bos.edge_type == EdgeType.INTRADAY:
+        #         logger.debug(...)
+        #         return False
         
         # No crear nuevo edge si ya hay uno activo
         if self._state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
@@ -3026,6 +3204,18 @@ class EdgeStateManager:
             )
             return False
         
+        # =====================================================================
+        # 🔥 FIX #51 (Feb 05): Location extreme cooldown check
+        # If edge was recently invalidated by location_extreme, don't re-arm
+        # This prevents the infinite cycle: ARM → BLOCK → ARM → BLOCK...
+        # =====================================================================
+        if self.is_location_extreme_cooldown_active(direction, market_time):
+            logger.debug(
+                f"[CONSENSUS_BLOCKED] Location extreme cooldown active for {direction} | "
+                f"Expires: {self._location_extreme_cooldown_until.strftime('%H:%M:%S') if self._location_extreme_cooldown_until else 'N/A'}"
+            )
+            return False
+        
         # 🔥 FIX #36 (Feb 05): Reset from EXPIRED state to allow re-arming
         # Without this, once an edge expires, CONSENSUS can never arm again
         if self._state == EdgeState.EDGE_EXPIRED:
@@ -3153,7 +3343,8 @@ class EdgeStateManager:
         atr: float,
         edge_type: EdgeType = EdgeType.TREND,
         break_distance: float = 0.0,
-        trend_path: Optional[TrendEdgePath] = None  # 🔥 NEW: Path para TREND
+        trend_path: Optional[TrendEdgePath] = None,  # 🔥 NEW: Path para TREND
+        setup_origin_price: Optional[float] = None   # 🔥 FIX Feb 06: Price when setup started
     ):
         """
         Armar el edge tras detectar BOS.
@@ -3161,10 +3352,19 @@ class EdgeStateManager:
         🔥 FIX #31 (Feb 05): Para TREND edge, especificar el path:
         - BOS_PULLBACK: BOS detectado, esperar pullback (mejor entry)
         - CONSENSUS_DIRECT: Solo alineación, entrada directa
+        
+        🔥 FIX Feb 06: setup_origin_price for timing classification
         """
         # 🔥 Para BOS, siempre usar BOS_PULLBACK path (mejor sizing)
         if edge_type == EdgeType.TREND and trend_path is None:
             trend_path = TrendEdgePath.BOS_PULLBACK
+        
+        # 🔥 FIX Feb 06: Calculate move at detection
+        origin = setup_origin_price or bos_level
+        if direction == 'LONG':
+            move_at_detection = ((price - origin) / origin) * 100 if origin > 0 else 0.0
+        else:
+            move_at_detection = ((origin - price) / origin) * 100 if origin > 0 else 0.0
         
         self._current_bos = BOSEvent(
             timestamp=timestamp,
@@ -3174,7 +3374,10 @@ class EdgeStateManager:
             bos_level=bos_level,
             atr_at_bos=atr,
             edge_type=edge_type,
-            trend_path=trend_path  # 🔥 NEW: Path específico
+            trend_path=trend_path,  # 🔥 NEW: Path específico
+            # 🔥 FIX Feb 06: Timing fields
+            move_at_detection_pct=abs(move_at_detection),
+            setup_origin_price=setup_origin_price or bos_level
         )
         
         # Stats
@@ -3592,6 +3795,99 @@ class EdgeStateManager:
     
     # =========================================================================
     # 🌊 STATUS AND UTILITIES
+    # =========================================================================
+    # 🔥 FIX Feb 06: Signal Timing Classification
+    # =========================================================================
+    
+    def calculate_signal_timing(
+        self,
+        current_price: float,
+        direction: str
+    ) -> tuple[str, float]:
+        """
+        Calculate signal timing classification.
+        
+        Compares current price with the setup_origin_price or origin_price
+        to determine if we're detecting EARLY or LATE.
+        
+        Returns:
+            (timing_category: str, move_pct: float)
+            - timing_category: 'early' (<0.3%), 'on_time' (<0.8%), 'late' (<1.5%), 'very_late' (>1.5%)
+            - move_pct: percentage price has moved since setup origin
+        """
+        if self._current_bos is None:
+            return 'unknown', 0.0
+        
+        # Use setup_origin_price if available, else origin_price, else bos_level
+        origin = (
+            self._current_bos.setup_origin_price or 
+            self._current_bos.origin_price or 
+            self._current_bos.bos_level
+        )
+        
+        if origin is None or origin <= 0:
+            return 'unknown', 0.0
+        
+        # Calculate move percentage
+        if direction == 'LONG':
+            move_pct = ((current_price - origin) / origin) * 100
+        else:  # SHORT
+            move_pct = ((origin - current_price) / origin) * 100
+        
+        # Classify timing
+        # Thresholds based on typical BTC volatility
+        if move_pct < 0.3:
+            timing = 'early'
+        elif move_pct < 0.8:
+            timing = 'on_time'
+        elif move_pct < 1.5:
+            timing = 'late'
+        else:
+            timing = 'very_late'
+        
+        return timing, abs(move_pct)
+    
+    def get_timing_for_missed_tracker(
+        self,
+        current_price: float,
+        direction: str
+    ) -> dict:
+        """
+        Get timing info formatted for MissedOpportunityTracker.
+        
+        Returns dict with:
+            - timing_category: SignalTimingCategory enum value
+            - move_at_detection_pct: float
+            - setup_price: float
+        """
+        from src.infrastructure.monitoring.opportunity_tracker import SignalTimingCategory
+        
+        timing_str, move_pct = self.calculate_signal_timing(current_price, direction)
+        
+        # Map string to enum
+        timing_map = {
+            'early': SignalTimingCategory.EARLY,
+            'on_time': SignalTimingCategory.ON_TIME,
+            'late': SignalTimingCategory.LATE,
+            'very_late': SignalTimingCategory.VERY_LATE,
+            'unknown': SignalTimingCategory.UNKNOWN
+        }
+        
+        setup_price = 0.0
+        if self._current_bos:
+            setup_price = (
+                self._current_bos.setup_origin_price or 
+                self._current_bos.origin_price or 
+                self._current_bos.bos_level or
+                0.0
+            )
+        
+        return {
+            'timing_category': timing_map.get(timing_str, SignalTimingCategory.UNKNOWN),
+            'move_at_detection_pct': move_pct,
+            'setup_price': setup_price
+        }
+    
     # =========================================================================
     
     def get_status(self) -> Dict[str, Any]:

@@ -657,6 +657,18 @@ class TrendIntelligence:
             if self._state.adx_slope > 0.3:
                 return TrendPhase.ACCUMULATION, 0.5, "New cycle accumulation"
         
+        # 🔥 FIX #61 (Feb 06): COLD START COHERENCE
+        # When TrendPhase is stuck in RANGE_BOUND but ADX is very high,
+        # this indicates a cold start problem - the system initialized
+        # during an already-mature trend. Force transition to appropriate phase.
+        if current == TrendPhase.RANGE_BOUND and adx >= self.ADX_MATURE_THRESHOLD + 5:
+            # ADX >= 30 but still RANGE_BOUND = cold start issue
+            logger.info(
+                f"🔧 COLD START FIX: ADX={adx:.1f} too high for RANGE_BOUND | "
+                f"Force transitioning to TREND_MATURE"
+            )
+            return TrendPhase.TREND_MATURE, 0.7, "Cold start correction (ADX already high)"
+        
         # No transition
         return current, self._state.confidence, "No transition"
     

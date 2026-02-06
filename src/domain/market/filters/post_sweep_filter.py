@@ -275,14 +275,23 @@ class PostSweepConfirmationFilter(BaseFilter):
         
         # Update pending sweeps
         updated_pending = []
+        confirmed_this_tick = []  # Collect all confirmations for consolidated log
+        
         for sweep in self._pending_sweeps:
             sweep = self.check_confirmation(sweep, current_high, current_low, current_close)
             
             if sweep.confirmation_complete:
                 self._confirmed_sweeps.append(sweep)
-                logger.info(f"🎯 SWEEP CONFIRMATION COMPLETE: {sweep.sweep_type}")
+                confirmed_this_tick.append(sweep.sweep_type)
             elif not sweep.expired:
                 updated_pending.append(sweep)
+        
+        # Consolidated log for all confirmations this tick
+        if confirmed_this_tick:
+            if len(confirmed_this_tick) == 1:
+                logger.info(f"🎯 SWEEP CONFIRMATION COMPLETE: {confirmed_this_tick[0]}")
+            else:
+                logger.info(f"🎯 SWEEP CONFIRMATION COMPLETE: {len(confirmed_this_tick)}x ({', '.join(confirmed_this_tick)})")
         
         self._pending_sweeps = updated_pending
         

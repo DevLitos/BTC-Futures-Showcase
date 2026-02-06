@@ -192,7 +192,7 @@ from src.infrastructure.storage import get_position_store  # 🔥 REMOVED Feb 04
 from src.domain.trading.cost.cost_model import get_cost_model  # 🔥 FIX (Jan 24): Cost validator
 
 # 🔥 NEW (Jan 27, 2026 - AUDIT REFACTOR Point 3): Centralized indicator caching
-from src.shared.indicator_cache import get_indicator_cache  # 🔥 REMOVED Feb 04: IndicatorCache - unused
+from src.application.live.indicator_cache import get_indicator_cache  # Canonical location
 
 # 🔥 NEW (Jan 27, 2026 - AUDIT REFACTOR Point 5): Position management utilities
 from src.application.live.position_manager import (
@@ -3872,7 +3872,9 @@ class SignalEngine:
                     price_confirms, price_change, confirm_reason = self._price_confirms_direction(direction)
                     
                     if not price_confirms:
-                        logger.warning(f"⚠️ TREND: {source} BLOCKED BY PRICE | {confirm_reason}")
+                        # 🔥 FIX (Feb 05): Rate-limit this warning - spams logs
+                        if self._idle_eval_count % 60 == 1:
+                            logger.warning(f"⚠️ TREND: {source} BLOCKED BY PRICE | {confirm_reason}")
                         self._current_trade_tags['trend_reason'] = 'PRICE_CONTRADICTED'
                         return
                 
@@ -3994,11 +3996,21 @@ class SignalEngine:
         atr_1h_vals = calculate_atr(highs_1h, lows_1h, closes_1h, 14)
         atr_1h = float(atr_1h_vals[-1]) if len(atr_1h_vals) > 0 else current_price * 0.01
         
-        # Detectar swings con lookback de 5 velas
+        # =========================================================================
+        # 🔥 FIX #58 (Feb 06, 2026): Reducir swing lookback de 5→3
+        # 
+        # ANTES: lookback=5 en 1H = ~5 horas de delay para detectar swing
+        # AHORA: lookback=3 en 1H = ~3 horas (40% más rápido)
+        # 
+        # Esto acelera la detección de swings y reduce latencia en BOS detection.
+        # El tradeoff es swings menos "robustos" pero más reactivos.
+        # =========================================================================
+        SWING_LOOKBACK_1H = 3  # Reducido de 5 para detección más temprana
+        
         from src.shared.indicators import detect_swing_high, detect_swing_low
         
-        swing_high_detected, swing_high_price, _ = detect_swing_high(highs_1h, lows_1h, closes_1h, lookback=5)
-        swing_low_detected, swing_low_price, _ = detect_swing_low(highs_1h, lows_1h, closes_1h, lookback=5)
+        swing_high_detected, swing_high_price, _ = detect_swing_high(highs_1h, lows_1h, closes_1h, lookback=SWING_LOOKBACK_1H)
+        swing_low_detected, swing_low_price, _ = detect_swing_low(highs_1h, lows_1h, closes_1h, lookback=SWING_LOOKBACK_1H)
         
         # Actualizar swings si se detectaron nuevos
         if swing_high_detected and swing_high_price > 0:
@@ -4556,28 +4568,21 @@ class SignalEngine:
                 self._location_context.is_breakout_up or self._location_context.is_breakout_down
             )
             
-            # 🔥 FIX #39b: Clear forbidden_direction when price leaves extreme zone
-            # If SHORT was forbidden due to extreme low, and we're no longer in extreme low → allow SHORT again
-            if self._forbidden_direction == 'SHORT' and not self._location_context.in_extreme_low:
-                from src.config.trading_config import LocationFilters
-                if self._location_context.percentile_60d > LocationFilters.EXTREME_LOW_PERCENTILE + 5:
-                    logger.info(
-                        f"🟢 SHORT ALLOWED AGAIN: Price left extreme zone | "
-                        f"Percentile: {self._location_context.percentile_60d:.1f}% (was forbidden at bottom)"
-                    )
-                    self._forbidden_direction = None
-                    self._current_trade_tags['forbidden_cleared'] = 'left_extreme_low'
-            
-            # Same for LONG at extreme high
-            if self._forbidden_direction == 'LONG' and not self._location_context.in_extreme_high:
-                from src.config.trading_config import LocationFilters
-                if self._location_context.percentile_60d < LocationFilters.EXTREME_HIGH_PERCENTILE - 5:
-                    logger.info(
-                        f"🟢 LONG ALLOWED AGAIN: Price left extreme zone | "
-                        f"Percentile: {self._location_context.percentile_60d:.1f}% (was forbidden at top)"
-                    )
-                    self._forbidden_direction = None
-                    self._current_trade_tags['forbidden_cleared'] = 'left_extreme_high'
+            # 🔥 FIX #68: REMOVED FIX #39b - Was causing log spam conflict with BIAS FLIP
+            # The forbidden_direction can be set by:
+            # 1. BIAS FLIP (bias_invalidation) → has its own reclaim logic
+            # 2. Location extreme zone → should only be cleared by Location
+            # 
+            # Problem: FIX #39b was clearing ALL forbids based on Location,
+            # including those set by BIAS FLIP, causing infinite spam:
+            # - BIAS FLIP sets forbidden='SHORT' every tick
+            # - FIX #39b clears it every tick (not in extreme_low)
+            # - Log spams "SHORT ALLOWED AGAIN" on every tick
+            #
+            # Solution: Let each subsystem manage its own forbidden state.
+            # BIAS FLIP already has reclaim logic in bias_invalidation_handler.
+            # Location filter already applies penalties without needing this clear.
+            pass  # Intentionally empty - each subsystem handles its own state
             
             # 🔥 FIX (Jan 22, 2026): Store location penalties for scoring
             self._current_trade_tags['location_penalty_long'] = self._location_context.location_penalty_long
@@ -4714,6 +4719,34 @@ class SignalEngine:
                 self._last_countertrend_log = market_time
                 logger.info(f"⚠️ COUNTERTREND TRADE: {bias} against {bias_value} → size={ct_rules['size_mult']:.0%}, max_rr={ct_rules['max_rr']:.1f}")
             
+            # =====================================================================
+            # 🔥 FIX #70: Block countertrend during TREND_EXHAUSTION + STRONG HTF
+            # =====================================================================
+            # PROBLEM: System enters LONG when:
+            # - TREND_EXHAUSTION (trend dying)
+            # - BEAR_STRONG (HTF is strongly bearish)
+            # - BIAS FLIP detected (SHORT invalidated)
+            #
+            # BIAS FLIP only means "SHORT is temporarily invalid", NOT that LONG is good.
+            # During TREND_EXHAUSTION of a STRONG trend, the trend often resumes after
+            # a brief pullback. Entering countertrend here is very risky.
+            #
+            # SOLUTION: Block countertrend trades during TREND_EXHAUSTION when:
+            # - HTF bias is STRONG (BEAR_STRONG or BULL_STRONG)
+            # - Even if BIAS FLIP detected (BIAS FLIP is necessary but not sufficient)
+            # =====================================================================
+            from src.domain.market.regime.trend_intelligence import TrendPhase
+            htf_is_strong = bias_value in ['BEAR_STRONG', 'BULL_STRONG']
+            is_exhaustion = self._trend_phase == TrendPhase.TREND_EXHAUSTION
+            
+            if is_exhaustion and htf_is_strong:
+                logger.warning(
+                    f"⛔ FIX #70 CT BLOCK: No countertrend during TREND_EXHAUSTION + {bias_value} | "
+                    f"Trend exhaustion is NOT reversal confirmation - wait for DISTRIBUTION or TREND_DEATH"
+                )
+                self._current_trade_tags['skip_reason'] = 'ct_blocked_exhaustion_strong'
+                return
+            
             # Check countertrend limits
             if self._countertrend_losses_session >= BiasStrengthConfig.COUNTERTREND_MAX_PER_SESSION:
                 logger.warning(f"⛔ CT SESSION LIMIT: {self._countertrend_losses_session} CT losses this session")
@@ -4811,15 +4844,67 @@ class SignalEngine:
                 # SOFT mode conditions:
                 # 1. Displacement memory active for SHORT
                 # 2. All bullish signals are LAGGING
-                # 3. Price impulse confirms downward movement
-                soft_mode_eligible = all_lagging and price_impulse_down
+                # 3. Price impulse confirms downward movement OR strong HTF trend (ADX > 45)
+                #
+                # 🧠 FIX #55 (Feb 06, 2026): Added strong trend override
+                # PROBLEM: impulse_down is too sensitive to micro-rebotes on 1m candles.
+                # When all signals are LAGGING (VWAP, EMAs) and there's a STRONG HTF trend
+                # (ADX 1h > 45), the lagging signals should NOT block the trade.
+                # The trend strength on HTF is a more reliable indicator than 1m impulse.
+                STRONG_TREND_ADX_OVERRIDE = 45.0
+                strong_htf_trend = adx_1h >= STRONG_TREND_ADX_OVERRIDE
+                soft_mode_eligible = all_lagging and (price_impulse_down or strong_htf_trend)
                 self._current_trade_tags['obstinacy_soft_mode_eligible'] = soft_mode_eligible
+                self._current_trade_tags['obstinacy_strong_trend_override'] = strong_htf_trend
                 
                 if soft_mode_eligible:
+                    reason = "price impulse down" if price_impulse_down else f"strong HTF ADX={adx_1h:.1f}"
                     logger.info(
                         f"🧠 OBSTINACY SOFT MODE: Displacement memory active, "
-                        f"all signals lagging, price impulse down → SOFT mode enabled"
+                        f"all signals lagging, {reason} → SOFT mode enabled"
                     )
+            else:
+                # 🧠 FIX #55b (Feb 06, 2026): STRONG TREND OVERRIDE without displacement_memory
+                # PROBLEM: System stuck in infinite loop when:
+                # - SHORT edge armed with 100% confidence
+                # - SHORT OBSTINACY blocks with lagging signals
+                # - Edge invalidated after 3x blocks
+                # - Re-armed immediately, blocked again → infinite loop
+                #
+                # When there's a VERY STRONG HTF trend (ADX > 50) and ALL signals are
+                # LAGGING, the lagging indicators should NOT hard-block. They're simply
+                # catching up to the actual trend.
+                #
+                # 🔥 FIX #69 (Feb 06, 2026): RELAXED THRESHOLD when impulse_down is True
+                # PROBLEM: ADX 43.6 with impulse_down=True and all_lagging=True 
+                # still gets blocked. The impulse confirms the direction is real.
+                # When there's actual price movement in the right direction,
+                # lagging signals should not block.
+                VERY_STRONG_TREND_OVERRIDE = 50.0
+                STRONG_TREND_WITH_IMPULSE = 35.0  # Lower threshold if impulse confirms
+                
+                # FIX #69: Either very strong ADX OR strong ADX + impulse confirms
+                strong_trend_bypass = (
+                    (all_lagging and adx_1h >= VERY_STRONG_TREND_OVERRIDE) or
+                    (all_lagging and price_impulse_down and adx_1h >= STRONG_TREND_WITH_IMPULSE)
+                )
+                
+                if strong_trend_bypass:
+                    self._current_trade_tags['displacement_memory_active'] = False
+                    self._current_trade_tags['obstinacy_soft_mode_eligible'] = True
+                    self._current_trade_tags['obstinacy_strong_trend_override'] = True
+                    
+                    if price_impulse_down:
+                        logger.info(
+                            f"🧠 FIX #69 OBSTINACY BYPASS: All lagging + ADX={adx_1h:.1f} >= {STRONG_TREND_WITH_IMPULSE} "
+                            f"+ impulse_down=True → SOFT mode (trend confirmed by price action)"
+                        )
+                    else:
+                        logger.info(
+                            f"🧠 OBSTINACY SOFT MODE (NO DISPLACEMENT): "
+                            f"All signals lagging + VERY STRONG HTF ADX={adx_1h:.1f} >= {VERY_STRONG_TREND_OVERRIDE} → "
+                            f"SOFT mode enabled (lagging signals catching up to trend)"
+                        )
             
             # Check short cooldown
             # 🔄 REFACTORED Feb 04: Use CooldownManager for unified cooldown check
@@ -4988,6 +5073,29 @@ class SignalEngine:
             # BREAKOUT/DISPLACEMENT edge armed - DO NOT allow micro_trend to change direction
             edge_dir = self._edge_manager.current_bos.direction if self._edge_manager.current_bos else bias
             logger.info(f"🛡️ MICRO_TREND BYPASS: {sovereign_edge_type.value} EDGE {edge_dir} has authority")
+        # =====================================================================
+        # 🔥 FIX #71: Block BIAS INVERSION when HTF is STRONG
+        # =====================================================================
+        # PROBLEM: System inverts bias (e.g., SHORT→LONG) when micro-trend is 
+        # bullish with high strength (90%+). But during a STRONG trend (BEAR_STRONG),
+        # these micro-rebounds are normal pullbacks, NOT trend reversals.
+        #
+        # EVIDENCE: Log showed HTF=SHORT, ADX=43.6, BEAR_STRONG, but micro=BULLISH 
+        # strength 97% → inverted to LONG → bad trade during TREND_EXHAUSTION.
+        #
+        # ROOT CAUSE: BIAS INVERSION was designed for when HTF is WRONG (lagging).
+        # But when HTF is STRONG and CONFIRMED by high ADX, micro-rebounds are noise.
+        #
+        # SOLUTION: Block BIAS INVERSION when:
+        # - HTF bias_strength is STRONG (BEAR_STRONG or BULL_STRONG)
+        # - Trust the HTF trend, trade with it, ignore micro-noise
+        # =====================================================================
+        elif self._current_bias_strength is not None and self._current_bias_strength.value in ['BEAR_STRONG', 'BULL_STRONG']:
+            # HTF is STRONG - DO NOT allow micro_trend to invert bias
+            logger.info(
+                f"🛡️ FIX #71 BIAS INVERSION BLOCKED: HTF is {self._current_bias_strength.value} | "
+                f"Strong trends don't get inverted by micro-noise - trade WITH the trend"
+            )
         # 🔥 FIX (Jan 29, 2026 - AUDIT BUG 8): Add explicit null check before accessing .micro_trend
         # 🔥 FIX #51 (Feb 5, 2026): Don't invert if inverted direction would be blocked by location extreme
         # - If LONG→SHORT but we're at extreme LOW (percentile < 10%), SHORT will be blocked anyway
@@ -5161,6 +5269,13 @@ class SignalEngine:
             self._current_trade_tags.get('anticipation_confidence', 0) >= 0.55
         )
         
+        # 🔥 FIX #67 (Feb 06): Check if BIAS FLIP bypass should be active
+        # BIAS FLIP = market structure changed, old sweeps are stale
+        bias_flip_bypass = (
+            self._current_trade_tags.get('bias_invalidated', False) or
+            self._current_trade_tags.get('bias_inverted', False)
+        )
+        
         filter_decision = self.filter_pipeline.evaluate(
             df_1m=df_1m_micro,  # pyright: ignore[reportArgumentType]
             df_5m=df_5m_micro,  # pyright: ignore[reportArgumentType]
@@ -5172,7 +5287,8 @@ class SignalEngine:
             spread=spread,
             market_time=market_time,
             displacement_bypass=self._displacement_bypass,  # 🔥 FIX (Jan 29): Pass displacement state
-            anticipation_bypass=anticipation_bypass  # 🔥 FIX #46 (Feb 05): ANTICIPATION bypasses macro slope
+            anticipation_bypass=anticipation_bypass,  # 🔥 FIX #46 (Feb 05): ANTICIPATION bypasses macro slope
+            bias_flip_bypass=bias_flip_bypass  # 🔥 FIX #67 (Feb 06): BIAS FLIP bypasses sweep
         )
         
         # Store filter pipeline tags
@@ -6048,6 +6164,9 @@ class SignalEngine:
                         trade_type_for_log = entry_data.get('trade_type', TradeType.LONG_MAIN if entry_data['bias'] == 'LONG' else TradeType.SHORT_STRUCTURAL)
                         trade_type_name = trade_type_for_log.value if hasattr(trade_type_for_log, 'value') else str(trade_type_for_log)
                         
+                        # 🔥 EDGE TYPE (Feb 05, 2026): Get edge_type from tags for logging
+                        edge_type_for_log = trade_tags.get('edge_type', '') if isinstance(trade_tags, dict) else ''
+                        
                         self._current_trade_id = self.trade_logger.start_trade(
                             symbol=self.symbol,
                             direction=entry_data['bias'],
@@ -6066,7 +6185,9 @@ class SignalEngine:
                             # 🔥 ML Data Collection (Jan 24, 2026)
                             feature_snapshot=self._build_ml_feature_snapshot(),
                             entry_trading_mode=trade_tags.get('trading_mode', ''),
-                            entry_daily_regime=self._daily_regime
+                            entry_daily_regime=self._daily_regime,
+                            # 🔥 EDGE TYPE (Feb 05, 2026)
+                            edge_type=edge_type_for_log
                         )
                         # 🔥 FIX (Jan 27, 2026): Use CENTRALIZED activity tracker
                         # This is the SINGLE source of truth for trade activity
@@ -7146,10 +7267,49 @@ class SignalEngine:
         """
         # FIX #40: CHECK FORBIDDEN DIRECTION FIRST (PRIORITY 0)
         # This prevents ANY direction matching forbidden from being returned
+        # 
+        # 🔥 FIX #53 (Feb 05): "BE WATER" - Location extreme check
+        # Instead of: ARM edge → BLOCK → EXPIRE → RE-ARM (infinite loop)
+        # Now: Don't want that direction at all if in extreme zone (flows naturally)
+        # 
+        # 🔥 FIX #54 (Feb 05): BREAKOUT OVERRIDE - Allow trades in extreme if breakout confirmed
+        # If breakout score >= 3 AND breakout direction matches → override the extreme block
         def _check_forbidden(direction: str, source: str, confidence: float) -> tuple[str | None, str, float]:
             if self._forbidden_direction and direction == self._forbidden_direction:
                 logger.debug(f"🚫 {direction} FORBIDDEN | Source would be {source} | Returning None")
                 return None, 'FORBIDDEN', 0.0
+            
+            # 🔥 BE WATER: Check location extreme - don't even WANT incompatible direction
+            # percentile <= 10% (low extreme) → don't want SHORT (already at bottom)
+            # percentile >= 90% (high extreme) → don't want LONG (already at top)
+            # UNLESS: Breakout confirmed in same direction (genuine trend continuation)
+            if self._location_context:
+                # Check for breakout override FIRST
+                breakout_override = False
+                min_breakout_score = 3  # Same as LocationFilterOverride
+                
+                if direction == 'SHORT' and self._location_context.in_extreme_low:
+                    # At bottom - but check if breaking down (continuation)
+                    if (self._location_context.is_breakout_down and 
+                        self._location_context.breakout_down_score >= min_breakout_score):
+                        breakout_override = True
+                        logger.info(f"🌊 BE WATER: SHORT in extreme low ALLOWED - breakout down "
+                                   f"(score={self._location_context.breakout_down_score})")
+                    
+                    if not breakout_override:
+                        return None, 'LOCATION_EXTREME_LOW', 0.0
+                
+                if direction == 'LONG' and self._location_context.in_extreme_high:
+                    # At top - but check if breaking up (continuation)
+                    if (self._location_context.is_breakout_up and 
+                        self._location_context.breakout_up_score >= min_breakout_score):
+                        breakout_override = True
+                        logger.info(f"🌊 BE WATER: LONG in extreme high ALLOWED - breakout up "
+                                   f"(score={self._location_context.breakout_up_score})")
+                    
+                    if not breakout_override:
+                        return None, 'LOCATION_EXTREME_HIGH', 0.0
+            
             return direction, source, confidence
         
         # PRIORITY 1: Expansion mode (locked direction)
@@ -7304,6 +7464,14 @@ class SignalEngine:
             
             # Record in edge manager
             self._edge_manager.record_trade_result(won=is_win, r_captured=r_realized)
+            
+            # 🔥 FIX (Feb 05, 2026): Record direction outcome for circuit breaker
+            try:
+                from src.domain.trading.direction_orchestrator import get_direction_orchestrator
+                orchestrator = get_direction_orchestrator()
+                orchestrator.record_direction_outcome(was_profitable=is_win, tick_count=self._tick_count)
+            except Exception as cb_err:
+                logger.debug(f"Circuit breaker recording error: {cb_err}")
             
             logger.debug(f"📊 Edge result recorded: {'WIN' if is_win else 'LOSS'} {r_realized:+.2f}R")
         except Exception as e:
@@ -7525,6 +7693,18 @@ class SignalEngine:
         if df_1m is None:
             df_1m = pd.DataFrame()
         
+        # 🔥 FIX #56: Get context for structure gate overrides
+        expansion_mode_active = self._current_trade_tags.get('expansion_mode_activated', False) if hasattr(self, '_current_trade_tags') else False
+        effective_adx = 0.0
+        if hasattr(self, '_current_trade_tags'):
+            effective_adx = self._current_trade_tags.get('effective_adx', 0) or self._current_trade_tags.get('htf_adx', 0)
+        
+        # 🔥 FIX #61: Get bias inversion status
+        bias_inverted = self._current_trade_tags.get('bias_inverted', False) if hasattr(self, '_current_trade_tags') else False
+        
+        # 🔥 FIX #63: Get bias invalidation status (opposite direction forbidden)
+        bias_invalidated = self._current_trade_tags.get('bias_invalidated', False) if hasattr(self, '_current_trade_tags') else False
+        
         # Delegate to EntryScorer
         score, breakdown, structure_blocks = self._entry_scorer.calculate_entry_score(
             df_1h=df_1h,
@@ -7535,6 +7715,10 @@ class SignalEngine:
             market_time=market_time,
             micro_trend_state=getattr(self, '_micro_trend_state', None),
             filter_pipeline=getattr(self, 'filter_pipeline', None),
+            expansion_mode_active=expansion_mode_active,  # 🔥 FIX #56
+            strong_trend_adx=effective_adx,               # 🔥 FIX #56
+            bias_inverted=bias_inverted,                  # 🔥 FIX #61
+            bias_invalidated=bias_invalidated,            # 🔥 FIX #63
         )
         
         # Copy trade tags from scorer to signal engine for backwards compatibility

@@ -223,6 +223,10 @@ class EntryScorer:
         micro_trend_state: Optional['MicroTrendState'] = None,
         filter_pipeline: Optional['EntryFilterPipeline'] = None,
         displacement_edge_active: bool = False,  # 🔥 FIX (Jan 30): Bypass structure for displacement
+        expansion_mode_active: bool = False,     # 🔥 FIX #56: Expansion mode bypass
+        strong_trend_adx: float = 0.0,           # 🔥 FIX #56: ADX for strong trend override
+        bias_inverted: bool = False,             # 🔥 FIX #61: Bias was inverted by micro-trend
+        bias_invalidated: bool = False,          # 🔥 FIX #63: Bias was flipped (opposite dir forbidden)
     ) -> Tuple[int, Dict[str, Any], bool]:
         """
         Calculate entry score using 4 blocks.
@@ -237,6 +241,10 @@ class EntryScorer:
             micro_trend_state: Optional MicroTrendState for adjustment
             filter_pipeline: Optional filter pipeline for adjustments
             displacement_edge_active: If True, bypass STRUCTURE GATE (market already voted)
+            expansion_mode_active: If True, bypass STRUCTURE GATE (expansion/trend mode)
+            strong_trend_adx: ADX value for strong trend override (>50 = override)
+            bias_inverted: If True, bypass STRUCTURE GATE (direction changed by micro-trend)
+            bias_invalidated: If True, bypass STRUCTURE GATE (opposite direction forbidden by price action)
         
         Returns:
             (total_score, breakdown_dict, structure_blocks)
@@ -262,6 +270,56 @@ class EntryScorer:
             )
             structure_blocks = False
             structure_score = 1  # Give partial structure credit
+        
+        # 🔥 FIX #56: EXPANSION MODE OVERRIDE - Market in confirmed expansion
+        if structure_blocks and expansion_mode_active:
+            logger.warning(
+                f"📈 EXPANSION STRUCTURE BYPASS: Ignoring STRUCTURE GATE for {bias} | "
+                f"Expansion mode active - trend already confirmed"
+            )
+            structure_blocks = False
+            structure_score = 1
+        
+        # 🔥 FIX #56: STRONG TREND ADX OVERRIDE - Very high ADX means clear trend
+        STRUCTURE_GATE_ADX_OVERRIDE = 55.0  # Very strong trend threshold
+        if structure_blocks and strong_trend_adx >= STRUCTURE_GATE_ADX_OVERRIDE:
+            logger.warning(
+                f"🔥 STRONG TREND STRUCTURE BYPASS: Ignoring STRUCTURE GATE for {bias} | "
+                f"ADX={strong_trend_adx:.1f} >= {STRUCTURE_GATE_ADX_OVERRIDE} → clear trend"
+            )
+            structure_blocks = False
+            structure_score = 1
+        
+        # 🔥 FIX #61 (Feb 06): BIAS INVERSION OVERRIDE
+        # When bias is inverted by strong micro-trend (BULLISH when HTF=SHORT or vice versa),
+        # STRUCTURE GATE should not block because:
+        # 1. The inversion already considered location extreme checks
+        # 2. HTF structure (EMA50_1h) is slow and doesn't reflect current micro-trend
+        # 3. Blocking creates DEADLOCK: can't SHORT (obstinacy) and can't LONG (structure)
+        if structure_blocks and bias_inverted:
+            logger.warning(
+                f"🔄 BIAS INVERSION STRUCTURE BYPASS: Ignoring STRUCTURE GATE for {bias} | "
+                f"Direction was inverted by micro-trend - structure check is stale"
+            )
+            structure_blocks = False
+            structure_score = 1  # Partial credit - inversion means micro is aligned
+        
+        # 🔥 FIX #63 (Feb 06): BIAS FLIP/INVALIDATION OVERRIDE
+        # When opposite direction is FORBIDDEN by price action (e.g., "SHORT forbidden, LONG enabled"),
+        # the system has already confirmed direction change via price structure.
+        # STRUCTURE GATE should not block because:
+        # 1. Price has moved significantly against the old bias (invalidated)
+        # 2. The system is now FORCED to trade the new direction
+        # 3. EMA50_1h is slow and doesn't reflect the price invalidation
+        # Example: Price rises $300+ from low → SHORT forbidden → LONG is the ONLY valid direction
+        if structure_blocks and bias_invalidated:
+            logger.warning(
+                f"🔄 FIX #63 BIAS FLIP STRUCTURE BYPASS: Ignoring STRUCTURE GATE for {bias} | "
+                f"Opposite direction was FORBIDDEN by price action - structure is stale"
+            )
+            structure_blocks = False
+            structure_score = 1  # Partial credit - price has voted
+        
         self._breakdown.structure = structure_score
         self._trade_tags.htf_aligned = structure_score > 0
         self._trade_tags.ltf_clean = structure_score == 2
@@ -610,6 +668,22 @@ class EntryScorer:
                 logger.info(f"📉 STRUCTURE: SHORT allowed - strong negative slope ({ema50_slope:.3f}%) indicates downtrend")
         
         if not htf_aligned:
+            # 🔥 FIX #62b (Feb 06): EXTREME DISTANCE BYPASS
+            # If price is >7% away from EMA50_1h, the EMA is STALE and irrelevant.
+            # This happens during:
+            # 1. Flash crashes (price drops -10% in hours, EMA50_1h hasn't caught up)
+            # 2. V-recoveries (price recovers but EMA50 is still at crash levels)
+            # 3. Gap moves (weekend gaps where EMA50 is completely wrong)
+            # In these cases, blocking trades is HARMFUL - we lose huge moves.
+            EXTREME_DISTANCE_THRESHOLD = 0.07  # 7% = EMA50 is stale
+            if abs(price_distance_pct) > EXTREME_DISTANCE_THRESHOLD:
+                logger.warning(
+                    f"🔥 FIX #62b EXTREME DISTANCE BYPASS: EMA50 at {price_distance_pct:.1%} is STALE | "
+                    f"{bias} allowed - EMA50_1h cannot reflect current market during crash/recovery"
+                )
+                # Allow trade but with partial structure score
+                return 1, False, False
+            
             # Against HTF → Structure = 0 → BLOCKS
             logger.warning(f"⛔ STRUCTURE GATE: {bias} against HTF (Price vs EMA50_1h) | "
                           f"Price: {current_price:.0f}, EMA50: {ema50_1h[-1]:.0f}, "

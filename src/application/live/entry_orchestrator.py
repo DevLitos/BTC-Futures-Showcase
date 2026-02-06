@@ -236,11 +236,21 @@ class GuardOrchestrator:
         # 8. Spread filter
         spread_result = engine.spread_filter.check_entry_allowed(ctx.session_name)
         if not spread_result.allowed:
-            result.passed = False
-            result.reason = f"Spread block: {spread_result.reason}"
-            result.tags['block_category'] = 'spread'
-            engine._set_rejection_cooldown("Spread too wide", candles=1)
-            return result
+            # 🔥 FIX #66 (Feb 06, 2026): BYPASS SPREAD BLOCK DURING BIAS FLIP/INVERSION
+            # When market is moving fast due to bias flip, spread spikes are normal
+            # Missing a BIAS FLIP trade because of momentary spread is worse than paying 1-2 bps extra
+            bias_flip = engine._current_trade_tags.get('bias_invalidated', False)
+            bias_inverted = engine._current_trade_tags.get('bias_inverted', False)
+            
+            if bias_flip or bias_inverted:
+                logger.warning(f"🔄 FIX #66 SPREAD BYPASS: Ignoring spread block (bias_flip={bias_flip}, bias_inverted={bias_inverted}) | {spread_result.reason}")
+                # Continue with entry - don't block
+            else:
+                result.passed = False
+                result.reason = f"Spread block: {spread_result.reason}"
+                result.tags['block_category'] = 'spread'
+                engine._set_rejection_cooldown("Spread too wide", candles=1)
+                return result
         
         result.tags['spread_penalty'] = spread_result.score_penalty
         result.tags['spread_size_factor'] = spread_result.size_factor
@@ -283,26 +293,20 @@ class GuardOrchestrator:
         # =====================================================================
         # 🚨 GUARD 10: SHORT OBSTINACY BLOCKER (Fix #13 - Feb 02, 2026)
         # 🧠 FIX #20 (Feb 03, 2026): SOFT MODE for displacement memory
+        # 
+        # 🔥 FIX #59 (Feb 06, 2026): PRIORIDAD EXPLÍCITA DE OVERRIDES
         # =====================================================================
-        # PROBLEMA CRÍTICO DETECTADO (Feb 02):
-        # - Con 4 señales bullish, solo aplicaba -0.5 al score
-        # - El trade del SHORT (Feb 02) tenía 4 señales bullish pero se ejecutó
+        # 
+        # JERARQUÍA DE PRIORIDAD (mayor número = mayor prioridad):
+        # 
+        # | Prioridad | Mecanismo              | Acción                    |
+        # |-----------|------------------------|---------------------------|
+        # | 100       | DISPLACEMENT_BYPASS    | BYPASS completo           |
+        # | 80        | SOFT_MODE (strong HTF) | Allow con cap 0.5x        |
+        # | 60        | SOFT_MODE (displacement)| Allow con cap 0.5x       |
+        # | 0         | HARD_BLOCK (default)   | Bloquea trade             |
         #
-        # SOLUCIÓN ORIGINAL: 3+ bullish signals en SHORT = HARD BLOCK
-        #
-        # 🧠 PROBLEMA NUEVO DETECTADO (Feb 03):
-        # - Displacement SHORT detectado, pero precio rebotó → BIAS FLIP
-        # - Indicadores lagging (VWAP, EMA) siguen mostrando "bullish"
-        # - OBSTINACY bloqueó 14 señales que habrían sido +11R
-        #
-        # 🧠 SOLUCIÓN: SOFT MODE cuando:
-        # 1. Displacement memory activo (hubo displacement reciente)
-        # 2. Todas las señales bullish son LAGGING (no estructurales)
-        # 3. Price impulse confirma movimiento bajista (leading indicator)
-        #
-        # SOFT MODE NO bloquea, pero aplica:
-        # - Size cap 0.5 (50% max position)
-        # - Score penalty -1.5
+        # REGLA: Evaluamos en orden de prioridad. El primero que matchea, gana.
         # =====================================================================
         if ctx.bias == 'SHORT':
             bullish_signals = engine._current_trade_tags.get('bullish_signals', 0)
@@ -310,81 +314,91 @@ class GuardOrchestrator:
             
             OBSTINACY_BLOCK_THRESHOLD = 3
             if bullish_signals >= OBSTINACY_BLOCK_THRESHOLD:
-                # 🧠 FIX #20: Check if SOFT mode is eligible
-                soft_mode_eligible = engine._current_trade_tags.get('obstinacy_soft_mode_eligible', False)
-                displacement_memory_active = engine._current_trade_tags.get('displacement_memory_active', False)
-                all_lagging = engine._current_trade_tags.get('obstinacy_all_lagging', False)
-                price_impulse_down = engine._current_trade_tags.get('price_impulse_down', False)
+                # =========================================================
+                # 🔥 FIX #59: Evaluar overrides en orden de prioridad
+                # =========================================================
                 
-                if soft_mode_eligible and displacement_memory_active:
-                    # 🧠 SOFT MODE: Allow trade with restrictions
-                    # Apply size cap and score penalty instead of blocking
-                    # 🔄 REFACTORED Feb 04: Use ScoreAdjustments centralized class
-                    from src.config.trading_config import ScoreAdjustments
-                    SOFT_MODE_SIZE_CAP = 0.5
-                    SOFT_MODE_SCORE_PENALTY = ScoreAdjustments.SOFT_MODE_PENALTY
-                    
-                    logger.warning(
-                        f"🧠 GUARD SOFT MODE: SHORT OBSTINACY | "
-                        f"{bullish_signals} bullish signals ({obstinacy_reason}) | "
-                        f"BUT displacement_memory=active, all_lagging={all_lagging}, impulse_down={price_impulse_down} | "
-                        f"Allowing with size_cap={SOFT_MODE_SIZE_CAP}, penalty={SOFT_MODE_SCORE_PENALTY}"
+                # PRIORIDAD 100: DISPLACEMENT_BYPASS - máxima autoridad
+                displacement_bypass_active = engine._current_trade_tags.get('displacement_bypass', False)
+                if displacement_bypass_active:
+                    # DISPLACEMENT tiene bypass completo - NO aplicar obstinacy
+                    logger.info(
+                        f"🔥 OBSTINACY BYPASSED by DISPLACEMENT: {bullish_signals} bullish signals ignored | "
+                        f"DISPLACEMENT has sovereign authority"
                     )
-                    
-                    # Store SOFT mode restrictions in tags for later application
-                    engine._current_trade_tags['obstinacy_soft_mode'] = True
-                    engine._current_trade_tags['obstinacy_soft_size_cap'] = SOFT_MODE_SIZE_CAP
-                    engine._current_trade_tags['obstinacy_soft_score_penalty'] = SOFT_MODE_SCORE_PENALTY
-                    result.tags['obstinacy_soft_mode'] = True
-                    
-                    # Don't block - continue with restrictions applied later
+                    engine._current_trade_tags['obstinacy_bypassed_by'] = 'DISPLACEMENT'
+                    # No block - continue normally
                 else:
-                    # HARD BLOCK: Normal case without SOFT mode eligibility
-                    # 🔥 FIX #41: Rate-limit log spam
-                    log_key = 'SHORT_OBSTINACY'
-                    last_log = _last_guard_log.get(log_key)
-                    should_log = last_log is None or (ctx.market_time - last_log) > _guard_log_interval
-                    if should_log:
-                        _last_guard_log[log_key] = ctx.market_time
+                    # PRIORIDAD 60-80: Check SOFT MODE eligibility
+                    soft_mode_eligible = engine._current_trade_tags.get('obstinacy_soft_mode_eligible', False)
+                    displacement_memory_active = engine._current_trade_tags.get('displacement_memory_active', False)
+                    all_lagging = engine._current_trade_tags.get('obstinacy_all_lagging', False)
+                    price_impulse_down = engine._current_trade_tags.get('price_impulse_down', False)
+                    strong_trend_override = engine._current_trade_tags.get('obstinacy_strong_trend_override', False)
+                    
+                    # PRIORIDAD 80: strong_trend_override
+                    # PRIORIDAD 60: displacement_memory_active
+                    soft_mode_active = soft_mode_eligible and (displacement_memory_active or strong_trend_override)
+                    
+                    if soft_mode_active:
+                        # 🧠 SOFT MODE: Allow trade with restrictions
+                        from src.config.trading_config import ScoreAdjustments
+                        SOFT_MODE_SIZE_CAP = 0.5
+                        SOFT_MODE_SCORE_PENALTY = ScoreAdjustments.SOFT_MODE_PENALTY
+                        
+                        soft_reason = "strong_trend (P80)" if strong_trend_override else "displacement_memory (P60)"
                         logger.warning(
-                            f"🚫🚫🚫 GUARD BLOCKED: SHORT OBSTINACY | "
+                            f"🧠 GUARD SOFT MODE: SHORT OBSTINACY | "
                             f"{bullish_signals} bullish signals ({obstinacy_reason}) | "
-                            f"Market is BULLISH - don't short the bull"
+                            f"Override by {soft_reason}, all_lagging={all_lagging} | "
+                            f"Size cap={SOFT_MODE_SIZE_CAP}"
                         )
-                    result.passed = False
-                    result.reason = f"Short obstinacy: {bullish_signals} bullish signals ({obstinacy_reason})"
-                    result.tags['block_category'] = 'short_obstinacy'
-                    engine._current_trade_tags['guard_blocked_by_obstinacy'] = True
+                        
+                        engine._current_trade_tags['obstinacy_soft_mode'] = True
+                        engine._current_trade_tags['obstinacy_soft_size_cap'] = SOFT_MODE_SIZE_CAP
+                        engine._current_trade_tags['obstinacy_soft_score_penalty'] = SOFT_MODE_SCORE_PENALTY
+                        engine._current_trade_tags['obstinacy_override_priority'] = 80 if strong_trend_override else 60
+                        result.tags['obstinacy_soft_mode'] = True
+                    else:
+                        # PRIORIDAD 0: HARD BLOCK - default
+                        log_key = 'SHORT_OBSTINACY'
+                        last_log = _last_guard_log.get(log_key)
+                        should_log = last_log is None or (ctx.market_time - last_log) > _guard_log_interval
+                        if should_log:
+                            _last_guard_log[log_key] = ctx.market_time
+                            logger.warning(
+                                f"🚫🚫🚫 GUARD BLOCKED: SHORT OBSTINACY | "
+                                f"{bullish_signals} bullish signals ({obstinacy_reason}) | "
+                                f"No override available (P0) - blocking trade"
+                            )
+                        result.passed = False
+                        result.reason = f"Short obstinacy: {bullish_signals} bullish signals ({obstinacy_reason})"
+                        result.tags['block_category'] = 'short_obstinacy'
+                        engine._current_trade_tags['guard_blocked_by_obstinacy'] = True
+                        
+                        # 🔥 FIX #37: INVALIDATE EDGE AFTER 3 BLOCKS
+                        engine._obstinacy_block_count = getattr(engine, '_obstinacy_block_count', 0) + 1
+                        OBSTINACY_INVALIDATE_THRESHOLD = 3
+                        
+                        if engine._obstinacy_block_count >= OBSTINACY_INVALIDATE_THRESHOLD:
+                            edge_mgr = getattr(engine, '_edge_manager', None)
+                            if edge_mgr is not None:
+                                from src.domain.trading.edge_state_manager import EdgeState
+                                if edge_mgr.state in [EdgeState.EDGE_ACTIVE, EdgeState.EDGE_ARMED]:
+                                    logger.warning(
+                                        f"🔄 EDGE INVALIDATED by OBSTINACY: {engine._obstinacy_block_count}x consecutive blocks | "
+                                        f"Edge {edge_mgr.state.value} SHORT but market BULLISH ({bullish_signals} signals) | "
+                                        f"Resetting edge to allow direction change"
+                                    )
+                                    edge_mgr._transition_to(
+                                        EdgeState.NO_EDGE,
+                                        f"Obstinacy invalidation: {engine._obstinacy_block_count}x blocks, {bullish_signals} bullish signals",
+                                        ctx.market_time
+                                    )
+                                    engine._obstinacy_block_count = 0  # Reset counter
+                                    engine._current_trade_tags['edge_invalidated_by'] = 'obstinacy_consecutive'
                     
-                    # =========================================================
-                    # 🔥 FIX #37 (Feb 05, 2026): INVALIDATE EDGE AFTER 3 BLOCKS
-                    # If SHORT_OBSTINACY blocks 3+ times consecutively, the edge
-                    # is clearly wrong (bullish market, SHORT edge). Invalidate
-                    # the edge to allow system to re-evaluate and potentially
-                    # arm a LONG edge.
-                    # =========================================================
-                    engine._obstinacy_block_count = getattr(engine, '_obstinacy_block_count', 0) + 1
-                    OBSTINACY_INVALIDATE_THRESHOLD = 3
-                    
-                    if engine._obstinacy_block_count >= OBSTINACY_INVALIDATE_THRESHOLD:
-                        edge_mgr = getattr(engine, '_edge_manager', None)
-                        if edge_mgr is not None:
-                            from src.domain.trading.edge_state_manager import EdgeState
-                            if edge_mgr.state in [EdgeState.EDGE_ACTIVE, EdgeState.EDGE_ARMED]:
-                                logger.warning(
-                                    f"🔄 EDGE INVALIDATED by OBSTINACY: {engine._obstinacy_block_count}x consecutive blocks | "
-                                    f"Edge {edge_mgr.state.value} SHORT but market BULLISH ({bullish_signals} signals) | "
-                                    f"Resetting edge to allow direction change"
-                                )
-                                edge_mgr._transition_to(
-                                    EdgeState.NO_EDGE,
-                                    f"Obstinacy invalidation: {engine._obstinacy_block_count}x blocks, {bullish_signals} bullish signals",
-                                    ctx.market_time  # 🔥 FIX: Use ctx.market_time, not engine._last_tick_time
-                                )
-                                engine._obstinacy_block_count = 0  # Reset counter
-                                engine._current_trade_tags['edge_invalidated_by'] = 'obstinacy_consecutive'
-                    
-                    return result
+                        return result
             else:
                 # 🔥 FIX #37: Reset counter if not blocked (bullish_signals < 3)
                 engine._obstinacy_block_count = 0
@@ -451,10 +465,16 @@ class GuardOrchestrator:
                             return result
         
         # =====================================================================
-        # 🚨 GUARD 12: LOCATION EXTREME BLOCK (Fix #16 - Feb 02, 2026)
+        # 🚨 GUARD 12: LOCATION EXTREME → SOFT MODE (Fix #56 - Feb 06, 2026)
         # =====================================================================
-        # 🔄 REFACTOR Feb 04: Use centralized LocationFilters thresholds
-        # 🔥 FIX #38 (Feb 05): Also invalidate edge when location extreme blocks
+        # 🔄 REFACTOR Feb 06: LOCATION_EXTREME ya NO es HARD BLOCK
+        # Es SOFT MODE: reduce size, requiere confirmación, tightens stops
+        # 
+        # LÓGICA:
+        # - Percentil <= 10% NO bloquea shorts automáticamente
+        # - Detectamos si es AGOTAMIENTO (no short) vs PÁNICO (yes short)
+        # - PANIC MODE = displacement + ADX alto + volumen → permite short
+        # - Sin pánico = SOFT MODE (40% size, tight stops, need confirm)
         # =====================================================================
         from src.config.trading_config import LocationFilters
         location_ctx = getattr(engine, '_location_context', None)
@@ -470,152 +490,166 @@ class GuardOrchestrator:
                 pct_60d >= LocationFilters.EXTREME_HIGH_PERCENTILE
             )
             
-            # 🔥 FIX #41: Check if we're in ACTIVE BREAKOUT (bear market scenario)
-            # If ADX is very high AND we're breaking down, allow shorts even at low percentile
+            # 🔥 FIX #56: PANIC DETECTOR - Distinguir agotamiento vs pánico
+            # PÁNICO = El mercado sigue cayendo con fuerza, hay más caída por venir
+            # AGOTAMIENTO = El mercado tocó fondo, probable rebote
             is_breakout_down = getattr(location_ctx, 'is_breakout_down', False)
             adx_current = getattr(location_ctx, 'adx_current', 0)
-            # Also check breakout score - higher score = more confident breakout
             breakout_down_score = getattr(location_ctx, 'breakout_down_score', 0)
             
-            # 🔥 FIX #45 (Feb 05, 2026): Also get ADX from engine (more reliable)
-            # LocationContext.adx_current might be stale or different timeframe
             engine_adx = getattr(engine, '_current_adx', None) or adx_current
             effective_adx = max(adx_current, engine_adx) if engine_adx else adx_current
             
-            # BREAKOUT OVERRIDE: Allow shorts if strong downward breakout
-            # This handles bear market scenarios where we're always at "low" percentile
-            # 🔥 FIX #50 (Feb 05): ADX alone should NOT override location extreme
-            # ADX=57 means strong trend, but if percentile=2%, the move ALREADY HAPPENED
-            # Only allow breakout override if:
-            # 1. Multiple breakout confirmations (score >= 3) - market structure confirms
-            # 2. Breakout detected AND percentile not yet at extreme (<5% threshold)
-            # 3. Displacement active (volatility shock = chase allowed)
             displacement_bypass = engine._current_trade_tags.get('fp_displacement_bypass', False)
             
+            # Get ADX 5m for panic detection (fast momentum)
+            adx_5m = engine._current_trade_tags.get('adx_5m', 0) or engine._current_trade_tags.get('adx_5m_fast', 0)
+            # Get volume ratio if available  
+            vol_ratio = engine._current_trade_tags.get('move_vol_ratio', 1.0)
+            
+            # 🔥 FIX #56: Use CrashDetector for panic detection
+            from src.domain.market.crash_detector import CrashDetector
+            crash_detector = CrashDetector()
+            
+            # Calculate displacement from price move if available
+            displacement_amount = engine._current_trade_tags.get('displacement_amount', 0)
+            current_price = ctx.current_price
+            displacement_pct = displacement_amount / current_price if current_price > 0 else 0
+            
+            crash_result = crash_detector.detect(
+                displacement_pct=-abs(displacement_pct) if ctx.bias == 'SHORT' else abs(displacement_pct),
+                adx_5m=adx_5m,
+                adx_1h=effective_adx,
+                vol_ratio=vol_ratio,
+                direction=ctx.bias
+            )
+            
+            is_panic_mode = crash_result.is_panic_down if ctx.bias == 'SHORT' else crash_result.is_meltup
+            engine._current_trade_tags['crash_detector_result'] = crash_result.reason
+            engine._current_trade_tags['crash_detector_confidence'] = crash_result.confidence
+            
+            # 🔥 FIX #56: Use AbsorptionDetector to check for reversal signals
+            from src.domain.market.absorption_detector import AbsorptionDetector
+            absorption_detector = AbsorptionDetector()
+            
+            # Get VWAP if available
+            vwap_price = engine._current_trade_tags.get('vwap_price', None)
+            delta_ratio = engine._current_trade_tags.get('volume_delta_ratio', None)
+            
+            absorption_result = absorption_detector.detect(
+                df_5m=ctx.df_5m,
+                current_price=current_price,
+                vwap=vwap_price,
+                delta_ratio=delta_ratio,
+                direction=ctx.bias
+            )
+            
+            has_absorption = (
+                absorption_result.is_bullish_absorption if ctx.bias == 'SHORT'
+                else absorption_result.is_bearish_distribution
+            )
+            engine._current_trade_tags['absorption_detector_result'] = absorption_result.reason
+            engine._current_trade_tags['absorption_detector_signals'] = absorption_result.signal_count
+            
+            # 🔥 BREAKOUT OVERRIDE: Still allow if clear structure break
             allow_short_breakout = (
                 breakout_down_score >= 3  # Multiple confirmations = structure break
             ) or (
                 is_breakout_down and pct_60d > 5.0  # Breakout but NOT at floor yet
             ) or (
-                displacement_bypass and effective_adx > 50  # Volatility shock + strong trend
+                is_panic_mode and not has_absorption  # 🔥 FIX #56: Panic WITHOUT absorption
             )
             
+            # 🔥 FIX #56: SOFT MODE instead of HARD BLOCK
+            # En extreme low, NO bloqueamos shorts - los modulamos
             if ctx.bias == 'SHORT' and in_extreme_low and not allow_short_breakout:
-                # 🔥 FIX #41: Rate-limit log spam
+                # 🔥 FIX #56: SOFT MODE instead of HARD BLOCK
+                # NO bloqueamos - activamos SOFT MODE con restricciones
                 now = ctx.market_time
-                log_key = 'LOCATION_EXTREME_SHORT'
+                log_key = 'LOCATION_EXTREME_SOFT_SHORT'
                 last_log = _last_guard_log.get(log_key)
                 should_log = last_log is None or (now - last_log) > _guard_log_interval
                 
                 if should_log:
                     _last_guard_log[log_key] = now
                     logger.warning(
-                        f"🚫🚫🚫 GUARD BLOCKED: LOCATION EXTREME OVERSOLD | "
-                        f"Attempting SHORT at percentile {pct_60d:.1f}% | "
-                        f"Don't short the bottom"
+                        f"⚠️ LOCATION SOFT MODE: SHORT at extreme low ({pct_60d:.1f}%) | "
+                        f"Size→40%, TightStops, NeedConfirm | ADX_5m={adx_5m:.0f} vol={vol_ratio:.1f}"
                     )
-                result.passed = False
-                result.reason = f"Location extreme: SHORT at {pct_60d:.0f}% percentile"
-                result.tags['block_category'] = 'location_extreme'
-                engine._current_trade_tags['guard_blocked_by_location_extreme'] = True
                 
-                # 🔥 FIX #38 + #39: Invalidate SHORT edge AND forbid re-arming
-                if edge_mgr is not None:
-                    from src.domain.trading.edge_state_manager import EdgeState
-                    if edge_mgr.state in [EdgeState.EDGE_ACTIVE, EdgeState.EDGE_ARMED]:
-                        if edge_mgr.current_bos and edge_mgr.current_bos.direction == 'SHORT':
-                            logger.warning(
-                                f"🔄 EDGE INVALIDATED: SHORT edge reached bottom ({pct_60d:.1f}%) | "
-                                f"Edge objective achieved - price moved to extreme"
-                            )
-                            edge_mgr._transition_to(
-                                EdgeState.EDGE_EXPIRED,
-                                f"Location extreme: SHORT reached {pct_60d:.0f}% percentile",
-                                ctx.market_time
-                            )
-                            engine._current_trade_tags['edge_invalidated_by'] = 'location_extreme_achieved'
-                            
-                            # 🔥 FIX #39: Forbid SHORT direction until price leaves extreme zone
-                            # This prevents the edge from re-arming immediately
-                            engine._forbidden_direction = 'SHORT'
-                            engine._current_trade_tags['forbidden_by_location_extreme'] = True
-                            logger.warning(
-                                f"🚫 SHORT FORBIDDEN: Price at bottom ({pct_60d:.1f}%) | "
-                                f"No shorts allowed until price leaves extreme zone"
-                            )
+                # 🔥 FIX #56: Activar SOFT MODE en lugar de bloquear
+                engine._current_trade_tags['location_extreme_soft_mode'] = True
+                engine._current_trade_tags['location_extreme_size_cap'] = 0.40  # 40% max size
+                engine._current_trade_tags['location_extreme_tight_stops'] = True
+                engine._current_trade_tags['location_extreme_need_confirm'] = True
+                engine._current_trade_tags['location_extreme_percentile'] = pct_60d
                 
-                return result
+                # 🔥 FIX #56: NO return result - dejamos que continúe pero con soft mode
+                # El size cap y tight stops se aplicarán en el sizing/risk engine
             
-            # 🔥 FIX #41: Log when breakout override allows trading
+            # 🔥 FIX #56: Log cuando PANIC MODE o BREAKOUT permite trading normal
             if ctx.bias == 'SHORT' and in_extreme_low and allow_short_breakout:
-                log_key = 'BREAKOUT_OVERRIDE_SHORT'
+                log_key = 'LOCATION_PANIC_OVERRIDE_SHORT'
                 last_log = _last_guard_log.get(log_key)
                 should_log = last_log is None or (ctx.market_time - last_log) > _guard_log_interval
                 if should_log:
                     _last_guard_log[log_key] = ctx.market_time
+                    mode_reason = "PANIC_MODE" if is_panic_mode else f"BREAKOUT_SCORE={breakout_down_score}"
                     logger.info(
-                        f"✅ BREAKOUT OVERRIDE: SHORT allowed despite low percentile ({pct_60d:.1f}%) | "
-                        f"ADX={effective_adx:.1f} | Breakout_down={is_breakout_down} | Score={breakout_down_score}"
+                        f"🔥 LOCATION OVERRIDE: {mode_reason} | SHORT at low ({pct_60d:.1f}%) | "
+                        f"ADX_1h={effective_adx:.0f} ADX_5m={adx_5m:.0f} | Full size allowed"
                     )
             
-            # 🔥 FIX #41/#45: Check breakout up for LONG override
+            # 🔥 FIX #56: Same logic for LONG at extreme high
             is_breakout_up = getattr(location_ctx, 'is_breakout_up', False)
             breakout_up_score = getattr(location_ctx, 'breakout_up_score', 0)
-            # 🔥 FIX #45/#50: LONG at ceiling needs PROOF of continuation, not just ADX
-            # ADX=60 at percentile 98% = move already happened, chasing tops
+            
+            # Check MELT-UP mode (euphoria) - use CrashDetector result
+            is_meltup_mode = crash_result.is_meltup
+            
             allow_long_breakout = (
                 breakout_up_score >= 3  # Multiple confirmations = structure break
             ) or (
                 is_breakout_up and pct_60d < 95.0  # Breakout but NOT at ceiling yet
             ) or (
-                displacement_bypass and effective_adx > 50  # Volatility shock + strong trend
+                is_meltup_mode  # 🔥 FIX #56: Melt-up mode overrides location extreme
             )
             
             if ctx.bias == 'LONG' and in_extreme_high and not allow_long_breakout:
-                # Rate-limit log spam
+                # 🔥 FIX #56: SOFT MODE for LONGs at extreme high too
                 now = ctx.market_time
-                log_key = 'LOCATION_EXTREME_LONG'
+                log_key = 'LOCATION_EXTREME_SOFT_LONG'
                 last_log = _last_guard_log.get(log_key)
                 should_log = last_log is None or (now - last_log) > _guard_log_interval
                 
                 if should_log:
                     _last_guard_log[log_key] = now
                     logger.warning(
-                        f"🚫🚫🚫 GUARD BLOCKED: LOCATION EXTREME OVERBOUGHT | "
-                        f"Attempting LONG at percentile {pct_60d:.1f}% | "
-                        f"Don't buy the top"
+                        f"⚠️ LOCATION SOFT MODE: LONG at extreme high ({pct_60d:.1f}%) | "
+                        f"Size→40%, TightStops, NeedConfirm | ADX_5m={adx_5m:.0f} vol={vol_ratio:.1f}"
                     )
-                result.passed = False
-                result.reason = f"Location extreme: LONG at {pct_60d:.0f}% percentile"
-                result.tags['block_category'] = 'location_extreme'
-                engine._current_trade_tags['guard_blocked_by_location_extreme'] = True
                 
-                # 🔥 FIX #38 + #39: Invalidate LONG edge AND forbid re-arming
-                if edge_mgr is not None:
-                    from src.domain.trading.edge_state_manager import EdgeState
-                    if edge_mgr.state in [EdgeState.EDGE_ACTIVE, EdgeState.EDGE_ARMED]:
-                        if edge_mgr.current_bos and edge_mgr.current_bos.direction == 'LONG':
-                            logger.warning(
-                                f"🔄 EDGE INVALIDATED: LONG edge reached top ({pct_60d:.1f}%) | "
-                                f"Edge objective achieved - price moved to extreme"
-                            )
-                            edge_mgr._transition_to(
-                                EdgeState.EDGE_EXPIRED,
-                                f"Location extreme: LONG reached {pct_60d:.0f}% percentile",
-                                ctx.market_time
-                            )
-                            engine._current_trade_tags['edge_invalidated_by'] = 'location_extreme_achieved'
-                            
-                            # 🔥 FIX #39: Forbid LONG direction until price leaves extreme zone
-                            # This prevents the edge from re-arming immediately
-                            engine._forbidden_direction = 'LONG'
-                            engine._current_trade_tags['forbidden_by_location_extreme'] = True
-                            logger.warning(
-                                f"🚫 LONG FORBIDDEN: Price at top ({pct_60d:.1f}%) | "
-                                f"No longs allowed until price leaves extreme zone"
-                            )
+                # 🔥 FIX #56: Activar SOFT MODE en lugar de bloquear
+                engine._current_trade_tags['location_extreme_soft_mode'] = True
+                engine._current_trade_tags['location_extreme_size_cap'] = 0.40  # 40% max size
+                engine._current_trade_tags['location_extreme_tight_stops'] = True
+                engine._current_trade_tags['location_extreme_need_confirm'] = True
+                engine._current_trade_tags['location_extreme_percentile'] = pct_60d
                 
-                return result
+                # 🔥 FIX #56: NO return result - dejamos que continúe pero con soft mode
+            
+            # Log when MELT-UP mode allows normal trading
+            if ctx.bias == 'LONG' and in_extreme_high and allow_long_breakout:
+                log_key = 'LOCATION_MELTUP_OVERRIDE_LONG'
+                last_log = _last_guard_log.get(log_key)
+                should_log = last_log is None or (ctx.market_time - last_log) > _guard_log_interval
+                if should_log:
+                    _last_guard_log[log_key] = ctx.market_time
+                    mode_reason = "MELTUP_MODE" if is_meltup_mode else f"BREAKOUT_SCORE={breakout_up_score}"
+                    logger.info(
+                        f"🔥 LOCATION OVERRIDE: {mode_reason} | LONG at high ({pct_60d:.1f}%) | "
+                        f"ADX_1h={effective_adx:.0f} ADX_5m={adx_5m:.0f} | Full size allowed"
+                    )
         
         # =====================================================================
         # 🚨 GUARD 13: COUNTER-MOMENTUM BLOCK (Fix #17 - Feb 02, 2026)
@@ -906,6 +940,13 @@ class GuardOrchestrator:
         result.tags['session_base_limit'] = base_limit
         result.tags['session_mode_cap'] = mode_cap
         
+        # 🔥 FIX #60.2 (Feb 06): Reset OBSTINACY counter if all guards passed
+        # Conflicto #9: Counter se acumulaba incorrectamente si guards fallaban
+        # por otras razones (spread, location). Ahora solo se acumula cuando
+        # el bloqueo es específicamente por SHORT_OBSTINACY.
+        if result.passed:
+            engine._obstinacy_block_count = 0
+        
         return result
 
 
@@ -942,7 +983,12 @@ class ScoreOrchestrator:
         # Handle None df_1m
         df_1m_safe = ctx.df_1m if ctx.df_1m is not None else pd.DataFrame()
         
-        # 🔥 FIX (Jan 30): Check if DISPLACEMENT edge is active for structure bypass
+        # 🔥 FIX (Jan 30) + FIX #62 (Feb 06): Check if DISPLACEMENT is active for structure bypass
+        # FIX #62: The edge_type check alone misses cases where:
+        # 1. Displacement was detected → edge becomes TREND with CONSENSUS_DIRECT
+        # 2. The _displacement_bypass flag is still True
+        # 3. But EdgeType is TREND, not DISPLACEMENT
+        # Solution: Also check _displacement_bypass from trading_app state
         displacement_edge_active = False
         edge_mgr = getattr(engine, '_edge_manager', None)
         if edge_mgr is not None:
@@ -952,6 +998,30 @@ class ScoreOrchestrator:
                 edge_mgr.current_bos is not None and
                 edge_mgr.current_bos.edge_type == EdgeType.DISPLACEMENT
             )
+        
+        # 🔥 FIX #62: Also check trading_app's displacement_bypass flag
+        # This catches cases where DISPLACEMENT was detected but edge_type is TREND
+        if not displacement_edge_active:
+            displacement_bypass_flag = engine._current_trade_tags.get('displacement_bypass', False)
+            trend_displacement = engine._current_trade_tags.get('trend_displacement', False)
+            if displacement_bypass_flag or trend_displacement:
+                displacement_edge_active = True
+                logger.debug(
+                    f"🔥 FIX #62: DISPLACEMENT detected via trading_app flags | "
+                    f"displacement_bypass={displacement_bypass_flag} trend_displacement={trend_displacement}"
+                )
+        
+        # 🔥 FIX #56: Get expansion mode and ADX for structure gate overrides
+        expansion_mode_active = engine._current_trade_tags.get('expansion_mode_activated', False)
+        effective_adx = engine._current_trade_tags.get('effective_adx', 0) or engine._current_trade_tags.get('htf_adx', 0)
+        
+        # 🔥 FIX #61: Check if bias was inverted by micro-trend
+        bias_inverted = engine._current_trade_tags.get('bias_inverted', False)
+        
+        # 🔥 FIX #63: Check if bias was invalidated (opposite direction forbidden)
+        # This happens when price moves significantly against the old bias
+        # e.g., "SHORT invalidated → FORBID SHORT, LONG detection ENABLED"
+        bias_invalidated = engine._current_trade_tags.get('bias_invalidated', False)
         
         # 1. Base score from scorer
         score, breakdown, structure_blocks = engine._entry_scorer.calculate_entry_score(
@@ -964,6 +1034,10 @@ class ScoreOrchestrator:
             micro_trend_state=getattr(engine, '_micro_trend_state', None),
             filter_pipeline=getattr(engine, 'filter_pipeline', None),
             displacement_edge_active=displacement_edge_active,  # 🔥 FIX: Bypass structure for displacement
+            expansion_mode_active=expansion_mode_active,        # 🔥 FIX #56: Bypass for expansion
+            strong_trend_adx=effective_adx,                     # 🔥 FIX #56: Bypass for strong trend
+            bias_inverted=bias_inverted,                        # 🔥 FIX #61: Bypass for bias inversion
+            bias_invalidated=bias_invalidated,                  # 🔥 FIX #63: Bypass for bias flip
         )
         
         result.score = float(score)
@@ -1120,6 +1194,27 @@ class SizingOrchestrator:
     
     LEGACY MODE (for comparison):
     All 13+ multipliers active
+    
+    🔥 FIX #60.3 (Feb 06): SIZING ORDER DOCUMENTATION
+    =================================================
+    Size caps are applied as MULTIPLIERS, meaning they are multiplicative
+    with other factors, not absolute caps. The order is:
+    
+    1. Base size = capital * risk_pct / price_risk
+    2. Edge multiplier (1.0-1.5x for institutional, 0.15-0.30x for intraday)
+    3. Regime multiplier (0.5-1.0x based on ADX)
+    4. Session multiplier (0.6-1.0x based on session quality)
+    5. Loss streak multiplier (0.5-1.0x if consecutive losses)
+    6. Spread multiplier (0.5-1.0x if spread is wide)
+    7. Countertrend multiplier (0.3-0.5x for CT trades)
+    8. CAPS APLICADOS ÚLTIMOS (siempre son min con final):
+       - obstinacy_soft_size_cap (0.5x when SOFT MODE active)
+       - kill_check_size_cap (0.5x when kill switch partial)
+       - gate_size_cap (0.5x when guards detect risk)
+    
+    IMPORTANTE: Los caps son MULTIPLICATIVOS, no ABSOLUTOS.
+    Si obstinacy_soft_cap = 0.5 y el size calculado es 0.001 BTC,
+    el final será 0.0005 BTC, NO 0.5 BTC.
     """
     
     @staticmethod
@@ -1426,6 +1521,26 @@ class OrderExecutor:
                     stop_loss=stop_loss,
                     take_profit=take_profit
                 )
+                
+                # 🔥 FIX #65 (Feb 06, 2026): FALLBACK TO IOC IF POST-ONLY REJECTED
+                # When price is moving fast (bias_flip, momentum), post-only fails
+                # Instead of 5min cooldown, try IOC to catch the move
+                if order_result is None:
+                    bias_flip = engine._current_trade_tags.get('bias_invalidated', False)
+                    bias_inverted = engine._current_trade_tags.get('bias_inverted', False)
+                    
+                    if bias_flip or bias_inverted:
+                        logger.warning(f"🔄 FIX #65 POST-ONLY FALLBACK: Retrying with IOC (bias_flip={bias_flip}, bias_inverted={bias_inverted})")
+                        order_result = await engine.execution.place_aggressive_order(
+                            symbol=engine.symbol,
+                            side='buy' if ctx.bias == 'LONG' else 'sell',
+                            amount=size,
+                            price=ctx.current_price,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit
+                        )
+                        if order_result:
+                            logger.info(f"✅ FIX #65 IOC FALLBACK SUCCESS: Order filled as taker")
             
             if order_result:
                 result.success = True
@@ -1966,6 +2081,10 @@ async def _displacement_fast_path(
         # Obtener entry_scorer si está disponible
         entry_scorer = getattr(engine, '_entry_scorer', None)
         if entry_scorer and ctx.df_1h is not None and ctx.df_5m is not None and ctx.df_1m is not None:
+            # 🔥 FIX #56: Get context for structure gate overrides
+            expansion_mode_active = engine._current_trade_tags.get('expansion_mode_activated', False)
+            effective_adx = engine._current_trade_tags.get('effective_adx', 0) or engine._current_trade_tags.get('htf_adx', 0)
+            
             # Calcular score con la firma correcta del método
             score, breakdown, structure_blocked = entry_scorer.calculate_entry_score(
                 df_1h=ctx.df_1h,
@@ -1977,6 +2096,8 @@ async def _displacement_fast_path(
                 micro_trend_state=getattr(engine, '_micro_trend_state', None),
                 filter_pipeline=getattr(engine, '_entry_filter_pipeline', None),
                 displacement_edge_active=True,  # FAST_PATH = displacement activo
+                expansion_mode_active=expansion_mode_active,  # 🔥 FIX #56
+                strong_trend_adx=effective_adx,               # 🔥 FIX #56
             )
             fast_path_score = score
             fast_path_breakdown = breakdown
@@ -2340,6 +2461,9 @@ async def _displacement_fast_path(
             session_name = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
             trade_type_name = trade_type.value if hasattr(trade_type, 'value') else str(trade_type)
             
+            # 🔥 EDGE TYPE (Feb 05, 2026): Get edge_type from tags
+            edge_type_for_log = engine._current_trade_tags.get('edge_type', '')
+            
             engine._current_trade_id = engine.trade_logger.start_trade(
                 symbol=engine.symbol,
                 direction=disp_direction,
@@ -2357,7 +2481,8 @@ async def _displacement_fast_path(
                 metadata={'fast_path': True, 'bars_since': bars_since},
                 feature_snapshot=engine._build_ml_feature_snapshot() if hasattr(engine, '_build_ml_feature_snapshot') else {},
                 entry_trading_mode=engine._current_trade_tags.get('trading_mode', ''),
-                entry_daily_regime=getattr(engine, '_daily_regime', '')
+                entry_daily_regime=getattr(engine, '_daily_regime', ''),
+                edge_type=edge_type_for_log
             )
         except Exception as e:
             logger.error(f"TradeLogger.start_trade() failed: {e}")
@@ -2746,6 +2871,20 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     regime_config = engine.regime_detector.get_config(ctx.regime) if hasattr(engine, 'regime_detector') else None
     regime_sl_mult = regime_config.sl_atr_multiplier if regime_config else 2.0
     
+    # 🔥 FIX #56: TIGHT STOPS in LOCATION EXTREME SOFT MODE
+    # When trading in extreme location, use tighter stops to limit risk
+    location_tight_stops = engine._current_trade_tags.get('location_extreme_tight_stops', False)
+    if location_tight_stops:
+        # Reduce SL multiplier by 30% for tighter stops
+        original_mult = regime_sl_mult
+        regime_sl_mult = max(1.0, regime_sl_mult * 0.7)  # At least 1.0 ATR
+        logger.warning(
+            f"⚠️ TIGHT STOPS: Location extreme → SL mult {original_mult:.1f} → {regime_sl_mult:.1f}"
+        )
+        engine._current_trade_tags['tight_stop_applied'] = True
+        engine._current_trade_tags['tight_stop_original_mult'] = original_mult
+        engine._current_trade_tags['tight_stop_new_mult'] = regime_sl_mult
+    
     stop_loss = engine.risk_engine.calculate_stop_loss(
         current_price, bias, support_resistance, ctx.atr_for_sl,
         atr_ratio=getattr(engine, '_last_atr_ratio', None),
@@ -2791,54 +2930,79 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     #
     # EXCEPTION: If we're in BREAKOUT mode (breaking out of range), allow more room
     # =========================================================================
+    # 🔥 FIX (Feb 05, 2026): DISABLE TP CAPPING ENTIRELY DURING CONFIRMED BREAKOUT
+    # =========================================================================
+    # PROBLEM: On 2026-02-05, the system detected BREAKOUT correctly (score=4)
+    #          but still capped TP to stale range_low_60d, resulting in NEGATIVE R:R
+    #          (R:R = -0.13R, -0.19R, -0.20R) which blocked 30+ valid entries.
+    #
+    # ROOT CAUSE: The buffer_pct (2% vs 0.5%) is not enough when price has already
+    #             moved significantly beyond the range. The capped TP ends up
+    #             ABOVE the entry price for shorts.
+    #
+    # SOLUTION: During CONFIRMED breakout (breakout_score >= 3), do NOT cap TP at all.
+    #           The breakout IS the edge - let the TP extend into new territory.
+    # =========================================================================
     location_ctx = getattr(engine, '_location_context', None)
     if location_ctx and risk > 0:
         is_breakout = location_ctx.is_breakout_up or location_ctx.is_breakout_down
         
-        # Buffer: 0.5% in normal mode, 2% in breakout mode
-        buffer_pct = 0.02 if is_breakout else 0.005
-        
-        if bias == 'SHORT':
-            # For SHORT, TP is below current price
-            # Cap at historical low minus small buffer
-            historical_floor = location_ctx.range_low_60d * (1 - buffer_pct)
+        # 🔥 FIX: Skip TP capping entirely during confirmed breakout
+        if is_breakout:
+            # Get breakout score for logging
+            breakout_score = location_ctx.breakout_up_score if location_ctx.is_breakout_up else location_ctx.breakout_down_score
+            logger.info(
+                f"🚀 BREAKOUT TP BYPASS: Confirmed breakout (score={breakout_score}) | "
+                f"TP NOT capped - allowing extension beyond historical range | "
+                f"TP={take_profit:.0f}, entry={current_price:.0f}, "
+                f"is_breakout_up={location_ctx.is_breakout_up}, is_breakout_down={location_ctx.is_breakout_down}"
+            )
+            # Skip all TP capping logic - don't modify take_profit
+        else:
+            # Normal mode: Apply TP capping to historical range
+            buffer_pct = 0.005  # 0.5% buffer
             
-            if take_profit < historical_floor:
-                original_tp = take_profit
-                take_profit = historical_floor
-                # Recalculate actual R:R we'll get
-                actual_r = (current_price - take_profit) / risk if risk > 0 else 0
-                logger.warning(
-                    f"⚠️ TP CAPPED BY RANGE: SHORT TP {original_tp:.0f} → {take_profit:.0f} | "
-                    f"60d-low={location_ctx.range_low_60d:.0f} | "
-                    f"Effective R:R = {actual_r:.2f}R (was {tp_mult:.2f}R) | "
-                    f"pct_60d={location_ctx.percentile_60d:.1f}%"
-                )
-                engine._current_trade_tags['tp_capped_by_range'] = True
-                engine._current_trade_tags['tp_original'] = original_tp
-                engine._current_trade_tags['tp_capped_to'] = take_profit
-                engine._current_trade_tags['effective_tp_r'] = actual_r
+            if bias == 'SHORT':
+                # For SHORT, TP is below current price
+                # Cap at historical low minus small buffer
+                historical_floor = location_ctx.range_low_60d * (1 - buffer_pct)
                 
-        elif bias == 'LONG':
-            # For LONG, TP is above current price
-            # Cap at historical high plus small buffer
-            historical_ceiling = location_ctx.range_high_60d * (1 + buffer_pct)
-            
-            if take_profit > historical_ceiling:
-                original_tp = take_profit
-                take_profit = historical_ceiling
-                # Recalculate actual R:R we'll get
-                actual_r = (take_profit - current_price) / risk if risk > 0 else 0
-                logger.warning(
-                    f"⚠️ TP CAPPED BY RANGE: LONG TP {original_tp:.0f} → {take_profit:.0f} | "
-                    f"60d-high={location_ctx.range_high_60d:.0f} | "
-                    f"Effective R:R = {actual_r:.2f}R (was {tp_mult:.2f}R) | "
-                    f"pct_60d={location_ctx.percentile_60d:.1f}%"
-                )
-                engine._current_trade_tags['tp_capped_by_range'] = True
-                engine._current_trade_tags['tp_original'] = original_tp
-                engine._current_trade_tags['tp_capped_to'] = take_profit
-                engine._current_trade_tags['effective_tp_r'] = actual_r
+                if take_profit < historical_floor:
+                    original_tp = take_profit
+                    take_profit = historical_floor
+                    # Recalculate actual R:R we'll get
+                    actual_r = (current_price - take_profit) / risk if risk > 0 else 0
+                    logger.warning(
+                        f"⚠️ TP CAPPED BY RANGE: SHORT TP {original_tp:.0f} → {take_profit:.0f} | "
+                        f"60d-low={location_ctx.range_low_60d:.0f} | "
+                        f"Effective R:R = {actual_r:.2f}R (was {tp_mult:.2f}R) | "
+                        f"pct_60d={location_ctx.percentile_60d:.1f}%"
+                    )
+                    engine._current_trade_tags['tp_capped_by_range'] = True
+                    engine._current_trade_tags['tp_original'] = original_tp
+                    engine._current_trade_tags['tp_capped_to'] = take_profit
+                    engine._current_trade_tags['effective_tp_r'] = actual_r
+                    
+            elif bias == 'LONG':
+                # For LONG, TP is above current price
+                # Cap at historical high plus small buffer
+                historical_ceiling = location_ctx.range_high_60d * (1 + buffer_pct)
+                
+                if take_profit > historical_ceiling:
+                    original_tp = take_profit
+                    take_profit = historical_ceiling
+                    # Recalculate actual R:R we'll get
+                    actual_r = (take_profit - current_price) / risk if risk > 0 else 0
+                    logger.warning(
+                        f"⚠️ TP CAPPED BY RANGE: LONG TP {original_tp:.0f} → {take_profit:.0f} | "
+                        f"60d-high={location_ctx.range_high_60d:.0f} | "
+                        f"Effective R:R = {actual_r:.2f}R (was {tp_mult:.2f}R) | "
+                        f"pct_60d={location_ctx.percentile_60d:.1f}%"
+                    )
+                    engine._current_trade_tags['tp_capped_by_range'] = True
+                    engine._current_trade_tags['tp_original'] = original_tp
+                    engine._current_trade_tags['tp_capped_to'] = take_profit
+                    engine._current_trade_tags['effective_tp_r'] = actual_r
     
     # =========================================================================
     # 🔥 NEW (Feb 04, 2026): BLOCK if TP cap results in R:R too low
@@ -3229,6 +3393,9 @@ async def _handle_instant_fill(
         session_name = ctx.session_name
         trade_type_name = trade_type.value if hasattr(trade_type, 'value') else str(trade_type)
         
+        # 🔥 EDGE TYPE (Feb 05, 2026): Get edge_type from tags
+        edge_type_for_log = engine._current_trade_tags.get('edge_type', '')
+        
         engine._current_trade_id = engine.trade_logger.start_trade(
             symbol=engine.symbol,
             direction=ctx.bias,
@@ -3246,7 +3413,8 @@ async def _handle_instant_fill(
             metadata={},
             feature_snapshot=engine._build_ml_feature_snapshot() if hasattr(engine, '_build_ml_feature_snapshot') else {},
             entry_trading_mode=engine._current_trade_tags.get('trading_mode', ''),
-            entry_daily_regime=getattr(engine, '_daily_regime', '')
+            entry_daily_regime=getattr(engine, '_daily_regime', ''),
+            edge_type=edge_type_for_log
         )
     except Exception as e:
         logger.error(f"TradeLogger.start_trade() failed: {e}")

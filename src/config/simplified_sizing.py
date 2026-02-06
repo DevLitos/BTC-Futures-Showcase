@@ -120,14 +120,16 @@ class SimplifiedSizingResult:
 # =============================================================================
 class RRBucket:
     """
-    Simplified RR sizing.
+    🔥 SCALPING INTELIGENTE - Calidad > Cantidad
     
-    OLD: Complex curve with 0.25x, 0.5x, 0.75x...
-    NEW: 3 buckets only
+    FIX (Feb 05, 2026): Sistema de 5-15 trades/día
+    - NO queremos trades basura de bajo RR
+    - Preferimos MENOS trades de MAYOR calidad
+    - Bloquear trades < 0.6R, reducir < 0.9R
     """
-    BLOCK_THRESHOLD = 0.70       # Below this = HARD BLOCK
-    REDUCED_THRESHOLD = 1.00     # Below this = 0.5x
-    # Above 1.0R = 1.0x
+    BLOCK_THRESHOLD = 0.60       # Below this = HARD BLOCK (quality filter)
+    REDUCED_THRESHOLD = 0.90     # Below this = 0.75x (moderate quality)
+    # Above 0.6R = 1.0x
     
     @classmethod
     def get_multiplier(cls, worst_case_rr: float) -> Tuple[float, bool]:
@@ -137,7 +139,7 @@ class RRBucket:
         if worst_case_rr < cls.BLOCK_THRESHOLD:
             return 0.0, True  # HARD BLOCK
         elif worst_case_rr < cls.REDUCED_THRESHOLD:
-            return 0.5, False  # Reduced but trade
+            return 0.75, False  # Slightly reduced (was 0.5)
         else:
             return 1.0, False  # Full size
 
@@ -832,35 +834,46 @@ class SimplifiedExitConfig:
     INTRADAY is high frequency, small wins.
     """
     
-    # WTP - DISABLED for 30 days to see true edge
-    WORST_TRADE_PREVENTION_ENABLED = False  # 🔥 THIS IS THE PAINFUL DECISION
+    # 🔥 SCALPING INTELIGENTE (Feb 05, 2026)
+    # NO es scalping de alto volumen (100 trades/día)
+    # ES scalping de CALIDAD (5-15 trades/día con edge real)
+    # 
+    # Filosofía: Menos oportunidades, más calidad
+    # - TP moderados (1.0-1.5R) para dar tiempo al trade
+    # - Filtros estrictos para solo trades de alta probabilidad
+    # - WTP deshabilitado para ver edge real
     
-    # Take Profit - Fixed by regime (INSTITUTIONAL)
-    TP_R_TREND = 1.5    # 1.5R in trending markets
-    TP_R_RANGE = 1.0    # 1.0R in ranging markets
+    # Take Profit - Moderados para calidad
+    TP_R_TREND = 1.2    # 1.2R en tendencia (equilibrio calidad/frecuencia)
+    TP_R_RANGE = 0.8    # 0.8R en rango (scalp conservador)
     
-    # 🔥 BREAKOUT edge - higher TP target obligatorio
-    TP_R_BREAKOUT = 2.0       # BREAKOUT MUST target 2.0R minimum (low winrate)
-    TP_R_BREAKOUT_IDEAL = 3.0 # Ideal target for BREAKOUT
+    # 🔥 BREAKOUT edge - Alto TP porque baja frecuencia
+    TP_R_BREAKOUT = 1.8       # BREAKOUT target (calidad > cantidad)
+    TP_R_BREAKOUT_IDEAL = 2.5 # Ideal target for BREAKOUT
     
-    # 🔥 DISPLACEMENT edge (Jan 30, 2026) - Momentum plays need room to run
-    TP_R_DISPLACEMENT = 2.0        # DISPLACEMENT targets 2.0R (institutional momentum)
-    TP_R_DISPLACEMENT_IDEAL = 2.5  # Ideal 2.5R for strong displacement
+    # 🔥 DISPLACEMENT edge - Momentum institucional
+    TP_R_DISPLACEMENT = 1.5        # DISPLACEMENT targets 1.5R
+    TP_R_DISPLACEMENT_IDEAL = 2.0  # Ideal 2.0R for strong displacement
     
-    # 🔥 INTRADAY edge - Must be >= RR floor (0.7R) to be viable
-    # Jan 28, 2026: Changed from 0.5R to 1.0R - 0.5R was ALWAYS blocked by RR floor
-    TP_R_INTRADAY = 1.0       # Same as RANGE (must pass RR floor)
-    TP_R_INTRADAY_MIN = 0.8   # Minimum 0.8R (above 0.7R floor)
-    TP_R_INTRADAY_MAX = 1.0   # Maximum 1.0R (keep conservative)
+    # 🔥 INTRADAY edge - Core scalping targets
+    TP_R_INTRADAY = 0.8       # Scalp target
+    TP_R_INTRADAY_MIN = 0.5   # Mínimo 0.5R 
+    TP_R_INTRADAY_MAX = 1.0   # Máximo 1.0R
     SL_R_INTRADAY_MAX = 0.5   # SL técnico: máximo 0.5R
     
     # Trailing - Only after profit
     TRAILING_ACTIVATION_R = 1.0  # Only trail after 1R profit
     TRAILING_ATR_MULT = 1.5      # Trail at 1.5 ATR
     
+    # 🔥 NEW (Feb 05, 2026): PROFIT LOCK TEMPRANO
+    # Problema: Trades llegan a 0.2-0.3R MFE pero no capturamos la ganancia
+    # Solución: Lock profit temprano antes del trailing estándar
+    PROFIT_LOCK_ACTIVATION_R = 0.20  # Start protecting at 0.20R profit
+    PROFIT_LOCK_AT_R = 0.10          # Lock stop at breakeven + 0.10R buffer
+    
     # Time Invalidation - Simplified
     TIME_INVALIDATION_MINUTES = 60  # 60 min flat (INSTITUTIONAL)
-    TIME_INVALIDATION_INTRADAY_MIN = 5  # 5 min for INTRADAY
+    TIME_INVALIDATION_INTRADAY_MIN = 15  # 🔥 FIX Feb 05: 15 min for INTRADAY (was 5)
     TIME_INVALIDATION_MAX_LOSS_R = -0.20  # 🔥 FIX: -0.20R (was -0.50R!)
     
     # Stop Loss - No change (structural)

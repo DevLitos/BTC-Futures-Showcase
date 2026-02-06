@@ -33,26 +33,42 @@ logger = logging.getLogger(__name__)
 
 
 class SignalPriority(Enum):
-    """Priority levels for direction signals.
-    
-    HIERARCHY (highest wins):
-    - EXPANSION_MODE (100): Strong displacement with direction lock - BYPASSES VETO
-    - EDGE_BREAKOUT (95): Breakout/Displacement edge armed - sovereign authority
-    - DISPLACEMENT (90): Large price movement detected
-    - ANTICIPATION (85): Anticipation breakout pending
-    - FAST_REVERSAL (80): Single-candle reversal detected
-    - MICRO_MOMENTUM (70): HH/HL scoring on recent candles
-    - STRUCTURAL_BIAS (60): HTF EMA-based bias
-    - FORBIDDEN_FALLBACK (50): When everything else is blocked
     """
-    EXPANSION_MODE = 100      # Highest - Strong displacement with lock (BYPASSES VETO)
-    EDGE_BREAKOUT = 95        # Breakout/Displacement edge - sovereign authority
-    DISPLACEMENT = 90         # Large price movement
-    ANTICIPATION = 85         # Anticipation breakout pending
-    FAST_REVERSAL = 80        # Single-candle reversal (overrides momentum)
-    MICRO_MOMENTUM = 70       # HH/HL scoring
-    STRUCTURAL_BIAS = 60      # HTF EMA-based
-    FORBIDDEN_FALLBACK = 50   # When nothing else works
+    Priority levels for direction signals.
+    
+    🔥 REFACTOR (Feb 05, 2026): SIMPLIFIED HIERARCHY
+    
+    PROBLEM: We had 8 priority levels (100, 95, 90, 85, 80, 70, 60, 50).
+    Each module wanted to be the boss. Result: conflicting signals, erratic behavior.
+    
+    SOLUTION: Only 4 CORE signals can determine direction:
+    1. DISPLACEMENT (the market MOVED - fastest, most reliable)
+    2. BREAKOUT (compression broke - confirmed direction)  
+    3. ANTICIPATION (100% accuracy - pre-breakout detection)
+    4. ADX_TREND (sustained trend - ADX > 20 with direction)
+    
+    Everything else (MICRO_MOMENTUM, STRUCTURAL_BIAS, etc.) becomes ADVISORY ONLY.
+    They can reduce size or add confidence, but NOT determine direction.
+    
+    NEW HIERARCHY:
+    - CORE (100): DISPLACEMENT, EXPANSION_MODE, EDGE_BREAKOUT, ANTICIPATION → determines direction
+    - CONFIRMER (50): STRUCTURAL_BIAS → confirms or warns
+    - ADVISORY (10): MICRO_MOMENTUM, FAST_REVERSAL → size adjustment only
+    """
+    # CORE LEVEL (100) - These DETERMINE direction (only one needs to fire)
+    EXPANSION_MODE = 100      # Strong displacement with lock - BYPASSES ALL
+    EDGE_BREAKOUT = 100       # Same level as EXPANSION (sovereign)
+    DISPLACEMENT = 100        # Same level as EXPANSION (sovereign)
+    ANTICIPATION = 100        # 🔥 RESTORED: 100% accuracy = CORE signal
+    
+    # CONFIRMER LEVEL (50) - These CONFIRM but don't override CORE
+    STRUCTURAL_BIAS = 50      # HTF EMA-based bias
+    
+    # ADVISORY LEVEL (10) - These ADVISE but never determine direction
+    # 🔥 REFACTOR: These signals are LAGGING. They should NOT set direction.
+    FAST_REVERSAL = 10        # Downgraded from 80 → advisory only
+    MICRO_MOMENTUM = 10       # Downgraded from 70 → advisory only
+    FORBIDDEN_FALLBACK = 10   # Last resort
     NONE = 0                  # No signal
 
 
@@ -103,11 +119,76 @@ class DirectionOrchestrator:
     
     Collects signals from multiple sources, applies priority rules,
     and outputs a single coherent direction decision.
+    
+    🔥 FIX (Feb 05, 2026): Added circuit breaker for consecutive direction failures.
+    If 3 consecutive directions result in losses, PAUSE for N candles.
     """
+    
+    # Circuit breaker configuration
+    CIRCUIT_BREAKER_LOSSES = 3       # Consecutive losses to trigger
+    CIRCUIT_BREAKER_PAUSE_CANDLES = 10  # Candles to pause after trigger
     
     def __init__(self):
         self._last_result: Optional[OrchestrationResult] = None
         self._signal_history: List[DirectionSignal] = []
+        
+        # 🔥 Circuit breaker state
+        self._direction_outcomes: List[bool] = []  # True=win, False=loss
+        self._circuit_breaker_active: bool = False
+        self._circuit_breaker_until_tick: int = 0
+        self._consecutive_losses: int = 0
+    
+    def record_direction_outcome(self, was_profitable: bool, tick_count: int = 0):
+        """
+        Record whether the last direction decision was profitable.
+        
+        🔥 NEW (Feb 05, 2026): Circuit breaker for consecutive failures.
+        If 3 consecutive directions → loss, pause for 10 candles.
+        
+        Args:
+            was_profitable: True if trade was profitable
+            tick_count: Current tick for pause timing
+        """
+        self._direction_outcomes.append(was_profitable)
+        
+        # Keep last 20
+        if len(self._direction_outcomes) > 20:
+            self._direction_outcomes = self._direction_outcomes[-20:]
+        
+        # Update consecutive losses
+        if was_profitable:
+            self._consecutive_losses = 0
+        else:
+            self._consecutive_losses += 1
+        
+        # Check circuit breaker
+        if self._consecutive_losses >= self.CIRCUIT_BREAKER_LOSSES:
+            self._circuit_breaker_active = True
+            self._circuit_breaker_until_tick = tick_count + self.CIRCUIT_BREAKER_PAUSE_CANDLES
+            logger.warning(
+                f"🚨 DIRECTION CIRCUIT BREAKER TRIGGERED: {self._consecutive_losses} consecutive losses | "
+                f"Pausing direction decisions for {self.CIRCUIT_BREAKER_PAUSE_CANDLES} candles"
+            )
+    
+    def is_circuit_breaker_active(self, tick_count: int = 0) -> tuple[bool, str]:
+        """
+        Check if circuit breaker is active.
+        
+        Returns:
+            (is_active, reason_string)
+        """
+        if not self._circuit_breaker_active:
+            return False, ""
+        
+        if tick_count >= self._circuit_breaker_until_tick:
+            # Circuit breaker expired
+            self._circuit_breaker_active = False
+            self._consecutive_losses = 0
+            logger.info(f"✅ DIRECTION CIRCUIT BREAKER RESET at tick {tick_count}")
+            return False, ""
+        
+        remaining = self._circuit_breaker_until_tick - tick_count
+        return True, f"CIRCUIT_BREAKER: {self._consecutive_losses} losses, {remaining} candles remaining"
         
     def orchestrate(self,
                     # Expansion mode signals (Priority 100 - HIGHEST)
@@ -196,7 +277,7 @@ class DirectionOrchestrator:
                 metadata={'strong': strong_displacement}
             ))
         
-        # 4. ANTICIPATION - Pre-signal direction (85)
+        # 4. ANTICIPATION - CORE signal (100) - 100% accuracy confirmed by user
         # 🔥 FIX #28 (Feb 04): Use actual confidence and mark high-confidence for bypass
         if anticipation_pending and anticipation_direction:
             actual_conf = anticipation_confidence if anticipation_confidence > 0 else 0.55
@@ -210,18 +291,23 @@ class DirectionOrchestrator:
                 metadata={'pending': True, 'high_confidence': is_high_confidence, 'can_bypass_forbidden': is_high_confidence}
             ))
         
-        # 5. FAST_REVERSAL - Single-candle reversal (80)
+        # 5. FAST_REVERSAL - Single-candle reversal
+        # 🔥 REFACTOR (Feb 05, 2026): Now ADVISORY only - cannot determine direction
+        # It can only be used to CONFIRM or add confidence to an existing CORE signal
         if fast_reversal_detected and fast_reversal_direction:
             signals.append(DirectionSignal(
                 source='FAST_REVERSAL',
                 direction=fast_reversal_direction,
                 priority=SignalPriority.FAST_REVERSAL,
                 confidence=fast_reversal_confidence,
-                reason="Fast reversal candle detected",
-                metadata={'override_momentum': True}
+                reason="Fast reversal (advisory only)",
+                metadata={'override_momentum': False, 'is_advisory': True}  # 🔥 CHANGED
             ))
         
-        # 6. MICRO_MOMENTUM - HH/HL scoring (70)
+        # 6. MICRO_MOMENTUM - HH/HL scoring
+        # 🔥 REFACTOR (Feb 05, 2026): Now ADVISORY only - CANNOT determine direction
+        # This is the KEY FIX. MicroMomentum is LAGGING. It should not set direction.
+        # It can only modify size/confidence of an existing CORE direction.
         if micro_momentum:
             conf = 0.9 if micro_momentum_strength == 'STRONG' else 0.6
             signals.append(DirectionSignal(
@@ -229,19 +315,20 @@ class DirectionOrchestrator:
                 direction=micro_momentum,
                 priority=SignalPriority.MICRO_MOMENTUM,
                 confidence=conf,
-                reason=f"Micro momentum {micro_momentum_strength}",
-                metadata={'strength': micro_momentum_strength}
+                reason=f"Micro momentum {micro_momentum_strength} (advisory only)",
+                metadata={'strength': micro_momentum_strength, 'is_advisory': True}  # 🔥 CHANGED
             ))
         
-        # 7. STRUCTURAL_BIAS - HTF EMA (60)
+        # 7. STRUCTURAL_BIAS - HTF EMA
+        # 🔥 REFACTOR: Now CONFIRMER level - can confirm but not override CORE
         if structural_bias:
             signals.append(DirectionSignal(
                 source='STRUCTURAL_BIAS',
                 direction=structural_bias,
                 priority=SignalPriority.STRUCTURAL_BIAS,
                 confidence=0.5,
-                reason="HTF structural bias",
-                metadata={}
+                reason="HTF structural bias (confirmer)",
+                metadata={'is_confirmer': True}
             ))
         
         # 8. FORBIDDEN_FALLBACK - When nothing else works (10)
@@ -263,6 +350,26 @@ class DirectionOrchestrator:
         signals.sort(reverse=True)
         
         # =====================================================================
+        # 🔥 REFACTOR (Feb 05, 2026): FILTER ADVISORY SIGNALS WHEN CORE EXISTS
+        # Advisory signals (MICRO_MOMENTUM, FAST_REVERSAL) should NOT determine
+        # direction when there are CORE signals (DISPLACEMENT, BREAKOUT, EXPANSION)
+        # =====================================================================
+        core_signals = [s for s in signals if s.priority.value >= 100]
+        confirmer_signals = [s for s in signals if 10 < s.priority.value < 100]
+        advisory_signals = [s for s in signals if s.priority.value <= 10]
+        
+        # If we have CORE signals, ADVISORY signals cannot determine direction
+        # They can only be used for confidence/size adjustment
+        if core_signals:
+            # Log that we're ignoring advisory signals
+            if advisory_signals:
+                advisory_dirs = [f"{s.source}={s.direction}" for s in advisory_signals]
+                logger.debug(
+                    f"🎯 CORE SIGNAL ACTIVE: {core_signals[0].source}={core_signals[0].direction} | "
+                    f"Ignoring advisory signals: {', '.join(advisory_dirs)}"
+                )
+        
+        # =====================================================================
         # APPLY VETO LOGIC
         # =====================================================================
         winning_signal: Optional[DirectionSignal] = None
@@ -272,15 +379,14 @@ class DirectionOrchestrator:
         conflict_details = ""
         
         for signal in signals:
-            # EXPANSION_MODE bypasses EVERYTHING including forbidden_direction
-            if signal.priority == SignalPriority.EXPANSION_MODE:
-                winning_signal = signal
-                final_direction = signal.direction
-                break
+            # 🔥 SKIP ADVISORY signals if we have CORE signals
+            if signal.metadata.get('is_advisory') and core_signals:
+                logger.debug(f"⏭️ Skipping advisory signal {signal.source}={signal.direction}")
+                continue
             
-            # EDGE_BREAKOUT has SOVEREIGN AUTHORITY - only EXPANSION can override
-            # It bypasses forbidden_direction
-            if signal.priority == SignalPriority.EDGE_BREAKOUT:
+            # EXPANSION_MODE/EDGE_BREAKOUT/DISPLACEMENT are all CORE (100)
+            # They bypass EVERYTHING including forbidden_direction
+            if signal.priority.value >= 100:
                 winning_signal = signal
                 final_direction = signal.direction
                 break

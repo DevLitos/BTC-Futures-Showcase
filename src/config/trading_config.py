@@ -401,11 +401,11 @@ class AsymmetryConfig:
     MAX_STOP_R = 1.0                 # Stop máximo = 1.0R (igual que TP)
     
     # TIME_INVALIDATION: EXIT RÁPIDO SI NO FUNCIONA
-    # 🔥 FIX (Feb 04, 2026): TIME_INVALIDATION_MAX_LOSS = -10.27R (27 trades)
-    # Avg loss was -0.38R when limit was -0.30R. Code allowed -0.50R/-0.60R for
-    # DISPLACEMENT/RANGE. This destroyed all gains (+8.56R from other trades).
-    # SOLUTION: Much stricter limits across the board.
-    TIME_INVALIDATION_CANDLES = 8   # 8 velas 1m = 8 min
+    # 🔥 FIX (Feb 05, 2026): Scalping adjustment
+    # OLD: 8 candles → Too aggressive, trades never develop
+    # NEW: 15 candles (15 min) → Standard scalp window
+    # Still strict on MAX_LOSS (-0.20R) to prevent disasters
+    TIME_INVALIDATION_CANDLES = 15  # 15 velas 1m = 15 min
     TIME_INVALIDATION_EXIT_R = 0.0  # Target: salir en breakeven o mejor
     TIME_INVALIDATION_MAX_LOSS_R = -0.20  # 🔥 FIX: -0.20R (was -0.30R) - cut faster!
     
