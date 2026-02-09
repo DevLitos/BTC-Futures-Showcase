@@ -195,7 +195,8 @@ class WaitFillHandler:
                     
                     ctx.record_trade_price(fill_price)
                     
-                    ctx.state_machine.record_trade_open(ctx.pending_order_id)
+                    if ctx.pending_order_id:
+                        ctx.state_machine.record_trade_open(ctx.pending_order_id)
                     ctx.reset_trade_state("Instant fill processed")
                     ctx.state_machine.transition_to(BotState.MANAGE, "Fill detected (backtest)")
                     
@@ -215,6 +216,10 @@ class WaitFillHandler:
     ) -> FillHandlerResult:
         """Handle order timeout with late fill detection."""
         result = FillHandlerResult()
+        
+        if ctx.entry_order_time is None:
+            logger.warning("No entry_order_time set - cannot check timeout")
+            return result
         
         elapsed = (market_time - ctx.entry_order_time).total_seconds()
         
@@ -329,7 +334,16 @@ class WaitFillHandler:
         self,
         ctx: FillHandlerContext
     ) -> FillHandlerResult:
-        """Handle rejected order (POST_ONLY crossed book)."""
+        """
+        Handle rejected order (POST_ONLY crossed book).
+        
+        🔥 FIX #78 (Feb 06, 2026): POST-ONLY RETRY MECHANISM
+        Instead of immediately giving up:
+        1. Retry 3 times with price adjustment (+/- tick to win spread)
+        2. After 3 failures, fallback to MARKET order at 0.5× size
+        
+        User requirement: "3 retries with price adjustment, then market at 0.5× size"
+        """
         result = FillHandlerResult()
         
         logger.warning(f"🚫 Order {ctx.pending_order_id} was REJECTED by exchange (likely POST_ONLY crossed book)")
@@ -338,10 +352,130 @@ class WaitFillHandler:
             ctx.health_monitor.record_order_rejected()
         
         self._consecutive_post_only_rejects += 1
-        logger.debug(f"POST_ONLY rejection count: {self._consecutive_post_only_rejects}")
+        logger.info(f"📊 FIX #78: POST_ONLY rejection count: {self._consecutive_post_only_rejects}/3")
         
-        ctx.reset_trade_state("Order rejected by exchange")
-        ctx.state_machine.transition_to(BotState.IDLE, "Order rejected")
+        # =================================================================
+        # FIX #78: RETRY MECHANISM
+        # =================================================================
+        MAX_RETRIES = 3
+        PRICE_ADJUSTMENT_TICKS = 1.0  # $1 adjustment per retry
+        FALLBACK_SIZE_MULTIPLIER = 0.5  # Market order at half size
+        
+        entry_data = ctx.last_entry_data
+        
+        if not entry_data:
+            logger.warning("⚠️ FIX #78: No entry_data available, cannot retry")
+            ctx.reset_trade_state("Order rejected - no entry data for retry")
+            ctx.state_machine.transition_to(BotState.IDLE, "Order rejected")
+            result.handled = True
+            result.new_state = BotState.IDLE
+            result.pending_order_id = None
+            return result
+        
+        bias = entry_data.get('bias', 'LONG')
+        original_price = entry_data.get('entry_price', 0)
+        original_size = entry_data.get('position_size', 0)
+        stop_loss = entry_data.get('stop_loss', 0)
+        take_profit = entry_data.get('take_profit', 0)
+        
+        if self._consecutive_post_only_rejects < MAX_RETRIES:
+            # ==========================================
+            # RETRY WITH PRICE ADJUSTMENT
+            # ==========================================
+            # LONG: Lower price to be more aggressive (below current ask)
+            # SHORT: Higher price to be more aggressive (above current bid)
+            adjustment = PRICE_ADJUSTMENT_TICKS * self._consecutive_post_only_rejects
+            
+            if bias == 'LONG':
+                adjusted_price = original_price - adjustment
+            else:
+                adjusted_price = original_price + adjustment
+            
+            logger.info(f"🔄 FIX #78: RETRY {self._consecutive_post_only_rejects}/{MAX_RETRIES} - "
+                       f"{bias} @ {adjusted_price:.2f} (adjusted from {original_price:.2f})")
+            
+            try:
+                order_result = await ctx.execution.place_limit_order(
+                    symbol=ctx.symbol,
+                    side='buy' if bias == 'LONG' else 'sell',
+                    amount=original_size,
+                    price=adjusted_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+                
+                if order_result and order_result.get('id'):
+                    logger.info(f"✅ FIX #78: RETRY ORDER PLACED: {order_result['id']}")
+                    
+                    # Update pending order - stay in WAIT_FILL
+                    result.handled = True
+                    result.pending_order_id = order_result['id']
+                    # Note: state stays WAIT_FILL - just update the order ID
+                    
+                    # Update entry data with new price
+                    if ctx.last_entry_data is not None:
+                        ctx.last_entry_data['entry_price'] = adjusted_price
+                        ctx.last_entry_data['tags']['post_only_retry'] = self._consecutive_post_only_rejects
+                        ctx.last_entry_data['tags']['original_price'] = original_price
+                    
+                    return result
+                else:
+                    logger.warning(f"⚠️ FIX #78: Retry order returned None")
+                    
+            except Exception as retry_err:
+                logger.error(f"❌ FIX #78: Retry order failed: {retry_err}")
+        
+        # ==========================================
+        # MAX RETRIES REACHED → MARKET ORDER FALLBACK
+        # ==========================================
+        if self._consecutive_post_only_rejects >= MAX_RETRIES:
+            reduced_size = original_size * FALLBACK_SIZE_MULTIPLIER
+            
+            logger.warning(f"🚨 FIX #78: MAX RETRIES ({MAX_RETRIES}) REACHED - "
+                          f"FALLBACK to MARKET @ {reduced_size:.6f} (0.5× original)")
+            
+            try:
+                order_result = await ctx.execution.place_aggressive_order(
+                    symbol=ctx.symbol,
+                    side='buy' if bias == 'LONG' else 'sell',
+                    amount=reduced_size,
+                    price=original_price,  # Market uses this as reference
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+                
+                if order_result and order_result.get('id'):
+                    logger.info(f"✅ FIX #78: MARKET FALLBACK PLACED: {order_result['id']} @ {reduced_size:.6f}")
+                    
+                    # Reset counter - we got an order placed
+                    self._consecutive_post_only_rejects = 0
+                    
+                    # Update state
+                    result.handled = True
+                    result.pending_order_id = order_result['id']
+                    
+                    # Update entry data
+                    if ctx.last_entry_data is not None:
+                        ctx.last_entry_data['position_size'] = reduced_size
+                        ctx.last_entry_data['order_type'] = 'MARKET'
+                        ctx.last_entry_data['tags']['post_only_fallback'] = True
+                        ctx.last_entry_data['tags']['fallback_size_reduction'] = FALLBACK_SIZE_MULTIPLIER
+                    
+                    return result
+                else:
+                    logger.error("❌ FIX #78: Market fallback also failed - giving up")
+                    
+            except Exception as fallback_err:
+                logger.error(f"❌ FIX #78: Market fallback error: {fallback_err}")
+        
+        # =================================================================
+        # ALL RETRIES FAILED - RESET TO IDLE
+        # =================================================================
+        logger.error(f"❌ FIX #78: All retry attempts exhausted - resetting to IDLE")
+        self._consecutive_post_only_rejects = 0
+        
+        ctx.reset_trade_state("Order rejected after all retries")
+        ctx.state_machine.transition_to(BotState.IDLE, "Order rejected - max retries")
         
         result.handled = True
         result.new_state = BotState.IDLE
@@ -407,6 +541,7 @@ class WaitFillHandler:
             )
         
         # Verify position exists on exchange
+        import asyncio
         await asyncio.sleep(0.5)
         exchange_has_position = await ctx.execution.has_open_position(ctx.symbol)
         

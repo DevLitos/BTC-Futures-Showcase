@@ -17,7 +17,8 @@ from src.domain.trading.state.state_machine import BotState
 from src.shared.indicators import (
     calculate_ema, calculate_adx, calculate_atr,
     calculate_relative_volume, calculate_orderbook_imbalance,
-    check_hl_lh_structure, calculate_fibonacci_levels
+    check_hl_lh_structure, calculate_fibonacci_levels,
+    calculate_adx_with_di  # 🔥 FIX #77: Add +DI/-DI for direction
 )
 
 logger = logging.getLogger(__name__)
@@ -380,6 +381,37 @@ class HTFFilter:
         adx = float(adx_values[-1]) if len(adx_values) > 0 else 0.0
         slope = float(adx_slope[-1]) if len(adx_slope) > 0 else 0.0
         
+        # =====================================================================
+        # 🔥 FIX #77 (Feb 07, 2026): USE +DI/-DI FOR DIRECTION
+        # 
+        # PROBLEM: Bias determined by EMA50 position is LAGGING.
+        # - During fast moves, price can be "wrong side" of EMA50 temporarily
+        # - EMA50 doesn't measure MOMENTUM DIRECTION, only price position
+        # 
+        # SOLUTION: Use +DI/-DI which measures ACTUAL directional momentum:
+        # - +DI > -DI + threshold → BULLISH momentum (buy pressure > sell)
+        # - -DI > +DI + threshold → BEARISH momentum (sell pressure > buy)
+        # 
+        # When ADX >= 25 (trending), use +DI/-DI as PRIMARY direction source.
+        # EMA50 becomes SECONDARY (for zones/confirmation only).
+        # =====================================================================
+        adx_full, _, plus_di, minus_di = calculate_adx_with_di(highs, lows, closes, 14)
+        
+        # Get latest +DI/-DI values
+        plus_di_last = float(plus_di[-1]) if len(plus_di) > 0 and not np.isnan(plus_di[-1]) else 20.0
+        minus_di_last = float(minus_di[-1]) if len(minus_di) > 0 and not np.isnan(minus_di[-1]) else 20.0
+        
+        # DI threshold for clear direction (avoid noise when +DI ≈ -DI)
+        DI_THRESHOLD = 5.0  # Require at least 5 points difference for conviction
+        
+        # Determine DI-based direction
+        di_direction = None
+        di_strength = abs(plus_di_last - minus_di_last)
+        if plus_di_last > minus_di_last + DI_THRESHOLD:
+            di_direction = 'LONG'
+        elif minus_di_last > plus_di_last + DI_THRESHOLD:
+            di_direction = 'SHORT'
+        
         # FIX: Handle NaN ADX - use default values instead of blocking
         if np.isnan(adx):
             logger.warning(f"HTF: ADX is NaN - using default value 20")
@@ -398,43 +430,121 @@ class HTFFilter:
             atr_ma = atr
         
         # =========================================================
-        # SIMPLIFIED BIAS DETERMINATION WITH HYSTERESIS
+        # 🔥 FIX #77 BIAS DETERMINATION WITH +DI/-DI
         # =========================================================
-        # Primary: Price vs EMA50 (most reliable with limited data)
-        # 
-        # HYSTERESIS: To avoid rapid bias flips when price is near EMA50,
-        # we require a minimum buffer (0.05% of price, or ~50 points on BTC)
-        # Price must be clearly above/below EMA50 to change bias
+        # PRIORITY ORDER:
+        # 1. +DI/-DI when ADX >= 25 (trending market, DI is reliable)
+        # 2. EMA50/EMA200 macro trend (when ADX < 25 or DI indecisive)
+        # 3. Price vs EMA50 with hysteresis (fallback)
+        #
+        # RATIONALE:
+        # - +DI/-DI measures CURRENT directional momentum (ANTICIPATORY)
+        # - EMA50 position measures where price WAS (LAGGING)
+        # - During fast moves, +DI/-DI leads EMA50 by several bars
         # =========================================================
         bias = None
+        bias_source = "UNKNOWN"
+        
+        # Determine macro trend (EMA50 vs EMA200)
+        is_macro_bear = ema_50 < ema_200  # BEAR_STRONG potential
+        is_macro_bull = ema_50 > ema_200  # BULL_STRONG potential
         
         # Calculate hysteresis buffer (0.05% of price, minimum 30 points for BTC)
         hysteresis_pct = 0.0005  # 0.05%
         hysteresis_buffer = max(current_price * hysteresis_pct, 30.0)
         
-        if current_price > ema_50 + hysteresis_buffer:
-            bias = 'LONG'
-        elif current_price < ema_50 - hysteresis_buffer:
-            bias = 'SHORT'
-        else:
-            # Price within hysteresis zone - use trend direction from recent candles
-            if len(closes) >= 5:
-                # Use 5-candle momentum direction
-                momentum = closes[-1] - closes[-5]
-                if momentum > 0:
-                    bias = 'LONG'
-                elif momentum < 0:
-                    bias = 'SHORT'
-                else:
-                    # Truly flat - default to price relative to EMA50
-                    bias = 'LONG' if current_price >= ema_50 else 'SHORT'
-            else:
-                bias = 'LONG' if current_price >= ema_50 else 'SHORT'
+        # Calculate distance from EMA50 as percentage
+        price_distance_from_ema50 = (current_price - ema_50) / ema_50
+        
+        # =====================================================================
+        # PRIORITY 1: +DI/-DI in trending markets (ADX >= 25)
+        # This is the KEY FIX #77 - use directional indicators for direction!
+        # =====================================================================
+        ADX_TREND_THRESHOLD = 25.0
+        
+        if adx >= ADX_TREND_THRESHOLD and di_direction is not None:
+            # Trending market with clear DI direction → trust DI
+            bias = di_direction
+            bias_source = f"+DI/-DI (ADX={adx:.1f}, +DI={plus_di_last:.1f}, -DI={minus_di_last:.1f})"
             
-            logger.debug(f"📊 HTF: Price in hysteresis zone (±{hysteresis_buffer:.0f} around EMA50={ema_50:.2f})")
+            logger.info(
+                f"📊 FIX #77: Bias from +DI/-DI | ADX={adx:.1f} | "
+                f"+DI={plus_di_last:.1f} vs -DI={minus_di_last:.1f} (diff={di_strength:.1f}) → {bias}"
+            )
+        
+        # =====================================================================
+        # PRIORITY 2: Macro trend (EMA50 vs EMA200) when DI unclear
+        # =====================================================================
+        elif is_macro_bear or is_macro_bull:
+            # Use macro direction but validate with price action
+            MACRO_ALIGNMENT_THRESHOLD = 0.015  # 1.5%
+            
+            if is_macro_bear:
+                # BEAR macro - prefer SHORT unless price strongly above EMA50
+                if price_distance_from_ema50 > MACRO_ALIGNMENT_THRESHOLD:
+                    # Price clearly above EMA50 in bear macro - possible reversal or rally
+                    # Check DI for confirmation
+                    if di_direction == 'LONG':
+                        bias = 'LONG'
+                        bias_source = f"RALLY_IN_BEAR (+DI confirms)"
+                    else:
+                        bias = 'SHORT'  # Bear macro, not confirmed rally → stay SHORT
+                        bias_source = f"BEAR_MACRO (price above EMA50 but no DI confirm)"
+                else:
+                    bias = 'SHORT'
+                    bias_source = f"BEAR_MACRO (EMA50<EMA200)"
+            else:  # is_macro_bull
+                # BULL macro - prefer LONG unless price strongly below EMA50
+                if abs(price_distance_from_ema50) > MACRO_ALIGNMENT_THRESHOLD and price_distance_from_ema50 < 0:
+                    # Price clearly below EMA50 in bull macro - possible correction
+                    if di_direction == 'SHORT':
+                        bias = 'SHORT'
+                        bias_source = f"DIP_IN_BULL (-DI confirms)"
+                    else:
+                        bias = 'LONG'  # Bull macro, not confirmed dip → stay LONG
+                        bias_source = f"BULL_MACRO (price below EMA50 but no DI confirm)"
+                else:
+                    bias = 'LONG'
+                    bias_source = f"BULL_MACRO (EMA50>EMA200)"
+        
+        # =====================================================================
+        # PRIORITY 3: Price vs EMA50 with hysteresis (original logic, fallback)
+        # =====================================================================
+        else:
+            # No strong macro trend and no DI signal - use price position
+            if current_price > ema_50 + hysteresis_buffer:
+                bias = 'LONG'
+                bias_source = "PRICE>EMA50"
+            elif current_price < ema_50 - hysteresis_buffer:
+                bias = 'SHORT'
+                bias_source = "PRICE<EMA50"
+            else:
+                # Price within hysteresis zone - use DI or momentum
+                if di_direction:
+                    bias = di_direction
+                    bias_source = f"HYSTERESIS_ZONE_DI"
+                elif len(closes) >= 5:
+                    momentum = closes[-1] - closes[-5]
+                    if momentum > 0:
+                        bias = 'LONG'
+                        bias_source = "HYSTERESIS_MOMENTUM_UP"
+                    elif momentum < 0:
+                        bias = 'SHORT'
+                        bias_source = "HYSTERESIS_MOMENTUM_DOWN"
+                    else:
+                        bias = 'LONG' if current_price >= ema_50 else 'SHORT'
+                        bias_source = "HYSTERESIS_FLAT"
+                else:
+                    bias = 'LONG' if current_price >= ema_50 else 'SHORT'
+                    bias_source = "HYSTERESIS_DEFAULT"
         
         # Log bias decision (DEBUG level to reduce noise)
-        logger.debug(f"[DATA] HTF bias: Price={current_price:.2f} | EMA50={ema_50:.2f} | EMA200={ema_200:.2f} | ADX={adx:.2f} | Slope={slope:.4f} -> bias={bias}")
+        macro_label = "BEAR" if is_macro_bear else ("BULL" if is_macro_bull else "NEUTRAL")
+        logger.debug(
+            f"[DATA] FIX #77 HTF bias: Price={current_price:.2f} | EMA50={ema_50:.2f} | "
+            f"ADX={adx:.2f} | +DI={plus_di_last:.1f} | -DI={minus_di_last:.1f} | "
+            f"Macro={macro_label} | Source={bias_source} → bias={bias}"
+        )
         
         # =========================================================
         # RELAXED FILTERS FOR BACKTEST MODE

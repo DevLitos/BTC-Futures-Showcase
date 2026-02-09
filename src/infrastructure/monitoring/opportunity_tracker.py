@@ -1,19 +1,28 @@
 """
-Missed Opportunity Tracker - Track trades we didn't take
+Missed Opportunity Tracker v2.0 - REAL Trade Simulation
 
-"You need to know: How many good trades did I NOT take?"
+"You need to know: How many REAL trades did I NOT take?"
 
-This module logs every blocked entry with:
-- Hypothetical entry price
-- Block reason (filter, HARD_LOCK, etc.)
-- What happened to price after (missed edge calculation)
-- 🔥 FIX Feb 06: TIMING CLASSIFICATION (early vs late detection)
+🔥 COMPLETE REWRITE (Feb 07, 2026):
+
+PROBLEMA ANTERIOR:
+- Usaba precio de bloqueo como "entry" → FALSO
+- MFE > MAE como criterio de "buen trade" → HINDSIGHT BIAS
+- Ventana fija de 60 min → ARBITRARIO
+- No verificaba invalidación estructural → FAKE MISSED
+- No simulaba ejecución real → OPTIMISMO ESTRUCTURAL
+
+SOLUCIÓN:
+1. SETUP-BASED: Usa origin_price, stop_level, invalidation_level del EDGE
+2. PATH SIMULATION: ¿Tocó entry? ¿Tocó stop primero? ¿Se invalidó?
+3. DYNAMIC TTL: Lifetime basado en tipo de edge (no fijo)
+4. REAL OUTCOME: winner/loser/dead/unresolved (no MFE)
+5. EXECUTION MODEL: Entry solo si precio CRUZA nivel (no cualquier precio)
 
 Purpose:
-- Tune filters by seeing their false positive rate
-- Detect if system is too conservative
-- Quantify opportunity cost of safety measures
-- 🔥 NEW: Distinguish REAL MISSED (early detection blocked) from FAKE MISSED (late detection)
+- Detectar si filtros bloquean trades REALES (no inventados)
+- Cuantificar costo de oportunidad REAL
+- Distinguir "DODGED LOSER" vs "REAL MISSED" correctamente
 """
 
 import logging
@@ -21,202 +30,401 @@ from datetime import datetime, UTC, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from collections import deque
-from enum import Enum, auto
+from enum import Enum
 import json
 
 logger = logging.getLogger(__name__)
 
-# Module-level constants for trade classification
-# Minimum R threshold to consider a blocked trade as a "missed winner"
-# A trade that only reaches 0.5R MFE before hitting 0.4R MAE is marginal at best
-MIN_R_FOR_WINNER = 1.0  # Must reach at least 1R favorable excursion
+
+# =============================================================================
+# 📊 OUTCOME TYPES - Estados finales de un setup bloqueado
+# =============================================================================
+class SetupOutcome(Enum):
+    """
+    Resultado REAL del setup (no hindsight).
+    
+    Se determina por PATH del precio, no por MFE/MAE.
+    """
+    PENDING = "PENDING"              # Aún tracking
+    ENTRY_NEVER_HIT = "ENTRY_NEVER_HIT"  # Entry level nunca tocado → no era trade
+    INVALIDATED = "INVALIDATED"      # Estructura invalidada antes de TP/SL
+    WINNER = "WINNER"                # TP tocado primero
+    LOSER = "LOSER"                  # SL tocado primero
+    EXPIRED = "EXPIRED"              # TTL expirado sin resolución
 
 
+class SetupTimingType(Enum):
+    """
+    Timing de detección vs formación del setup.
+    
+    EARLY = Detectamos antes de que precio llegue a zona ideal
+    ON_TIME = Detectamos cuando precio está en zona
+    LATE = Detectamos después de que precio ya movió significativamente
+    """
+    EARLY = "EARLY"        # < 20% del move inicial
+    ON_TIME = "ON_TIME"    # 20-50% del move
+    LATE = "LATE"          # 50-80% del move
+    VERY_LATE = "VERY_LATE"  # > 80% del move (persiguiendo)
+    UNKNOWN = "UNKNOWN"
+
+
+# Legacy compatibility enum
 class SignalTimingCategory(Enum):
-    """🔥 FIX Feb 06: Categoría de timing de la señal"""
-    EARLY = "early"           # Antes de movimiento significativo (< 0.3%)
-    ON_TIME = "on_time"       # Durante inicio de movimiento (< 0.8%)
-    LATE = "late"             # Después de movimiento significativo (< 1.5%)
-    VERY_LATE = "very_late"   # Persiguiendo precio (> 1.5%)
-    UNKNOWN = "unknown"       # No se pudo determinar
+    """🔥 LEGACY: Kept for backwards compatibility."""
+    EARLY = "early"
+    ON_TIME = "on_time"
+    LATE = "late"
+    VERY_LATE = "very_late"
+    UNKNOWN = "unknown"
 
 
+# =============================================================================
+# 📊 SETUP CONFIG - TTL por tipo de edge
+# =============================================================================
 @dataclass
-class MissedOpportunity:
-    """A trade signal that was blocked"""
+class SetupTTLConfig:
+    """
+    Time-to-live por tipo de edge.
+    
+    Basado en el horizonte natural de cada tipo:
+    - DISPLACEMENT: Movimiento rápido, resolución rápida
+    - RANGE: Mean reversion, puede tardar más
+    - TREND: Continuación, horizonte medio
+    - BREAKOUT: Post-compresión, resolución rápida
+    """
+    DISPLACEMENT_MINUTES: int = 15   # Resolve in 15 min or dead
+    RANGE_MINUTES: int = 45          # Can take up to 45 min
+    TREND_MINUTES: int = 30          # 30 min window
+    BREAKOUT_MINUTES: int = 20       # 20 min for breakout
+    DEFAULT_MINUTES: int = 30        # Fallback
+    
+    @classmethod
+    def get_ttl(cls, edge_type: str) -> int:
+        """Get TTL in minutes for edge type."""
+        mapping = {
+            'DISPLACEMENT': cls.DISPLACEMENT_MINUTES,
+            'RANGE': cls.RANGE_MINUTES,
+            'TREND': cls.TREND_MINUTES,
+            'BREAKOUT': cls.BREAKOUT_MINUTES,
+        }
+        return mapping.get(edge_type, cls.DEFAULT_MINUTES)
+
+
+# =============================================================================
+# 📊 BLOCKED SETUP - Un setup que fue bloqueado
+# =============================================================================
+@dataclass
+class BlockedSetup:
+    """
+    Un setup de trading que fue BLOQUEADO.
+    
+    Contiene TODO lo necesario para simular el trade:
+    - Niveles del setup (no precio arbitrario)
+    - Reglas de invalidación
+    - TTL natural del edge
+    """
+    # ========== IDENTIDAD ==========
     timestamp: datetime
-    signal_direction: str  # 'LONG' or 'SHORT'
-    hypothetical_entry: float
-    block_reason: str  # What filter/condition blocked it
-    block_category: str  # Category: 'filter', 'hard_lock', 'penalty', 'funding', 'session'
-    signal_score: float = 0.0  # The score that would have triggered
-    atr_at_signal: float = 0.0  # ATR for R calculation
+    edge_type: str  # 'DISPLACEMENT', 'RANGE', 'TREND', 'BREAKOUT'
+    direction: str  # 'LONG' or 'SHORT'
+    block_reason: str
+    block_category: str
     
-    # 🔥 FIX Feb 06: Timing classification
-    timing_category: SignalTimingCategory = SignalTimingCategory.UNKNOWN
-    move_at_detection_pct: float = 0.0  # % price moved before we detected
-    setup_price: float = 0.0  # Price when setup originally formed
+    # ========== SETUP LEVELS (del EDGE, no del precio actual) ==========
+    origin_price: float  # Donde empezó el setup
+    entry_level: float   # Nivel de entrada ideal (puede ser != current price)
+    stop_level: float    # SL estructural
+    tp_level: float      # TP calculado
+    invalidation_level: float  # Si cruza esto → setup MUERTO
     
-    # Filled post-hoc
-    price_5min_later: Optional[float] = None
-    price_15min_later: Optional[float] = None
-    price_1h_later: Optional[float] = None
-    max_favorable_excursion: float = 0.0  # MFE in price
-    max_adverse_excursion: float = 0.0  # MAE in price
-    hypothetical_r: float = 0.0  # If we had taken it, what R would we have gotten?
-    resolved: bool = False  # True after post-hoc analysis done
+    # ========== DETECTION TIMING ==========
+    detection_price: float  # Precio cuando detectamos/bloqueamos
+    move_pct_at_detection: float = 0.0  # % del move que ya ocurrió
+    timing_type: SetupTimingType = SetupTimingType.UNKNOWN
+    
+    # ========== CONTEXT ==========
+    atr: float = 0.0
+    score: float = 0.0
+    
+    # ========== SIMULATION STATE ==========
+    entry_touched: bool = False      # ¿Precio llegó a entry level?
+    entry_price: float = 0.0         # Precio exacto de "fill" simulado
+    entry_time: Optional[datetime] = None
+    
+    stop_touched: bool = False
+    tp_touched: bool = False
+    invalidation_touched: bool = False
+    
+    high_since_entry: float = 0.0    # Para tracking (no para decisión)
+    low_since_entry: float = 0.0
+    
+    # ========== OUTCOME ==========
+    outcome: SetupOutcome = SetupOutcome.PENDING
+    outcome_price: float = 0.0
+    outcome_time: Optional[datetime] = None
+    outcome_reason: str = ""
+    
+    # ========== TTL ==========
+    ttl_minutes: int = 30
+    expires_at: Optional[datetime] = None
+    
+    def __post_init__(self):
+        """Set expiration time based on edge type."""
+        self.ttl_minutes = SetupTTLConfig.get_ttl(self.edge_type)
+        self.expires_at = self.timestamp + timedelta(minutes=self.ttl_minutes)
     
     @property
-    def was_good_trade(self) -> bool:
-        """
-        Would this have been a winning trade?
-        
-        Criteria:
-        1. MFE > MAE (favorable excursion exceeds adverse)
-        2. MFE >= MIN_R_FOR_WINNER * ATR (must reach meaningful profit)
-        
-        A trade with MFE=10 MAE=9 is technically MFE>MAE but marginal.
-        We require at least MIN_R_FOR_WINNER (1R) favorable excursion.
-        """
-        if not self.resolved:
-            return False
-        
-        # Basic check: MFE must exceed MAE
-        if self.max_favorable_excursion <= self.max_adverse_excursion:
-            return False
-        
-        # Must reach at least MIN_R_FOR_WINNER in favorable direction
-        if self.atr_at_signal > 0:
-            mfe_r = self.max_favorable_excursion / self.atr_at_signal
-            if mfe_r < MIN_R_FOR_WINNER:
-                return False
-        
-        return True
+    def risk_r(self) -> float:
+        """Risk in R terms."""
+        if self.atr <= 0:
+            return 0.0
+        return abs(self.entry_level - self.stop_level) / self.atr
+    
+    @property
+    def reward_r(self) -> float:
+        """Reward in R terms."""
+        if self.atr <= 0:
+            return 0.0
+        return abs(self.tp_level - self.entry_level) / self.atr
+    
+    @property
+    def rr_ratio(self) -> float:
+        """Risk:Reward ratio."""
+        if self.risk_r <= 0:
+            return 0.0
+        return self.reward_r / self.risk_r
     
     @property
     def is_real_missed(self) -> bool:
-        """🔥 FIX Feb 06: True if this was a REAL missed opportunity (early detection)"""
-        return (
-            self.was_good_trade and 
-            self.timing_category in [SignalTimingCategory.EARLY, SignalTimingCategory.ON_TIME]
-        )
-    
-    @property
-    def is_fake_missed(self) -> bool:
-        """🔥 FIX Feb 06: True if this was a FAKE missed (late detection, not real opportunity)"""
-        return (
-            self.was_good_trade and 
-            self.timing_category in [SignalTimingCategory.LATE, SignalTimingCategory.VERY_LATE]
-        )
-    
-    @property
-    def missed_classification(self) -> str:
-        """🔥 FIX Feb 06: Classify the miss type"""
-        if not self.was_good_trade:
-            return "DODGED_LOSER"
+        """
+        ¿Fue un REAL missed? 
         
-        if self.timing_category == SignalTimingCategory.EARLY:
-            return "REAL_MISSED_EARLY"
-        elif self.timing_category == SignalTimingCategory.ON_TIME:
-            return "REAL_MISSED_ONTIME"
-        elif self.timing_category == SignalTimingCategory.LATE:
-            return "FAKE_MISSED_LATE"
-        elif self.timing_category == SignalTimingCategory.VERY_LATE:
-            return "FAKE_MISSED_CHASE"
-        else:
-            return "UNKNOWN"
+        Criterios:
+        1. El trade era WINNER (TP tocado primero)
+        2. Detectamos EARLY/ON_TIME (no persiguiendo)
+        3. Entry fue tocado (no imaginario)
+        """
+        return (
+            self.outcome == SetupOutcome.WINNER and
+            self.timing_type in [SetupTimingType.EARLY, SetupTimingType.ON_TIME] and
+            self.entry_touched
+        )
     
     @property
-    def hypothetical_r_at_mfe(self) -> float:
-        """What R would we have reached at MFE?"""
-        if self.atr_at_signal <= 0:
-            return 0.0
-        return self.max_favorable_excursion / self.atr_at_signal
+    def is_dodged_loser(self) -> bool:
+        """¿Esquivamos un loser?"""
+        return (
+            self.outcome == SetupOutcome.LOSER and
+            self.entry_touched  # Only counts if entry was hit
+        )
     
-    def to_dict(self) -> Dict:
+    @property
+    def is_dead_setup(self) -> bool:
+        """¿Era un setup muerto (invalidado)?"""
+        return self.outcome == SetupOutcome.INVALIDATED
+    
+    @property
+    def is_phantom(self) -> bool:
+        """¿Era un trade fantasma (entry nunca tocado)?"""
+        return self.outcome == SetupOutcome.ENTRY_NEVER_HIT
+    
+    @property
+    def classification(self) -> str:
+        """Clasificación final del setup bloqueado."""
+        if not self.outcome or self.outcome == SetupOutcome.PENDING:
+            return "PENDING"
+        
+        if self.outcome == SetupOutcome.ENTRY_NEVER_HIT:
+            return "PHANTOM_TRADE"  # Trade que nunca existió
+        
+        if self.outcome == SetupOutcome.INVALIDATED:
+            return "DEAD_SETUP"  # Setup murió estructuralmente
+        
+        if self.outcome == SetupOutcome.EXPIRED:
+            return "STALE"  # Expiró sin resolución
+        
+        if self.outcome == SetupOutcome.WINNER:
+            if self.timing_type in [SetupTimingType.EARLY, SetupTimingType.ON_TIME]:
+                return "REAL_MISSED"  # Este SÍ era un trade real
+            else:
+                return "LATE_DETECTION_WINNER"  # Ganó pero lo detectamos tarde
+        
+        if self.outcome == SetupOutcome.LOSER:
+            return "DODGED_LOSER"  # Correcto bloquear
+        
+        return "UNKNOWN"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dict for persistence."""
         return {
             'timestamp': self.timestamp.isoformat(),
-            'direction': self.signal_direction,
-            'entry': self.hypothetical_entry,
+            'edge_type': self.edge_type,
+            'direction': self.direction,
             'block_reason': self.block_reason,
             'block_category': self.block_category,
-            'score': self.signal_score,
-            'atr': self.atr_at_signal,
-            'price_5m': self.price_5min_later,
-            'price_15m': self.price_15min_later,
-            'price_1h': self.price_1h_later,
-            'mfe': self.max_favorable_excursion,
-            'mae': self.max_adverse_excursion,
-            'hypothetical_r': self.hypothetical_r,
-            'was_good': self.was_good_trade,
-            'resolved': self.resolved,
-            # 🔥 FIX Feb 06: Timing classification
-            'timing_category': self.timing_category.value,
-            'move_at_detection_pct': self.move_at_detection_pct,
-            'missed_classification': self.missed_classification,
+            # Levels
+            'origin_price': self.origin_price,
+            'entry_level': self.entry_level,
+            'stop_level': self.stop_level,
+            'tp_level': self.tp_level,
+            'invalidation_level': self.invalidation_level,
+            # Detection
+            'detection_price': self.detection_price,
+            'move_pct_at_detection': self.move_pct_at_detection,
+            'timing_type': self.timing_type.value,
+            # Context
+            'atr': self.atr,
+            'score': self.score,
+            'risk_r': self.risk_r,
+            'reward_r': self.reward_r,
+            'rr_ratio': self.rr_ratio,
+            # Simulation
+            'entry_touched': self.entry_touched,
+            'entry_price': self.entry_price,
+            # Outcome
+            'outcome': self.outcome.value,
+            'outcome_price': self.outcome_price,
+            'outcome_reason': self.outcome_reason,
+            'classification': self.classification,
             'is_real_missed': self.is_real_missed,
-            'is_fake_missed': self.is_fake_missed
+            'is_dodged_loser': self.is_dodged_loser,
+            'ttl_minutes': self.ttl_minutes,
         }
 
 
+# =============================================================================
+# 📊 LEGACY DATACLASS - For backwards compatibility
+# =============================================================================
+@dataclass
+class MissedOpportunity:
+    """
+    🚨 LEGACY: Kept for backwards compatibility only.
+    Use BlockedSetup for new code.
+    """
+    timestamp: datetime
+    signal_direction: str
+    hypothetical_entry: float
+    block_reason: str
+    block_category: str
+    signal_score: float = 0.0
+    atr_at_signal: float = 0.0
+    timing_category: SignalTimingCategory = SignalTimingCategory.UNKNOWN
+    move_at_detection_pct: float = 0.0
+    setup_price: float = 0.0
+    price_5min_later: Optional[float] = None
+    price_15min_later: Optional[float] = None
+    price_1h_later: Optional[float] = None
+    max_favorable_excursion: float = 0.0
+    max_adverse_excursion: float = 0.0
+    hypothetical_r: float = 0.0
+    resolved: bool = False
+    
+    @property
+    def was_good_trade(self) -> bool:
+        return False  # Legacy - always False in v2
+    
+    @property
+    def is_real_missed(self) -> bool:
+        return False  # Legacy
+    
+    @property
+    def is_fake_missed(self) -> bool:
+        return False  # Legacy
+    
+    @property
+    def missed_classification(self) -> str:
+        return "LEGACY_UNSUPPORTED"
+    
+    @property
+    def hypothetical_r_at_mfe(self) -> float:
+        return 0.0
+    
+    def to_dict(self) -> Dict:
+        return {'legacy': True, 'timestamp': self.timestamp.isoformat()}
+
+
+# =============================================================================
+# 📊 TRACKER V2 - Simulación real de setups bloqueados
+# =============================================================================
 class MissedOpportunityTracker:
     """
-    Track missed trading opportunities for filter tuning.
+    Track blocked trading setups with REAL outcome simulation.
+    
+    V2 CHANGES:
+    1. Usa niveles del setup (no precio arbitrario)
+    2. Simula path del precio (entry→SL/TP/invalidation)
+    3. TTL dinámico por tipo de edge
+    4. Outcome real (no MFE/MAE hindsight)
+    5. Solo cuenta REAL MISSED (entry hit + winner + early detection)
     
     Usage:
         tracker = MissedOpportunityTracker()
         
-        # When a signal is blocked:
-        tracker.log_blocked_signal(
-            direction='LONG',
-            price=98000.0,
-            block_reason='Consecutive losses penalty',
-            block_category='penalty',
-            score=8.5,
-            atr=150.0
+        # When a signal is blocked, pass the SETUP levels:
+        tracker.log_blocked_setup(
+            edge_type='DISPLACEMENT',
+            direction='SHORT',
+            block_reason='chase_penalty',
+            block_category='filter',
+            origin_price=100000.0,
+            entry_level=99800.0,
+            stop_level=100100.0,
+            tp_level=99200.0,
+            invalidation_level=100050.0,
+            detection_price=99750.0,
+            atr=100.0
         )
         
-        # On every tick, update with new price:
-        tracker.update_pending(current_price=98500.0)
+        # On every tick:
+        tracker.update(current_price=99500.0)
         
-        # Get statistics:
+        # Get real statistics:
         stats = tracker.get_statistics()
     """
     
-    # How long to track a missed opportunity
-    TRACKING_DURATION_MINUTES = 60
-    
-    # Maximum pending opportunities to track
-    MAX_PENDING = 100
+    MAX_PENDING = 50  # Max setups tracking simultaneously
+    TRACKING_DURATION_MINUTES = 60  # Legacy compat
     
     def __init__(self, persist_path: Optional[str] = None):
-        """
-        Initialize tracker.
-        
-        Args:
-            persist_path: Optional path to persist completed opportunities
-        """
-        self._pending: deque[MissedOpportunity] = deque(maxlen=self.MAX_PENDING)
-        self._completed: List[MissedOpportunity] = []
+        self._pending: deque[BlockedSetup] = deque(maxlen=self.MAX_PENDING)
+        self._completed: List[BlockedSetup] = []
         self._persist_path = persist_path
         
-        # Statistics
+        # 🔥 Throttle para logs repetitivos
+        self._last_blocked_reason: str = ""
+        self._same_reason_count: int = 0
+        
+        # ========== STATISTICS ==========
         self._total_blocked = 0
+        
+        # Outcome counters
+        self._real_missed = 0        # WINNER + early detection + entry hit
+        self._late_detection_winners = 0  # WINNER but detected late
+        self._dodged_losers = 0      # LOSER with entry hit
+        self._dead_setups = 0        # INVALIDATED
+        self._phantom_trades = 0     # Entry never hit
+        self._stale = 0              # Expired without resolution
+        
+        # Legacy compat
         self._good_trades_missed = 0
         self._bad_trades_avoided = 0
         
-        # Block reason statistics
+        # By block reason
         self._block_counts: Dict[str, int] = {}
-        self._block_good_missed: Dict[str, int] = {}
+        self._block_real_missed: Dict[str, int] = {}
+        self._block_good_missed: Dict[str, int] = {}  # Legacy alias
         
-        # 🔥 FIX Feb 06: Timing classification statistics
+        # Legacy timing stats
         self._real_missed_early = 0
         self._real_missed_ontime = 0
         self._fake_missed_late = 0
         self._fake_missed_chase = 0
         
-        logger.info("MissedOpportunityTracker initialized")
+        logger.info("MissedOpportunityTracker v2.0 initialized (REAL simulation)")
     
+    # =========================================================================
+    # 📊 LEGACY COMPATIBILITY - Redirect old calls to new format
+    # =========================================================================
     def log_blocked_signal(
         self,
         direction: str | None,
@@ -225,57 +433,41 @@ class MissedOpportunityTracker:
         block_category: str,
         score: float = 0.0,
         atr: float = 0.0,
-        # 🔥 FIX Feb 06: Timing classification
-        timing_category: SignalTimingCategory = SignalTimingCategory.UNKNOWN,
+        # Legacy timing params (ignored in v2)
+        timing_category: Any = None,
         move_at_detection_pct: float = 0.0,
-        setup_price: float = 0.0
+        setup_price: float = 0.0,
+        # NEW v2 params (required for real simulation)
+        origin_price: float = 0.0,
+        entry_level: float = 0.0,
+        stop_level: float = 0.0,
+        tp_level: float = 0.0,
+        invalidation_level: float = 0.0,
+        edge_type: str = 'UNKNOWN'
     ):
         """
-        Log a signal that was blocked.
+        LEGACY COMPATIBILITY WRAPPER.
         
-        Args:
-            direction: 'LONG' or 'SHORT' (or None if unknown)
-            price: Current price (hypothetical entry)
-            block_reason: Human-readable reason for block
-            block_category: Category (filter, hard_lock, penalty, funding, session)
-            score: The signal score
-            atr: Current ATR for R calculations
-            timing_category: 🔥 NEW - EARLY/ON_TIME/LATE/VERY_LATE
-            move_at_detection_pct: 🔥 NEW - % price moved before detection
-            setup_price: 🔥 NEW - Price when setup originally formed
+        Old code calls this with just price.
+        New code should call log_blocked_setup() directly.
+        
+        If proper levels aren't provided, we log but mark as INCOMPLETE
+        (won't generate false "missed" stats).
         """
-        # =====================================================================
-        # 🔥 FIX (Feb 3, 2026): Filter categories that are NOT missed opportunities
-        # 
-        # These are CORRECT blocks, not "missed" opportunities:
-        # - delta_contradict: Market flow is against us, blocking is correct
-        # - chase_penalty: We're too late, blocking is correct  
-        # - displacement_expired: Edge is dead, not a real opportunity
-        # - obstinacy: Multiple conflicting signals, blocking is correct
-        #
-        # Only log as "MISSED" when we had a REAL opportunity blocked by:
-        # - spread: Liquidity issue but valid setup
-        # - session_limit: Hit daily limit but valid setup
-        # - funding: Funding too high but valid setup
-        # =====================================================================
-        
-        # Categories that are NOT real missed opportunities
-        # 🔥 FIX (Feb 05, 2026): Added location_extreme - NOT a missed trade
-        # when we're at bottom/top and correctly refusing to trade into it
+        # ========== PROTECTION CATEGORIES (NOT missed opportunities) ==========
         PROTECTION_CATEGORIES = {
-            'delta_contradict',      # Market going against us
-            'chase_penalty',         # Too late to enter
-            'obstinacy',             # Conflicting signals
-            'quality_gate',          # Quality too low
-            'location_filter',       # Wrong location in structure
-            'location_extreme',      # 🔥 At top/bottom - CORRECT block, not missed
-            'forbidden_direction',   # Direction explicitly forbidden (bias flip)
-            'bias_flip',             # Bias has flipped against setup
-            'direction_lock',        # Direction is locked opposite
-            'warmup',                # System still warming up
+            'delta_contradict',
+            'chase_penalty', 
+            'obstinacy',
+            'quality_gate',
+            'location_filter',
+            'location_extreme',
+            'forbidden_direction',
+            'bias_flip',
+            'direction_lock',
+            'warmup',
         }
         
-        # Skip logging for protection blocks (they're not missed opportunities)
         if block_category in PROTECTION_CATEGORIES:
             logger.debug(
                 f"[PROTECTED] {direction} @ {price:.2f} | "
@@ -283,190 +475,412 @@ class MissedOpportunityTracker:
             )
             return
         
-        opp = MissedOpportunity(
-            timestamp=datetime.now(UTC),
-            signal_direction=(direction or 'UNKNOWN').upper(),
-            hypothetical_entry=price,
-            block_reason=block_reason,
-            block_category=block_category,
-            signal_score=score,
-            atr_at_signal=atr,
-            # 🔥 FIX Feb 06: Timing classification
-            timing_category=timing_category,
-            move_at_detection_pct=move_at_detection_pct,
-            setup_price=setup_price if setup_price > 0 else price
+        # Check if we have real setup levels
+        has_real_levels = (
+            origin_price > 0 and 
+            stop_level > 0 and 
+            invalidation_level > 0
         )
         
-        self._pending.append(opp)
-        self._total_blocked += 1
+        if has_real_levels:
+            # New-style call with proper levels
+            self.log_blocked_setup(
+                edge_type=edge_type,
+                direction=direction or 'UNKNOWN',
+                block_reason=block_reason,
+                block_category=block_category,
+                origin_price=origin_price,
+                entry_level=entry_level if entry_level > 0 else price,
+                stop_level=stop_level,
+                tp_level=tp_level,
+                invalidation_level=invalidation_level,
+                detection_price=price,
+                atr=atr,
+                score=score
+            )
+        else:
+            # Legacy call - log but don't track (incomplete data)
+            # 🔥 Throttle: solo log si cambia el reason o cada 60 bloqueados
+            if block_reason != self._last_blocked_reason:
+                if self._same_reason_count > 1:
+                    logger.info(f"📊 (suppressed {self._same_reason_count} similar blocks)")
+                self._same_reason_count = 1
+                self._last_blocked_reason = block_reason
+                logger.info(
+                    f"📊 BLOCKED: {direction} @ {price:.2f} | "
+                    f"{block_category}: {block_reason}"
+                )
+            else:
+                self._same_reason_count += 1
+                # Log resumen cada 60 bloques del mismo tipo
+                if self._same_reason_count % 60 == 0:
+                    logger.info(
+                        f"📊 BLOCKED x{self._same_reason_count}: {direction} | "
+                        f"{block_category}: {block_reason}"
+                    )
+            self._total_blocked += 1
+            self._block_counts[block_reason] = self._block_counts.get(block_reason, 0) + 1
+    
+    # =========================================================================
+    # 📊 NEW V2 API - Log blocked setup with REAL levels
+    # =========================================================================
+    def log_blocked_setup(
+        self,
+        edge_type: str,
+        direction: str,
+        block_reason: str,
+        block_category: str,
+        origin_price: float,
+        entry_level: float,
+        stop_level: float,
+        tp_level: float,
+        invalidation_level: float,
+        detection_price: float,
+        atr: float = 0.0,
+        score: float = 0.0
+    ):
+        """
+        Log a blocked setup with REAL levels for simulation.
         
-        # Track by reason
+        This is the correct way to log missed opportunities.
+        """
+        # Calculate timing
+        timing_type, move_pct = self._calculate_timing(
+            origin_price=origin_price,
+            entry_level=entry_level,
+            detection_price=detection_price,
+            direction=direction
+        )
+        
+        setup = BlockedSetup(
+            timestamp=datetime.now(UTC),
+            edge_type=edge_type,
+            direction=direction.upper(),
+            block_reason=block_reason,
+            block_category=block_category,
+            origin_price=origin_price,
+            entry_level=entry_level,
+            stop_level=stop_level,
+            tp_level=tp_level,
+            invalidation_level=invalidation_level,
+            detection_price=detection_price,
+            move_pct_at_detection=move_pct,
+            timing_type=timing_type,
+            atr=atr,
+            score=score,
+        )
+        
+        # Initialize tracking highs/lows
+        setup.high_since_entry = detection_price
+        setup.low_since_entry = detection_price
+        
+        self._pending.append(setup)
+        self._total_blocked += 1
         self._block_counts[block_reason] = self._block_counts.get(block_reason, 0) + 1
         
-        # 🔥 FIX Feb 06: Log with timing info
-        timing_str = f" [TIMING: {timing_category.value}, moved {move_at_detection_pct:.2f}%]" if move_at_detection_pct > 0 else ""
-        logger.info(f"📊 MISSED: {direction} @ {price:.2f} blocked by {block_category}: {block_reason}{timing_str}")
+        logger.info(
+            f"📊 BLOCKED SETUP: {edge_type} {direction} | "
+            f"Entry={entry_level:.0f} SL={stop_level:.0f} TP={tp_level:.0f} | "
+            f"Timing={timing_type.value} ({move_pct:.0f}% move) | "
+            f"{block_category}: {block_reason}"
+        )
     
-    def update_pending(self, current_price: float, current_time: datetime | None = None):
+    def _calculate_timing(
+        self,
+        origin_price: float,
+        entry_level: float,
+        detection_price: float,
+        direction: str
+    ) -> tuple[SetupTimingType, float]:
         """
-        Update all pending opportunities with new price.
+        Calculate timing of detection.
         
-        Should be called on every tick to track price movement.
+        Returns (timing_type, move_percentage)
+        """
+        if origin_price <= 0 or entry_level <= 0:
+            return SetupTimingType.UNKNOWN, 0.0
+        
+        total_move = abs(entry_level - origin_price)
+        if total_move <= 0:
+            return SetupTimingType.UNKNOWN, 0.0
+        
+        # How much has price moved from origin towards entry?
+        if direction.upper() == 'LONG':
+            # LONG: origin is LOW, entry is higher
+            # detection_price closer to origin = early
+            current_move = detection_price - origin_price
+        else:
+            # SHORT: origin is HIGH, entry is lower
+            # detection_price closer to origin = early
+            current_move = origin_price - detection_price
+        
+        move_pct = (current_move / total_move) * 100 if total_move > 0 else 0
+        move_pct = max(0, min(100, move_pct))  # Clamp to 0-100
+        
+        if move_pct < 20:
+            return SetupTimingType.EARLY, move_pct
+        elif move_pct < 50:
+            return SetupTimingType.ON_TIME, move_pct
+        elif move_pct < 80:
+            return SetupTimingType.LATE, move_pct
+        else:
+            return SetupTimingType.VERY_LATE, move_pct
+    
+    # =========================================================================
+    # 📊 UPDATE - Simulate price path on each tick
+    # =========================================================================
+    def update(self, current_price: float, current_time: datetime | None = None):
+        """
+        Update all pending setups with new price.
+        
+        SIMULATION LOGIC:
+        1. Check if expired (TTL)
+        2. Check invalidation FIRST (structure died → DEAD)
+        3. Check entry touched (if not yet)
+        4. If entry touched: check SL/TP
+        5. First to touch wins
         """
         if current_time is None:
             current_time = datetime.now(UTC)
         
         resolved_indices = []
         
-        for i, opp in enumerate(self._pending):
-            if opp.resolved:
+        for i, setup in enumerate(self._pending):
+            if setup.outcome != SetupOutcome.PENDING:
                 continue
             
-            age_minutes = (current_time - opp.timestamp).total_seconds() / 60.0
-            
-            # Update MFE/MAE
-            if opp.signal_direction == 'LONG':
-                excursion = current_price - opp.hypothetical_entry
-            else:
-                excursion = opp.hypothetical_entry - current_price
-            
-            if excursion > 0:
-                opp.max_favorable_excursion = max(opp.max_favorable_excursion, excursion)
-            else:
-                opp.max_adverse_excursion = max(opp.max_adverse_excursion, abs(excursion))
-            
-            # Record price at specific intervals
-            if opp.price_5min_later is None and age_minutes >= 5:
-                opp.price_5min_later = current_price
-                
-            if opp.price_15min_later is None and age_minutes >= 15:
-                opp.price_15min_later = current_price
-                
-            if opp.price_1h_later is None and age_minutes >= 60:
-                opp.price_1h_later = current_price
-            
-            # Resolve after tracking duration
-            if age_minutes >= self.TRACKING_DURATION_MINUTES:
-                self._resolve_opportunity(opp)
+            # ========== CHECK EXPIRATION ==========
+            if setup.expires_at and current_time >= setup.expires_at:
+                if setup.entry_touched:
+                    # Entry was hit but no resolution
+                    self._resolve_setup(setup, SetupOutcome.EXPIRED, current_price, 
+                                       "TTL expired (entry hit but no SL/TP)")
+                else:
+                    # Entry never hit
+                    self._resolve_setup(setup, SetupOutcome.ENTRY_NEVER_HIT, current_price,
+                                       "TTL expired, entry never touched")
                 resolved_indices.append(i)
+                continue
+            
+            # ========== CHECK INVALIDATION (before entry check) ==========
+            if self._check_invalidation(setup, current_price):
+                self._resolve_setup(setup, SetupOutcome.INVALIDATED, current_price,
+                                   f"Invalidation hit @ {current_price:.0f}")
+                resolved_indices.append(i)
+                continue
+            
+            # ========== CHECK ENTRY TOUCH ==========
+            if not setup.entry_touched:
+                if self._check_entry_touch(setup, current_price):
+                    setup.entry_touched = True
+                    setup.entry_price = current_price
+                    setup.entry_time = current_time
+                    setup.high_since_entry = current_price
+                    setup.low_since_entry = current_price
+                    logger.debug(f"📊 Setup entry touched: {setup.direction} @ {current_price:.0f}")
+            
+            # ========== IF ENTRY TOUCHED: CHECK SL/TP ==========
+            if setup.entry_touched:
+                # Update highs/lows
+                setup.high_since_entry = max(setup.high_since_entry, current_price)
+                setup.low_since_entry = min(setup.low_since_entry, current_price)
+                
+                # Check STOP LOSS
+                if self._check_stop_hit(setup, current_price):
+                    setup.stop_touched = True
+                    self._resolve_setup(setup, SetupOutcome.LOSER, current_price,
+                                       f"Stop hit @ {current_price:.0f}")
+                    resolved_indices.append(i)
+                    continue
+                
+                # Check TAKE PROFIT
+                if self._check_tp_hit(setup, current_price):
+                    setup.tp_touched = True
+                    self._resolve_setup(setup, SetupOutcome.WINNER, current_price,
+                                       f"TP hit @ {current_price:.0f}")
+                    resolved_indices.append(i)
+                    continue
         
-        # Move resolved to completed and REMOVE from pending
-        # We must iterate in reverse to avoid index shifting issues
-        for i in sorted(resolved_indices, reverse=True):
-            if i < len(self._pending):
-                completed = self._pending[i]
-                self._completed.append(completed)
-        
-        # Remove resolved items from deque (rebuild without them)
+        # Remove resolved from pending
         if resolved_indices:
             resolved_set = set(resolved_indices)
-            # Create new deque without resolved items
             new_pending = deque(maxlen=self.MAX_PENDING)
-            for i, opp in enumerate(self._pending):
+            for i, setup in enumerate(self._pending):
                 if i not in resolved_set:
-                    new_pending.append(opp)
+                    new_pending.append(setup)
             self._pending = new_pending
     
-    def _resolve_opportunity(self, opp: MissedOpportunity):
-        """Finalize tracking for an opportunity"""
-        opp.resolved = True
+    # Alias for legacy code
+    def update_pending(self, current_price: float, current_time: datetime | None = None):
+        """Legacy alias for update()."""
+        self.update(current_price, current_time)
+    
+    def _check_invalidation(self, setup: BlockedSetup, price: float) -> bool:
+        """Check if price crossed invalidation level."""
+        if setup.invalidation_level <= 0:
+            return False
         
-        # Calculate hypothetical R
-        if opp.atr_at_signal > 0:
-            # Use MFE as potential profit (optimistic)
-            # This shows what we COULD have gotten
-            opp.hypothetical_r = opp.max_favorable_excursion / opp.atr_at_signal
+        if setup.direction == 'LONG':
+            # LONG invalidates if price goes BELOW invalidation
+            return price < setup.invalidation_level
+        else:
+            # SHORT invalidates if price goes ABOVE invalidation
+            return price > setup.invalidation_level
+    
+    def _check_entry_touch(self, setup: BlockedSetup, price: float) -> bool:
+        """Check if price reached entry level."""
+        if setup.entry_level <= 0:
+            return False
         
-        # Format timestamp for clarity (show when signal was originally blocked)
-        signal_time_str = opp.timestamp.strftime('%H:%M:%S')
+        if setup.direction == 'LONG':
+            # LONG: Entry touched if price drops to or below entry level
+            return price <= setup.entry_level
+        else:
+            # SHORT: Entry touched if price rises to or above entry level
+            return price >= setup.entry_level
+    
+    def _check_stop_hit(self, setup: BlockedSetup, price: float) -> bool:
+        """Check if stop loss was hit."""
+        if setup.stop_level <= 0:
+            return False
         
-        # Calculate best/worst prices reached for context
-        if opp.signal_direction == 'SHORT':
-            best_price = opp.hypothetical_entry - opp.max_favorable_excursion
-            worst_price = opp.hypothetical_entry + opp.max_adverse_excursion
-        else:  # LONG
-            best_price = opp.hypothetical_entry + opp.max_favorable_excursion
-            worst_price = opp.hypothetical_entry - opp.max_adverse_excursion
+        if setup.direction == 'LONG':
+            # LONG SL is below entry
+            return price <= setup.stop_level
+        else:
+            # SHORT SL is above entry
+            return price >= setup.stop_level
+    
+    def _check_tp_hit(self, setup: BlockedSetup, price: float) -> bool:
+        """Check if take profit was hit."""
+        if setup.tp_level <= 0:
+            return False
+        
+        if setup.direction == 'LONG':
+            # LONG TP is above entry
+            return price >= setup.tp_level
+        else:
+            # SHORT TP is below entry
+            return price <= setup.tp_level
+    
+    def _resolve_setup(
+        self, 
+        setup: BlockedSetup, 
+        outcome: SetupOutcome, 
+        price: float,
+        reason: str
+    ):
+        """Resolve a setup with final outcome."""
+        setup.outcome = outcome
+        setup.outcome_price = price
+        setup.outcome_time = datetime.now(UTC)
+        setup.outcome_reason = reason
+        
+        self._completed.append(setup)
         
         # Update statistics
-        if opp.was_good_trade:
-            self._good_trades_missed += 1
-            # Track by reason
-            self._block_good_missed[opp.block_reason] = \
-                self._block_good_missed.get(opp.block_reason, 0) + 1
+        classification = setup.classification
+        
+        if classification == "REAL_MISSED":
+            self._real_missed += 1
+            self._good_trades_missed += 1  # Legacy compat
+            self._block_real_missed[setup.block_reason] = \
+                self._block_real_missed.get(setup.block_reason, 0) + 1
+            self._block_good_missed[setup.block_reason] = \
+                self._block_good_missed.get(setup.block_reason, 0) + 1
             
-            # 🔥 FIX Feb 06: Track timing classification
-            classification = opp.missed_classification
-            if classification == "REAL_MISSED_EARLY":
+            # Legacy timing stats
+            if setup.timing_type == SetupTimingType.EARLY:
                 self._real_missed_early += 1
-                logger.warning(
-                    f"❌ REAL MISSED (EARLY) [{signal_time_str}]: {opp.signal_direction} @ ${opp.hypothetical_entry:.0f} "
-                    f"→ MFE {opp.hypothetical_r_at_mfe:.2f}R | Detected early but blocked by: {opp.block_reason}"
-                )
-            elif classification == "REAL_MISSED_ONTIME":
+            elif setup.timing_type == SetupTimingType.ON_TIME:
                 self._real_missed_ontime += 1
-                logger.warning(
-                    f"❌ REAL MISSED (ON-TIME) [{signal_time_str}]: {opp.signal_direction} @ ${opp.hypothetical_entry:.0f} "
-                    f"→ MFE {opp.hypothetical_r_at_mfe:.2f}R | Blocked by: {opp.block_reason}"
-                )
-            elif classification == "FAKE_MISSED_LATE":
-                self._fake_missed_late += 1
-                logger.info(
-                    f"⏰ FAKE MISSED (LATE) [{signal_time_str}]: {opp.signal_direction} @ ${opp.hypothetical_entry:.0f} "
-                    f"→ Already moved {opp.move_at_detection_pct:.1f}% before detection | Not a real opportunity"
-                )
-            elif classification == "FAKE_MISSED_CHASE":
-                self._fake_missed_chase += 1
-                logger.info(
-                    f"⏰ FAKE MISSED (CHASE) [{signal_time_str}]: {opp.signal_direction} @ ${opp.hypothetical_entry:.0f} "
-                    f"→ Moved {opp.move_at_detection_pct:.1f}% before detection | Would be chasing"
-                )
-            else:
-                logger.warning(
-                    f"❌ MISSED WINNER [{signal_time_str}]: {opp.signal_direction} entry={opp.hypothetical_entry:.2f} "
-                    f"→ best={best_price:.2f} (MFE {opp.hypothetical_r_at_mfe:.2f}R) worst={worst_price:.2f} "
-                    f"| Blocked by: {opp.block_reason}"
-                )
-        else:
-            self._bad_trades_avoided += 1
-            logger.info(
-                f"✅ DODGED LOSER [{signal_time_str}]: {opp.signal_direction} entry={opp.hypothetical_entry:.2f} "
-                f"→ best={best_price:.2f} worst={worst_price:.2f} (MAE > MFE) "
-                f"| Blocked by: {opp.block_reason}"
+            
+            logger.warning(
+                f"❌ REAL MISSED: {setup.direction} {setup.edge_type} | "
+                f"Entry={setup.entry_level:.0f} → TP={setup.tp_level:.0f} | "
+                f"Blocked by: {setup.block_reason} | {reason}"
             )
+        elif classification == "LATE_DETECTION_WINNER":
+            self._late_detection_winners += 1
+            
+            # Legacy stats
+            if setup.timing_type == SetupTimingType.LATE:
+                self._fake_missed_late += 1
+            else:
+                self._fake_missed_chase += 1
+            
+            logger.info(
+                f"⏰ LATE DETECTION WINNER: {setup.direction} | "
+                f"Detected after {setup.move_pct_at_detection:.0f}% move | "
+                f"Not a real miss (was chasing)"
+            )
+        elif classification == "DODGED_LOSER":
+            self._dodged_losers += 1
+            self._bad_trades_avoided += 1  # Legacy compat
+            logger.info(
+                f"✅ DODGED LOSER: {setup.direction} | "
+                f"Entry={setup.entry_level:.0f} → SL hit | "
+                f"Blocked by: {setup.block_reason}"
+            )
+        elif classification == "DEAD_SETUP":
+            self._dead_setups += 1
+            self._bad_trades_avoided += 1  # Legacy compat
+            logger.info(
+                f"💀 DEAD SETUP: {setup.direction} | "
+                f"Invalidated @ {price:.0f} | Structure died"
+            )
+        elif classification == "PHANTOM_TRADE":
+            self._phantom_trades += 1
+            logger.debug(
+                f"👻 PHANTOM: {setup.direction} | "
+                f"Entry {setup.entry_level:.0f} never touched"
+            )
+        elif classification == "STALE":
+            self._stale += 1
+            logger.debug(f"⌛ STALE: {setup.direction} | Expired without resolution")
         
         # Persist if configured
         if self._persist_path:
-            self._persist_opportunity(opp)
+            self._persist_setup(setup)
     
-    def _persist_opportunity(self, opp: MissedOpportunity):
-        """Append opportunity to file"""
+    def _persist_setup(self, setup: BlockedSetup):
+        """Append setup to file."""
         if self._persist_path is None:
             return
         try:
             with open(self._persist_path, 'a') as f:
-                f.write(json.dumps(opp.to_dict()) + '\n')
+                f.write(json.dumps(setup.to_dict()) + '\n')
         except Exception as e:
-            logger.error(f"Failed to persist missed opportunity: {e}")
+            logger.error(f"Failed to persist setup: {e}")
     
+    # =========================================================================
+    # 📊 STATISTICS
+    # =========================================================================
     def get_statistics(self) -> Dict[str, Any]:
-        """Get comprehensive missed opportunity statistics"""
-        total_resolved = self._good_trades_missed + self._bad_trades_avoided
+        """Get comprehensive statistics."""
+        total_resolved = (
+            self._real_missed + 
+            self._late_detection_winners +
+            self._dodged_losers + 
+            self._dead_setups + 
+            self._phantom_trades +
+            self._stale
+        )
         
-        # Calculate filter effectiveness
+        # Filter effectiveness
         filter_stats = {}
         for reason in self._block_counts:
             total = self._block_counts[reason]
-            good_missed = self._block_good_missed.get(reason, 0)
-            bad_avoided = total - good_missed  # This is approximate
+            real_missed = self._block_real_missed.get(reason, 0)
             
             filter_stats[reason] = {
                 'total_blocks': total,
-                'good_trades_missed': good_missed,
-                'false_positive_rate': good_missed / total if total > 0 else 0.0
+                'real_missed': real_missed,
+                'good_trades_missed': real_missed,  # Legacy alias
+                'false_positive_rate': real_missed / total if total > 0 else 0.0
             }
         
-        # 🔥 FIX Feb 06: Timing classification stats
+        # Legacy timing analysis
         real_missed = self._real_missed_early + self._real_missed_ontime
         fake_missed = self._fake_missed_late + self._fake_missed_chase
         total_missed = real_missed + fake_missed
@@ -475,11 +889,24 @@ class MissedOpportunityTracker:
             'total_blocked': self._total_blocked,
             'pending_tracking': len(self._pending),
             'resolved': total_resolved,
+            # Real outcomes (v2)
+            'real_missed': self._real_missed,
+            'late_detection_winners': self._late_detection_winners,
+            'dodged_losers': self._dodged_losers,
+            'dead_setups': self._dead_setups,
+            'phantom_trades': self._phantom_trades,
+            'stale': self._stale,
+            # Legacy compat
             'good_trades_missed': self._good_trades_missed,
             'bad_trades_avoided': self._bad_trades_avoided,
+            # Rates
+            'real_miss_rate': self._real_missed / total_resolved if total_resolved > 0 else 0.0,
             'miss_rate': self._good_trades_missed / total_resolved if total_resolved > 0 else 0.0,
+            'dodged_rate': self._dodged_losers / total_resolved if total_resolved > 0 else 0.0,
+            'phantom_rate': self._phantom_trades / total_resolved if total_resolved > 0 else 0.0,
+            # Filter analysis
             'filter_effectiveness': filter_stats,
-            # 🔥 FIX Feb 06: Real vs Fake missed breakdown
+            # Legacy timing analysis
             'timing_analysis': {
                 'real_missed': real_missed,
                 'real_missed_early': self._real_missed_early,
@@ -494,62 +921,67 @@ class MissedOpportunityTracker:
     
     def get_worst_filters(self, top_n: int = 5) -> List[Dict]:
         """
-        Get filters with highest false positive rate (blocking good trades).
-        
-        Use this to tune filters that are too aggressive.
+        Get filters with highest false positive rate (blocking REAL trades).
         """
         filter_stats = []
         
         for reason in self._block_counts:
             total = self._block_counts[reason]
-            good_missed = self._block_good_missed.get(reason, 0)
+            real_missed = self._block_real_missed.get(reason, 0)
             
-            if total >= 5:  # Need minimum sample
+            if total >= 3:  # Minimum sample
                 filter_stats.append({
                     'filter': reason,
                     'total_blocks': total,
-                    'good_missed': good_missed,
-                    'false_positive_rate': good_missed / total
+                    'real_missed': real_missed,
+                    'good_missed': real_missed,  # Legacy alias
+                    'false_positive_rate': real_missed / total
                 })
         
-        # Sort by false positive rate (highest first)
         filter_stats.sort(key=lambda x: x['false_positive_rate'], reverse=True)
-        
         return filter_stats[:top_n]
     
     def log_summary(self):
-        """Log a summary of missed opportunities"""
+        """Log a summary of missed opportunities."""
         stats = self.get_statistics()
         timing = stats.get('timing_analysis', {})
         
         logger.info("=" * 60)
-        logger.info("📊 MISSED OPPORTUNITY SUMMARY")
+        logger.info("📊 MISSED OPPORTUNITY SUMMARY (v2.0)")
         logger.info("=" * 60)
-        logger.info(f"Total signals blocked: {stats['total_blocked']}")
+        logger.info(f"Total blocked: {stats['total_blocked']}")
         logger.info(f"Currently tracking: {stats['pending_tracking']}")
         logger.info(f"Resolved: {stats['resolved']}")
-        logger.info(f"  ❌ Good trades missed: {stats['good_trades_missed']}")
-        logger.info(f"  ✅ Bad trades avoided: {stats['bad_trades_avoided']}")
-        logger.info(f"Miss rate: {stats['miss_rate']:.1%}")
+        logger.info("")
+        logger.info("📊 OUTCOMES:")
+        logger.info(f"  ❌ REAL MISSED (true opportunities): {stats['real_missed']}")
+        logger.info(f"  ⏰ Late detection winners: {stats['late_detection_winners']}")
+        logger.info(f"  ✅ DODGED LOSERS: {stats['dodged_losers']}")
+        logger.info(f"  💀 Dead setups (invalidated): {stats['dead_setups']}")
+        logger.info(f"  👻 Phantom trades (entry never hit): {stats['phantom_trades']}")
+        logger.info(f"  ⌛ Stale (expired): {stats['stale']}")
+        logger.info("")
+        logger.info(f"Real miss rate: {stats['real_miss_rate']:.1%}")
+        logger.info(f"Phantom rate: {stats['phantom_rate']:.1%}")
         
-        # 🔥 FIX Feb 06: Timing analysis
+        # Legacy timing analysis
         if timing:
             logger.info("")
             logger.info("📊 TIMING ANALYSIS (Real vs Fake Missed):")
-            logger.info(f"  🎯 REAL MISSED (detected early but blocked):")
+            logger.info(f"  🎯 REAL MISSED (detected early):")
             logger.info(f"     Early: {timing.get('real_missed_early', 0)}")
             logger.info(f"     On-time: {timing.get('real_missed_ontime', 0)}")
-            logger.info(f"     Total: {timing.get('real_missed', 0)} ({timing.get('real_missed_pct', 0):.0%} of winners)")
             logger.info(f"  ⏰ FAKE MISSED (detected late - not real opportunities):")
             logger.info(f"     Late: {timing.get('fake_missed_late', 0)}")
             logger.info(f"     Chase: {timing.get('fake_missed_chase', 0)}")
-            logger.info(f"     Total: {timing.get('fake_missed', 0)} ({timing.get('fake_missed_pct', 0):.0%} of winners)")
         
-        # Show worst filters
         worst = self.get_worst_filters(3)
         if worst:
             logger.info("")
-            logger.info("⚠️ FILTERS WITH HIGHEST FALSE POSITIVE RATE:")
+            logger.info("⚠️ FILTERS BLOCKING REAL TRADES:")
             for f in worst:
-                logger.info(f"  {f['filter']}: {f['false_positive_rate']:.0%} ({f['good_missed']}/{f['total_blocks']} good trades blocked)")
+                logger.info(
+                    f"  {f['filter']}: {f['false_positive_rate']:.0%} "
+                    f"({f['real_missed']}/{f['total_blocks']} real missed)"
+                )
         logger.info("=" * 60)

@@ -181,7 +181,7 @@ class BTCCorrelationFilter(BaseFilter):
             elif self.mode == "PENALTY":
                 # Apply penalty proportional to trend strength
                 penalty = self.COUNTER_TREND_PENALTY * btc_strength
-                logger.info(f"{msg} → penalty {penalty:.1f}")
+                logger.debug(f"{msg} → penalty {penalty:.1f}")  # Changed to debug - too noisy
                 return FilterDecision(
                     allow=True,
                     score_adjust=penalty,

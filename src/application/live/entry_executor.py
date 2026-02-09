@@ -256,6 +256,36 @@ class PositionSizeCalculator:
             edge_multiplier * vol_mult * spread_mult * antic_mult * loss_mult
         )
         
+        # =====================================================================
+        # 🔥 FIX #100 (Feb 09, 2026): SIZING FLOOR - PREVENT EXTREME REDUCTION
+        # 
+        # PROBLEMA DETECTADO:
+        # - Múltiples multiplicadores se acumulan: RR × REG × LOSS × SESS × EDGE × TOXIC_HR × FUSION
+        # - Resultado: 0.83 × 0.7 × 0.6 × 0.8 × 0.54 × 0.5 × 0.6 = 0.08 (8% sizing)
+        # - Con balance de $254, esto da posiciones de $20, beneficio de $0.20
+        # - $0.20 < threshold de $0.30 = HARD BLOCK infinito
+        # 
+        # SOLUCIÓN:
+        # - Aplicar floor del 25% mínimo al multiplicador combinado
+        # - Esto garantiza que al menos 25% del sizing base se use
+        # - Para balance $254: 25% sizing = ~$63 = profit ~$0.63 (>threshold)
+        # 
+        # WHY 25%:
+        # - Suficiente para superar thresholds de profitability
+        # - Aún permite reducción significativa en condiciones adversas
+        # - Balancea riesgo vs operabilidad
+        # =====================================================================
+        MIN_SIZING_FLOOR = 0.25  # Never reduce below 25%
+        
+        if result.final_multiplier < MIN_SIZING_FLOOR:
+            old_mult = result.final_multiplier
+            result.final_multiplier = MIN_SIZING_FLOOR
+            result.multipliers_applied['floor_applied'] = True
+            result.multipliers_applied['floor_original'] = old_mult
+            logger.info(
+                f"🔥 FIX #100: Sizing floor applied. Original={old_mult:.2%} → Floor={MIN_SIZING_FLOOR:.0%}"
+            )
+        
         # Apply multiplier
         result.size = base_size * result.final_multiplier
         result.size = round_size_to_exchange(result.size)

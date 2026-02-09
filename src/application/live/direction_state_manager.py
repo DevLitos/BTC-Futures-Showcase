@@ -41,6 +41,7 @@ class DirectionState:
     direction_lock_expires_at: Optional[datetime] = None
     direction_lock_initial_move: float = 0.0
     direction_lock_timeout_minutes: int = 30
+    direction_lock_start_time: Optional[datetime] = None  # FEB06: Para time decay
     
     # Displacement state
     displacement_bypass: bool = False
@@ -69,9 +70,15 @@ class AdaptiveParams:
     volatility_ratio: float = 1.0
     expansion_timeout_minutes: int = 20
     direction_lock_timeout_minutes: int = 15
-    asymmetric_invalidation_mult: float = 3.0
+    # FEB06: Bajado de 3.0 a 1.5 - era demasiado conservador
+    # 3.0x mataba oportunidades intraday (ej: $174 inicial → necesitaba $522 para invalidar)
+    asymmetric_invalidation_mult: float = 1.5
     displacement_atr_mult: float = 2.8
     strong_displacement_mult: float = 1.5
+    
+    # FEB06: Nuevos parámetros para invalidación inteligente
+    lock_time_decay_half_life_min: float = 8.0  # Lock pierde 50% fuerza cada 8min
+    momentum_override_threshold: float = 0.6  # Si opuesto > 60% inicial + momentum alto → invalidar
     
     # For debugging
     vol_displacement_adj: float = 1.0
@@ -285,14 +292,23 @@ class DirectionStateManager:
     def check_direction_lock_invalidation(
         self,
         drop_from_high: float,
-        rise_from_low: float
+        rise_from_low: float,
+        atr_5m: float = 0.0,
+        adx: float = 0.0,
+        vol_percentile: float = 50.0
     ) -> bool:
         """
         Check if direction lock should be invalidated by opposite movement.
         
-        Uses asymmetric invalidation - needs 3x the evidence to invalidate.
+        FEB06 REFACTOR: Ahora con time decay y momentum override.
+        - Time decay: Lock pierde fuerza con half-life de 8min
+        - Momentum override: Si opuesto > 60% inicial + ADX alto + vol alta → invalidar
+        - Multiplicador base: 1.5x (antes era 3.0x)
+        
         Returns True if lock was invalidated.
         """
+        import math
+        
         if not self._state.direction_lock or self._state.direction_lock_initial_move <= 0:
             return False
         
@@ -302,18 +318,63 @@ class DirectionStateManager:
         elif self._state.direction_lock == 'LONG':
             opposite_move = drop_from_high
         
-        threshold = self._state.direction_lock_initial_move * self._params.asymmetric_invalidation_mult
+        initial_move = self._state.direction_lock_initial_move
+        base_mult = self._params.asymmetric_invalidation_mult  # 1.5
         
+        # =====================================================================
+        # FEB06: TIME DECAY - Lock pierde fuerza con el tiempo
+        # Half-life de 8min: después de 8min, lock_strength = 0.5
+        # =====================================================================
+        elapsed_min = 0.0
+        lock_strength = 1.0
+        if self._state.direction_lock_start_time:
+            elapsed_min = (datetime.now() - self._state.direction_lock_start_time).total_seconds() / 60
+            half_life = self._params.lock_time_decay_half_life_min  # 8.0
+            # Decay exponencial: strength = 0.5^(elapsed/half_life)
+            lock_strength = math.pow(0.5, elapsed_min / half_life)
+        
+        # El threshold efectivo = initial * mult * lock_strength
+        # A medida que pasa el tiempo, es más fácil invalidar
+        effective_mult = base_mult * lock_strength
+        effective_mult = max(0.8, effective_mult)  # Floor: mínimo 0.8x
+        
+        threshold = initial_move * effective_mult
+        
+        # =====================================================================
+        # FEB06: MOMENTUM OVERRIDE - Si hay impulso fuerte opuesto, invalidar antes
+        # Condiciones: opuesto > 60% inicial + ADX > 25 + vol_percentile > 60
+        # =====================================================================
+        momentum_threshold = initial_move * self._params.momentum_override_threshold  # 0.6
+        adx_high = adx > 25
+        vol_high = vol_percentile > 60
+        
+        if opposite_move >= momentum_threshold and adx_high and vol_high:
+            logger.warning(
+                f"🔴 DIRECTION_LOCK INVALIDATED (MOMENTUM OVERRIDE): "
+                f"Opposite ${opposite_move:.0f} ≥ {self._params.momentum_override_threshold:.0%} of "
+                f"${initial_move:.0f} = ${momentum_threshold:.0f} | "
+                f"ADX={adx:.1f}>25 ✓ | VOL%={vol_percentile:.0f}>60 ✓ | "
+                f"Lock was {self._state.direction_lock} - NOW RELEASED"
+            )
+            self._clear_direction_lock()
+            self._trade_tags['direction_lock_invalidated_momentum'] = True
+            return True
+        
+        # =====================================================================
+        # INVALIDACIÓN ESTÁNDAR (con time decay aplicado)
+        # =====================================================================
         if opposite_move >= threshold:
             logger.warning(
                 f"🔴 DIRECTION_LOCK INVALIDATED (ASYMMETRIC): "
-                f"Opposite move ${opposite_move:.0f} ≥ "
-                f"{self._params.asymmetric_invalidation_mult:.1f}x initial "
-                f"${self._state.direction_lock_initial_move:.0f} = ${threshold:.0f} | "
+                f"Opposite ${opposite_move:.0f} ≥ "
+                f"effective {effective_mult:.2f}x (base {base_mult:.1f} × strength {lock_strength:.2f}) "
+                f"× initial ${initial_move:.0f} = ${threshold:.0f} | "
+                f"Elapsed: {elapsed_min:.1f}min | "
                 f"Lock was {self._state.direction_lock} - NOW RELEASED"
             )
             self._clear_direction_lock()
             self._trade_tags['direction_lock_invalidated_asymmetric'] = True
+            self._trade_tags['lock_strength_at_invalidation'] = lock_strength
             return True
         
         return False
@@ -330,6 +391,7 @@ class DirectionStateManager:
         self._state.direction_lock_reason = reason
         self._state.direction_lock_expires_at = datetime.now() + timedelta(minutes=timeout)
         self._state.direction_lock_initial_move = initial_move
+        self._state.direction_lock_start_time = datetime.now()  # FEB06: Para time decay
         
         self._trade_tags['direction_lock'] = direction
         self._trade_tags['direction_lock_reason'] = reason
@@ -340,6 +402,7 @@ class DirectionStateManager:
         self._state.direction_lock_reason = None
         self._state.direction_lock_expires_at = None
         self._state.direction_lock_initial_move = 0.0
+        self._state.direction_lock_start_time = None  # FEB06
     
     # =========================================================================
     # EXPANSION MODE MANAGEMENT
@@ -745,13 +808,16 @@ class DirectionStateManager:
 
     # =========================================================================
     # UNIFIED DIRECTION VALIDATION (Feb 04, 2026 - AUDIT FIX)
+    # 🔥 FIX #77 (Feb 07, 2026): REDUCE instead of BLOCK
     # =========================================================================
-    # This replaces scattered direction checks in:
-    # - entry_orchestrator.py Guard 13 (counter-momentum)
-    # - trading_app.py fast path checks  
-    # - Various getattr() based checks
+    # PHILOSOPHY: Direction conflicts should PENALIZE, not BLOCK.
+    # The market gives signals that conflict sometimes. That's normal.
+    # Instead of refusing to trade, we trade with reduced size/score.
     # 
-    # SINGLE SOURCE OF TRUTH for "can we trade this direction?"
+    # NEW RETURN: (is_allowed, reason, category, size_mult, score_penalty)
+    # - is_allowed: False ONLY for truly dangerous situations (< 2min expansion)
+    # - size_mult: 1.0 = normal, 0.5 = half size, etc
+    # - score_penalty: negative adjustment to entry score
     # =========================================================================
     
     def validate_direction(
@@ -759,53 +825,107 @@ class DirectionStateManager:
         proposed_direction: str,
         current_time: Optional[datetime] = None,
         is_edge_active: bool = False
-    ) -> tuple[bool, str, str]:
+    ) -> tuple[bool, str, str, float, float]:
         """
         Validate if a proposed trade direction is allowed.
         
-        Consolidates ALL direction checks into one method:
-        - Direction lock conflicts
-        - Forbidden direction blocks
-        - Counter-expansion blocks
+        🔥 FIX #77: Returns penalties instead of hard blocks for most cases.
         
         Args:
             proposed_direction: 'LONG' or 'SHORT' - direction we want to trade
             current_time: Current time for timeout calculations
-            is_edge_active: If True and edge matches direction, bypass some blocks
+            is_edge_active: If True, reduce penalties (edge already confirmed)
             
         Returns:
-            (is_allowed, block_reason, block_category)
-            - is_allowed: True if direction is OK
-            - block_reason: Human-readable reason if blocked
-            - block_category: Category code ('counter_momentum', 'forbidden', etc)
+            (is_allowed, block_reason, block_category, size_mult, score_penalty)
+            - is_allowed: True if trade can proceed (even with penalties)
+            - block_reason: Human-readable reason for penalty/block
+            - block_category: Category code
+            - size_mult: Position size multiplier (1.0 = full, 0.5 = half)
+            - score_penalty: Score adjustment (0 = no penalty, -1 = small, -2 = medium)
         """
         now = current_time or datetime.now()
         
+        # Default: fully allowed
+        size_mult = 1.0
+        score_penalty = 0.0
+        
         # =====================================================================
         # CHECK 1: DIRECTION LOCK
-        # If we have a direction lock that differs from proposed direction
+        # 🔥 FIX #77: Lock conflict → REDUCE, not BLOCK
+        # 
+        # OLD: direction_lock != proposed → HARD BLOCK
+        # NEW: direction_lock != proposed → 50% size, -1.5 score
+        # 
+        # WHY: The lock was set based on PAST momentum. The current signal
+        # may represent a LEGITIMATE reversal. Reducing size is safer than
+        # missing a valid trade.
         # =====================================================================
         if self._state.direction_lock and self._state.direction_lock != proposed_direction:
-            return (
-                False, 
-                f"Counter-momentum: {proposed_direction} against lock {self._state.direction_lock}",
-                'counter_momentum'
-            )
+            # Not a hard block anymore - just penalize
+            lock_size_mult = 0.50
+            lock_score_penalty = -1.5
+            
+            # If edge is active, reduce the penalty (edge already confirmed direction)
+            if is_edge_active:
+                lock_size_mult = 0.70
+                lock_score_penalty = -0.8
+                logger.info(
+                    f"⚠️ FIX #77 DIRECTION SOFT: {proposed_direction} vs lock {self._state.direction_lock} | "
+                    f"Edge active → size={lock_size_mult}, penalty={lock_score_penalty}"
+                )
+            else:
+                logger.info(
+                    f"⚠️ FIX #77 DIRECTION SOFT: {proposed_direction} vs lock {self._state.direction_lock} | "
+                    f"Reducing size={lock_size_mult}, penalty={lock_score_penalty}"
+                )
+            
+            size_mult = min(size_mult, lock_size_mult)
+            score_penalty += lock_score_penalty
+            self._trade_tags['direction_lock_penalty'] = True
+            self._trade_tags['direction_lock_size_mult'] = lock_size_mult
         
         # =====================================================================
         # CHECK 2: FORBIDDEN DIRECTION
-        # If the proposed direction is explicitly forbidden
+        # 🔥 FIX #77: Forbidden → HEAVY REDUCE (not block)
+        # 
+        # OLD: forbidden == proposed → HARD BLOCK
+        # NEW: forbidden == proposed → 30% size, -2.0 score (but CAN trade)
+        # 
+        # WHY: Forbidden was set because price moved against us. But the
+        # signal now may be a BETTER entry at lower price. Allow with caution.
         # =====================================================================
         if self._state.forbidden_direction == proposed_direction:
-            return (
-                False,
-                f"Forbidden direction: {proposed_direction}",
-                'forbidden_direction'
-            )
+            forbidden_size_mult = 0.30
+            forbidden_score_penalty = -2.0
+            
+            # If edge is active, it overrides the forbidden (edge detected fresh move)
+            if is_edge_active:
+                forbidden_size_mult = 0.60
+                forbidden_score_penalty = -1.0
+                logger.info(
+                    f"⚠️ FIX #77 FORBIDDEN SOFT: {proposed_direction} forbidden but edge active | "
+                    f"Reducing size={forbidden_size_mult}, penalty={forbidden_score_penalty}"
+                )
+            else:
+                logger.warning(
+                    f"⚠️ FIX #77 FORBIDDEN SOFT: {proposed_direction} forbidden | "
+                    f"Heavy reduction size={forbidden_size_mult}, penalty={forbidden_score_penalty}"
+                )
+            
+            size_mult = min(size_mult, forbidden_size_mult)
+            score_penalty += forbidden_score_penalty
+            self._trade_tags['forbidden_penalty'] = True
+            self._trade_tags['forbidden_size_mult'] = forbidden_size_mult
         
         # =====================================================================
         # CHECK 3: COUNTER-EXPANSION
-        # If expansion mode is active in opposite direction
+        # 🔥 FIX #77: ONLY hard block during first 2 minutes
+        # After that, degrade to penalty
+        #
+        # WHY: Expansion mode protects against immediate reversal. But after
+        # a few minutes, if there's a signal in opposite direction, the
+        # expansion may have failed. Better to trade small than miss reversal.
         # =====================================================================
         if (self._state.expansion_mode and 
             self._state.expansion_direction and 
@@ -813,21 +933,58 @@ class DirectionStateManager:
             
             if self._state.expansion_start_time:
                 elapsed_sec = (now - self._state.expansion_start_time).total_seconds()
-                # 10 minute protection window
-                if elapsed_sec < 600:
-                    elapsed_min = elapsed_sec / 60
+                elapsed_min = elapsed_sec / 60
+                
+                # First 2 minutes: HARD BLOCK (expansion just started)
+                if elapsed_sec < 120:
                     return (
                         False,
-                        f"Counter-expansion: {proposed_direction} against {self._state.expansion_direction} ({elapsed_min:.1f}min)",
-                        'counter_expansion'
+                        f"Counter-expansion: {proposed_direction} vs {self._state.expansion_direction} ({elapsed_min:.1f}min - too fresh)",
+                        'counter_expansion',
+                        0.0,
+                        0.0
                     )
+                # 2-5 minutes: HEAVY penalty (expansion still recent)
+                elif elapsed_sec < 300:
+                    exp_size_mult = 0.30
+                    exp_score_penalty = -2.5
+                    logger.warning(
+                        f"⚠️ FIX #77 EXPANSION SOFT: {proposed_direction} vs {self._state.expansion_direction} | "
+                        f"{elapsed_min:.1f}min elapsed → size={exp_size_mult}, penalty={exp_score_penalty}"
+                    )
+                    size_mult = min(size_mult, exp_size_mult)
+                    score_penalty += exp_score_penalty
+                    self._trade_tags['expansion_counter_penalty'] = True
+                # 5-10 minutes: MODERATE penalty (expansion may be failing)
+                elif elapsed_sec < 600:
+                    exp_size_mult = 0.50
+                    exp_score_penalty = -1.5
+                    logger.info(
+                        f"⚠️ FIX #77 EXPANSION SOFT: {proposed_direction} vs {self._state.expansion_direction} | "
+                        f"{elapsed_min:.1f}min elapsed → size={exp_size_mult}, penalty={exp_score_penalty}"
+                    )
+                    size_mult = min(size_mult, exp_size_mult)
+                    score_penalty += exp_score_penalty
+                    self._trade_tags['expansion_counter_penalty'] = True
+                # >10 minutes: Just log, no penalty (expansion is old)
         
-        # All checks passed
-        return (True, "", "")
+        # All checks passed (may have accumulated penalties)
+        has_any_penalty = size_mult < 1.0 or score_penalty < 0
+        reason = ""
+        category = ""
+        
+        if has_any_penalty:
+            reason = f"Direction penalties: size×{size_mult:.0%}, score{score_penalty:+.1f}"
+            category = "direction_penalty"
+        
+        return (True, reason, category, size_mult, score_penalty)
     
     def is_direction_blocked(self, proposed_direction: str) -> bool:
-        """Simple check if direction is blocked (no details)."""
-        is_allowed, _, _ = self.validate_direction(proposed_direction)
+        """Simple check if direction is blocked (no details).
+        
+        🔥 FIX #77: Now only returns True for HARD blocks (counter-expansion < 2min).
+        """
+        is_allowed, _, _, _, _ = self.validate_direction(proposed_direction)
         return not is_allowed
     
     def get_active_direction(self) -> Optional[str]:

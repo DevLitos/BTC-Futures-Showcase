@@ -470,16 +470,42 @@ class TradeType(str, Enum):
 # ============================================================================
 class BiasStrength(str, Enum):
     """
-    3-state bias system for smarter direction management.
+    MACRO BIAS (Régimen Estructural) - EMA50 vs EMA200
     
-    Instead of binary LONG/SHORT permission, we now have:
-    - BULL_STRONG: Strong uptrend - LONG preferred, SHORT only tactical
-    - BEAR_STRONG: Strong downtrend - SHORT preferred, LONG only tactical  
-    - NEUTRAL: Ranging/weak - both directions allowed with mean-reversion logic
+    This is the MACRO context - what the market IS, not what to trade.
+    - BULL_STRONG: EMA50 > EMA200 with separation
+    - BEAR_STRONG: EMA50 < EMA200 with separation
+    - NEUTRAL: Low ADX or no clear separation
     """
     BULL_STRONG = "BULL_STRONG"
     BEAR_STRONG = "BEAR_STRONG"
     NEUTRAL = "NEUTRAL"
+
+
+class WorkingBias(str, Enum):
+    """
+    🔥 FIX #76 (Feb 07, 2026): WORKING BIAS - Dirección Operativa
+    
+    Derived from macro_bias (BiasStrength), tells us what to PREFER trading.
+    This is NOT a blocker, it's a PREFERENCE.
+    
+    - LONG_PREF: Prefer LONGs, allow SHORTs only with strong setup
+    - SHORT_PREF: Prefer SHORTs, allow LONGs only with strong setup  
+    - BOTH: Both directions equally valid (ranging market)
+    
+    HOW IT WORKS:
+    - BEAR_STRONG macro → SHORT_PREF working bias
+    - BULL_STRONG macro → LONG_PREF working bias
+    - NEUTRAL macro → BOTH (trade what triggers)
+    
+    CRITICAL: WorkingBias NEVER BLOCKS, it only:
+    1. Reduces size for counter-preference trades
+    2. Increases RR requirement for counter-preference
+    3. Gets overridden by STRONG EDGES (Displacement, BOS, Breakout)
+    """
+    LONG_PREF = "LONG_PREF"    # Prefer LONGs (in BULL markets)
+    SHORT_PREF = "SHORT_PREF"  # Prefer SHORTs (in BEAR markets)
+    BOTH = "BOTH"              # No preference (ranging)
 
 
 class BiasStrengthConfig:
@@ -564,6 +590,139 @@ class BiasStrengthConfig:
                 'hard_stop': False,
                 'cooldown_on_loss': 0,
             }
+    
+    @classmethod
+    def get_working_bias(cls, bias_strength: 'BiasStrength') -> 'WorkingBias':
+        """
+        ⚠️ DEPRECATED: Use RegimeFusion.fuse() instead for sizing decisions.
+        
+        This function is kept for logging/analysis purposes only.
+        The actual sizing multiplier now comes from RegimeFusion.
+        
+        See: src/domain/market/regime/regime_fusion.py
+        """
+        if bias_strength == BiasStrength.BEAR_STRONG:
+            return WorkingBias.SHORT_PREF
+        elif bias_strength == BiasStrength.BULL_STRONG:
+            return WorkingBias.LONG_PREF
+        else:
+            return WorkingBias.BOTH
+    
+    @classmethod
+    def get_counter_preference_rules(cls, working_bias: 'WorkingBias', direction: str) -> dict:
+        """
+        ⚠️ DEPRECATED: Use RegimeFusion.fuse() instead.
+        
+        RegimeFusion provides:
+        - size_mult based on alignment
+        - rr_min based on alignment
+        - is_blocked for "stupid fades"
+        
+        This function is kept for backward compatibility only.
+        See: src/domain/market/regime/regime_fusion.py
+        """
+        # Determine if trade is against preference
+        is_counter_pref = (
+            (working_bias == WorkingBias.LONG_PREF and direction == 'SHORT') or
+            (working_bias == WorkingBias.SHORT_PREF and direction == 'LONG')
+        )
+        
+        if is_counter_pref:
+            return {
+                'is_counter_preference': True,
+                'size_mult': 0.5,       # 50% size (meaningful, not tiny)
+                'rr_add': 0.3,          # Need 0.3R extra (1.3R min instead of 1.0R)
+                'score_penalty': -0.3,  # Small score deduction
+            }
+        else:
+            return {
+                'is_counter_preference': False,
+                'size_mult': 1.0,
+                'rr_add': 0.0,
+                'score_penalty': 0.0,
+            }
+    
+    @classmethod
+    def calculate_weighted_bias_score(
+        cls,
+        ema50_vs_ema200: str,      # 'BULL', 'BEAR', 'NEUTRAL'
+        di_direction: str | None,  # 'LONG', 'SHORT', or None
+        di_strength: float,        # abs(+DI - -DI)
+        price_vs_ema50_pct: float, # % distance from EMA50
+        ema50_slope: float,        # slope of EMA50
+        trade_direction: str       # 'LONG' or 'SHORT'
+    ) -> dict:
+        """
+        ⚠️ DEPRECATED: Use RegimeFusion.update_macro() and fuse() instead.
+        
+        This function is superseded by the 3-layer RegimeFusion architecture:
+        - CAPA 1 (MACRO): EMA50/200, +DI/-DI, EMA50 slope → macro_score
+        - CAPA 2 (MICRO): direction, confidence, displacement
+        - CAPA 3 (FUSION): alignment → size_mult, rr_min
+        
+        RegimeFusion provides cleaner separation and explicit BLOCK logic.
+        See: src/domain/market/regime/regime_fusion.py
+        """
+        scores = {}
+        
+        # Component 1: EMA50/200 macro (weight 0.35)
+        if ema50_vs_ema200 == 'BULL':
+            scores['macro'] = 1.0
+        elif ema50_vs_ema200 == 'BEAR':
+            scores['macro'] = -1.0
+        else:
+            scores['macro'] = 0.0
+        
+        # Component 2: DI direction (weight 0.30)
+        if di_direction == 'LONG' and di_strength >= 5:
+            scores['di'] = min(1.0, di_strength / 15.0)  # Scale: 5-15 → 0.33-1.0
+        elif di_direction == 'SHORT' and di_strength >= 5:
+            scores['di'] = -min(1.0, di_strength / 15.0)
+        else:
+            scores['di'] = 0.0
+        
+        # Component 3: Price vs EMA50 (weight 0.20)
+        # Positive = price above EMA50 (bullish)
+        # Negative = price below EMA50 (bearish)
+        # Cap at ±5% for normalization
+        scores['position'] = max(-1.0, min(1.0, price_vs_ema50_pct / 0.05))
+        
+        # Component 4: EMA50 slope (weight 0.15)
+        # Cap at ±0.1% for normalization
+        scores['slope'] = max(-1.0, min(1.0, ema50_slope / 0.001))
+        
+        # Calculate weighted score
+        weights = {'macro': 0.35, 'di': 0.30, 'position': 0.20, 'slope': 0.15}
+        weighted_score = sum(scores[k] * weights[k] for k in scores)
+        
+        # Calculate alignment with trade direction
+        # LONG trade: positive score = aligned, negative = misaligned
+        # SHORT trade: negative score = aligned, positive = misaligned
+        if trade_direction == 'LONG':
+            alignment = weighted_score  # LONG wants positive score
+        else:
+            alignment = -weighted_score  # SHORT wants negative score
+        
+        # Size multiplier based on alignment
+        # alignment >= 0.5: Full size (1.0)
+        # alignment 0 to 0.5: 0.7 to 1.0
+        # alignment -0.5 to 0: 0.4 to 0.7
+        # alignment < -0.5: 0.3
+        if alignment >= 0.5:
+            size_mult = 1.0
+        elif alignment >= 0:
+            size_mult = 0.7 + (alignment * 0.6)  # 0.7 to 1.0
+        elif alignment >= -0.5:
+            size_mult = 0.4 + ((alignment + 0.5) * 0.6)  # 0.4 to 0.7
+        else:
+            size_mult = 0.3
+        
+        return {
+            'score': round(weighted_score, 3),
+            'alignment': round(alignment, 3),
+            'size_mult': round(size_mult, 2),
+            'breakdown': {k: round(v, 3) for k, v in scores.items()},
+        }
 
 
 # ============================================================================
@@ -1079,7 +1238,7 @@ class OperatingMode:
     PLANNED_EXIT_REASONS = {
         'VPOC_EXIT', 'TP_HIT', 'TAKE_PROFIT', 'TP1', 'TP2',
         'EXCHANGE_TAKE_PROFIT', 'MOMENTUM_EXHAUSTION', 'SMART_EXIT',
-        'VOLATILITY_SQUEEZE_EXIT'
+        'VOLATILITY_SQUEEZE_EXIT', 'EARLY_MFE_EXIT'  # 🔥 FIX (Feb 07): If profitable, short cooldown
     }
     
     @classmethod
@@ -1090,8 +1249,19 @@ class OperatingMode:
         🔥 FIX (Jan 22, 2026): Differentiate planned exits from losses
         - VPOC_EXIT with profit = 5 min (was 15)
         - SL hit = depends on loss size
+        🔥 FIX (Feb 07, 2026): EARLY_MFE_EXIT with profit = short cooldown
+        🔥🔥🔥 FIX #86 (Feb 07, 2026): EARLY_MFE_EXIT = MINIMO cooldown
+        PROBLEMA: Después de EARLY_MFE_EXIT, 8min de cooldown mientras 
+        el mercado sigue moviéndose = PERDER el movimiento real.
+        EARLY_MFE_EXIT significa que cortamos temprano por precaución,
+        NO que hubo un error → cooldown mínimo de 2 minutos.
         """
         exit_upper = exit_reason.upper()
+        
+        # 🔥 FIX #86: EARLY_MFE_EXIT = cooldown MINIMO de 2 minutos
+        # Ya cortamos temprano, no tiene sentido castigarse más
+        if exit_upper == 'EARLY_MFE_EXIT':
+            return 2  # 2 minutos MAXIMO - no perdemos el movimiento
         
         # Planned exits with profit/small loss = short cooldown
         if exit_upper in cls.PLANNED_EXIT_REASONS or any(r in exit_upper for r in ['VPOC', 'TP', 'PROFIT']):
@@ -1829,7 +1999,9 @@ class RiskManagement:
     LOSS_STREAK_5_COOLDOWN_MIN = 60   # Minutes to wait after 5+ losses
     
     # --- MOMENTUM SIZING ---
-    MOMENTUM_SIZING_ENABLED = True
+    # 🔥 DISABLED (Feb 7, 2026): momentum_score is always 0 (never calculated)
+    # This was silently reducing all sizes by 50%
+    MOMENTUM_SIZING_ENABLED = False  # TODO: Fix momentum calculation first
     MOMENTUM_LOW_THRESHOLD = 0.5    # Below this = low momentum
     MOMENTUM_HIGH_THRESHOLD = 1.5   # Above this = high momentum  
     MOMENTUM_LOW_MULT = 0.5         # Sizing mult for low momentum

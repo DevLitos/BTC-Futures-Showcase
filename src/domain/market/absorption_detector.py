@@ -265,25 +265,49 @@ class AbsorptionDetector:
         return bool((recent_closes < vwap * 1.001).all())
     
     def _check_no_new_low(self, df: pd.DataFrame, cfg: AbsorptionDetectorConfig) -> bool:
-        """Check if no new lows in recent candles."""
-        if len(df) < cfg.NO_NEW_EXTREME_CANDLES + 2:
+        """
+        Check if no new lows in recent candles.
+        
+        🔥 FIX M2 (Feb 07, 2026): Compare against REASONABLE lookback, not all history.
+        """
+        LOOKBACK_CANDLES = 12  # 1 hour window for comparison
+        
+        if len(df) < LOOKBACK_CANDLES:
             return False
         
-        # Get lowest low before the check period
-        prior_low = df['low'].iloc[:-cfg.NO_NEW_EXTREME_CANDLES].min()
-        # Get lowest low in recent period
+        # Compare recent 4 candles against prior 8 candles (not all history)
         recent_low = df['low'].tail(cfg.NO_NEW_EXTREME_CANDLES).min()
+        prior_section = df.iloc[-LOOKBACK_CANDLES:-cfg.NO_NEW_EXTREME_CANDLES]
+        
+        if len(prior_section) < 4:
+            return False
+        
+        prior_low = prior_section['low'].min()
         
         # No new low if recent low is higher than prior
         return recent_low > prior_low
     
     def _check_no_new_high(self, df: pd.DataFrame, cfg: AbsorptionDetectorConfig) -> bool:
-        """Check if no new highs in recent candles."""
-        if len(df) < cfg.NO_NEW_EXTREME_CANDLES + 2:
+        """
+        Check if no new highs in recent candles.
+        
+        🔥 FIX M2 (Feb 07, 2026): Compare against REASONABLE lookback, not all history.
+        Before: compared against entire DataFrame = almost always True
+        Now: compare against last 12 candles (1 hour on 5m TF)
+        """
+        LOOKBACK_CANDLES = 12  # 1 hour window for comparison
+        
+        if len(df) < LOOKBACK_CANDLES:
             return False
         
-        prior_high = df['high'].iloc[:-cfg.NO_NEW_EXTREME_CANDLES].max()
+        # Compare recent 4 candles against prior 8 candles (not all history)
         recent_high = df['high'].tail(cfg.NO_NEW_EXTREME_CANDLES).max()
+        prior_section = df.iloc[-LOOKBACK_CANDLES:-cfg.NO_NEW_EXTREME_CANDLES]
+        
+        if len(prior_section) < 4:
+            return False
+        
+        prior_high = prior_section['high'].max()
         
         return recent_high < prior_high
     

@@ -1045,30 +1045,70 @@ class RESTExecutionEngine:
         try:
             # ================================================================
             # 🔥 STEP 0: CHECK EXISTING ORDERS - PREVENT DUPLICATES
+            # 🔥 FIX #103: Correct price extraction + cleanup duplicates
             # ================================================================
             existing_orders = await self.get_open_orders(symbol)
             existing_sl = None
             existing_tp = None
+            duplicate_sl_ids = []  # Track duplicates to cancel
+            duplicate_tp_ids = []
             
             if existing_orders:
                 for order in existing_orders:
                     order_type = order.get('type', '').lower()
                     order_info = order.get('info', {})
                     order_type_kraken = order_info.get('orderType', '').lower() if order_info else ''
+                    order_id = order.get('id')
                     
                     # Detect SL orders
                     if order_type in ('stop', 'stop-loss', 'stop_loss') or order_type_kraken in ('stp', 'stop'):
-                        existing_sl = order
-                        sl_price = float(order.get('stopPrice') or order.get('price') or order_info.get('triggerPrice') or 0)
-                        logger.info(f"✅ EXISTING SL found at {sl_price:.2f} - will NOT place duplicate")
+                        # 🔥 FIX #103a: Priority to triggerPrice from order_info (Kraken Futures)
+                        # order.get('price') returns 0 for stop orders, so check info first!
+                        sl_price = 0.0
+                        if order_info and order_info.get('triggerPrice'):
+                            sl_price = float(order_info.get('triggerPrice'))
+                        elif order.get('stopPrice'):
+                            sl_price = float(order.get('stopPrice'))
+                        elif order.get('triggerPrice'):
+                            sl_price = float(order.get('triggerPrice'))
+                        # Only use price as last resort if > 0
+                        elif order.get('price') and float(order.get('price', 0)) > 0:
+                            sl_price = float(order.get('price'))
+                        
+                        if sl_price > 0:
+                            if existing_sl is None:
+                                existing_sl = order
+                                logger.info(f"✅ EXISTING SL found at {sl_price:.2f} - will NOT place duplicate")
+                            else:
+                                # 🔥 FIX #103b: Track duplicate SL for cleanup
+                                duplicate_sl_ids.append(order_id)
+                                logger.warning(f"⚠️ DUPLICATE SL detected at {sl_price:.2f} (id={order_id}) - will cancel")
+                        else:
+                            logger.warning(f"⚠️ Found SL order but price is INVALID ({sl_price}) - will place new SL")
                     
                     # Detect TP orders (limit orders that are reduce-only)
                     elif order_type in ('limit', 'take-profit', 'take_profit'):
                         order_reduce_only = order_info.get('reduceOnly', False) if order_info else False
                         if order_reduce_only:
-                            existing_tp = order
                             tp_price = float(order.get('price') or 0)
-                            logger.info(f"✅ EXISTING TP found at {tp_price:.2f} - will NOT place duplicate")
+                            if tp_price > 0:
+                                if existing_tp is None:
+                                    existing_tp = order
+                                    logger.info(f"✅ EXISTING TP found at {tp_price:.2f} - will NOT place duplicate")
+                                else:
+                                    # 🔥 FIX #103b: Track duplicate TP for cleanup
+                                    duplicate_tp_ids.append(order_id)
+                                    logger.warning(f"⚠️ DUPLICATE TP detected at {tp_price:.2f} (id={order_id}) - will cancel")
+                            else:
+                                logger.warning(f"⚠️ Found TP order but price is INVALID ({tp_price}) - will place new TP")
+            
+            # 🔥 FIX #103b: Cancel duplicate orders
+            for dup_id in duplicate_sl_ids + duplicate_tp_ids:
+                try:
+                    await self.exchange.cancel_order(dup_id, symbol)
+                    logger.info(f"🗑️ Cancelled duplicate order: {dup_id}")
+                except Exception as cancel_err:
+                    logger.warning(f"⚠️ Failed to cancel duplicate {dup_id}: {cancel_err}")
             
             # If both exist, we're done!
             if existing_sl and existing_tp:

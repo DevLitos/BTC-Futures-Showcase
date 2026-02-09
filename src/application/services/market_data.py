@@ -222,10 +222,12 @@ class SynchronizedMultiTimeframeBuffer:
                        f"L={candle['low']:.2f} C={candle['close']:.2f} V={candle['volume']:.0f}")
         elif timeframe == '5m':
             status = "✓" if current_counts['5m'] >= 50 else "⏳"
-            logger.info(f"{status} [5m] O={candle['open']:.0f} C={candle['close']:.0f} ({current_counts['5m']}/50)")
+            # FIX #84: Reducido a DEBUG
+            logger.debug(f"{status} [5m] O={candle['open']:.0f} C={candle['close']:.0f} ({current_counts['5m']}/50)")
         elif timeframe == '1h':
             status = "✓" if current_counts['1h'] >= 50 else "⏳"
-            logger.info(f"{status} [1h] O={candle['open']:.0f} C={candle['close']:.0f} ({current_counts['1h']}/50)")
+            # FIX #84: Reducido a DEBUG
+            logger.debug(f"{status} [1h] O={candle['open']:.0f} C={candle['close']:.0f} ({current_counts['1h']}/50)")
         
         # Recalcular indicadores SOLO si hay suficientes velas
         if timeframe == '1m':
@@ -366,7 +368,8 @@ class SynchronizedMultiTimeframeBuffer:
         atr = calculate_atr(highs, lows, closes, 14)[-1]
         self.indicators['1h']['atr'] = atr
         
-        logger.info(f"1h indicators: EMA50={ema50:.2f} EMA200={ema200:.2f} ADX={self.indicators['1h']['adx']:.2f} "
+        # FIX #84: Reducido a DEBUG
+        logger.debug(f"1h indicators: EMA50={ema50:.2f} EMA200={ema200:.2f} ADX={self.indicators['1h']['adx']:.2f} "
                    f"Slope={self.indicators['1h']['adx_slope']:.4f}")
     
     def _update_cvd_from_tick(self, tick: dict):

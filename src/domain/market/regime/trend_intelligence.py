@@ -550,18 +550,33 @@ class TrendIntelligence:
             self._state.volume_trend = "neutral"
             
         # Volume on directional moves
+        # 🔥 FIX M1 (Feb 07, 2026): Less sensitive divergence detection
+        # Previous: Any volume below average = diverges
+        # Now: Need SIGNIFICANT divergence (>20% below average on meaningful move)
         if len(self._price_history) >= 5:
             price_change = self._price_history[-1] - self._price_history[-5]
-            vol_change = vol_recent - vol_avg
+            price_change_pct = abs(price_change) / self._price_history[-5] if self._price_history[-5] > 0 else 0
+            vol_ratio = vol_recent / vol_avg if vol_avg > 0 else 1.0
             
-            # Volume confirms direction
-            if (price_change > 0 and vol_change > 0) or \
-               (price_change < 0 and vol_change > 0):
-                self._state.volume_on_moves = "confirms"
-            elif (price_change > 0 and vol_change < 0) or \
-                 (price_change < 0 and vol_change < 0):
-                self._state.volume_on_moves = "diverges"
+            # 🔥 FIX M1: Only flag divergence if:
+            # 1. Meaningful price move (>0.1%)
+            # 2. Volume significantly below average (<0.7x)
+            is_meaningful_move = price_change_pct > 0.001  # 0.1% minimum
+            is_significant_vol_drop = vol_ratio < 0.7  # 30% below average
+            is_significant_vol_rise = vol_ratio > 1.3  # 30% above average
+            
+            if is_meaningful_move:
+                if is_significant_vol_rise:
+                    # High volume on move = confirms
+                    self._state.volume_on_moves = "confirms"
+                elif is_significant_vol_drop:
+                    # Low volume on move = diverges
+                    self._state.volume_on_moves = "diverges"
+                else:
+                    # Normal volume = neutral
+                    self._state.volume_on_moves = "neutral"
             else:
+                # Small move = neutral (don't overinterpret noise)
                 self._state.volume_on_moves = "neutral"
     
     def _detect_phase_transition(
@@ -719,7 +734,9 @@ class TrendIntelligence:
             elif direction == TrendDirection.BEARISH:
                 self._state.trade_bias = "LONG_PREFERRED"
             else:
-                self._state.trade_bias = "NONE"
+                # 🔥 FIX (Feb 06, 2026): NEUTRAL direction in exhaustion = allow BOTH
+                # EdgeManager will decide direction based on price action
+                self._state.trade_bias = "BOTH"
         elif phase == TrendPhase.DISTRIBUTION:
             self._state.trade_bias = "NONE"  # Wait for clarity
         elif phase == TrendPhase.TREND_DEATH:
@@ -740,8 +757,14 @@ class TrendIntelligence:
             self._state.entry_mode = "NORMAL"
         elif phase in [TrendPhase.TREND_MATURE, TrendPhase.ACCUMULATION]:
             self._state.entry_mode = "CONSERVATIVE"
-        elif phase in [TrendPhase.TREND_EXHAUSTION, TrendPhase.DISTRIBUTION]:
-            self._state.entry_mode = "WAIT"  # Don't enter, manage existing
+        elif phase == TrendPhase.TREND_EXHAUSTION:
+            # 🔥 FIX (Feb 06, 2026): EXHAUSTION = fade opportunity, NOT wait
+            # BULLISH exhaustion = SHORT opportunity
+            # BEARISH exhaustion = LONG opportunity
+            # Use CONSERVATIVE mode to fade with reduced size
+            self._state.entry_mode = "CONSERVATIVE"
+        elif phase == TrendPhase.DISTRIBUTION:
+            self._state.entry_mode = "WAIT"  # True wait - no clarity
         elif phase == TrendPhase.TREND_DEATH:
             self._state.entry_mode = "AGGRESSIVE"  # Reversal opportunity
         else:
@@ -764,10 +787,24 @@ class TrendIntelligence:
         
         # Check if direction aligns with bias
         direction_allowed = True
+        size_bonus = 1.0  # Default no bonus
+        
         if bias == "LONG_ONLY" and desired_direction == "SHORT":
             direction_allowed = False
         elif bias == "SHORT_ONLY" and desired_direction == "LONG":
             direction_allowed = False
+        elif bias == "SHORT_PREFERRED":
+            # SHORT is preferred but LONG is allowed with penalty
+            if desired_direction == "SHORT":
+                size_bonus = 1.0  # Full size for preferred direction
+            else:
+                size_bonus = 0.5  # Reduced size for non-preferred
+        elif bias == "LONG_PREFERRED":
+            # LONG is preferred but SHORT is allowed with penalty
+            if desired_direction == "LONG":
+                size_bonus = 1.0
+            else:
+                size_bonus = 0.5
         elif bias == "NONE":
             direction_allowed = False
             
@@ -780,6 +817,9 @@ class TrendIntelligence:
             size_mult = 0.7
         else:  # WAIT
             size_mult = 0.0
+        
+        # Apply size bonus from preferred direction
+        size_mult *= size_bonus
             
         # Score adjustment
         if phase == TrendPhase.TREND_BIRTH:
@@ -788,7 +828,15 @@ class TrendIntelligence:
             score_adj = -0.5
         elif phase == TrendPhase.TREND_MATURE:
             score_adj = 0.0
-        elif phase in [TrendPhase.TREND_EXHAUSTION, TrendPhase.DISTRIBUTION]:
+        elif phase == TrendPhase.TREND_EXHAUSTION:
+            # 🔥 FIX (Feb 06, 2026): EXHAUSTION fade trades need easier entry
+            # If trading preferred direction (fade), reduce threshold
+            if (bias == "SHORT_PREFERRED" and desired_direction == "SHORT") or \
+               (bias == "LONG_PREFERRED" and desired_direction == "LONG"):
+                score_adj = -0.5  # Easier entry for fade
+            else:
+                score_adj = +2.0  # Harder entry for with-trend
+        elif phase == TrendPhase.DISTRIBUTION:
             score_adj = +2.0  # Harder entry
         elif phase == TrendPhase.TREND_DEATH:
             score_adj = -0.5  # Reversal opportunity

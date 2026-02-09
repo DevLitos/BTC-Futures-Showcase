@@ -40,6 +40,7 @@ class CooldownType(Enum):
     SHORT_OBSTINACY = 40   # After short bias obstinacy
     EDGE_CONTEXT = 30      # Edge-specific context cooldown
     COUNTERTREND = 20      # After countertrend loss
+    POST_TRADE = 15        # FEB06: After any trade (adaptive by PnL)
 
 
 @dataclass
@@ -104,6 +105,13 @@ class CooldownManager:
     DEFAULT_REJECTION_SECONDS = 120  # 2 candles × 60s
     DEFAULT_SHORT_OBSTINACY_MIN = 10
     DEFAULT_COUNTERTREND_CANDLES = 2
+    
+    # FEB06: Post-trade cooldown adaptativo por PnL
+    # Lógica: Trade ganador = 30s, perdedor = 6min
+    # Idea: "No bloquear → hacer caro equivocarte"
+    DEFAULT_POST_TRADE_WIN_SECONDS = 30      # Ganador: cooldown mínimo
+    DEFAULT_POST_TRADE_LOSS_SECONDS = 360    # Perdedor: 6 minutos
+    DEFAULT_POST_TRADE_BE_SECONDS = 60       # Breakeven: 1 minuto
     
     def __init__(self):
         """Initialize with empty cooldown states."""
@@ -396,6 +404,62 @@ class CooldownManager:
         state.reason = f"Countertrend loss - wait {candles} candles"
         state.triggered_by = "countertrend_loss"
         state.severity = 3
+    
+    # =========================================================================
+    # POST-TRADE COOLDOWN (FEB06) - Adaptive by PnL
+    # =========================================================================
+    
+    def activate_post_trade_cooldown(
+        self,
+        current_time: datetime,
+        pnl_r: float,
+        exit_reason: str = ""
+    ):
+        """
+        Activate adaptive cooldown after a trade closes.
+        
+        FEB06 DESIGN:
+        - Trade ganador (pnl_r > 0.1): 30 segundos (puede seguir operando)
+        - Trade breakeven (-0.15 < pnl_r < 0.1): 60 segundos
+        - Trade perdedor (pnl_r < -0.15): 6 minutos (penalización)
+        
+        RATIONALE: "No bloquear → hacer caro equivocarte"
+        El sistema no impide trades, pero sí impone un "tax" temporal
+        a los trades perdedores para evitar tilt.
+        """
+        # Determinar cooldown según resultado
+        if pnl_r >= 0.1:
+            # Ganador: cooldown mínimo
+            cooldown_seconds = self._get_config(
+                'post_trade_win_seconds', self.DEFAULT_POST_TRADE_WIN_SECONDS
+            )
+            outcome = "WIN"
+        elif pnl_r > -0.15:
+            # Breakeven: cooldown intermedio
+            cooldown_seconds = self._get_config(
+                'post_trade_be_seconds', self.DEFAULT_POST_TRADE_BE_SECONDS
+            )
+            outcome = "BREAKEVEN"
+        else:
+            # Perdedor: cooldown largo
+            cooldown_seconds = self._get_config(
+                'post_trade_loss_seconds', self.DEFAULT_POST_TRADE_LOSS_SECONDS
+            )
+            outcome = "LOSS"
+        
+        expires = current_time + timedelta(seconds=cooldown_seconds)
+        state = self._cooldowns[CooldownType.POST_TRADE]
+        state.active = True
+        state.expires_at = expires
+        state.reason = f"Post-trade cooldown ({outcome}: {pnl_r:.2f}R) - wait {cooldown_seconds}s"
+        state.triggered_by = f"post_trade_{outcome.lower()}"
+        state.severity = 2 if outcome == "WIN" else (3 if outcome == "BREAKEVEN" else 5)
+        
+        logger.info(
+            f"⏱️ POST-TRADE COOLDOWN ({outcome}): {pnl_r:.2f}R → "
+            f"Wait {cooldown_seconds}s | Expires: {expires.strftime('%H:%M:%S')} | "
+            f"Reason: {exit_reason}"
+        )
     
     # =========================================================================
     # SYNC METHODS (Bridge with trading_app.py legacy variables)

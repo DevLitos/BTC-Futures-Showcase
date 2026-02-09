@@ -201,6 +201,107 @@ def calculate_adx(
     return _jit_calculate_adx(to_ndarray(high), to_ndarray(low), to_ndarray(close), period)
 
 
+@jit(nopython=True)
+def _jit_calculate_adx_full(
+    high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    JIT-compiled ADX calculation returning +DI/-DI.
+    
+    Returns:
+        Tuple of (adx, adx_slope, plus_di, minus_di) arrays
+    """
+    n = len(close)
+    if n < period + 1:
+        nans = np.full(n, np.nan)
+        return nans.copy(), nans.copy(), nans.copy(), nans.copy()
+
+    # Calculate True Range
+    tr = np.zeros(n)
+    tr[0] = high[0] - low[0]
+    for i in range(1, n):
+        hl = high[i] - low[i]
+        hc = abs(high[i] - close[i - 1])
+        lc = abs(low[i] - close[i - 1])
+        tr[i] = max(hl, hc, lc)
+
+    # Calculate Directional Movement
+    plus_dm = np.zeros(n)
+    minus_dm = np.zeros(n)
+
+    for i in range(1, n):
+        up_move = high[i] - high[i - 1]
+        down_move = low[i - 1] - low[i]
+
+        if up_move > down_move and up_move > 0:
+            plus_dm[i] = up_move
+        if down_move > up_move and down_move > 0:
+            minus_dm[i] = down_move
+
+    # Smooth the indicators
+    atr_smooth = np.full(n, np.nan)
+    plus_di = np.full(n, np.nan)
+    minus_di = np.full(n, np.nan)
+    dx = np.full(n, np.nan)
+    adx = np.full(n, np.nan)
+
+    # Initial values
+    atr_smooth[period - 1] = np.mean(tr[:period])
+    plus_dm_smooth = np.mean(plus_dm[:period])
+    minus_dm_smooth = np.mean(minus_dm[:period])
+
+    for i in range(period, n):
+        atr_smooth[i] = (atr_smooth[i - 1] * (period - 1) + tr[i]) / period
+        plus_dm_smooth = (plus_dm_smooth * (period - 1) + plus_dm[i]) / period
+        minus_dm_smooth = (minus_dm_smooth * (period - 1) + minus_dm[i]) / period
+
+        if atr_smooth[i] > 0:
+            plus_di[i] = 100 * plus_dm_smooth / atr_smooth[i]
+            minus_di[i] = 100 * minus_dm_smooth / atr_smooth[i]
+
+            di_sum = plus_di[i] + minus_di[i]
+            if di_sum > 0:
+                dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / di_sum
+
+    # Calculate ADX
+    adx_start = period * 2 - 1
+    if n > adx_start:
+        adx[adx_start] = np.mean(dx[period:adx_start + 1])
+        for i in range(adx_start + 1, n):
+            adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+
+    # Calculate ADX slope
+    adx_slope = np.full(n, np.nan)
+    for i in range(1, n):
+        if not np.isnan(adx[i]) and not np.isnan(adx[i - 1]):
+            adx_slope[i] = adx[i] - adx[i - 1]
+
+    return adx, adx_slope, plus_di, minus_di
+
+
+def calculate_adx_with_di(
+    high: InputArray,
+    low: InputArray,
+    close: InputArray,
+    period: int = 14
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Calculate ADX with directional indicators (+DI/-DI).
+    
+    🔥 FIX #77 (Feb 07, 2026): Expose +DI/-DI for directional decisions.
+    
+    Returns:
+        Tuple of (adx, adx_slope, plus_di, minus_di)
+        
+    Usage for direction detection:
+        - plus_di > minus_di + 5 → bullish momentum
+        - minus_di > plus_di + 5 → bearish momentum
+    """
+    return _jit_calculate_adx_full(
+        to_ndarray(high), to_ndarray(low), to_ndarray(close), period
+    )
+
+
 def _base_calculate_rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
     """Base RSI calculation (internal use)."""
     n = len(prices)

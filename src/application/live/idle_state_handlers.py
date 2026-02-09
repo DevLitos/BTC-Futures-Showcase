@@ -111,7 +111,8 @@ def check_candle_gate(
         # 🔥 NEW (Feb 04, 2026): Track candles since startup for warmup
         engine._candles_since_start = getattr(engine, '_candles_since_start', 0) + 1
         
-        logger.info(f"🕯️ NEW CANDLE CLOSE → EVALUATING | Price: ${current_price:.2f} | ATR: {atr_1m:.2f}")
+        # FIX #84: Reducido a DEBUG para eliminar spam
+        logger.debug(f"🕯️ NEW CANDLE CLOSE → EVALUATING | Price: ${current_price:.2f} | ATR: {atr_1m:.2f}")
         return True, new_count
     
     # =========================================================================
@@ -136,7 +137,8 @@ def check_candle_gate(
             direction = "↑" if current_price > last_eval_price else "↓"
             _update_last_eval_price(engine, current_price)
             engine._ticks_since_last_eval = 0
-            logger.info(
+            # FIX #84: Reducido a DEBUG para eliminar spam
+            logger.debug(
                 f"📈 PRICE EVENT {direction} → EVALUATING | "
                 f"Move: ${price_delta:.2f} (threshold: ${threshold:.2f}) | "
                 f"Price: ${last_eval_price:.2f} → ${current_price:.2f}"
@@ -149,7 +151,8 @@ def check_candle_gate(
     if ticks_since_last_eval >= EVENT_GATE_CONFIG["MAX_TICKS_WITHOUT_EVAL"]:
         _update_last_eval_price(engine, current_price)
         engine._ticks_since_last_eval = 0
-        logger.info(
+        # FIX #84: Reducido a DEBUG para eliminar spam
+        logger.debug(
             f"⏰ MAX TICKS ({EVENT_GATE_CONFIG['MAX_TICKS_WITHOUT_EVAL']}) → EVALUATING | "
             f"Price: ${current_price:.2f} | ATR: {atr_1m:.2f}"
         )
@@ -158,15 +161,8 @@ def check_candle_gate(
     # =========================================================================
     # 6. NO EVENT: Skip evaluation (log rate-limited)
     # =========================================================================
-    if new_count % 60 == 0:  # Log every 60 ticks
-        last_eval_price = getattr(engine, '_last_eval_price', 0)
-        price_delta = abs(current_price - last_eval_price) if last_eval_price > 0 else 0
-        threshold = atr_1m * EVENT_GATE_CONFIG["PRICE_MOVE_ATR_THRESHOLD"] if atr_1m > 0 else 0
-        logger.info(
-            f"📊 IDLE: Waiting | Ticks since eval: {ticks_since_last_eval}/{EVENT_GATE_CONFIG['MAX_TICKS_WITHOUT_EVAL']} | "
-            f"Price move: ${price_delta:.2f} (need ${threshold:.2f}) | "
-            f"Price: ${current_price:.2f}"
-        )
+    # FIX #84: Eliminado log de IDLE: Waiting - no aporta nada
+    # Solo logear en DEBUG si realmente se necesita diagnóstico
     
     return False, new_count
 
@@ -487,8 +483,9 @@ def check_anticipation_signal(
         elif active_direction and (not direction_is_relevant or direction_is_stale):
             # Edge is stale o no hay edge - dirección es obsoleta, permitir anticipation
             if anticipation.direction and anticipation.direction != active_direction:
+                # 🔥 FIX #96 (Feb 09): Log confidence para debug
                 logger.info(
-                    f"📝 ANTICIPATION preserved: {anticipation.direction} differs from stale "
+                    f"📝 ANTICIPATION preserved: {anticipation.direction} (conf={anticipation.confidence:.0%}) differs from stale "
                     f"ACTIVE_DIRECTION={active_direction} (stale={direction_is_stale}, edge={engine._edge_manager.state.value if hasattr(engine, '_edge_manager') else 'N/A'}) | "
                     f"New signal allowed"
                 )
@@ -501,11 +498,12 @@ def check_anticipation_signal(
         # - Solo debe servir para cambiar estado interno / alertas
         # - NUNCA como trigger directo de trades
         #
-        # Subimos umbral de log a 55% y DESHABILITAMOS probe directo
+        # 🔥 FIX #97 (Feb 09): BAJAR umbral de 55% a 50% - anticipation acierta más de lo esperado
         # =========================================================================
         
-        # Check for valid anticipation signal (confidence > 55% for logging)
-        if anticipation.signal != AnticipationSignal.NONE and anticipation.confidence >= 0.55:
+        # Check for valid anticipation signal (confidence >= 50% - bajado de 55%)
+        ANTICIPATION_MIN_CONFIDENCE = 0.50  # 🔥 FIX #97: Bajado de 0.55
+        if anticipation.signal != AnticipationSignal.NONE and anticipation.confidence >= ANTICIPATION_MIN_CONFIDENCE:
             tags['anticipation_signal'] = anticipation.signal.value
             tags['anticipation_confidence'] = anticipation.confidence
             tags['anticipation_direction'] = anticipation.direction
@@ -557,13 +555,38 @@ def check_anticipation_signal(
                 anticipation = AnticipationState()  # Reset to empty
                 engine._last_anticipation_state = anticipation
             else:
-                logger.info(
-                    f"🔮 ANTICIPATION: {anticipation.signal.value} {anticipation.direction} @ ${current_price:.0f} | "
-                    f"conf={anticipation.confidence:.0%} | ADX={adx_5m:.1f} | phase={trend_phase}"
-                )
-                if anticipation.reasons:
-                    for reason in anticipation.reasons[:3]:
-                        logger.info(f"   → {reason}")
+                # =====================================================================
+                # 🔥 FIX #107 (Feb 09, 2026): THROTTLE ANTICIPATION LOGS
+                # 
+                # PROBLEMA: ~40 logs de "🔮 ANTICIPATION: COMPRESSION_BREAKOUT" en pocos
+                # minutos cuando detecta squeeze. Es spam que no aporta valor.
+                #
+                # SOLUCIÓN: Throttle a máximo 1 log por minuto por signal+direction.
+                # - Guarda last log time/signal/direction en engine
+                # - Solo loguea si cambió el signal o direction O pasó 1 minuto
+                # =====================================================================
+                should_log_anticipation = True
+                log_key = f"{anticipation.signal.value}_{anticipation.direction}"
+                
+                if hasattr(engine, '_anticipation_last_log_time') and hasattr(engine, '_anticipation_last_log_key'):
+                    time_since_last = (market_time - engine._anticipation_last_log_time).total_seconds()
+                    key_changed = log_key != engine._anticipation_last_log_key
+                    
+                    # Only log if: signal/direction changed OR 60+ seconds passed
+                    if not key_changed and time_since_last < 60:
+                        should_log_anticipation = False
+                
+                if should_log_anticipation:
+                    engine._anticipation_last_log_time = market_time
+                    engine._anticipation_last_log_key = log_key
+                    
+                    logger.info(
+                        f"🔮 ANTICIPATION: {anticipation.signal.value} {anticipation.direction} @ ${current_price:.0f} | "
+                        f"conf={anticipation.confidence:.0%} | ADX={adx_5m:.1f} | phase={trend_phase}"
+                    )
+                    if anticipation.reasons:
+                        for reason in anticipation.reasons[:3]:
+                            logger.info(f"   → {reason}")
             
             # =========================================================================
             # 🔥 FIX #58 (Feb 06, 2026): RE-HABILITAR ANTICIPATION COMO TRIGGER
@@ -710,6 +733,30 @@ async def check_pre_trade_conditions(
     Returns:
         (can_trade, reason) tuple
     """
+    # 🔥 FIX #87 (Feb 09, 2026): STALE DATA KILL SWITCH
+    # If market data is stale >60s, trading decisions are GARBAGE.
+    # ADX, ATR, Volume, Bias - ALL WRONG. Don't trade with bad data.
+    from datetime import timezone
+    if hasattr(engine, 'market_data') and hasattr(engine.market_data, 'get_feed_age_sec'):
+        feed_age = engine.market_data.get_feed_age_sec()
+        STALE_THRESHOLD_SECONDS = 60.0  # 60s = data too old
+        
+        if feed_age > STALE_THRESHOLD_SECONDS:
+            # Don't spam logs - only log every 30 ticks when stale
+            if not hasattr(engine, '_stale_data_tick_count'):
+                engine._stale_data_tick_count = 0
+            engine._stale_data_tick_count += 1
+            
+            if engine._stale_data_tick_count % 30 == 1:
+                logger.warning(
+                    f"🛑 STALE DATA BLOCK: Feed age {feed_age:.0f}s > {STALE_THRESHOLD_SECONDS}s | "
+                    f"Indicators invalid, NO TRADING"
+                )
+            return False, f"DATA_STALE_{feed_age:.0f}s"
+        else:
+            # Reset counter when data is fresh
+            engine._stale_data_tick_count = 0
+    
     # 🔥 FIX (Feb 1, 2026): LOSS STREAK COOLDOWN + KILL SWITCH CHECK
     # This was MISSING! _check_loss_cooldown was defined but never called
     if hasattr(engine, '_check_loss_cooldown'):

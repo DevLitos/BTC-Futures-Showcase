@@ -20,13 +20,20 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BiasInvalidationConfig:
-    """Configuration for bias invalidation thresholds."""
-    base_atr_mult: float = 1.5  # Base threshold = ATR_1m * 1.5
-    min_threshold: float = 50.0  # Minimum $50
-    max_threshold: float = 250.0  # Maximum $250
+    """Configuration for bias invalidation thresholds.
+    
+    FIX #89 (Feb 2026): Increased base_atr_mult from 1.5 to 2.5
+    to reduce BIAS FLIP whipsaws. With ATR ~$60:
+    - Normal: $60 * 2.5 = $150 threshold (was $90)
+    - Direction Lock: $150 * 1.5 = $225 
+    - Expansion: $150 * 2.0 = $300
+    """
+    base_atr_mult: float = 2.5  # Base threshold = ATR_1m * 2.5 (FIX #89: was 1.5)
+    min_threshold: float = 80.0  # Minimum $80 (FIX #89: was $50)
+    max_threshold: float = 350.0  # Maximum $350 (FIX #89: was $250)
     expansion_mult: float = 2.0  # Harder to invalidate during expansion
     direction_lock_mult: float = 1.5  # Harder during direction lock
-    hysteresis_ticks: int = 120  # Min ticks before clearing forbidden
+    hysteresis_ticks: int = 180  # Min ticks before clearing forbidden (FIX #89: was 120)
 
 
 @dataclass

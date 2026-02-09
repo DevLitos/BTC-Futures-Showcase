@@ -993,53 +993,51 @@ class Position:
         
         return False
     
-    def check_early_mfe_exit(self, current_price: float | None = None) -> dict | None:
+    def check_early_mfe_exit(self, current_price: float | None = None,
+                               bb_width_percentile: float | None = None,
+                               volume_ratio: float | None = None,
+                               delta_ratio: float | None = None,
+                               session: str | None = None,
+                               atr_1m: float | None = None,
+                               atr_avg: float | None = None) -> dict | None:
         """
-        🔥 NEW (Feb 04, 2026): EARLY MFE CHECK
+        🔥🔥🔥 FIX #101 v3 (Feb 09, 2026): CONTEXTUAL EARLY EXIT SYSTEM
+        🔥 FIX #106 (Feb 09, 2026): PROFIT DRAWDOWN PROTECTION
         
-        DATA SHOWS:
-        - MFE >= 0.2R: 47 trades → P&L = +7.49R (WR 70%)
-        - MFE < 0.2R:  33 trades → P&L = -9.20R (WR 0%)
+        BALANCE: Protección contra salidas prematuras + Seguridad contra pérdidas excesivas
         
-        CONCLUSION: If trade doesn't show momentum in first N candles,
-        it's less likely to become a winner. Cut it early to minimize loss.
+        ARQUITECTURA EQUILIBRADA:
         
-        🔥 FIX (Feb 05, 2026): BE WATER - Adapt to regime
-        TREND trades need MORE time because:
-        - They target larger moves (1.2-1.5R)
-        - Pullbacks are normal and expected
-        - ADX high = trend developing, give it time
+        CAPAS DE EMERGENCIA (ignoran todo, salen inmediatamente):
+        E1. MAE CRÍTICO: current_r < -0.6R → EXIT (ya perdió demasiado)
+        E2. FLASH CRASH: caída > 0.5R en < 3 candles → EXIT
         
-        RANGE trades can cut earlier because:
-        - They target smaller moves (0.8-1.0R)
-        - Should see momentum quickly
+        🔥 NUEVA CAPA - PROFIT DRAWDOWN:
+        PD. Si MFE >= 0.35R y drawdown_from_mfe > 60% del MFE → EXIT con profit restante
+            Ejemplo: MFE=0.47R, drawdown>0.28R (60%) → sale con ~0.19R
+        
+        CAPAS DE PROTECCIÓN (bloquean exit, pero con TIMEOUT):
+        P1. PROFITABLE: R > 0 → no salir (SOLO si no aplica PD)
+        P2. COMPRESSION: BB < 20% → esperar MAX 12 candles, luego timeout
+        P3. ABSORPTION: vol bajo + precio aguantando → esperar MAX 10 candles
+        P4. ANTI-TRAP: MFE >= 0.2R + pullback → esperar MAX 8 candles
+        
+        CAPAS DE EXIT (requieren confirmación estructural):
+        X1. STRUCTURE BREAK: drawdown > 0.4R + delta confirma
+        X2. STRUCTURE BREAK SIN DELTA: drawdown > 0.5R (delta no requerido)
+        X3. VELOCITY DEAD: candles extremas + sin momentum + pérdida
+        X4. DETERIORO PROGRESIVO: cada 5 candles peor → exit
         """
         # Skip adopted positions
         if self.is_adopted:
             return None
         
-        # 🔥 FIX (Feb 05, 2026): Adapt thresholds to regime
-        # TREND: More patient (10 candles, 0.15R threshold)
-        # RANGE: Less patient (6 candles, 0.25R threshold)
-        if self.regime_mode == 'TREND':
-            EARLY_CHECK_CANDLES = 10  # 10 minutes in trend
-            EARLY_MFE_THRESHOLD = 0.15  # Lower bar - just need SOME movement
-        else:
-            EARLY_CHECK_CANDLES = 6   # 6 minutes in range
-            EARLY_MFE_THRESHOLD = 0.25  # Higher bar - need clear momentum
-        
-        if self.candle_count != EARLY_CHECK_CANDLES:
-            return None
-        
-        mfe_r = self.calculate_mfe_r()
-        
-        if mfe_r >= EARLY_MFE_THRESHOLD:
-            return None  # Trade is showing momentum, let it run
-        
-        # Calculate current R
         if current_price is None:
             return None
         
+        # =====================================================================
+        # CAPA 0: Calcular R actual y MFE
+        # =====================================================================
         initial_risk = abs(self.entry_price - self.initial_stop_loss)
         if initial_risk <= 0:
             return None
@@ -1049,23 +1047,246 @@ class Position:
         else:
             current_r = (self.entry_price - current_price) / initial_risk
         
-        # Only close if we're losing or flat (don't close small winners)
-        if current_r > 0.05:
+        mfe_r = self.calculate_mfe_r()
+        mae_r = self.calculate_mae_r()
+        
+        # =====================================================================
+        # 🚨 EMERGENCIA E1: MAE CRÍTICO (ignora todo)
+        # Si ya perdió > 0.6R, no tiene sentido esperar más
+        # =====================================================================
+        if current_r < -0.6:
+            logger.warning(
+                f"🚨 EMERGENCY_MAE_EXIT: Current R={current_r:.2f} < -0.6R | "
+                f"Trade already lost too much, cutting before SL"
+            )
+            return {
+                'action': 'CLOSE',
+                'reason': 'EMERGENCY_MAE_EXIT',
+                'mfe_r': mfe_r,
+                'current_r': current_r,
+                'candles': self.candle_count,
+                'exit_type': 'EMERGENCY'
+            }
+        
+        # =====================================================================
+        # 🚨 EMERGENCIA E2: FLASH CRASH (caída rápida)
+        # Si perdió > 0.5R en menos de 3 candles, algo malo pasó
+        # =====================================================================
+        if self.candle_count <= 3 and current_r < -0.5:
+            logger.warning(
+                f"🚨 FLASH_CRASH_EXIT: Lost {current_r:.2f}R in only {self.candle_count} candles | "
+                f"Rapid adverse move, exiting immediately"
+            )
+            return {
+                'action': 'CLOSE',
+                'reason': 'FLASH_CRASH_EXIT',
+                'mfe_r': mfe_r,
+                'current_r': current_r,
+                'candles': self.candle_count,
+                'exit_type': 'EMERGENCY'
+            }
+        
+        # =====================================================================
+        # 🔥 FIX #106: PROFIT DRAWDOWN PROTECTION (antes de P1)
+        # 
+        # PROBLEMA: Trade llegó a +0.47R pero P1 lo protegió hasta caer a -0.03R
+        # porque "R > 0 → no salir". Devolvió 100% de las ganancias.
+        #
+        # SOLUCIÓN: Si MFE >= 0.35R y perdemos > 60% del MFE, salir con lo restante
+        # - MFE = 0.47R, drawdown_threshold = 0.47 * 0.6 = 0.28R
+        # - Si current_r < 0.47 - 0.28 = 0.19R → salir con ~0.19R
+        #
+        # CONDICIONES:
+        # 1. MFE >= 0.35R (trade mostró dirección correcta)
+        # 2. Drawdown desde MFE > 60% del MFE
+        # 3. Current R < 0.15R (ya devolvió casi todo)
+        # =====================================================================
+        PROFIT_PROTECTION_MFE_THRESHOLD = 0.35  # Mínimo MFE para activar
+        PROFIT_PROTECTION_DRAWDOWN_PCT = 0.60   # Máximo drawdown permitido (60% del MFE)
+        PROFIT_PROTECTION_MIN_R = 0.15          # Debajo de esto ya perdió demasiado
+        
+        if mfe_r >= PROFIT_PROTECTION_MFE_THRESHOLD:
+            drawdown_from_mfe = mfe_r - current_r
+            max_allowed_drawdown = mfe_r * PROFIT_PROTECTION_DRAWDOWN_PCT
+            
+            if drawdown_from_mfe > max_allowed_drawdown and current_r < PROFIT_PROTECTION_MIN_R:
+                logger.warning(
+                    f"🛡️ PROFIT_DRAWDOWN_EXIT: MFE={mfe_r:.2f}R → now={current_r:.2f}R | "
+                    f"Drawdown {drawdown_from_mfe:.2f}R > {max_allowed_drawdown:.2f}R (60% of MFE) | "
+                    f"Protecting remaining profit"
+                )
+                return {
+                    'action': 'CLOSE',
+                    'reason': 'PROFIT_DRAWDOWN_EXIT',
+                    'mfe_r': mfe_r,
+                    'current_r': current_r,
+                    'candles': self.candle_count,
+                    'exit_type': 'PROFIT_PROTECTION',
+                    'drawdown_from_mfe': drawdown_from_mfe,
+                    'max_allowed': max_allowed_drawdown
+                }
+        
+        # =====================================================================
+        # CAPA P1: SI ESTÁ EN PROFIT → NUNCA CERRAR TEMPRANO
+        # El trade va en la dirección correcta, dejarlo correr
+        # (Solo llega aquí si no aplica PROFIT_DRAWDOWN_EXIT)
+        # =====================================================================
+        if current_r > 0:
+            return None  # Silencioso, no necesita log
+        
+        # =====================================================================
+        # CAPA P2: COMPRESSION CHECK (BB Squeeze) - CON TIMEOUT
+        # Squeeze es pre-explosión, pero máximo 12 candles de espera
+        # =====================================================================
+        bb_compressed = bb_width_percentile is not None and bb_width_percentile < 20
+        COMPRESSION_TIMEOUT = 12
+        
+        if bb_compressed and self.candle_count < COMPRESSION_TIMEOUT:
+            # Solo bloquear si no estamos en pérdida grave
+            if current_r > -0.4:
+                logger.debug(
+                    f"🔒 EARLY EXIT blocked: BB SQUEEZE (percentile={bb_width_percentile:.0f}%) | "
+                    f"Waiting for explosion ({self.candle_count}/{COMPRESSION_TIMEOUT} candles)"
+                )
+                return None
+            # Si pérdida > 0.4R, el squeeze ya no protege
+        
+        # =====================================================================
+        # CAPA P3: ABSORPTION CHECK - CON TIMEOUT Y VALIDACIÓN
+        # Volumen bajo + precio aguantando, pero debe MEJORAR con tiempo
+        # =====================================================================
+        volume_declining = volume_ratio is not None and volume_ratio < 0.7
+        price_holding = abs(current_r) < 0.3  # Dentro de 0.3R del entry
+        ABSORPTION_TIMEOUT = 10
+        
+        if volume_declining and price_holding and self.candle_count < ABSORPTION_TIMEOUT:
+            logger.debug(
+                f"🔒 EARLY EXIT blocked: ABSORPTION detected | "
+                f"vol_ratio={volume_ratio:.2f} < 0.7, R={current_r:.2f} | "
+                f"Waiting ({self.candle_count}/{ABSORPTION_TIMEOUT} candles)"
+            )
             return None
         
-        logger.warning(
-            f"⚡ EARLY_MFE_EXIT: After {EARLY_CHECK_CANDLES} candles, MFE={mfe_r:.2f}R < {EARLY_MFE_THRESHOLD}R | "
-            f"Current P&L={current_r:.2f}R | Data shows these trades NEVER win → Cutting early"
+        # =====================================================================
+        # CAPA P4: ANTI-TRAP DETECTION - CON TIMEOUT
+        # MFE >= 0.2R mostró momentum, pullback puede ser stop-hunt
+        # Pero máximo 8 candles de espera
+        # =====================================================================
+        ANTITRAP_TIMEOUT = 8
+        
+        if mfe_r >= 0.20 and current_r > -0.3 and self.candle_count < ANTITRAP_TIMEOUT:
+            logger.debug(
+                f"🔒 EARLY EXIT blocked: ANTI-TRAP | "
+                f"MFE={mfe_r:.2f}R, now={current_r:.2f}R | "
+                f"Waiting ({self.candle_count}/{ANTITRAP_TIMEOUT} candles)"
+            )
+            return None
+        
+        # =====================================================================
+        # CAPA X1: STRUCTURE BREAK (con delta confirmation)
+        # Perdió estructura + delta confirma debilidad
+        # =====================================================================
+        drawdown_from_mfe = mfe_r - current_r
+        delta_confirms_weakness = False
+        
+        if delta_ratio is not None:
+            if self.direction == 'LONG' and delta_ratio < -0.25:
+                delta_confirms_weakness = True
+            elif self.direction == 'SHORT' and delta_ratio > 0.25:
+                delta_confirms_weakness = True
+        
+        if drawdown_from_mfe > 0.4 and delta_confirms_weakness:
+            logger.warning(
+                f"⚡ EARLY_STRUCTURE_EXIT: Drawdown {drawdown_from_mfe:.2f}R + delta confirms ({delta_ratio:.2f})"
+            )
+            return {
+                'action': 'CLOSE',
+                'reason': 'EARLY_STRUCTURE_EXIT',
+                'mfe_r': mfe_r,
+                'current_r': current_r,
+                'candles': self.candle_count,
+                'exit_type': 'STRUCTURE_BREAK',
+                'delta_ratio': delta_ratio
+            }
+        
+        # =====================================================================
+        # CAPA X2: STRUCTURE BREAK SIN DELTA (fallback más agresivo)
+        # Si no hay delta pero drawdown es muy grande, salir igual
+        # =====================================================================
+        if drawdown_from_mfe > 0.5:
+            logger.warning(
+                f"⚡ STRUCTURE_EXIT_NO_DELTA: Drawdown {drawdown_from_mfe:.2f}R > 0.5R | "
+                f"Delta unavailable/neutral but structure clearly broken"
+            )
+            return {
+                'action': 'CLOSE',
+                'reason': 'STRUCTURE_EXIT_NO_DELTA',
+                'mfe_r': mfe_r,
+                'current_r': current_r,
+                'candles': self.candle_count,
+                'exit_type': 'STRUCTURE_BREAK_NO_DELTA'
+            }
+        
+        # =====================================================================
+        # CAPA X3: VELOCITY CHECK (trade realmente muerto)
+        # =====================================================================
+        # Candles dinámicas por contexto
+        base_min_candles = 8  # Reducido de 10
+        session_mult = 1.3 if session == 'ASIA' else (1.5 if session == 'DEAD_HOURS' else 1.0)
+        
+        # Si está muy mal, reducir paciencia
+        if current_r < -0.4:
+            base_min_candles = 5  # Menos paciencia si ya perdió mucho
+        
+        velocity_min_candles = int(base_min_candles * session_mult)
+        velocity_min_candles = max(5, min(15, velocity_min_candles))
+        
+        is_truly_dead = (
+            self.candle_count >= velocity_min_candles and
+            mfe_r < 0.15 and
+            current_r < -0.2 and
+            not bb_compressed
         )
         
-        return {
-            'action': 'CLOSE',
-            'reason': 'EARLY_MFE_EXIT',
-            'mfe_r': mfe_r,
-            'current_r': current_r,
-            'candles': self.candle_count,
-            'threshold': EARLY_MFE_THRESHOLD
-        }
+        if is_truly_dead:
+            logger.warning(
+                f"⚡ EARLY_VELOCITY_EXIT: Dead after {self.candle_count} candles | "
+                f"MFE={mfe_r:.2f}R, Current={current_r:.2f}R"
+            )
+            return {
+                'action': 'CLOSE',
+                'reason': 'EARLY_VELOCITY_EXIT',
+                'mfe_r': mfe_r,
+                'current_r': current_r,
+                'candles': self.candle_count,
+                'exit_type': 'VELOCITY_DEAD'
+            }
+        
+        # =====================================================================
+        # CAPA X4: DETERIORO PROGRESIVO
+        # Si cada 5 candles el trade está PEOR, es tendencia en contra
+        # =====================================================================
+        # Usamos el tracking de R histórico si está disponible
+        if self.candle_count >= 10 and current_r < -0.3:
+            # Si después de 10 candles estamos en -0.3R o peor Y nunca llegamos a profit
+            if mfe_r < 0.1:
+                logger.warning(
+                    f"⚡ DETERIORATION_EXIT: {self.candle_count} candles, never profitable (MFE={mfe_r:.2f}R) | "
+                    f"Current={current_r:.2f}R | Slow bleed detected"
+                )
+                return {
+                    'action': 'CLOSE',
+                    'reason': 'DETERIORATION_EXIT',
+                    'mfe_r': mfe_r,
+                    'current_r': current_r,
+                    'candles': self.candle_count,
+                    'exit_type': 'SLOW_BLEED'
+                }
+        
+        # =====================================================================
+        # NINGUNA CONDICIÓN DE EXIT MET → CONTINUAR HOLDING
+        # =====================================================================
+        return None
     
     def check_mediocre_trade_exit(self, n_candles: int = 6, mfe_threshold: float = 0.3,
                                      adx: float | None = None, atr_ratio: float | None = None,
@@ -1246,25 +1467,33 @@ class Position:
         MFE_PROVED_THRESHOLD = 0.20  # Trade mostró dirección correcta
         MFE_STRONG_THRESHOLD = 0.50  # Trade claramente correcto
         
+        # 🔥 FIX #106b: Throttle TIME checkpoint logs (era cada tick, ahora cada 30s)
+        _time_checkpoint_last_log = getattr(self, '_time_checkpoint_last_log', 0)
+        _should_log_checkpoint = (self.candle_count - _time_checkpoint_last_log) >= 30
+        
         if mfe_r >= MFE_STRONG_THRESHOLD:
             # Trade clearly proved correct - give it room
             extended_max_loss = -0.50
             if current_r > extended_max_loss:
-                logger.info(
-                    f"📊 TIME checkpoint: MFE={mfe_r:.2f}R PROVED CORRECT | "
-                    f"Pullback to {current_r:.2f}R is normal | "
-                    f"Extended tolerance to {extended_max_loss}R"
-                )
+                if _should_log_checkpoint:
+                    self._time_checkpoint_last_log = self.candle_count
+                    logger.info(
+                        f"📊 TIME checkpoint: MFE={mfe_r:.2f}R PROVED CORRECT | "
+                        f"Pullback to {current_r:.2f}R is normal | "
+                        f"Extended tolerance to {extended_max_loss}R"
+                    )
                 return None  # Don't close - pullback is normal
         elif mfe_r >= MFE_PROVED_THRESHOLD:
             # Trade showed life - extend tolerance
             extended_max_loss = -0.40
             if current_r > extended_max_loss:
-                logger.info(
-                    f"📊 TIME checkpoint: MFE={mfe_r:.2f}R showed direction correct | "
-                    f"Pullback to {current_r:.2f}R within tolerance | "
-                    f"Extended tolerance to {extended_max_loss}R"
-                )
+                if _should_log_checkpoint:
+                    self._time_checkpoint_last_log = self.candle_count
+                    logger.info(
+                        f"📊 TIME checkpoint: MFE={mfe_r:.2f}R showed direction correct | "
+                        f"Pullback to {current_r:.2f}R within tolerance | "
+                        f"Extended tolerance to {extended_max_loss}R"
+                    )
                 return None  # Don't close - give it room
         
         # =====================================================================
@@ -1382,7 +1611,7 @@ class Position:
             # Mercado activo - dar más tiempo, solo ajustar stop
             # 🔥 FIX #43 (Feb 05, 2026): TIME-based rate limiting (every 60s, not per R-bucket)
             adx_str = f"{adx:.1f}" if adx is not None else "N/A"
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             
             # Only log if 60 seconds have passed since last log
             should_log = False
@@ -3021,7 +3250,8 @@ class RiskEngine:
                         self.equity = total
                         self.max_equity = total
                     
-                    logger.info(f"💰 Capital actualizado: ${self.capital:.2f} {currency} (Libre: ${free:.2f}, En uso: ${used:.2f})")
+                    # FIX #84: Reducido a DEBUG para eliminar spam
+                    logger.debug(f"💰 Capital actualizado: ${self.capital:.2f} {currency} (Libre: ${free:.2f}, En uso: ${used:.2f})")
                     return True
             
             # Log available currencies if we didn't find USDT/USD/EUR
@@ -3429,15 +3659,58 @@ class RiskEngine:
                         logger.info(f"🚀 SMART EXIT: {action_type} - {reason}")
                         return await self._close_position(current_price, action_type)
                 
-                # 🔥 NEW (Feb 04): Check EARLY MFE exit (4 candles, MFE < 0.15R → cut)
-                # Data shows: MFE < 0.2R = -9.20R total loss (0% WR)
-                early_mfe_check = pos.check_early_mfe_exit(current_price=current_price)
+                # 🔥🔥🔥 FIX #101 (Feb 09, 2026): CONTEXTUAL EARLY EXIT
+                # Now uses: regime, BB compression, volume, delta, session, ATR
+                # Instead of just "MFE < 0.25R in 6 candles = exit"
+                
+                # Calculate BB width percentile (proxy for compression detection)
+                bb_width_percentile = None
+                if bb_width is not None and bb_avg is not None and bb_avg > 0:
+                    # bb_width / bb_avg < 0.5 → ~20 percentile (compressed)
+                    # bb_width / bb_avg > 1.5 → ~80 percentile (expanded)
+                    bb_ratio = bb_width / bb_avg
+                    bb_width_percentile = min(100, max(0, bb_ratio * 50))  # Rough percentile
+                
+                # Get session from market_time
+                session_str = None
+                if market_time:
+                    hour = market_time.hour
+                    if 0 <= hour < 8:
+                        session_str = 'ASIA'
+                    elif 8 <= hour < 13:
+                        session_str = 'LONDON'
+                    elif 13 <= hour < 17:
+                        session_str = 'LONDON_NY_OVERLAP'
+                    elif 17 <= hour < 22:
+                        session_str = 'NY'
+                    else:
+                        session_str = 'DEAD_HOURS'
+                
+                # Get delta_ratio from position tags if available
+                trade_tags = getattr(pos, 'trade_tags', {}) or {}
+                delta_ratio = trade_tags.get('volume_delta_ratio', None)
+                
+                # ATR average (use atr_1m as proxy for avg if not available)
+                atr_avg_val = pos.atr_1m * 1.0 if pos.atr_1m else None  # TODO: track rolling avg
+                
+                early_mfe_check = pos.check_early_mfe_exit(
+                    current_price=current_price,
+                    bb_width_percentile=bb_width_percentile,
+                    volume_ratio=volume_ratio,
+                    delta_ratio=delta_ratio,
+                    session=session_str,
+                    atr_1m=atr_1m,
+                    atr_avg=atr_avg_val
+                )
                 if early_mfe_check and early_mfe_check.get('action') == 'CLOSE':
+                    exit_reason = early_mfe_check.get('reason', 'EARLY_MFE_EXIT')
+                    exit_type = early_mfe_check.get('exit_type', 'unknown')
                     logger.warning(
-                        f"⚡ EARLY_MFE_EXIT triggered: MFE={early_mfe_check.get('mfe_r', 0):.2f}R, "
-                        f"current={early_mfe_check.get('current_r', 0):.2f}R | Cutting early to prevent worse loss"
+                        f"⚡ {exit_reason} triggered: MFE={early_mfe_check.get('mfe_r', 0):.2f}R, "
+                        f"current={early_mfe_check.get('current_r', 0):.2f}R | "
+                        f"Type={exit_type} | Cutting loss"
                     )
-                    return await self._close_position(current_price, 'EARLY_MFE_EXIT')
+                    return await self._close_position(current_price, exit_reason)
                 
                 # 0. Check mediocre trade exit (TIME_INVALIDATION INTELIGENTE)
                 # 🔥 FIX (Jan 23, 2026): Now returns dict with action, not bool

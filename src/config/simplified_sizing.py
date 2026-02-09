@@ -96,6 +96,7 @@ class SimplifiedSizingResult:
     toxic_hour_mult: float = 1.0  # Toxic hour multiplier
     toxic_combo_mult: float = 1.0  # 🔥 NEW: Toxic combo multiplier (REDUCE mode)
     momentum_mult: float = 1.0  # Momentum predictor multiplier
+    regime_fusion_mult: float = 1.0  # 🔥 FIX #83: RegimeFusion macro/micro alignment
     
     # Final
     combined_multiplier: float = 1.0
@@ -505,6 +506,8 @@ class SimplifiedSizer:
         last_trade_time: Optional[datetime] = None,  # For loss streak cooldown
         # 🔥 NEW (Feb 2, 2026): Momentum predictor
         momentum_score: float = 1.0,  # 0-2 score from entry_scorer
+        # 🔥 FIX #83 (Feb 7, 2026): RegimeFusion macro/micro alignment
+        regime_fusion_mult: float = 1.0,  # 0.3 for fades, 1.0 for aligned
     ) -> SimplifiedSizingResult:
         """
         Calculate position size using simplified 5-multiplier system.
@@ -763,6 +766,10 @@ class SimplifiedSizer:
         if result.is_provisional:
             result.tags['edge_mode_provisional'] = True
         
+        # 🔥 FIX #83: Apply RegimeFusion alignment multiplier
+        result.regime_fusion_mult = regime_fusion_mult
+        result.tags['regime_fusion_mult'] = regime_fusion_mult
+        
         # 6. COMBINED MULTIPLIER (includes all adaptive filters)
         result.combined_multiplier = (
             result.rr_mult *
@@ -772,8 +779,31 @@ class SimplifiedSizer:
             result.edge_mult *          # Edge mode multiplier
             result.toxic_hour_mult *    # Toxic hour multiplier
             result.toxic_combo_mult *   # Toxic combo multiplier (REDUCE mode)
-            result.momentum_mult        # Momentum predictor multiplier
+            result.momentum_mult *      # Momentum predictor multiplier
+            result.regime_fusion_mult   # 🔥 FIX #83: Macro/Micro alignment (0.3-1.0)
         )
+        
+        # =====================================================================
+        # 🔥 FIX #100 (Feb 09, 2026): SIZING FLOOR - PREVENT EXTREME REDUCTION
+        # 
+        # PROBLEMA: Múltiples multiplicadores compuestos reducen sizing a 8%
+        # EJEMPLO: 0.83 × 0.7 × 0.6 × 0.8 × 0.54 × 0.5 × 0.6 = 0.08
+        # 
+        # Con balance de $254, esto da posiciones de $20, beneficio ~$0.20
+        # $0.20 < threshold de $0.30 = HARD BLOCK infinito
+        # 
+        # SOLUCIÓN: Floor del 25% para garantizar operabilidad
+        # =====================================================================
+        MIN_SIZING_FLOOR = 0.25
+        
+        if result.combined_multiplier < MIN_SIZING_FLOOR:
+            old_mult = result.combined_multiplier
+            result.combined_multiplier = MIN_SIZING_FLOOR
+            result.tags['sizing_floor_applied'] = True
+            result.tags['sizing_floor_original'] = old_mult
+            logger.info(
+                f"🔥 FIX #100: Sizing floor applied. Original={old_mult:.2%} → Floor={MIN_SIZING_FLOOR:.0%}"
+            )
         
         # Calculate base size from risk
         risk_per_trade = capital * result.base_risk_pct  # 1% of capital
@@ -799,6 +829,7 @@ class SimplifiedSizer:
         toxic_hour_log = f" × TOXIC_HR={result.toxic_hour_mult:.2f}" if result.toxic_hour_mult < 1.0 else ""
         toxic_combo_log = f" × TOXIC_COMBO={result.toxic_combo_mult:.2f}" if result.toxic_combo_mult < 1.0 else ""
         momentum_log = f" × MOM={result.momentum_mult:.2f}" if result.momentum_mult != 1.0 else ""
+        fusion_log = f" × FUSION={result.regime_fusion_mult:.2f}" if result.regime_fusion_mult < 1.0 else ""
         logger.info(
             f"📊 SIMPLIFIED SIZING [{edge_mode}]: "
             f"RR={result.rr_mult:.2f} × "
@@ -806,7 +837,7 @@ class SimplifiedSizer:
             f"LOSS={result.loss_streak_mult:.2f} × "
             f"SESS={result.session_mult:.2f} × "
             f"EDGE={result.edge_mult:.2f}"
-            f"{toxic_hour_log}{toxic_combo_log}{momentum_log} = "
+            f"{toxic_hour_log}{toxic_combo_log}{momentum_log}{fusion_log} = "
             f"{result.combined_multiplier:.2f} → "
             f"{result.final_size:.6f} BTC"
         )

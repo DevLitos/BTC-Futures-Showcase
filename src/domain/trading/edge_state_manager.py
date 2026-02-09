@@ -392,9 +392,11 @@ class BreakoutEdgeCriteria:
     1. BB squeeze (width < percentile 10)
     2. Volume decline confirmado
     3. Ruptura del squeeze con volumen
+    
+    🔥 FIX #97 (Feb 09): Relajar criterios - anticipation acierta más de lo esperado
     """
-    BB_WIDTH_PERCENTILE_MAX = 10  # BB width < percentil 10
-    VOLUME_DECLINE_RATIO = 0.50   # Vol actual / Vol medio < 0.5
+    BB_WIDTH_PERCENTILE_MAX = 25  # 🔥 Subido de 10 a 25 - percentil 25 ya indica compresión relativa
+    VOLUME_DECLINE_RATIO = 0.70   # 🔥 Subido de 0.50 a 0.70 - volumen ≤70% es suficiente
     BREAKOUT_CONFIRMATION_CANDLES = 2  # 2 velas para confirmar ruptura
     # 🔥 REFACTOR (Feb 05, 2026): Extended from 15 min to 30 min
     # Breakouts often require consolidation after initial impulse
@@ -407,7 +409,6 @@ class BreakoutEdgeCriteria:
     # Invalidación lógica (distinta del SL monetario)
     INVALIDATION_CLOSE_INSIDE_BB = True  # Close de vuelta dentro de BB invalida
     INVALIDATION_LOSS_OF_BREAKOUT_LEVEL_ATR = 0.3  # Pérdida de nivel + 0.3 ATR
-
 
 # =============================================================================
 # � DISPLACEMENT EDGE CRITERIA (Jan 30, 2026)
@@ -2221,7 +2222,8 @@ class EdgeStateManager:
     # 🔥 AJUSTE (Jan 28): Compresión extrema NO bloquea PROBE
     # Antes: COMPRESSION_DISABLES_RANGE_PCT = 5 → bloqueaba PROBE
     # Ahora: Dejamos que ProbeValidator decida rentabilidad en compresión
-    COMPRESSION_DISABLES_RANGE_PCT = 0  # Disabled - PROBE allowed in compression
+    # 🔥 FIX #83 (Feb 07): Usar -1 para deshabilitar completamente
+    COMPRESSION_DISABLES_RANGE_PCT = -1  # Disabled - never block by compression
     
     # Buffer para sweep (evitar micro-ruido)
     SWEEP_ATR_BUFFER = 0.1  # Sweep debe ser >= 0.1 ATR para ser válido
@@ -3168,26 +3170,52 @@ class EdgeStateManager:
         current_price: float,
         atr: float,
         market_time: datetime,
-        reason: str = "CONSENSUS"
+        reason: str = "CONSENSUS",
+        macro_bias_strength: str | None = None,
+        has_momentum_override: bool = False
     ) -> bool:
         """
         Arma un CONSENSUS_EDGE cuando structural == active en TREND mode.
         
         🔥 FIX #31 (Feb 05): CONSENSUS tiene la MENOR prioridad (20).
+        🔥 FIX #78 (Feb 07): MACRO BIAS COHERENCE CHECK
         
         Este edge NO requiere:
         - BOS (el consenso ES la señal)
         - Sweep/rejection (no es mean reversion)
         - Compresión (no es breakout)
         
-        Solo requiere:
+        REQUIERE (FIX #78):
         - structural_bias == active_direction
         - ADX >= 20 (confirmado por trading_mode='TREND')
+        - macro_bias_strength coherente con direction:
+          * BEAR_STRONG + LONG = INCOHERENTE → BLOCKED (unless momentum_override)
+          * BULL_STRONG + SHORT = INCOHERENTE → BLOCKED (unless momentum_override)
         
         Sizing: 0.40-0.60x (menor que BOS_PULLBACK por ser entrada directa)
         
         Returns: True si se armó el edge
         """
+        # =====================================================================
+        # 🔥 FIX #78: MACRO BIAS COHERENCE CHECK
+        # 
+        # PROBLEMA: El log mostró TREND_CONSENSUS LONG con macro=BEAR_STRONG
+        # Eso es INCOHERENTE. No deberíamos armar un LONG consensus en BEAR_STRONG.
+        # 
+        # EXCEPCIÓN: Momentum override (DISPLACEMENT, EXPANSION) puede ignorar esto
+        # porque el price action ha demostrado que el macro se está rompiendo.
+        # =====================================================================
+        if macro_bias_strength and not has_momentum_override:
+            is_incoherent = (
+                (macro_bias_strength == 'BEAR_STRONG' and direction == 'LONG') or
+                (macro_bias_strength == 'BULL_STRONG' and direction == 'SHORT')
+            )
+            if is_incoherent:
+                logger.warning(
+                    f"🚫 CONSENSUS BLOCKED: {direction} incoherent with macro={macro_bias_strength} | "
+                    f"reason={reason} | momentum_override={has_momentum_override}"
+                )
+                return False
         # =====================================================================
         # 🔥 FIX #31: CONSENSUS es el FALLBACK más bajo
         # Si ya hay edge de cualquier tipo, NO reemplazar
@@ -3581,7 +3609,8 @@ class EdgeStateManager:
     def check_invalidation(
         self,
         current_price: float,
-        atr: float
+        atr: float,
+        swing_range: float = 0.0  # 🔥 FIX #77b: swing_high - swing_low for adaptive buffer
     ) -> bool:
         """
         Verifica si el edge se ha invalidado por precio.
@@ -3591,6 +3620,8 @@ class EdgeStateManager:
         BREAKOUT: Invalidado si precio vuelve al squeeze
         DISPLACEMENT: Invalidado si precio vuelve >60% del displacement al origen
         PROVISIONAL: Usa mismas reglas que su edge_type subyacente
+        
+        🔥 FIX #77b: swing_range permite buffer adaptativo al contexto actual
         
         Returns: True si se invalidó
         """
@@ -3631,19 +3662,146 @@ class EdgeStateManager:
             # DISPLACEMENT no se invalida fácilmente - NO aplicar buffer ATR
             return False
         
-        # TREND y BREAKOUT: invalidación con buffer pequeño
-        invalidation_buffer = atr * 0.2
+        # =====================================================================
+        # 🔥 FIX #77b (Feb 07, 2026): BUFFER ADAPTATIVO CON SWING
+        # 
+        # OLD: invalidation_buffer = atr * 0.6 (estático)
+        # NEW: invalidation_buffer = max(atr * 0.6, swing_range * 0.3)
+        # 
+        # WHY ADAPTIVE:
+        # - En swings pequeños (mercado tranquilo): usa 0.6× ATR
+        # - En swings grandes (volatilidad): usa 30% del swing range
+        # - Esto adapta automáticamente al contexto del mercado
+        # 
+        # EXAMPLE:
+        # - ATR = $500, swing = $1200 → max(300, 360) = $360 buffer
+        # - ATR = $500, swing = $600 → max(300, 180) = $300 buffer
+        # - ATR = $500, swing = $2000 → max(300, 600) = $600 buffer
+        # =====================================================================
+        atr_buffer = atr * 0.6
+        swing_buffer = swing_range * 0.3 if swing_range > 0 else 0.0
+        invalidation_buffer = max(atr_buffer, swing_buffer)
+        
+        # Log if using swing-based buffer (significant difference) - THROTTLED
+        # Solo loggear la primera vez para reducir spam
+        if swing_buffer > atr_buffer * 1.2 and not getattr(self, '_swing_buffer_logged', False):
+            _edge_log(
+                self._state.value, bos.edge_type.value, bos.direction,
+                f"FIX #77b: Using swing buffer ${swing_buffer:.0f} > ATR buffer ${atr_buffer:.0f}"
+            )
+            self._swing_buffer_logged = True
         
         if bos.direction == 'LONG':
             if current_price < (bos.bos_level - invalidation_buffer):
-                self._expire_edge(f"invalidated: price {current_price:.0f} < level {bos.bos_level:.0f}")
+                self._expire_edge(f"invalidated: price {current_price:.0f} < level {bos.bos_level:.0f} (buffer ${invalidation_buffer:.0f})")
                 return True
         elif bos.direction == 'SHORT':
             if current_price > (bos.bos_level + invalidation_buffer):
-                self._expire_edge(f"invalidated: price {current_price:.0f} > level {bos.bos_level:.0f}")
+                self._expire_edge(f"invalidated: price {current_price:.0f} > level {bos.bos_level:.0f} (buffer ${invalidation_buffer:.0f})")
                 return True
         
         return False
+    
+    def check_crash_invalidation(
+        self,
+        is_panic_down: bool,
+        is_meltup: bool,
+        crash_confidence: float = 0.0
+    ) -> bool:
+        """
+        🔥 FIX A3 (Feb 07, 2026): Invalidar edge cuando crash en dirección contraria.
+        🔥 FIX #81 (Feb 07): STATS TRACKING for Crash Invalidation
+        
+        PROBLEMA:
+        - Edge LONG armado/activo
+        - Mercado entra en PANIC_DOWN (crash)
+        - El edge LONG sigue activo, esperando pullback que nunca viene
+        - Sistema pierde oportunidades de SHORT
+        
+        SOLUCIÓN:
+        - Si edge es LONG y hay PANIC_DOWN → invalidar edge inmediatamente
+        - Si edge es SHORT y hay MELTUP → invalidar edge inmediatamente
+        
+        VALIDACIÓN REQUERIDA (USER FEEDBACK):
+        - "Si <50 PANIC_DOWN reales → esto es ajuste fino peligroso (overfitting)"
+        - Trackear cuántas veces se usa para validar utilidad
+        
+        Args:
+            is_panic_down: True si crash detector detecta pánico bajista
+            is_meltup: True si crash detector detecta subida parabólica
+            crash_confidence: 0-1 confianza del detector (usar si > 0.6)
+        
+        Returns: True si se invalidó el edge
+        """
+        # 🔥 FIX #81: Initialize stats tracker if not exists
+        if not hasattr(self, '_crash_invalidation_stats'):
+            self._crash_invalidation_stats = {
+                'panic_down_detected': 0,
+                'meltup_detected': 0,
+                'long_invalidated': 0,
+                'short_invalidated': 0,
+                'skipped_no_edge': 0,
+                'skipped_low_confidence': 0,
+            }
+        
+        # Track all detections (for stats validation)
+        if is_panic_down:
+            self._crash_invalidation_stats['panic_down_detected'] += 1
+        if is_meltup:
+            self._crash_invalidation_stats['meltup_detected'] += 1
+        
+        if self._state not in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE, EdgeState.EDGE_PROVISIONAL]:
+            if is_panic_down or is_meltup:
+                self._crash_invalidation_stats['skipped_no_edge'] += 1
+            return False
+        
+        if not self._current_bos:
+            return False
+        
+        bos = self._current_bos
+        direction = bos.direction
+        
+        # Check confidence threshold
+        if crash_confidence < 0.6:
+            if is_panic_down or is_meltup:
+                self._crash_invalidation_stats['skipped_low_confidence'] += 1
+            return False
+        
+        # Edge LONG durante crash → invalidar
+        if direction == 'LONG' and is_panic_down:
+            self._crash_invalidation_stats['long_invalidated'] += 1
+            self._expire_edge(
+                f"🔥 CRASH_INVALIDATION: LONG edge killed by PANIC_DOWN (conf={crash_confidence:.0%})",
+                set_context_cooldown=True
+            )
+            logger.warning(
+                f"🔥 FIX A3: Edge {bos.edge_type.value} LONG invalidated by CRASH | "
+                f"Confidence: {crash_confidence:.0%} | "
+                f"Stats: {self._crash_invalidation_stats}"
+            )
+            return True
+        
+        # Edge SHORT durante melt-up → invalidar
+        if direction == 'SHORT' and is_meltup:
+            self._crash_invalidation_stats['short_invalidated'] += 1
+            self._expire_edge(
+                f"🔥 CRASH_INVALIDATION: SHORT edge killed by MELTUP (conf={crash_confidence:.0%})",
+                set_context_cooldown=True
+            )
+            logger.warning(
+                f"🔥 FIX A3: Edge {bos.edge_type.value} SHORT invalidated by MELTUP | "
+                f"Confidence: {crash_confidence:.0%} | "
+                f"Stats: {self._crash_invalidation_stats}"
+            )
+            return True
+        
+        return False
+    
+    def get_crash_invalidation_stats(self) -> dict:
+        """Get stats for crash invalidation to validate usefulness."""
+        if not hasattr(self, '_crash_invalidation_stats'):
+            return {'error': 'Stats not initialized'}
+        return self._crash_invalidation_stats.copy()
     
     # =========================================================================
     # REGISTRO DE TRADES

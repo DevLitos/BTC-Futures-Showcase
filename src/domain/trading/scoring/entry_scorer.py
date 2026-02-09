@@ -281,52 +281,69 @@ class EntryScorer:
             structure_score = 1
         
         # 🔥 FIX #56: STRONG TREND ADX OVERRIDE - Very high ADX means clear trend
-        STRUCTURE_GATE_ADX_OVERRIDE = 55.0  # Very strong trend threshold
+        # 🔥 FIX #73 (Feb 06): Lowered from 55 → 50
+        # EVIDENCE: Log showed ADX=52.1 blocking 11.59R SHORT (MFE $70431→$69272)
+        # ADX 50+ is already a strong trend - don't let slow EMA50_1h block it
+        STRUCTURE_GATE_ADX_OVERRIDE = 50.0  # Strong trend threshold (was 55)
         if structure_blocks and strong_trend_adx >= STRUCTURE_GATE_ADX_OVERRIDE:
             logger.warning(
-                f"🔥 STRONG TREND STRUCTURE BYPASS: Ignoring STRUCTURE GATE for {bias} | "
+                f"🔥 FIX #73 STRONG TREND STRUCTURE BYPASS: Ignoring STRUCTURE GATE for {bias} | "
                 f"ADX={strong_trend_adx:.1f} >= {STRUCTURE_GATE_ADX_OVERRIDE} → clear trend"
             )
             structure_blocks = False
             structure_score = 1
         
-        # 🔥 FIX #61 (Feb 06): BIAS INVERSION OVERRIDE
-        # When bias is inverted by strong micro-trend (BULLISH when HTF=SHORT or vice versa),
-        # STRUCTURE GATE should not block because:
-        # 1. The inversion already considered location extreme checks
-        # 2. HTF structure (EMA50_1h) is slow and doesn't reflect current micro-trend
-        # 3. Blocking creates DEADLOCK: can't SHORT (obstinacy) and can't LONG (structure)
-        if structure_blocks and bias_inverted:
-            logger.warning(
-                f"🔄 BIAS INVERSION STRUCTURE BYPASS: Ignoring STRUCTURE GATE for {bias} | "
-                f"Direction was inverted by micro-trend - structure check is stale"
-            )
-            structure_blocks = False
-            structure_score = 1  # Partial credit - inversion means micro is aligned
-        
-        # 🔥 FIX #63 (Feb 06): BIAS FLIP/INVALIDATION OVERRIDE
-        # When opposite direction is FORBIDDEN by price action (e.g., "SHORT forbidden, LONG enabled"),
-        # the system has already confirmed direction change via price structure.
-        # STRUCTURE GATE should not block because:
-        # 1. Price has moved significantly against the old bias (invalidated)
-        # 2. The system is now FORCED to trade the new direction
-        # 3. EMA50_1h is slow and doesn't reflect the price invalidation
-        # Example: Price rises $300+ from low → SHORT forbidden → LONG is the ONLY valid direction
-        if structure_blocks and bias_invalidated:
-            logger.warning(
-                f"🔄 FIX #63 BIAS FLIP STRUCTURE BYPASS: Ignoring STRUCTURE GATE for {bias} | "
-                f"Opposite direction was FORBIDDEN by price action - structure is stale"
-            )
-            structure_blocks = False
-            structure_score = 1  # Partial credit - price has voted
+        # =====================================================================
+        # 🔥 REMOVED (Feb 06): FIX #61 and FIX #63 BYPASS
+        # =====================================================================
+        # ANALYSIS: These bypasses were causing BAD trades:
+        # - FIX #61: Bypassed structure when bias_inverted (micro-trend)
+        # - FIX #63: Bypassed structure when bias_invalidated (BIAS FLIP)
+        #
+        # PROBLEM: Both allowed LONG trades during BEAR_STRONG when:
+        # - Price was 2%+ below EMA50_1h (strong bearish structure)
+        # - System was just experiencing a temporary bullish micro-bounce
+        # - BIAS FLIP = "SHORT temporarily invalid" NOT "LONG is good"
+        #
+        # EVIDENCE: Log showed LONG @ 67234 when EMA50_1h was at 68684 (-2%)
+        # Trade was countertrend against BEAR_STRONG and lost money.
+        #
+        # NEW PHILOSOPHY: STRUCTURE GATE is the TRUTH. If price is significantly
+        # below/above EMA50_1h, we should NOT enter countertrend regardless of
+        # micro-rebounds or bias flips. Wait for price to confirm structurally.
+        #
+        # The bypasses are now DISABLED. Structure gate will block countertrend
+        # trades when HTF structure doesn't support them.
+        # =====================================================================
+        # (Bypasses removed - structure gate now always enforced)
         
         self._breakdown.structure = structure_score
         self._trade_tags.htf_aligned = structure_score > 0
         self._trade_tags.ltf_clean = structure_score == 2
         
+        # =========================================================================
+        # 🔥 FIX #76 (Feb 07, 2026): STRUCTURE NO LONGER BLOCKS - PENALIZES
+        # 
+        # OLD: structure_blocks=True → return 0 (hard block, no trade)
+        # NEW: structure_blocks=True → heavy penalty but trade CAN continue
+        # 
+        # WHY: Hard blocking creates paralysis. When:
+        # - FIX #70 blocks LONGs (BEAR_STRONG + exhaustion)
+        # - STRUCTURE GATE blocks SHORTs (price > EMA50)
+        # → System can't trade at all.
+        # 
+        # NEW APPROACH: Structure mismatch = score penalty + size reduction
+        # The penalty is severe (-3 points) but strong edges can still trigger.
+        # =========================================================================
         if structure_blocks:
-            # Structure = 0 is the only hard gate
-            return 0, self._breakdown.to_dict(), True
+            # Apply heavy penalty instead of blocking
+            STRUCTURE_PENALTY = -3.0
+            self._breakdown.filter_pipeline_adj += STRUCTURE_PENALTY
+            logger.warning(
+                f"⚠️ FIX #76 STRUCTURE PENALTY: {bias} vs structure → "
+                f"penalty={STRUCTURE_PENALTY} (was: hard block)"
+            )
+            # Continue with scoring instead of return
         
         # 2️⃣ TIMING (0-2)
         timing_score, bos_confirmed = self._score_timing(df_1m, bias)
@@ -359,10 +376,37 @@ class EntryScorer:
             self._breakdown.synergy = 1
             logger.debug("✨ Synergy bonus: HTF clean + BOS confirmed")
         
+        # =====================================================================
+        # 🔥 FIX #74 (Feb 06): STRONG EDGE PENALTY REDUCTION
+        # 🔥 FIX #79 (Feb 07): Lowered threshold from 45 to 35
+        # =====================================================================
+        # PROBLEM: Edge detector confirms TREND_CONSENSUS with ADX 52+, but
+        # then micro_trend and filter_pipeline penalties destroy the score.
+        # 
+        # EVIDENCE: Score 4.3 after penalties blocked 11.59R SHORT opportunity.
+        # The edge detector already did the hard work of confirming trend.
+        #
+        # FIX #79: ADX 35+ is enough to trust the trend. Was blocking entries at ADX=37.
+        # 
+        # SOLUTION: When strong ADX (>=35) edge is active, reduce penalties 75%
+        # because the market has clearly voted on direction.
+        # =====================================================================
+        STRONG_EDGE_ADX_THRESHOLD = 35.0  # Was 45, now 35
+        # 🔥 FIX #79: Reduce penalties to 25% instead of 50% when strong trend
+        penalty_reduction = 0.25 if strong_trend_adx >= STRONG_EDGE_ADX_THRESHOLD else 1.0
+        
         # 6️⃣ MICRO TREND ADJUSTMENT
         if micro_trend_state is not None:
             micro_adj = micro_trend_state.score_adjustment
             if micro_adj != 0:
+                # 🔥 FIX #74: Reduce penalties when strong edge active
+                if micro_adj < 0 and penalty_reduction < 1.0:
+                    original_adj = micro_adj
+                    micro_adj = micro_adj * penalty_reduction
+                    logger.info(
+                        f"🔥 FIX #74: Micro penalty reduced {original_adj:+.1f} → {micro_adj:+.1f} "
+                        f"(ADX={strong_trend_adx:.1f} edge confirms trend)"
+                    )
                 self._breakdown.micro_trend_adj = micro_adj
                 if micro_adj < 0:
                     logger.warning(
@@ -385,6 +429,14 @@ class EntryScorer:
                     last_decision,
                     self._breakdown.micro_trend_adj
                 )
+                # 🔥 FIX #74: Reduce penalties when strong edge active
+                if fp_adj < 0 and penalty_reduction < 1.0:
+                    original_adj = fp_adj
+                    fp_adj = fp_adj * penalty_reduction
+                    logger.info(
+                        f"🔥 FIX #74: Filter penalty reduced {original_adj:+.1f} → {fp_adj:+.1f} "
+                        f"(ADX={strong_trend_adx:.1f} edge confirms trend)"
+                    )
                 self._breakdown.filter_pipeline_adj = fp_adj
                 if fp_adj < 0:
                     logger.warning(f"📉 Filter pipeline penalty (hierarchical): {fp_adj:+.1f}")
@@ -639,33 +691,127 @@ class EntryScorer:
         if len(ema50_1h) >= 4:
             ema50_slope = (ema50_1h[-1] - ema50_1h[-4]) / ema50_1h[-4] * 100  # % change
         
-        # Price proximity to EMA50 (0.3% tolerance = ~$250 at BTC $85k)
+        # Price distance from EMA50 (0.3% tolerance = ~$250 at BTC $85k)
         PROXIMITY_TOLERANCE = 0.003  # 0.3%
         price_distance_pct = (current_price - ema50_1h[-1]) / ema50_1h[-1]
         is_near_ema50 = abs(price_distance_pct) <= PROXIMITY_TOLERANCE
         
+        # =========================================================================
+        # 🔥 FIX #77 (Feb 07, 2026): ANTICIPATION vs CONFIRMATION
+        # 
+        # OLD LOGIC (flawed for SHORT):
+        #   - LONG: price > EMA50 (good - buy and ride up)
+        #   - SHORT: price < EMA50 (BAD - already fell, too late to sell)
+        # 
+        # NEW LOGIC (anticipatory):
+        #   - LONG: price > EMA50 OR (near EMA50 with bullish slope)
+        #   - SHORT: price > EMA50 (SELL HIGH!) OR (near EMA50 with bearish slope)
+        # 
+        # KEY INSIGHT from user analysis: "Para SHORT quieres VENDER ALTO.
+        # El gate actual pide que ya cayó. Eso es CONFIRMACIÓN TARDÍA."
+        # 
+        # ZONE-BASED APPROACH:
+        #   - GOOD_ZONE: Where you WANT to enter (favorable price)
+        #   - BAD_ZONE: Where entry is LATE (unfavorable price, missed the move)
+        # =========================================================================
+        
         htf_aligned = False
         htf_slope_override = False
+        zone_quality = "NEUTRAL"  # For logging
         
         if bias == 'LONG':
+            # =====================================================================
+            # 🔥 FIX #80 (Feb 07): LONG LOGIC WITH REVERSAL DETECTION
+            # 
+            # LONG wants to buy low and sell high
+            # GOOD: price > EMA50 (uptrend confirmed, momentum)
+            # ALSO GOOD: price near/below EMA50 with bullish slope (buy the dip)
+            # 
+            # NEW: Allow counter-trend LONG when:
+            # - Price is within 3% below EMA50 (not too extended)
+            # - There's evidence of reversal (we check slope change or momentum)
+            # =====================================================================
             htf_aligned = current_price > ema50_1h[-1]
-            # Allow LONG if near EMA50 and slope is positive (recovering uptrend)
-            if not htf_aligned and is_near_ema50 and ema50_slope > 0:
-                htf_aligned = True
-                htf_slope_override = True
-                logger.info(f"📈 STRUCTURE: LONG allowed - near EMA50 ({price_distance_pct:.2%}) with positive slope ({ema50_slope:.3f}%)")
+            
+            if htf_aligned:
+                zone_quality = "ABOVE_EMA"
+            elif not htf_aligned:
+                # Near EMA50 with positive slope → buying the dip in uptrend
+                if is_near_ema50 and ema50_slope > 0:
+                    htf_aligned = True
+                    htf_slope_override = True
+                    zone_quality = "DIP_BUY"
+                    logger.info(f"📈 STRUCTURE: LONG allowed - near EMA50 ({price_distance_pct:.2%}) with positive slope ({ema50_slope:.3f}%)")
+                # Very strong upward slope → allow even slightly below
+                elif ema50_slope > 0.05:
+                    htf_aligned = True
+                    htf_slope_override = True
+                    zone_quality = "STRONG_UP"
+                    logger.info(f"📈 STRUCTURE: LONG allowed - strong positive slope ({ema50_slope:.3f}%) overrides position")
+                # 🔥 FIX #80: Within 3% below EMA50 → allow with score penalty
+                # This is a "reversal zone" where bounce plays can work
+                # The entry scoring will naturally give lower scores due to HTF misalignment
+                elif price_distance_pct >= -0.03:  # Within 3% below EMA50
+                    htf_aligned = True
+                    htf_slope_override = True
+                    zone_quality = "REVERSAL_ZONE"
+                    logger.info(f"📈 FIX #80: LONG allowed in REVERSAL_ZONE - price {current_price:.0f} at {price_distance_pct:.1%} (within 3% of EMA50)")
+                # Extended below (>3%) with negative slope → truly counter-trend, block
+                else:
+                    zone_quality = "TOO_LOW"
+                    logger.warning(f"📈 STRUCTURE: LONG blocked - price {current_price:.0f} at {price_distance_pct:.1%} is too far below EMA50 with slope {ema50_slope:.3f}%")
         else:
-            htf_aligned = current_price < ema50_1h[-1]
-            # Allow SHORT if near EMA50 and slope is negative (developing downtrend)
-            if not htf_aligned and is_near_ema50 and ema50_slope < 0:
+            # =====================================================================
+            # 🔥 FIX #77: SHORT LOGIC INVERTED FOR ANTICIPATION
+            # 🔥 FIX #79 (Feb 07): REDUCED TOO_LATE THRESHOLD
+            # 
+            # SHORT wants to SELL HIGH and buy back low.
+            # GOOD: price > EMA50 (SELL FROM STRENGTH, price has room to fall)
+            # ALSO GOOD: price near EMA50 with bearish slope (breakdown imminent)
+            # 
+            # PROBLEM with old TOO_LATE (>2%):
+            # - In a strong downtrend, price can be 3-5% below EMA50 and STILL trending down
+            # - Blocking at 2% meant missing the continuation of the move
+            # - Example: $69,343 → $67,500 (2.66% drop) blocked even though trend continued
+            # 
+            # NEW RULE: TOO_LATE only applies when BOTH conditions are true:
+            # 1. Price is >4% below EMA50 (really extended)
+            # 2. Slope is NOT strongly negative (momentum fading)
+            # =====================================================================
+            
+            # GOOD ZONE: Price ABOVE EMA50 → selling from strength
+            if current_price > ema50_1h[-1]:
+                htf_aligned = True
+                zone_quality = "SELL_HIGH"
+                logger.info(f"📉 FIX #77: SHORT in GOOD ZONE - price {current_price:.0f} ABOVE EMA50 {ema50_1h[-1]:.0f} (selling from strength)")
+            
+            # ALSO GOOD: Near EMA50 with bearish slope (breakdown setup)
+            elif is_near_ema50 and ema50_slope < 0:
                 htf_aligned = True
                 htf_slope_override = True
+                zone_quality = "BREAKDOWN"
                 logger.info(f"📉 STRUCTURE: SHORT allowed - near EMA50 ({price_distance_pct:.2%}) with negative slope ({ema50_slope:.3f}%)")
-            # Also allow SHORT if slope is strongly negative (fast move down)
-            elif not htf_aligned and ema50_slope < -0.05:  # -0.05% = ~$45/hour drop
+            
+            # ALSO GOOD: Strong bearish slope overrides (fast crash in progress)
+            # 🔥 FIX #79: Relaxed from -0.05 to -0.02 (less restrictive)
+            elif ema50_slope < -0.02:
                 htf_aligned = True
                 htf_slope_override = True
-                logger.info(f"📉 STRUCTURE: SHORT allowed - strong negative slope ({ema50_slope:.3f}%) indicates downtrend")
+                zone_quality = "TREND_DOWN"
+                logger.info(f"📉 STRUCTURE: SHORT allowed - negative slope ({ema50_slope:.3f}%) indicates active downtrend")
+            
+            # 🔥 FIX #79: BAD ZONE only when REALLY extended AND momentum fading
+            # Changed from: price < -2% → block
+            # To: price < -4% AND slope >= -0.02 (flat/up) → block
+            elif price_distance_pct < -0.04 and ema50_slope >= -0.02:
+                htf_aligned = False
+                zone_quality = "TOO_LATE"
+                logger.warning(f"📉 FIX #79: SHORT in BAD ZONE - price {current_price:.0f} is {price_distance_pct:.1%} below EMA50 AND momentum fading (slope={ema50_slope:.3f}%)")
+            
+            # Near EMA50 with neutral/bullish slope → still acceptable
+            else:
+                htf_aligned = True
+                zone_quality = "NEUTRAL_OK"
         
         if not htf_aligned:
             # 🔥 FIX #62b (Feb 06): EXTREME DISTANCE BYPASS
@@ -685,7 +831,7 @@ class EntryScorer:
                 return 1, False, False
             
             # Against HTF → Structure = 0 → BLOCKS
-            logger.warning(f"⛔ STRUCTURE GATE: {bias} against HTF (Price vs EMA50_1h) | "
+            logger.warning(f"⛔ STRUCTURE GATE: {bias} against HTF (zone={zone_quality}) | "
                           f"Price: {current_price:.0f}, EMA50: {ema50_1h[-1]:.0f}, "
                           f"Distance: {price_distance_pct:.2%}, Slope: {ema50_slope:.3f}%")
             return 0, True, False

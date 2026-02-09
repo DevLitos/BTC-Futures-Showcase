@@ -105,6 +105,24 @@ class ActivityTracker:
         self._last_trade_was_win: bool = False
         self._current_session: Optional[str] = None  # Track session for reset
         
+        # 🔥 FIX #82: Track session P&L for smarter session limits
+        self._session_pnl_r: float = 0.0  # P&L in R-multiples for current session
+        self._session_pnl_usd: float = 0.0  # P&L in USD for current session
+        
+        # 🔥 FIX #83: Track last trade details for session limit override
+        self._last_exit_reason: Optional[str] = None
+        self._last_trade_pnl_r: Optional[float] = None
+        
+        # 🔥 PASO 1: Lista de trades para RECONCILIACIÓN DURA
+        # Sin esto, el P&L trackeado puede desincronizarse silenciosamente
+        self._session_trades: list = []  # [(pnl_r, exit_reason, timestamp)]
+        self._reconciliation_errors: int = 0
+        
+        # 🔥 PASO 2: Métricas de EXPECTANCY (200 trades rolling)
+        self._trade_history: list = []  # [{pnl_r, won, blocked, missed_r, timestamp}]
+        self._blocked_signals_count: int = 0
+        self._missed_r_estimate: float = 0.0
+        
     def record_trade_executed(self, market_time: datetime) -> None:
         """
         Record that a trade was executed.
@@ -173,6 +191,26 @@ class ActivityTracker:
         
         self._pnl_today_r += pnl_r
         
+        # 🔥 FIX #82: Track session P&L
+        self._session_pnl_r += pnl_r
+        
+        # 🔥 FIX #83: Track last trade details for session limit override
+        self._last_exit_reason = exit_reason
+        self._last_trade_pnl_r = pnl_r
+        
+        # 🔥 PASO 1: Agregar trade para reconciliación
+        from datetime import datetime as dt
+        self._session_trades.append((pnl_r, exit_reason, dt.utcnow()))
+        
+        # 🔥 PASO 2: Agregar a historial de expectancy (rolling 200)
+        self._trade_history.append({
+            'pnl_r': pnl_r,
+            'won': pnl_r > 0,
+            'exit_reason': exit_reason,
+        })
+        if len(self._trade_history) > 200:
+            self._trade_history.pop(0)
+        
         if is_loss:
             self._consecutive_losses += 1
             self._losses_today += 1
@@ -234,6 +272,148 @@ class ActivityTracker:
         """
         return self._last_trade_was_win
     
+    def get_session_pnl_r(self) -> float:
+        """
+        🔥 FIX #82: Get session P&L in R-multiples.
+        
+        Used to override Hot Hand stop when session is profitable.
+        
+        Returns:
+            Session P&L in R-multiples (positive = profit)
+        """
+        return self._session_pnl_r
+    
+    def get_last_exit_reason(self) -> Optional[str]:
+        """
+        🔥 FIX #83: Get last trade exit reason.
+        
+        Used to allow trades after administrative exits (EARLY_MFE, WTP).
+        
+        Returns:
+            Last exit reason string, or None if no trades yet.
+        """
+        return self._last_exit_reason
+    
+    def get_last_trade_pnl_r(self) -> Optional[float]:
+        """
+        🔥 FIX #83: Get last trade P&L in R-multiples.
+        
+        Used to allow trades after small losses.
+        
+        Returns:
+            Last trade P&L in R, or None if no trades yet.
+        """
+        return self._last_trade_pnl_r
+    
+    def set_session_pnl_usd(self, pnl_usd: float) -> None:
+        """
+        🔥 FIX #82: Set session P&L in USD (from external source).
+        
+        Args:
+            pnl_usd: Session P&L in USD
+        """
+        self._session_pnl_usd = pnl_usd
+    
+    def get_session_pnl_usd(self) -> float:
+        """
+        🔥 FIX #82: Get session P&L in USD.
+        
+        Returns:
+            Session P&L in USD
+        """
+        return self._session_pnl_usd
+    
+    def session_is_profitable(self, min_r: float = 0.5) -> bool:
+        """
+        🔥 FIX #82: Check if session has minimum profit to override Hot Hand stop.
+        
+        Args:
+            min_r: Minimum R-multiple profit required (default 0.5R)
+            
+        Returns:
+            True if session P&L >= min_r
+        """
+        return self._session_pnl_r >= min_r
+    
+    def reconcile_session_pnl(self, epsilon: float = 0.05) -> bool:
+        """
+        🔥 PASO 1: RECONCILIACIÓN OBLIGATORIA de Session P&L.
+        
+        Verifica que el P&L trackeado coincide con la suma de trades.
+        Si hay diferencia > epsilon, ALERTA CRÍTICA.
+        
+        Args:
+            epsilon: Tolerancia máxima de diferencia en R
+            
+        Returns:
+            True si reconciliación OK, False si hay mismatch
+        """
+        if not self._session_trades:
+            return True  # No trades = nothing to reconcile
+        
+        sum_trades = sum(t[0] for t in self._session_trades)
+        diff = abs(sum_trades - self._session_pnl_r)
+        
+        if diff > epsilon:
+            self._reconciliation_errors += 1
+            logger.critical(
+                f"🚨 RECONCILIATION ERROR #{self._reconciliation_errors}: "
+                f"sum(trades)={sum_trades:.3f}R vs tracked={self._session_pnl_r:.3f}R | "
+                f"diff={diff:.3f}R > epsilon={epsilon}R"
+            )
+            # Auto-correct to sum of trades (source of truth)
+            self._session_pnl_r = sum_trades
+            return False
+        
+        return True
+    
+    def get_expectancy_metrics(self) -> dict:
+        """
+        🔥 PASO 2: Calcular métricas de EXPECTANCY real.
+        
+        Returns:
+            Dict con avg_r, winrate, profit_factor, block_pct, missed_r
+        """
+        if not self._trade_history:
+            return {
+                'avg_r': 0.0,
+                'winrate': 0.0,
+                'profit_factor': 0.0,
+                'trade_count': 0,
+                'blocked_signals': self._blocked_signals_count,
+                'missed_r_estimate': self._missed_r_estimate,
+            }
+        
+        trades = self._trade_history
+        wins = [t['pnl_r'] for t in trades if t['pnl_r'] > 0]
+        losses = [abs(t['pnl_r']) for t in trades if t['pnl_r'] < 0]
+        
+        total_wins = sum(wins) if wins else 0
+        total_losses = sum(losses) if losses else 0
+        
+        avg_r = sum(t['pnl_r'] for t in trades) / len(trades)
+        winrate = len(wins) / len(trades) if trades else 0
+        profit_factor = total_wins / total_losses if total_losses > 0 else float('inf')
+        
+        return {
+            'avg_r': avg_r,
+            'winrate': winrate,
+            'profit_factor': profit_factor,
+            'trade_count': len(trades),
+            'blocked_signals': self._blocked_signals_count,
+            'missed_r_estimate': self._missed_r_estimate,
+        }
+    
+    def record_blocked_signal(self, estimated_r: float = 0.5) -> None:
+        """
+        🔥 PASO 2: Trackear señales bloqueadas para medir opportunity cost.
+        
+        Args:
+            estimated_r: R estimado que se habría capturado (conservador: 0.5R)
+        """
+        self._blocked_signals_count += 1
+        self._missed_r_estimate += estimated_r
+    
     def reset_session_state(self, session_name: str) -> None:
         """
         🔥 FIX #10: Reset session state when session changes.
@@ -245,10 +425,19 @@ class ActivityTracker:
             old_session = self._current_session
             self._current_session = session_name
             self._last_trade_was_win = False  # Reset on session change
+            
+            # 🔥 PASO 1: Reconciliar antes de resetear
+            self.reconcile_session_pnl()
+            
+            # 🔥 FIX #82: Reset session P&L on session change
+            old_pnl = self._session_pnl_r
+            self._session_pnl_r = 0.0
+            self._session_pnl_usd = 0.0
+            self._session_trades = []  # Clear trade list for new session
             if old_session:
                 logger.info(
                     f"📊 Session change: {old_session} → {session_name} | "
-                    f"Hot Hand state reset"
+                    f"Hot Hand state reset | Previous session P&L: {old_pnl:+.2f}R"
                 )
     
     def get_hours_since_last_trade(self, current_time: datetime) -> float:

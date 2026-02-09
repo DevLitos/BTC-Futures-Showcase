@@ -356,10 +356,24 @@ class RegimeDetector:
         if chase_atr > 4.0:
             return True, f"Extreme chase ({chase_atr:.1f} ATR) - too risky"
         
-        # High chase in non-expansion blocks
-        # FIX (Jan 24, 2026): Raised from 2.0 to 2.8
-        if chase_atr > 2.8 and regime != EntryRegime.TREND_EXPANSION:
-            return True, f"High chase ({chase_atr:.1f} ATR) in {regime.value}"
+        # =========================================================
+        # 🔥 FIX #84 (Feb 7, 2026): STRICTER CHASE IN TRANSITION/RANGE
+        # 
+        # PROBLEMA: Con threshold 2.8 ATR, trades con 2.72 ATR pasaban
+        # pero entraban en el TOPE del movimiento y perdían.
+        # 
+        # SOLUCIÓN: En regímenes NORMAL/RANGE, usar 2.0 ATR como max.
+        # El displacement detecta que el precio YA subió, pero si chase
+        # es alto = el movimiento ya pasó = no entrar.
+        # 
+        # 🔧 FIX #85 (Feb 8, 2026): TRANSITION no existe en EntryRegime
+        # Cambiado a NORMAL que es el equivalente (ADX 18-25)
+        # =========================================================
+        is_low_trend_regime = regime in [EntryRegime.NORMAL, EntryRegime.RANGE]
+        max_chase_for_regime = 2.0 if is_low_trend_regime else 2.8
+        
+        if chase_atr > max_chase_for_regime and regime != EntryRegime.TREND_EXPANSION:
+            return True, f"High chase ({chase_atr:.1f} ATR > {max_chase_for_regime}) in {regime.value} - movement exhausted"
         
         return False, ""
     

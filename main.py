@@ -967,7 +967,8 @@ class TradingSystemOrchestrator:
         if not hasattr(self, '_ws_last_candle_time'):
             self._ws_last_candle_time = datetime.now()
         self._ws_last_candle_time = datetime.now()
-        logger.info(f"5m candle closed: O={candle['open']:.2f} C={candle['close']:.2f}")
+        # FIX #84: Reducido a DEBUG
+        logger.debug(f"5m candle closed: O={candle['open']:.2f} C={candle['close']:.2f}")
     
     async def _on_candle_1h(self, candle: dict):
         """Callback: vela 1h cerrada"""
@@ -977,7 +978,8 @@ class TradingSystemOrchestrator:
             self._ws_last_candle_time = datetime.now()
         self._ws_last_candle_time = datetime.now()
         self.ws_healthy = True
-        logger.info(f"1h candle closed: O={candle['open']:.2f} C={candle['close']:.2f}")
+        # FIX #84: Reducido a DEBUG
+        logger.debug(f"1h candle closed: O={candle['open']:.2f} C={candle['close']:.2f}")
     
     # ===== KILL SWITCH MONITOR =====
     
@@ -1113,10 +1115,10 @@ class TradingSystemOrchestrator:
     # ===== MONITORING =====
     
     async def _monitoring_loop(self):
-        """Monitoreo cada 5 minutos (reducido para menos spam)"""
+        """Monitoreo cada 15 minutos (FIX #84: reducido para menos spam)"""
         while self.is_running:
             try:
-                await asyncio.sleep(300)  # 5 minutes instead of 1
+                await asyncio.sleep(900)  # FIX #84: 15 minutes instead of 5
                 
                 # Status (compact single line)
                 logger.info("=" * 70)

@@ -157,6 +157,59 @@ class ChaseValidator:
             result.chase_atr, current_regime
         )
         
+        # =====================================================================
+        # 🔥 FIX #102c (Feb 09, 2026): HARD BLOCK for extreme chase without pullback
+        # =====================================================================
+        # PROBLEMA: chase 1.78 ATR se perdona con "trend expansion" → FOMO codificado
+        # 
+        # REGLA DURA: Chase > 1.5 ATR = BLOQUEO sin excepciones
+        # EXCEPCIÓN ÚNICA: Si hubo pullback significativo (> 0.3 ATR desde max/min)
+        # 
+        # RAZÓN: A 1.5+ ATR de chase, la probabilidad de reversión es alta
+        # No importa si hay "trend expansion" - estás comprando el top/vendiendo el bottom
+        # =====================================================================
+        HARD_CHASE_LIMIT = 1.5  # ATR múltiples - sin negociación
+        PULLBACK_EXCEPTION = 0.3  # ATR - solo si hubo retroceso significativo
+        
+        if result.chase_atr > HARD_CHASE_LIMIT:
+            # Check for pullback exception
+            has_pullback = False
+            try:
+                if df_1m is not None and len(df_1m) >= 5:
+                    closes = df_1m['close'].to_numpy()[-5:]
+                    highs = df_1m['high'].to_numpy()[-5:]
+                    lows = df_1m['low'].to_numpy()[-5:]
+                    
+                    if bias == 'LONG':
+                        # For LONG, check if price pulled back from recent high
+                        max_high = max(highs)
+                        pullback_atr = (max_high - closes[-1]) / atr_1m if atr_1m > 0 else 0
+                        has_pullback = pullback_atr >= PULLBACK_EXCEPTION
+                    else:
+                        # For SHORT, check if price pulled back from recent low
+                        min_low = min(lows)
+                        pullback_atr = (closes[-1] - min_low) / atr_1m if atr_1m > 0 else 0
+                        has_pullback = pullback_atr >= PULLBACK_EXCEPTION
+            except Exception:
+                has_pullback = False
+            
+            if not has_pullback:
+                result.should_block = True
+                result.block_reason = (
+                    f"🚫 FIX #102c: Chase {result.chase_atr:.2f} ATR > {HARD_CHASE_LIMIT} ATR | "
+                    f"No pullback detected | FOMO BLOCKED"
+                )
+                result.tags['fomo_blocked'] = True
+                logger.warning(result.block_reason)
+                return result
+            else:
+                # Has pullback - allow but log
+                logger.info(
+                    f"📊 FIX #102c: Chase {result.chase_atr:.2f} ATR > {HARD_CHASE_LIMIT} ATR | "
+                    f"Pullback detected ({pullback_atr:.2f} ATR) - ALLOWING"
+                )
+                result.tags['pullback_exception'] = True
+        
         # Check momentum context (if positive, may reduce penalty)
         adx_rising = len(adx_values) >= 3 and adx_values[-1] > adx_values[-3]
         candle_expansion = bool(atr_5m > atr_avg * 1.1)
