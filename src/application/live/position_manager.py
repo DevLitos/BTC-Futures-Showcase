@@ -81,10 +81,15 @@ def calculate_current_r(position, current_price: float) -> float:
 def check_bos_against_position(
     df_5m: pd.DataFrame,
     direction: str,
-    lookback: int = 3
+    lookback: int = 20,
+    min_bos_atr_mult: float = 0.3  # 🔧 FIX #126: Reduced from 0.5 to 0.3 for faster detection
 ) -> Tuple[bool, float]:
     """
     Check if there's a Break of Structure against the position direction.
+    
+    🔧 FIX #126 (Feb 09, 2026): Unified BOS detection with ATR filter
+    - Merged logic from filter_checks.py (ATR-filtered) with position_manager.py (returns level)
+    - BOS must exceed min_bos_atr_mult × ATR to avoid noise
     
     For SHORT: If 5m makes new HH above recent highs → bearish thesis broken
     For LONG: If 5m makes new LL below recent lows → bullish thesis broken
@@ -92,31 +97,55 @@ def check_bos_against_position(
     Args:
         df_5m: 5m candle DataFrame
         direction: Position direction ('LONG' or 'SHORT')
-        lookback: Number of candles to look back for BOS
+        lookback: Number of candles to look back for BOS (default 20)
+        min_bos_atr_mult: Minimum ATR multiple for valid BOS (default 0.3)
     
     Returns:
         (has_bos, bos_level)
     """
-    if df_5m is None or len(df_5m) < lookback + 1:
+    if df_5m is None or len(df_5m) < lookback:
         return False, 0.0
     
-    highs = df_5m['high'].to_numpy()
-    lows = df_5m['low'].to_numpy()
+    # Use last N candles
+    df = df_5m.iloc[-lookback:] if len(df_5m) > lookback else df_5m
     
-    # Get recent range (excluding current candle which is still forming)
-    recent_high = max(highs[-(lookback+1):-1])
-    recent_low = min(lows[-(lookback+1):-1])
+    highs = df['high'].to_numpy()
+    lows = df['low'].to_numpy()
+    closes = df['close'].to_numpy()
     
     current_high = highs[-1]
     current_low = lows[-1]
     
+    # Calculate ATR for minimum threshold (avoid noise)
+    if len(highs) > 1:
+        tr = np.maximum(
+            highs[1:] - lows[1:],
+            np.maximum(
+                np.abs(highs[1:] - closes[:-1]),
+                np.abs(lows[1:] - closes[:-1])
+            )
+        )
+        atr = np.mean(tr[-14:]) if len(tr) >= 14 else np.mean(tr)
+    else:
+        atr = highs[-1] - lows[-1]  # Fallback
+    
+    min_bos_distance = atr * min_bos_atr_mult
+    
+    # Find previous swing points (excluding last candle)
+    prev_highs = highs[:-1]
+    prev_lows = lows[:-1]
+    
     if direction == 'SHORT':
-        # New higher high = bearish thesis broken
-        if current_high > recent_high * 1.001:  # 0.1% buffer for noise
+        # BOS against SHORT = new higher high
+        prev_swing_high = np.max(prev_highs) if len(prev_highs) > 0 else current_high
+        bos_distance = current_high - prev_swing_high
+        if current_high > prev_swing_high and bos_distance >= min_bos_distance:
             return True, current_high
     else:  # LONG
-        # New lower low = bullish thesis broken
-        if current_low < recent_low * 0.999:  # 0.1% buffer for noise
+        # BOS against LONG = new lower low
+        prev_swing_low = np.min(prev_lows) if len(prev_lows) > 0 else current_low
+        bos_distance = prev_swing_low - current_low
+        if current_low < prev_swing_low and bos_distance >= min_bos_distance:
             return True, current_low
     
     return False, 0.0
@@ -326,23 +355,24 @@ class PositionHealthChecker:
         result['has_bos'] = has_bos
         result['bos_level'] = bos_level
         
-        # 🔧 FIX (Jan 30, 2026): Apply 5min grace period BEFORE acting on BOS
+        # 🔧 FIX #124 (Feb 09, 2026): Apply 7min grace period BEFORE acting on BOS
         # This prevents closing on pre-existing BOS detected immediately after entry
-        GRACE_PERIOD_MINUTES = 5.0
+        # 🔧 FIX #125 (Feb 09, 2026): Use BOSInvalidationChecker constants to avoid inconsistency
+        GRACE_PERIOD_MINUTES = BOSInvalidationChecker.GRACE_PERIOD_MINUTES
+        CLOSE_THRESHOLD_R = BOSInvalidationChecker.CLOSE_THRESHOLD_R
         trade_age_min = 0.0
         within_grace = False
         # 🔧 FIX (Jan 30, 2026): Position uses 'open_time', not 'entry_time'
         if hasattr(position, 'open_time') and position.open_time:
             trade_age_min = (market_time - position.open_time).total_seconds() / 60.0
             within_grace = trade_age_min < GRACE_PERIOD_MINUTES
-            if within_grace and has_bos:
-                logger.info(f"🛡️ BOS GRACE PERIOD: Trade age {trade_age_min:.1f}m < {GRACE_PERIOD_MINUTES}m → IGNORING BOS in HealthChecker")
+            # Note: BOS GRACE PERIOD log suppressed to avoid spam (logs only on first detection)
         
-        if has_bos and not within_grace and -0.3 < result['current_r'] < 0.3:
+        if has_bos and not within_grace and -CLOSE_THRESHOLD_R < result['current_r'] < CLOSE_THRESHOLD_R:
             # Near breakeven with BOS = close (only outside grace period)
             result['should_close'] = True
             result['close_reason'] = f'BOS_INVALIDATION (R={result["current_r"]:.2f})'
-        elif has_bos and not within_grace and result['current_r'] >= 0.3:
+        elif has_bos and not within_grace and result['current_r'] >= CLOSE_THRESHOLD_R:
             # In profit with BOS = tighten 50%
             result['should_tighten'] = True
             trail_dist = abs(current_price - position.trailing_stop) * 0.5
@@ -643,12 +673,17 @@ class BOSInvalidationChecker:
     
     If SHORT and price makes Higher High, or LONG and price makes Lower Low,
     the structural thesis is invalidated. Actions:
-    - Close if near BE or small loss (|R| < 0.3)
+    - Close if near BE or small loss (|R| < threshold)
     - Tighten stop by 50% if in profit
+    
+    🔧 FIX #124 (Feb 09, 2026): Increased tolerance
+    - Grace period 5→7 min: Give trade more time to develop
+    - Close threshold 0.3→0.5R: Only close if losing significantly
+    - Problem: BOS appearing 1 min after entry was closing trades prematurely
     """
     
-    GRACE_PERIOD_MINUTES = 5.0
-    CLOSE_THRESHOLD_R = 0.3  # Close if |R| < this
+    GRACE_PERIOD_MINUTES = 7.0  # FIX #124: 5→7 min
+    CLOSE_THRESHOLD_R = 0.4  # FIX #124: 0.3→0.4R (only close if |R| < this)
     TIGHTEN_PCT = 0.5  # Tighten by 50%
     
     @staticmethod
@@ -672,10 +707,11 @@ class BOSInvalidationChecker:
         
         # Check grace period
         # 🔧 FIX (Jan 30, 2026): Position uses 'open_time', not 'entry_time'
+        # Note: BOS GRACE PERIOD log suppressed to avoid spam (logs only at debug level)
         if hasattr(position, 'open_time') and position.open_time:
             trade_age_min = (market_time - position.open_time).total_seconds() / 60.0
             if trade_age_min < BOSInvalidationChecker.GRACE_PERIOD_MINUTES:
-                logger.info(f"🛡️ BOS GRACE PERIOD: Trade age {trade_age_min:.1f}m < {BOSInvalidationChecker.GRACE_PERIOD_MINUTES}m → IGNORING BOS")
+                logger.debug(f"🛡️ BOS GRACE PERIOD: Trade age {trade_age_min:.1f}m < {BOSInvalidationChecker.GRACE_PERIOD_MINUTES}m → IGNORING BOS")
                 return result
         
         current_r = calculate_current_r(position, current_price)

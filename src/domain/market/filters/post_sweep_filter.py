@@ -31,11 +31,13 @@ class SweepZone:
     sweep_low: float             # Low of the sweep candle
     sweep_time: datetime         # When sweep was detected
     pre_sweep_level: float       # Level that was swept (prior swing low/high)
-    candles_since_sweep: int = 0 # Counter for timeout
+    candles_since_sweep: int = 0 # Counter for timeout (legacy)
     break_confirmed: bool = False
     retest_confirmed: bool = False
     confirmation_complete: bool = False
     expired: bool = False
+    # 🔥 FIX #117: Time-based expiration
+    expires_at: datetime = None  # type: ignore
 
 
 class PostSweepConfirmationFilter(BaseFilter):
@@ -61,8 +63,14 @@ class PostSweepConfirmationFilter(BaseFilter):
     BREAK_BUFFER_PCT = 0.0005    # 0.05% buffer for break confirmation
     RETEST_TOLERANCE_PCT = 0.002 # 0.2% tolerance for retest zone
     
-    # Timeout
-    CONFIRMATION_TIMEOUT_CANDLES = 15  # Expire pending sweep after N candles
+    # 🔥 FIX #117 (Feb 09, 2026): DYNAMIC TIMEOUT
+    # ANTES: Timeout fijo de 15 velas = 15 minutos en cualquier volatilidad
+    # AHORA: Timeout basado en ATR - alta vol = más tiempo para confirmar
+    # Filosofía: El mercado dicta el tiempo, no un número mágico
+    CONFIRMATION_TIMEOUT_CANDLES = 15  # Fallback (legacy)
+    CONFIRMATION_TIMEOUT_MIN_MINUTES = 5   # Mínimo 5 minutos
+    CONFIRMATION_TIMEOUT_MAX_MINUTES = 20  # Máximo 20 minutos
+    CONFIRMATION_ATR_MULT = 2.0  # Timeout = ATR * mult / volatilidad esperada
     
     # Score adjustments
     PENDING_SWEEP_PENALTY = -2.0    # While waiting for confirmation
@@ -108,30 +116,45 @@ class PostSweepConfirmationFilter(BaseFilter):
         # Use market_time for backtest compatibility, fallback to utcnow for live
         now = market_time or datetime.utcnow()
         
+        # 🔥 FIX #117: Calculate dynamic timeout based on ATR
+        # Alta volatilidad (ATR grande) → más tiempo para confirmar
+        # Baja volatilidad (ATR pequeño) → menos tiempo
+        # Fórmula: timeout_minutes = clamp(ATR / price * 10000, min, max)
+        # Para BTC con ATR típico de $150 y precio $70k: ~21 → clamped a 20min
+        # Para ATR bajo ($50): ~7min
+        atr_pct = (atr / max(candle_close, 1)) * 10000  # Normalizar
+        timeout_minutes = max(
+            self.CONFIRMATION_TIMEOUT_MIN_MINUTES,
+            min(self.CONFIRMATION_TIMEOUT_MAX_MINUTES, atr_pct)
+        )
+        expires_at = now + timedelta(minutes=timeout_minutes)
+        
         # BULLISH SWEEP: wicked below prior low, closed above it
         if candle_low < prior_swing_low and candle_close > prior_swing_low:
             lower_wick = min(candle_open, candle_close) - candle_low
             if lower_wick >= atr * self.MIN_WICK_ATR_MULT:
-                logger.debug(f"BULLISH SWEEP detected: wicked to {candle_low:.2f}, closed at {candle_close:.2f}")
+                logger.debug(f"BULLISH SWEEP detected: wicked to {candle_low:.2f}, closed at {candle_close:.2f} | timeout={timeout_minutes:.0f}min")
                 return SweepZone(
                     sweep_type='BULLISH',
                     sweep_high=candle_high,
                     sweep_low=candle_low,
                     sweep_time=now,
-                    pre_sweep_level=prior_swing_low
+                    pre_sweep_level=prior_swing_low,
+                    expires_at=expires_at
                 )
         
         # BEARISH SWEEP: wicked above prior high, closed below it
         if candle_high > prior_swing_high and candle_close < prior_swing_high:
             upper_wick = candle_high - max(candle_open, candle_close)
             if upper_wick >= atr * self.MIN_WICK_ATR_MULT:
-                logger.debug(f"BEARISH SWEEP detected: wicked to {candle_high:.2f}, closed at {candle_close:.2f}")
+                logger.debug(f"BEARISH SWEEP detected: wicked to {candle_high:.2f}, closed at {candle_close:.2f} | timeout={timeout_minutes:.0f}min")
                 return SweepZone(
                     sweep_type='BEARISH',
                     sweep_high=candle_high,
                     sweep_low=candle_low,
                     sweep_time=now,
-                    pre_sweep_level=prior_swing_high
+                    pre_sweep_level=prior_swing_high,
+                    expires_at=expires_at
                 )
         
         return None
@@ -140,18 +163,28 @@ class PostSweepConfirmationFilter(BaseFilter):
                            sweep: SweepZone,
                            current_high: float,
                            current_low: float,
-                           current_close: float) -> SweepZone:
+                           current_close: float,
+                           market_time: datetime | None = None) -> SweepZone:
         """
         Check if a pending sweep has been confirmed.
+        
+        🔥 FIX #117: Now uses time-based expiration instead of fixed candles.
         
         Returns updated SweepZone.
         """
         sweep.candles_since_sweep += 1
+        now = market_time or datetime.utcnow()
         
-        # Check timeout
-        if sweep.candles_since_sweep > self.CONFIRMATION_TIMEOUT_CANDLES:
+        # 🔥 FIX #117: Time-based timeout (preferred if expires_at is set)
+        if sweep.expires_at and now > sweep.expires_at:
             sweep.expired = True
-            logger.debug(f"⏰ Sweep expired after {sweep.candles_since_sweep} candles")
+            elapsed = (now - sweep.sweep_time).total_seconds() / 60
+            logger.debug(f"⏰ FIX #117: Sweep expired after {elapsed:.1f}min (ATR-based timeout)")
+            return sweep
+        # Legacy fallback for sweeps without expires_at
+        elif not sweep.expires_at and sweep.candles_since_sweep > self.CONFIRMATION_TIMEOUT_CANDLES:
+            sweep.expired = True
+            logger.debug(f"⏰ Sweep expired after {sweep.candles_since_sweep} candles (legacy)")
             return sweep
         
         if sweep.sweep_type == 'BULLISH':

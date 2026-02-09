@@ -396,30 +396,30 @@ def check_expected_rr(
     return False, f"Poor R:R: {expected_rr:.2f} < {min_rr} (target={target:.0f})"
 
 
+# ⚠️ DEPRECATED (Feb 09, 2026 - FIX #127)
+# Use src.application.live.position_manager.check_bos_against_position instead
+# This function is kept for backward compatibility but will be removed
 def check_bos_against_position(
     direction: str,
     candles_5m: list,
     lookback: int = 20,
-    min_bos_atr_mult: float = 0.5  # 🔥 FIX (Jan 27, 2026): BOS mínimo = 0.5 ATR
+    min_bos_atr_mult: float = 0.5
 ) -> bool:
     """
+    ⚠️ DEPRECATED: Use position_manager.check_bos_against_position instead.
+    
     Detect Break of Structure (BOS) against position.
     
-    BOS against LONG: Price makes new Lower Low (breaks support)
-    BOS against SHORT: Price makes new Higher High (breaks resistance)
-    
-    🔥 FIX (Jan 27, 2026): Added minimum ATR threshold to avoid triggering
-    on noise. A true BOS should be at least 0.5 ATR beyond the previous swing.
-    
-    Args:
-        direction: Position direction ('LONG' or 'SHORT')
-        candles_5m: List of 5-minute candles
-        lookback: Number of candles to analyze
-        min_bos_atr_mult: Minimum ATR multiple for BOS to be valid (default 0.5)
-        
-    Returns:
-        True if BOS detected against position
+    This version returns only bool. The new version in position_manager
+    returns (bool, float) with the BOS level for better logging.
     """
+    import warnings
+    warnings.warn(
+        "check_bos_against_position in filter_checks is deprecated. "
+        "Use src.application.live.position_manager.check_bos_against_position instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     if not candles_5m or len(candles_5m) < lookback:
         return False
     

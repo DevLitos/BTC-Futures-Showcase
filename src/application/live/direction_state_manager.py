@@ -197,8 +197,8 @@ class DirectionStateManager:
         self._state.expansion_timeout_minutes = self._params.expansion_timeout_minutes
         self._state.direction_lock_timeout_minutes = self._params.direction_lock_timeout_minutes
         
-        # Log periodically
-        if self._tick_count % 60 == 1:
+        # Log periodically - 🔥 FIX #122: Throttle 60 → 300 ticks
+        if self._tick_count % 300 == 1:
             logger.info(
                 f"🌊 ADAPTIVE PARAMS: vol_ratio={vol_ratio:.2f} | "
                 f"exp_timeout={self._params.expansion_timeout_minutes}min | "

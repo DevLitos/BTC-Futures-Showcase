@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Tuple, List, TYPE_CHECKING
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.shared.indicators import (
     calculate_ema,
@@ -38,6 +38,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 🔧 FIX #129 (Feb 09, 2026): Throttle repetitive scorer logs
+_last_micro_trend_log: Optional[datetime] = None
+_last_filter_pipeline_log: Optional[datetime] = None
+_SCORER_LOG_THROTTLE_SECONDS = 120  # 2 minutes
+
 
 @dataclass
 class ScoreBreakdown:
@@ -53,12 +58,27 @@ class ScoreBreakdown:
     late_confirmation_penalty: float = 0.0
     penalty_hierarchy: Dict[str, Any] = field(default_factory=dict)
     adx_values: np.ndarray = field(default_factory=lambda: np.array([]))
+    # 🔥 FIX #131 (Feb 09): Edge floor protection - minimum score when edge is valid
+    edge_floor_applied: bool = False
+    
+    # 🔥 FIX #131: Global penalty cap to prevent "death by a thousand cuts"
+    MAX_TOTAL_PENALTY = -3.0  # Maximum total penalty allowed (was unbounded)
     
     @property
     def total(self) -> int:
-        """Calculate total score."""
+        """Calculate total score with FIX #131: Global penalty cap."""
         base = self.structure + self.timing + self.momentum + self.context + self.synergy
-        return max(0, int(base + self.micro_trend_adj + self.filter_pipeline_adj + self.late_confirmation_penalty))
+        
+        # Sum all penalties
+        total_penalty = self.micro_trend_adj + self.filter_pipeline_adj + self.late_confirmation_penalty
+        
+        # 🔥 FIX #131: Cap total penalty to prevent over-penalization
+        if total_penalty < self.MAX_TOTAL_PENALTY:
+            capped_penalty = self.MAX_TOTAL_PENALTY
+        else:
+            capped_penalty = total_penalty
+            
+        return max(0, int(base + capped_penalty))
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for logging."""
@@ -403,22 +423,31 @@ class EntryScorer:
                 if micro_adj < 0 and penalty_reduction < 1.0:
                     original_adj = micro_adj
                     micro_adj = micro_adj * penalty_reduction
-                    logger.info(
-                        f"🔥 FIX #74: Micro penalty reduced {original_adj:+.1f} → {micro_adj:+.1f} "
-                        f"(ADX={strong_trend_adx:.1f} edge confirms trend)"
-                    )
+                    # 🔧 FIX #129: Throttle this log - only show significant reductions
+                    global _last_micro_trend_log
+                    now = datetime.now()
+                    if _last_micro_trend_log is None or (now - _last_micro_trend_log).total_seconds() >= _SCORER_LOG_THROTTLE_SECONDS:
+                        logger.info(
+                            f"🔥 FIX #74: Micro penalty reduced {original_adj:+.1f} → {micro_adj:+.1f} "
+                            f"(ADX={strong_trend_adx:.1f} edge confirms trend)"
+                        )
+                        _last_micro_trend_log = now
                 self._breakdown.micro_trend_adj = micro_adj
-                if micro_adj < 0:
-                    logger.warning(
-                        f"📉 Micro trend penalty: {micro_adj:+.1f} "
-                        f"(micro={micro_trend_state.micro_trend}, "
-                        f"strength={micro_trend_state.strength:.0%})"
-                    )
-                else:
-                    logger.info(
-                        f"📈 Micro trend bonus: {micro_adj:+.1f} "
-                        f"(micro={micro_trend_state.micro_trend})"
-                    )
+                # 🔧 FIX #129: Throttle micro trend logs - they repeat every evaluation
+                now = datetime.now()
+                if _last_micro_trend_log is None or (now - _last_micro_trend_log).total_seconds() >= _SCORER_LOG_THROTTLE_SECONDS:
+                    if micro_adj < 0:
+                        logger.warning(
+                            f"📉 Micro trend penalty: {micro_adj:+.1f} "
+                            f"(micro={micro_trend_state.micro_trend}, "
+                            f"strength={micro_trend_state.strength:.0%})"
+                        )
+                    else:
+                        logger.info(
+                            f"📈 Micro trend bonus: {micro_adj:+.1f} "
+                            f"(micro={micro_trend_state.micro_trend})"
+                        )
+                    _last_micro_trend_log = now
         
         # 6.5️⃣ FILTER PIPELINE ADJUSTMENT with PENALTY HIERARCHY
         if filter_pipeline is not None:
@@ -433,15 +462,24 @@ class EntryScorer:
                 if fp_adj < 0 and penalty_reduction < 1.0:
                     original_adj = fp_adj
                     fp_adj = fp_adj * penalty_reduction
-                    logger.info(
-                        f"🔥 FIX #74: Filter penalty reduced {original_adj:+.1f} → {fp_adj:+.1f} "
-                        f"(ADX={strong_trend_adx:.1f} edge confirms trend)"
-                    )
+                    # 🔧 FIX #129: Throttle this log
+                    global _last_filter_pipeline_log
+                    now = datetime.now()
+                    if _last_filter_pipeline_log is None or (now - _last_filter_pipeline_log).total_seconds() >= _SCORER_LOG_THROTTLE_SECONDS:
+                        logger.info(
+                            f"🔥 FIX #74: Filter penalty reduced {original_adj:+.1f} → {fp_adj:+.1f} "
+                            f"(ADX={strong_trend_adx:.1f} edge confirms trend)"
+                        )
+                        _last_filter_pipeline_log = now
                 self._breakdown.filter_pipeline_adj = fp_adj
-                if fp_adj < 0:
-                    logger.warning(f"📉 Filter pipeline penalty (hierarchical): {fp_adj:+.1f}")
-                else:
-                    logger.info(f"📈 Filter pipeline bonus: {fp_adj:+.1f}")
+                # 🔧 FIX #129: Throttle filter pipeline logs
+                now = datetime.now()
+                if _last_filter_pipeline_log is None or (now - _last_filter_pipeline_log).total_seconds() >= _SCORER_LOG_THROTTLE_SECONDS:
+                    if fp_adj < 0:
+                        logger.warning(f"📉 Filter pipeline penalty (hierarchical): {fp_adj:+.1f}")
+                    else:
+                        logger.info(f"📈 Filter pipeline bonus: {fp_adj:+.1f}")
+                    _last_filter_pipeline_log = now
         
         # =====================================================================
         # 7️⃣ LATE CONFIRMATION PENALTY (Jan 24, 2026)
@@ -477,6 +515,37 @@ class EntryScorer:
                 f"(candles_since_bos={candles_since_bos}, all_maxed={all_maxed})"
             )
             self._trade_tags.late_confirmation_penalty = late_penalty
+        
+        # =====================================================================
+        # 🔥 FIX #131 (Feb 09, 2026): EDGE FLOOR PROTECTION
+        # =====================================================================
+        # PROBLEMA: Edges válidos (DISPLACEMENT, EXPANSION) pueden tener score=0
+        # después de aplicar todos los penalties. Esto bloquea trades que el
+        # edge detector ya validó.
+        #
+        # FILOSOFÍA INSTITUCIONAL: Si el edge detector confirma un edge, el
+        # sistema ya ha hecho el trabajo de validar la oportunidad. Los
+        # penalizadores de contexto no deberían poder destruir completamente
+        # una señal de edge válida.
+        #
+        # SOLUCIÓN: Score floor de 4.0 cuando hay edge activo válido.
+        # Threshold normal es 4.5-5.5, así que el floor permite que el trade
+        # tenga oportunidad pero aún necesita algo de contexto favorable.
+        # =====================================================================
+        EDGE_FLOOR_SCORE = 4.0
+        calculated_score = self._breakdown.total
+        
+        has_valid_edge = displacement_edge_active or expansion_mode_active or strong_trend_adx >= 35.0
+        
+        if has_valid_edge and calculated_score < EDGE_FLOOR_SCORE:
+            logger.info(
+                f"🛡️ FIX #131 EDGE FLOOR: Score {calculated_score} → {EDGE_FLOOR_SCORE:.0f} "
+                f"(disp={displacement_edge_active}, exp={expansion_mode_active}, ADX={strong_trend_adx:.1f})"
+            )
+            self._breakdown.edge_floor_applied = True
+            # Update tags with floored score
+            self._trade_tags.score = int(EDGE_FLOOR_SCORE)
+            return int(EDGE_FLOOR_SCORE), self._breakdown.to_dict(), False
         
         # Update final score in tags
         self._trade_tags.score = self._breakdown.total

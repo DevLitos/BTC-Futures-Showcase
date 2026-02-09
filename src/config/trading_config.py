@@ -401,17 +401,16 @@ class AsymmetryConfig:
     MAX_STOP_R = 1.0                 # Stop máximo = 1.0R (igual que TP)
     
     # TIME_INVALIDATION: EXIT RÁPIDO SI NO FUNCIONA
-    # 🔥 FIX (Feb 05, 2026): Scalping adjustment
-    # OLD: 8 candles → Too aggressive, trades never develop
-    # NEW: 15 candles (15 min) → Standard scalp window
-    # Still strict on MAX_LOSS (-0.20R) to prevent disasters
+    # 🔥 FIX #121a (Feb 09, 2026): Give trades more room
+    # OLD: -0.20R → Too aggressive, trades killed before developing
+    # NEW: -0.35R → Standard pullback tolerance
     TIME_INVALIDATION_CANDLES = 15  # 15 velas 1m = 15 min
     TIME_INVALIDATION_EXIT_R = 0.0  # Target: salir en breakeven o mejor
-    TIME_INVALIDATION_MAX_LOSS_R = -0.20  # 🔥 FIX: -0.20R (was -0.30R) - cut faster!
+    TIME_INVALIDATION_MAX_LOSS_R = -0.35  # 🔥 FIX #121a: -0.35R (was -0.20R) - give room!
     
     # === PÉRDIDA MÁXIMA ABSOLUTA ===
     # Si llegamos aquí, algo falló (slippage, gap, etc.)
-    ABSOLUTE_MAX_LOSS_R = -0.25     # 🔥 FIX: NUNCA perder más de -0.25R (was -0.35R)
+    ABSOLUTE_MAX_LOSS_R = -0.40     # 🔥 FIX #121a: NUNCA perder más de -0.40R (was -0.25R)
     
     # === RUNNERS (SOLO EN TREND DAYS) ===
     ALLOW_RUNNERS = False           # Default OFF
@@ -2448,7 +2447,7 @@ class SessionQuality:
     # =========================================================================
     QUALITY_SIZE_MULT = {
         'good': 1.0,       # Full size - LONDON, NY_OVERLAP, NY
-        'moderate': 0.80,  # Reduced - ASIA (was 0.85 in some places, now unified)
+        'moderate': 0.90,  # 🔥 FIX #121c: 0.80 → 0.90 - ASIA almost full size
         'poor': 0.0,       # BLOCKED - Dead hours, extreme times
     }
     

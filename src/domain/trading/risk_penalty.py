@@ -136,6 +136,10 @@ class RiskPenaltyAccumulator:
     # 50% ensures we ACTUALLY TRADE rather than just analyze
     MIN_VIABLE_MULT: float = 0.50
     
+    # 🔥 FIX #109 (Feb 09, 2026): TRANSITION_MODE floor
+    # During transitions (post-bias flip), use higher floor to capture the edge
+    TRANSITION_MODE_MULT: float = 0.70
+    
     def __init__(self):
         self._penalties: List[PenaltyEntry] = []
         self._has_catastrophic: bool = False
@@ -143,20 +147,26 @@ class RiskPenaltyAccumulator:
         # 🔥 FIX #88: Context flags for override
         self._trend_expansion_active: bool = False
         self._adx_value: float = 0.0
+        # 🔥 FIX #109: Transition mode flag
+        self._transition_mode_active: bool = False
     
     def set_context(
         self,
         trend_expansion_active: bool = False,
-        adx_value: float = 0.0
+        adx_value: float = 0.0,
+        transition_mode_active: bool = False
     ):
         """
         🔥 FIX #88 (Feb 09, 2026): Set context for penalty overrides.
+        🔥 FIX #109 (Feb 09, 2026): Added transition_mode_active.
         
         When TREND_EXPANSION is active with ADX>45, minor penalties are overridden.
-        This prevents over-filtering in strong trends where we MUST trade.
+        When TRANSITION_MODE is active, floor is 70% instead of 50%.
+        This prevents over-filtering in strong trends/transitions where we MUST trade.
         """
         self._trend_expansion_active = trend_expansion_active
         self._adx_value = adx_value
+        self._transition_mode_active = transition_mode_active
     
     def add_penalty(
         self,
@@ -218,21 +228,72 @@ class RiskPenaltyAccumulator:
         🔥 FIX #88 (Feb 09, 2026): TREND_EXPANSION OVERRIDE
         When trend_expansion_active AND ADX>45, we use a higher floor (0.60)
         because these are A++ setups that MUST trade.
+        
+        🔥 FIX #109 (Feb 09, 2026): TRANSITION_MODE OVERRIDE
+        When transition_mode_active, use 70% floor to capture transition edge.
+        
+        🔥 FIX #112 (Feb 09, 2026): SOFTMAX PENALTIES
+        Changed from pure multiplication (Π) to softmax approach:
+        - Use worst penalty as base
+        - Add small decay per additional penalty
+        - Never go below floor
+        This prevents 5 small penalties from killing the trade.
         """
         result = RiskPenaltyResult()
         result.penalties = self._penalties.copy()
         
-        # Calculate multiplicative size penalty
-        final_mult = 1.0
-        for p in self._penalties:
-            final_mult *= p.size_mult
+        # =====================================================================
+        # 🔥 FIX #112: SOFTMAX PENALTIES
+        #
+        # ANTES: final = Π(penalties) → 0.7^5 = 0.17 → trade muerto
+        # AHORA: final = min(penalties) * (1 - 0.05 * (n-1)) → más justo
+        #
+        # Filosofía:
+        # - El PEOR penalty domina (si uno dice 0.5x, ese es el base)
+        # - Cada penalty adicional resta un 5% extra
+        # - Nunca baja del floor (50%/70% según contexto)
+        # =====================================================================
+        active_penalties = [p for p in self._penalties if p.size_mult < 1.0]
+        
+        if not active_penalties:
+            final_mult = 1.0
+        else:
+            # El peor penalty domina
+            min_mult = min(p.size_mult for p in active_penalties)
+            
+            # Decay suave por cada penalty adicional (5% cada uno)
+            num_additional = max(0, len(active_penalties) - 1)
+            decay = 0.05 * num_additional
+            
+            # Calcular final con decay
+            final_mult = min_mult * (1.0 - decay)
+            
+            # Log si hay diferencia significativa vs método antiguo
+            old_mult = 1.0
+            for p in active_penalties:
+                old_mult *= p.size_mult
+            
+            if abs(final_mult - old_mult) > 0.05:
+                logger.debug(
+                    f"📊 FIX #112 SOFTMAX: {len(active_penalties)} penalties | "
+                    f"Old={old_mult:.0%} → New={final_mult:.0%} (saved {(final_mult-old_mult)*100:.0f}pp)"
+                )
         
         # 🔥 FIX #94: SIMPLIFIED OVERRIDE - Always allow trades
         # The system was killing ALL trades with stacking penalties.
         # Now: if there's displacement, FORCE minimum 50% size.
         effective_min = self.MIN_VIABLE_MULT  # 0.50
         
-        if self._trend_expansion_active:
+        # 🔥 FIX #109: TRANSITION_MODE gets highest floor (70%)
+        if self._transition_mode_active:
+            effective_min = self.TRANSITION_MODE_MULT  # 0.70
+            if final_mult < 0.70:
+                logger.info(
+                    f"🚀 TRANSITION_MODE OVERRIDE: Raising penalty floor from "
+                    f"{final_mult:.0%} to 70%"
+                )
+            final_mult = max(final_mult, 0.70)
+        elif self._trend_expansion_active:
             # TREND_EXPANSION = A+ setup, MUST trade
             if self._adx_value > 40:
                 # Strong trend: use 60% floor

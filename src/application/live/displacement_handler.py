@@ -203,7 +203,7 @@ class DisplacementHandler:
                 result.trade_tags['range_floor_block'] = True
                 result.trade_tags['range_floor_distance'] = distance_from_low
                 
-                if tick_count % 30 == 1 or not self._last_range_floor_log:
+                if tick_count % 90 == 1 or not self._last_range_floor_log:
                     logger.warning(f"🚫 RANGE FLOOR BLOCK SHORT: {result.range_block_reason}")
                     self._last_range_floor_log = True
             
@@ -215,7 +215,7 @@ class DisplacementHandler:
                 result.trade_tags['stale_displacement'] = True
                 result.trade_tags['stale_distance_from_extreme'] = distance_from_low
                 
-                if tick_count % 30 == 1 or not self._last_stale_log_short:
+                if tick_count % 90 == 1 or not self._last_stale_log_short:
                     logger.warning(f"⚠️ STALE DISPLACEMENT SHORT: {result.stale_reason}")
                     self._last_stale_log_short = True
             
@@ -270,7 +270,7 @@ class DisplacementHandler:
                 logger.info(f"🔥 DISPLACEMENT OVERRIDE: Clearing FORBIDDEN=SHORT")
         
         # Log detection
-        if tick_count % 30 == 1:
+        if tick_count % 90 == 1:
             logger.info(
                 f"🔥 DISPLACEMENT: Down ${drop_from_high:.0f} ≥ {displacement_threshold:.0f}"
                 f"{' | STRONG' if result.is_strong else ''}"
@@ -322,7 +322,7 @@ class DisplacementHandler:
                 result.trade_tags['range_ceiling_block'] = True
                 result.trade_tags['range_ceiling_distance'] = distance_from_high
                 
-                if tick_count % 30 == 1 or not self._last_range_ceiling_log:
+                if tick_count % 90 == 1 or not self._last_range_ceiling_log:
                     logger.warning(f"🚫 RANGE CEILING BLOCK LONG: {result.range_block_reason}")
                     self._last_range_ceiling_log = True
             
@@ -334,7 +334,7 @@ class DisplacementHandler:
                 result.trade_tags['stale_displacement'] = True
                 result.trade_tags['stale_distance_from_extreme'] = distance_from_high
                 
-                if tick_count % 30 == 1 or not self._last_stale_log_long:
+                if tick_count % 90 == 1 or not self._last_stale_log_long:
                     logger.warning(f"⚠️ STALE DISPLACEMENT LONG: {result.stale_reason}")
                     self._last_stale_log_long = True
             
@@ -389,7 +389,7 @@ class DisplacementHandler:
                 logger.info(f"🔥 DISPLACEMENT OVERRIDE: Clearing FORBIDDEN=LONG")
         
         # Log detection
-        if tick_count % 30 == 1:
+        if tick_count % 90 == 1:
             logger.info(
                 f"🔥 DISPLACEMENT: Up ${rise_from_low:.0f} ≥ {displacement_threshold:.0f}"
                 f"{' | STRONG' if result.is_strong else ''}"

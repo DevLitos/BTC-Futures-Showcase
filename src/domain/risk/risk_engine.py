@@ -1408,19 +1408,19 @@ class Position:
             max_loss_r = -0.15  # 🔥 WEEKEND: -0.15R (was -0.20R) - liquidity issues
             logger.info(f"📊 TIME checkpoint: WEEKEND → max_loss={max_loss_r}R (strictest)")
         elif is_low_quality_entry:
-            max_loss_r = -0.15  # 🔥 LOW QUALITY: -0.15R (was -0.25R) - cut fast
+            max_loss_r = -0.20  # 🔥 FIX #121a: -0.15R → -0.20R - give a bit more room
             logger.info(f"📊 TIME checkpoint: LOW_QUALITY (score={self.entry_score:.1f}) → max_loss={max_loss_r}R")
         elif is_displacement_trade:
             # DISPLACEMENT: Still give a bit more room (stop is the invalidation)
-            max_loss_r = -0.25  # 🔥 FIX: -0.25R (was -0.50R) - much stricter
+            max_loss_r = -0.30  # 🔥 FIX #121a: -0.25R → -0.30R - displacement needs room
             logger.debug(f"📊 TIME checkpoint: DISPLACEMENT mode → max_loss={max_loss_r}R")
         elif is_ranging:
-            # RANGE: No more special treatment
-            max_loss_r = -0.20  # 🔥 FIX: -0.20R (was -0.60R!!) - major reduction
+            # RANGE: Give more room than before
+            max_loss_r = -0.30  # 🔥 FIX #121a: -0.20R → -0.30R - range needs room too
             logger.debug(f"📊 TIME checkpoint: RANGING mode → max_loss={max_loss_r}R")
         else:
-            # TREND: normal limit
-            max_loss_r = ExitHierarchy.TIME_INVALIDATION_MAX_LOSS_R  # -0.20R
+            # TREND: normal limit from config
+            max_loss_r = ExitHierarchy.TIME_INVALIDATION_MAX_LOSS_R  # -0.35R
         
         # =====================================================================
         # 🔥 FIX #44 (Feb 05, 2026): STRONG TREND TOLERANCE
@@ -1458,12 +1458,14 @@ class Position:
         # INSIGHT: Si el trade YA DEMOSTRÓ ser correcto (MFE >= 0.25R), un pullback
         # de 0.4-0.5R es NORMAL en BTC. No es señal de trade malo.
         #
-        # SOLUCIÓN: Si MFE >= 0.25R, extender tolerancia:
-        # - MFE 0.25-0.50R → max_loss = -0.40R (trade mostró vida)
+        # SOLUCIÓN: Si MFE >= threshold, extender tolerancia:
+        # - MFE 0.10-0.20R → max_loss = -0.37R (trade mostró algo de vida) [FIX #132]
+        # - MFE 0.20-0.50R → max_loss = -0.40R (trade mostró vida)
         # - MFE >= 0.50R → max_loss = -0.50R (trade probado, dar room)
         # =====================================================================
         # 🔥 FIX #42 (Feb 05, 2026): Lowered from 0.25 to 0.20
-        # Trade con MFE=0.24R no estaba protegido y perdió -0.22R
+        # 🔥 FIX #132 (Feb 09, 2026): Added MFE_MIN_THRESHOLD for small positive MFE
+        MFE_MIN_THRESHOLD = 0.10     # Trade mostró algo de dirección correcta
         MFE_PROVED_THRESHOLD = 0.20  # Trade mostró dirección correcta
         MFE_STRONG_THRESHOLD = 0.50  # Trade claramente correcto
         
@@ -1495,6 +1497,21 @@ class Position:
                         f"Extended tolerance to {extended_max_loss}R"
                     )
                 return None  # Don't close - give it room
+        # 🔥 FIX #132 (Feb 09, 2026): New level for small positive MFE
+        # PROBLEMA: Trades con MFE 0.10-0.19R no tenían protección y se cerraban a -0.35R
+        # Si el trade mostró ALGO de dirección correcta, dar un poco más de room
+        elif mfe_r >= MFE_MIN_THRESHOLD:
+            # Trade showed some life - extend tolerance slightly
+            extended_max_loss = -0.37
+            if current_r > extended_max_loss:
+                if _should_log_checkpoint:
+                    self._time_checkpoint_last_log = self.candle_count
+                    logger.info(
+                        f"📊 FIX #132 TIME checkpoint: MFE={mfe_r:.2f}R showed some direction | "
+                        f"Pullback to {current_r:.2f}R within tolerance | "
+                        f"Extended tolerance to {extended_max_loss}R"
+                    )
+                return None  # Don't close - give it a chance
         
         # =====================================================================
         # REGLA CRÍTICA: Límite de pérdida por TIME_INVALIDATION

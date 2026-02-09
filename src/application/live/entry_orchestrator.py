@@ -42,6 +42,9 @@ from src.domain.market.regime import EntryRegime
 # FIX #41: Rate limiting for guard logs - don't spam same message
 _last_guard_log: dict[str, datetime] = {}  # guard_name -> last_log_time
 _guard_log_interval = timedelta(minutes=2)  # Only log same guard every 2 minutes
+
+# 🔧 FIX #129 (Feb 09, 2026): Throttle TRANSITION_MODE log
+_last_transition_mode_log: Optional[datetime] = None
 from src.infrastructure.exchanges.kraken.slippage_model import OrderType
 from src.application.live.entry_executor import ExecutionGuards, LocationGuards
 from src.application.live.entry_validators import ChaseResult
@@ -312,11 +315,27 @@ class GuardOrchestrator:
         penalties = RiskPenaltyAccumulator()
         
         # 🔥 FIX #88 (Feb 09, 2026): Set context for TREND_EXPANSION override
+        # 🔥 FIX #109 (Feb 09, 2026): Set context for TRANSITION_MODE override
         trend_expansion_active = getattr(engine, '_trend_expansion_active', False)
         adx_value = getattr(engine, '_htf_cache_adx', 0.0) or 0.0
+        
+        # Check transition mode (and check for expiration)
+        transition_mode_active = getattr(engine, '_transition_mode_active', False)
+        transition_expires = getattr(engine, '_transition_mode_expires', None)
+        if transition_mode_active and transition_expires:
+            from datetime import datetime
+            if datetime.now() > transition_expires:
+                # Transition mode expired
+                engine._transition_mode_active = False
+                engine._transition_mode_direction = None
+                engine._transition_mode_expires = None
+                transition_mode_active = False
+                logger.info("🏁 TRANSITION_MODE EXPIRED: Returning to normal penalty floor")
+        
         penalties.set_context(
             trend_expansion_active=trend_expansion_active,
-            adx_value=adx_value
+            adx_value=adx_value,
+            transition_mode_active=transition_mode_active
         )
         
         # =====================================================================
@@ -345,7 +364,8 @@ class GuardOrchestrator:
         if not can_enter:
             result.passed = False
             result.reason = f"Anchor veto: {anchor_reason}"
-            engine._set_rejection_cooldown("Anchor veto", candles=5)
+            # 🔧 FIX #130: Reduced cooldown from 5 to 2 candles - 5 minutes was too long
+            engine._set_rejection_cooldown("Anchor veto", candles=2)
             return result
         
         can_enter, range_reason = LocationGuards.check_range_location(engine, ctx.bias, ctx.current_price)
@@ -1514,6 +1534,41 @@ class ScoreOrchestrator:
                 engine._current_trade_tags['regime_conflict'] = True
                 engine._current_trade_tags['regime_conflict_threshold_adj'] = REGIME_CONFLICT_PENALTY
         
+        # =====================================================================
+        # 🔥 FIX #115 (Feb 09, 2026): TRANSITION_MODE REDUCES THRESHOLD
+        #
+        # PROBLEMA (P6): El sistema sube el threshold en TRANSITION mode,
+        # pero TRANSITION_MODE (post-BIAS_FLIP) es cuando DEBERÍAMOS ser
+        # más agresivos porque hay edge de transición.
+        #
+        # SOLUCIÓN: Cuando _transition_mode_active, BAJAR threshold
+        # - El mercado acaba de girar (BIAS_FLIP)
+        # - Tenemos ventana de 15min para capturar el edge
+        # - Score más bajo permite entrar antes del movimiento
+        # =====================================================================
+        transition_mode_active = getattr(engine, '_transition_mode_active', False)
+        transition_direction = getattr(engine, '_transition_mode_direction', None)
+        
+        if transition_mode_active and transition_direction:
+            TRANSITION_MODE_THRESHOLD_BONUS = -1.0  # Bajar 1 punto
+            original_threshold = threshold
+            threshold = max(4.0, threshold + TRANSITION_MODE_THRESHOLD_BONUS)  # Floor en 4.0
+            
+            # Solo aplicar si la dirección coincide
+            if hasattr(ctx, 'bias') and ctx.bias == transition_direction:
+                # 🔧 FIX #129: Throttle log to once per 2 minutes
+                global _last_transition_mode_log
+                market_time = ctx.market_time if hasattr(ctx, 'market_time') else datetime.now()
+                if _last_transition_mode_log is None or \
+                   (market_time - _last_transition_mode_log).total_seconds() >= 120:
+                    logger.info(
+                        f"🚀 FIX #115 TRANSITION_MODE: Lowering threshold from {original_threshold:.1f} to {threshold:.1f} | "
+                        f"Direction={transition_direction}"
+                    )
+                    _last_transition_mode_log = market_time
+                if hasattr(engine, '_current_trade_tags'):
+                    engine._current_trade_tags['transition_mode_threshold_bonus'] = TRANSITION_MODE_THRESHOLD_BONUS
+        
         # 🔥 FIX (Jan 27, 2026): Anti-paralysis DISABLED
         # The system was accepting garbage trades due to incorrect activity tracking
         # NO threshold reduction based on inactivity
@@ -1705,12 +1760,12 @@ class SizingOrchestrator:
         result.min_size_ok = result.size >= KRAKEN_BTC_MIN_SIZE
         
         # =====================================================================
-        # 🔥 FIX #102a (Feb 09, 2026): REGIME CONFLICT SIZE REDUCTION
+        # FIX #102a: REGIME CONFLICT SIZE PENALTY (RESTORED)
         # =====================================================================
         # Si hay conflicto de régimen (TREND mode + RANGE_BOUND phase),
         # reducir tamaño adicional × 0.6 (además del threshold penalty)
         # =====================================================================
-        REGIME_CONFLICT_SIZE_MULT = 0.60  # 40% reduction - defined outside if
+        REGIME_CONFLICT_SIZE_MULT = 0.60  # 40% reduction
         regime_conflict = engine._current_trade_tags.get('regime_conflict', False)
         if regime_conflict:
             result.size *= REGIME_CONFLICT_SIZE_MULT
@@ -1730,8 +1785,8 @@ class SizingOrchestrator:
             'toxic_hour': sizing_result.toxic_hour_mult,
             'toxic_combo': sizing_result.toxic_combo_mult,  # Toxic combo (REDUCE mode)
             'momentum': sizing_result.momentum_mult,
-            'regime_fusion': sizing_result.regime_fusion_mult,  # 🔥 FIX #83: Macro/Micro alignment
-            'regime_conflict': REGIME_CONFLICT_SIZE_MULT if regime_conflict else 1.0,  # 🔥 FIX #102a
+            'regime_fusion': sizing_result.regime_fusion_mult,  # FIX #83: Macro/Micro alignment
+            'regime_conflict': REGIME_CONFLICT_SIZE_MULT if regime_conflict else 1.0,  # FIX #102a
         }
         result.final_multiplier = sizing_result.combined_multiplier * (REGIME_CONFLICT_SIZE_MULT if regime_conflict else 1.0)
         
@@ -2542,12 +2597,12 @@ async def _displacement_fast_path(
     # =====================================================================
     # CHECK 2.5e: SCORE MÍNIMO PARA FAST PATH (Feb 03, 2026)
     # =====================================================================
-    # 🔥 FIX (Feb 04, 2026): Score mínimo 7 (antes 5) = MÁS CONSERVADOR
+    # 🔥 FIX #129 (Feb 09, 2026): Use centralized constant from unified_constants
     # Análisis de 49 trades FAST PATH: expectancy -0.012R, 35% TIME_INVALIDATION
     # Problema: Entraba con scores 5-6 en setups mediocres
     # Solución: Score >= 7 requiere buena estructura+timing+momentum
-    # El trade de 15:29 tenía Score=4.0 y perdió -1R
-    FAST_PATH_MIN_SCORE = 7.0
+    from src.config.unified_constants import SCORES
+    FAST_PATH_MIN_SCORE = SCORES.FAST_PATH_MIN_SCORE
     if fast_path_score < FAST_PATH_MIN_SCORE:
         logger.warning(
             f"🛑 FAST PATH BLOCKED: Score {fast_path_score:.1f} < {FAST_PATH_MIN_SCORE} minimum (conservative) | "
@@ -3727,14 +3782,15 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     capital = engine.risk_engine.capital if hasattr(engine, 'risk_engine') else 500.0
     
     # Umbrales de profit mínimo
-    # - Cuentas pequeñas (<$500): 0.20% del capital (~$0.51 para $256)
-    # - Cuentas grandes (>$500): 0.15% del capital
-    # - Floor absoluto: $0.50 (NO $0.10 - eso era muy bajo)
+    # 🔥 FIX #118 (Feb 09, 2026): Escalar con capital para cuentas pequeñas
+    # - Cuentas pequeñas (<$500): 0.20% del capital (~$0.50 para $250)
+    # - Cuentas grandes (>$500): 0.10% del capital
+    # - Floor absoluto: $0.50 mínimo para que tenga sentido el trade
     if capital < 500:
-        MIN_PROFIT_PERCENT = 0.0020  # 0.20% for small accounts (was 0.05%)
+        MIN_PROFIT_PERCENT = 0.0020  # 0.20% for small accounts
     else:
-        MIN_PROFIT_PERCENT = 0.0015  # 0.15% for larger accounts (was 0.10%)
-    MIN_PROFIT_FLOOR = 0.50     # $0.50 minimum (was $0.10 - too low)
+        MIN_PROFIT_PERCENT = 0.0010  # 0.10% for larger accounts
+    MIN_PROFIT_FLOOR = 0.50     # $0.50 minimum - si no puedes ganar esto, no vale la pena
     
     min_expected_profit = max(capital * MIN_PROFIT_PERCENT, MIN_PROFIT_FLOOR)
     

@@ -252,7 +252,7 @@ class BiasInvalidationHandler:
         
         # Log which structure broke
         if result.structure_broken and not structure_broken_5m and structure_broken_micro:
-            if tick_count % 30 == 1:
+            if tick_count % 90 == 1:
                 logger.info(
                     f"🔬 MICRO STRUCTURE BREAK: price ${current_price:.0f} < micro_swing ${micro_swing_low:.0f} "
                     f"(5m swing ${swing_low_5m:.0f} not yet broken)"
@@ -267,7 +267,7 @@ class BiasInvalidationHandler:
             result.protected = True
             result.protection_reason = 'DIRECTION_LOCK' if direction_locked_long else 'EXPANSION_MODE'
             
-            if self._previous_forbidden != 'LONG' and tick_count % 30 == 1:
+            if self._previous_forbidden != 'LONG' and tick_count % 90 == 1:
                 logger.info(
                     f"🛡️ {result.protection_reason} PROTECTED: "
                     f"Drop ${result.drop_from_high:.0f} would FORBID LONG, "
@@ -349,7 +349,7 @@ class BiasInvalidationHandler:
         
         # Log which structure broke
         if result.structure_broken and not structure_broken_5m and structure_broken_micro:
-            if tick_count % 30 == 1:
+            if tick_count % 90 == 1:
                 logger.info(
                     f"🔬 MICRO STRUCTURE BREAK: price ${current_price:.0f} > micro_swing ${micro_swing_high:.0f} "
                     f"(5m swing ${swing_high_5m:.0f} not yet broken)"
@@ -364,7 +364,7 @@ class BiasInvalidationHandler:
             result.protected = True
             result.protection_reason = 'DIRECTION_LOCK' if direction_locked_short else 'EXPANSION_MODE'
             
-            if self._previous_forbidden != 'SHORT' and tick_count % 30 == 1:
+            if self._previous_forbidden != 'SHORT' and tick_count % 90 == 1:
                 logger.info(
                     f"🛡️ {result.protection_reason} PROTECTED: "
                     f"Rise ${result.rise_from_low:.0f} would FORBID SHORT, "
@@ -489,7 +489,7 @@ class ExpansionActivationHandler:
             )
             result.is_stale = True  # Treat as stale
             
-            if tick_count % 30 == 1 and tick_count != self._last_log_tick_short:
+            if tick_count % 90 == 1 and tick_count != self._last_log_tick_short:
                 logger.warning(
                     f"🚫 RANGE FLOOR BLOCK SHORT: {result.range_block_reason}"
                 )
@@ -504,7 +504,7 @@ class ExpansionActivationHandler:
                 f"(< {stale_threshold:.0f})"
             )
             
-            if tick_count % 30 == 1 and tick_count != self._last_log_tick_short:
+            if tick_count % 90 == 1 and tick_count != self._last_log_tick_short:
                 logger.warning(
                     f"⚠️ STALE DISPLACEMENT SHORT: {result.stale_reason}"
                 )
@@ -547,7 +547,7 @@ class ExpansionActivationHandler:
             )
             result.is_stale = True  # Treat as stale
             
-            if tick_count % 30 == 1 and tick_count != self._last_log_tick_long:
+            if tick_count % 90 == 1 and tick_count != self._last_log_tick_long:
                 logger.warning(
                     f"🚫 RANGE CEILING BLOCK LONG: {result.range_block_reason}"
                 )
@@ -562,7 +562,7 @@ class ExpansionActivationHandler:
                 f"(< {stale_threshold:.0f})"
             )
             
-            if tick_count % 30 == 1 and tick_count != self._last_log_tick_long:
+            if tick_count % 90 == 1 and tick_count != self._last_log_tick_long:
                 logger.warning(
                     f"⚠️ STALE DISPLACEMENT LONG: {result.stale_reason}"
                 )

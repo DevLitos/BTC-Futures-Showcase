@@ -449,7 +449,7 @@ class SessionMultiplier:
          Only good/moderate trade
     """
     GOOD = 1.0      # LONDON, NY_OVERLAP, NY
-    MODERATE = 0.8  # ASIA
+    MODERATE = 0.9  # 🔥 FIX #121c: 0.8 → 0.9 - ASIA almost full size
     # POOR = HARD BLOCK (not a multiplier)
     
     @classmethod
@@ -905,7 +905,7 @@ class SimplifiedExitConfig:
     # Time Invalidation - Simplified
     TIME_INVALIDATION_MINUTES = 60  # 60 min flat (INSTITUTIONAL)
     TIME_INVALIDATION_INTRADAY_MIN = 15  # 🔥 FIX Feb 05: 15 min for INTRADAY (was 5)
-    TIME_INVALIDATION_MAX_LOSS_R = -0.20  # 🔥 FIX: -0.20R (was -0.50R!)
+    TIME_INVALIDATION_MAX_LOSS_R = -0.35  # 🔥 FIX #121a: -0.35R (was -0.20R) - give trades room to breathe
     
     # Stop Loss - No change (structural)
     SL_STRUCTURAL = True  # Use structural SL always

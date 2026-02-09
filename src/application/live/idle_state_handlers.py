@@ -18,6 +18,10 @@ from src.shared.indicators import calculate_atr, calculate_adx, calculate_ema
 from src.config.trading_config import DailyRegimeDetector
 from src.domain.trading.anticipation import AnticipationSignal, AnticipationState
 
+# FIX #116: Throttle for ANTICIPATION preserved log
+_last_anticipation_preserved_log: dict = {"direction": None, "time": None}
+_ANTICIPATION_PRESERVED_LOG_INTERVAL = 60  # seconds
+
 if TYPE_CHECKING:
     from src.application.live.trading_app import SignalEngine
 
@@ -59,9 +63,12 @@ def check_rejection_cooldown(engine: "SignalEngine") -> Tuple[bool, str]:
 # ==============================================================================
 
 # Configuration for event-based evaluation
+# 🔧 FIX #129 (Feb 09, 2026): Increased PRICE_MOVE_ATR_THRESHOLD from 0.3 to 0.5
+# - 0.3 ATR was triggering too many evaluations on minor price wiggles
+# - 0.5 ATR = ~$38 on typical $76 ATR = meaningful moves only
 EVENT_GATE_CONFIG = {
     "MAX_TICKS_WITHOUT_EVAL": 30,        # Evaluate every 30 ticks max
-    "PRICE_MOVE_ATR_THRESHOLD": 0.3,     # Evaluate if price moves 0.3 ATR
+    "PRICE_MOVE_ATR_THRESHOLD": 0.5,     # 🔧 FIX #129: Was 0.3, now 0.5 ATR
     "MIN_TICKS_BETWEEN_EVAL": 5,         # Minimum 5 ticks between evaluations
     "LOG_FREQUENCY": 30,                 # Log every N ticks
 }
@@ -137,7 +144,9 @@ def check_candle_gate(
             direction = "↑" if current_price > last_eval_price else "↓"
             _update_last_eval_price(engine, current_price)
             engine._ticks_since_last_eval = 0
-            # FIX #84: Reducido a DEBUG para eliminar spam
+            # 🔧 FIX #129 (Feb 09, 2026): Cambiado a DEBUG para reducir spam
+            # Con threshold 0.5 ATR ya filtra bien, pero aún puede ser muchos logs
+            # La información importante es si ENTRA o no, no cada evaluación
             logger.debug(
                 f"📈 PRICE EVENT {direction} → EVALUATING | "
                 f"Move: ${price_delta:.2f} (threshold: ${threshold:.2f}) | "
@@ -483,12 +492,21 @@ def check_anticipation_signal(
         elif active_direction and (not direction_is_relevant or direction_is_stale):
             # Edge is stale o no hay edge - dirección es obsoleta, permitir anticipation
             if anticipation.direction and anticipation.direction != active_direction:
-                # 🔥 FIX #96 (Feb 09): Log confidence para debug
-                logger.info(
-                    f"📝 ANTICIPATION preserved: {anticipation.direction} (conf={anticipation.confidence:.0%}) differs from stale "
-                    f"ACTIVE_DIRECTION={active_direction} (stale={direction_is_stale}, edge={engine._edge_manager.state.value if hasattr(engine, '_edge_manager') else 'N/A'}) | "
-                    f"New signal allowed"
+                # 🔥 FIX #116 (Feb 09): Throttle log to 1 per minute per direction
+                global _last_anticipation_preserved_log
+                now = datetime.now()
+                should_log = (
+                    _last_anticipation_preserved_log["direction"] != anticipation.direction or
+                    _last_anticipation_preserved_log["time"] is None or
+                    (now - _last_anticipation_preserved_log["time"]).total_seconds() > _ANTICIPATION_PRESERVED_LOG_INTERVAL
                 )
+                if should_log:
+                    _last_anticipation_preserved_log = {"direction": anticipation.direction, "time": now}
+                    logger.info(
+                        f"📝 ANTICIPATION preserved: {anticipation.direction} (conf={anticipation.confidence:.0%}) differs from stale "
+                        f"ACTIVE_DIRECTION={active_direction} (stale={direction_is_stale}, edge={engine._edge_manager.state.value if hasattr(engine, '_edge_manager') else 'N/A'}) | "
+                        f"New signal allowed (throttled: 1/min)"
+                    )
         
         # =========================================================================
         # 🔥 AJUSTE (Jan 27, 2026): ANTICIPATION = información, NO trigger
@@ -503,6 +521,35 @@ def check_anticipation_signal(
         
         # Check for valid anticipation signal (confidence >= 50% - bajado de 55%)
         ANTICIPATION_MIN_CONFIDENCE = 0.50  # 🔥 FIX #97: Bajado de 0.55
+        
+        # =========================================================================
+        # 🔥 FIX #113 (Feb 09, 2026): ANTICIPATION QUALITY GATE
+        #
+        # PROBLEMA (P1): ANTICIPATION spam con señales mediocres:
+        # - conf=51%, ADX=0, phase=UNKNOWN → 40+ logs sin valor
+        # - Estas señales NUNCA convierten porque faltan condiciones
+        #
+        # SOLUCIÓN: Quality gate antes de procesar:
+        # - Si conf < 60% AND (ADX < 5 OR phase = UNKNOWN) → skip
+        # - Señales de baja confianza sin contexto son ruido puro
+        # =========================================================================
+        adx_5m = getattr(engine, '_last_effective_adx', 0.0)
+        trend_phase = getattr(engine, '_current_trend_phase', 'UNKNOWN')
+        
+        if anticipation.signal != AnticipationSignal.NONE:
+            is_low_quality = (
+                anticipation.confidence < 0.60 and 
+                (adx_5m < 5.0 or trend_phase == 'UNKNOWN')
+            )
+            
+            if is_low_quality:
+                logger.debug(
+                    f"⏭️ FIX #113: ANTICIPATION skipped (low quality): conf={anticipation.confidence:.0%}, "
+                    f"ADX={adx_5m:.1f}, phase={trend_phase}"
+                )
+                anticipation = AnticipationState()  # Reset to empty
+                engine._last_anticipation_state = anticipation
+        
         if anticipation.signal != AnticipationSignal.NONE and anticipation.confidence >= ANTICIPATION_MIN_CONFIDENCE:
             tags['anticipation_signal'] = anticipation.signal.value
             tags['anticipation_confidence'] = anticipation.confidence
@@ -534,8 +581,7 @@ def check_anticipation_signal(
             
             # 🔥 FIX (Feb 02, 2026): Only log anticipation here (removed duplicate in anticipation.py)
             # Also add ADX context for debugging ADX vs RANGE_BOUND conflict
-            adx_5m = getattr(engine, '_last_effective_adx', 0.0)
-            trend_phase = getattr(engine, '_current_trend_phase', 'UNKNOWN')
+            # NOTE: adx_5m and trend_phase already defined in FIX #113 quality gate above
             
             # 🔥 FIX (Feb 05, 2026): Include current price to show context changes
             # Also detect if structure is invalidated by current price
@@ -616,6 +662,25 @@ def check_anticipation_signal(
             # En ese caso, NO activar anticipation como trigger - el edge ya lo maneja.
             # =========================================================================
             anticipation_redundant = False
+            
+            # =========================================================================
+            # 🔥 FIX #110 (Feb 09, 2026): ANTICIPATION FORBIDDEN CHECK
+            #
+            # PROBLEMA: ANTICIPATION seguía detectando SHORT después de BIAS_FLIP
+            # que prohibió SHORT. Esto causa esquizofrenia sistémica.
+            #
+            # SOLUCIÓN: Verificar forbidden_direction ANTES de procesar anticipation.
+            # Si la dirección está prohibida, resetear a estado vacío.
+            # =========================================================================
+            forbidden_dir = getattr(engine, '_forbidden_direction', None)
+            if forbidden_dir and anticipation.direction == forbidden_dir:
+                logger.debug(
+                    f"⛔ ANTICIPATION {anticipation.direction} blocked by forbidden_direction"
+                )
+                anticipation = AnticipationState()  # Reset to empty
+                engine._last_anticipation_state = anticipation
+                anticipation_redundant = True  # Skip further processing
+            
             if anticipation.signal == AnticipationSignal.COMPRESSION_BREAKOUT:
                 if hasattr(engine, '_edge_manager'):
                     from src.domain.trading.edge_state_manager import EdgeType

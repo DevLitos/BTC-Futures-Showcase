@@ -28,11 +28,16 @@ SEÑALES DE DISTRIBUCIÓN (bearish en highs):
 
 from dataclasses import dataclass
 from typing import Optional, List
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import logging
 
 logger = logging.getLogger(__name__)
+
+# 🔧 FIX #129 (Feb 09, 2026): Throttle absorption detection logs
+_last_absorption_log: Optional[datetime] = None
+_ABSORPTION_LOG_THROTTLE_SECONDS = 120  # 2 minutes
 
 
 @dataclass
@@ -178,10 +183,14 @@ class AbsorptionDetector:
         
         self._last_result = result
         
-        # Log if absorption detected
+        # Log if absorption detected - 🔧 FIX #129: Throttle to once per 2 minutes
         if result.is_bullish_absorption or result.is_bearish_distribution:
-            mode = "🛡️ ABSORPTION" if result.is_bullish_absorption else "🔻 DISTRIBUTION"
-            logger.info(f"{mode} DETECTED: conf={result.confidence:.0%} | {result.reason}")
+            global _last_absorption_log
+            now = datetime.now()
+            if _last_absorption_log is None or (now - _last_absorption_log).total_seconds() >= _ABSORPTION_LOG_THROTTLE_SECONDS:
+                mode = "🛡️ ABSORPTION" if result.is_bullish_absorption else "🔻 DISTRIBUTION"
+                logger.info(f"{mode} DETECTED: conf={result.confidence:.0%} | {result.reason}")
+                _last_absorption_log = now
         
         return result
     

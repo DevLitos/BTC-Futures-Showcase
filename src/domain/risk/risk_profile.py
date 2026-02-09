@@ -67,9 +67,12 @@ class RiskAssessment:
         return f"{emoji.get(self.profile, '❓')} Risk: {self.profile.value} ({self.size_multiplier:.0%}) - {self.reason}"
 
 
-class RiskEngine:
+class RiskProfileEngine:
     """
-    Central risk management engine.
+    Risk Profile Assessment Engine.
+    
+    ⚠️ NOTE: Renamed from RiskEngine to avoid confusion with
+    src.domain.risk.risk_engine.RiskEngine (the main position manager).
     
     Evaluates multiple risk factors and returns a clear RiskProfile.
     
@@ -347,23 +350,23 @@ class RiskEngine:
 # SINGLETON
 # =============================================================================
 
-_risk_engine: Optional[RiskEngine] = None
+_risk_profile_engine: Optional[RiskProfileEngine] = None
 
 
-def get_risk_engine(config: Optional[Dict] = None) -> RiskEngine:
-    """Get or create the risk engine singleton."""
-    global _risk_engine
-    if _risk_engine is None:
-        _risk_engine = RiskEngine(config)
-    return _risk_engine
+def get_risk_profile_engine(config: Optional[Dict] = None) -> RiskProfileEngine:
+    """Get or create the risk profile engine singleton."""
+    global _risk_profile_engine
+    if _risk_profile_engine is None:
+        _risk_profile_engine = RiskProfileEngine(config)
+    return _risk_profile_engine
 
 
-def reset_risk_engine():
+def reset_risk_profile_engine():
     """Reset the singleton."""
-    global _risk_engine
-    _risk_engine = None
+    global _risk_profile_engine
+    _risk_profile_engine = None
 
 
 def assess_risk(**kwargs) -> RiskAssessment:
     """Convenience function to assess risk."""
-    return get_risk_engine().assess_risk(**kwargs)
+    return get_risk_profile_engine().assess_risk(**kwargs)

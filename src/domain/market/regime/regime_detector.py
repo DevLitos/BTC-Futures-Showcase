@@ -413,32 +413,33 @@ class RegimeDetector:
         }
 
 
+# ⚠️ DEPRECATED (Feb 09, 2026 - FIX #128)
+# Use src.application.live.market_analysis.calculate_chase_atr instead
+# This function is kept for backward compatibility but unused
 def calculate_chase_atr(
     current_price: float,
-    entry_signal_price: float,  # Price when signal was generated
+    entry_signal_price: float,
     atr: float,
     direction: str
 ) -> float:
     """
-    Calculate how many ATRs price has moved since signal.
+    ⚠️ DEPRECATED: Use market_analysis.calculate_chase_atr instead.
     
-    Args:
-        current_price: Current market price
-        entry_signal_price: Price when the entry signal was generated
-        atr: Current ATR
-        direction: 'LONG' or 'SHORT'
-        
-    Returns:
-        Chase distance in ATRs (positive = chasing, negative = better entry)
+    Calculate how many ATRs price has moved since signal.
     """
+    import warnings
+    warnings.warn(
+        "calculate_chase_atr in regime_detector is deprecated. "
+        "Use src.application.live.market_analysis.calculate_chase_atr instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     if atr <= 0:
         return 0.0
     
     if direction == 'LONG':
-        # For LONG, chasing = price went up since signal
         chase_distance = current_price - entry_signal_price
     else:
-        # For SHORT, chasing = price went down since signal
         chase_distance = entry_signal_price - current_price
     
     return chase_distance / atr

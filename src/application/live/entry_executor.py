@@ -313,7 +313,10 @@ class LocationGuards:
     - Too close to range boundaries in RANGE regime
     """
     
-    MIN_HEADROOM_ATR = 0.75
+    # 🔧 FIX #130 (Feb 09, 2026): Reduced from 0.75 to allow more aggressive entries
+    # Old: 0.75 ATR was too conservative, blocked valid trends
+    # New: 0.3 ATR allows entries closer to levels while still protecting from exact level entries
+    MIN_HEADROOM_ATR = 0.3
     
     @staticmethod
     def check_anchor_levels(
@@ -340,8 +343,14 @@ class LocationGuards:
             if hasattr(engine, '_location_context') and engine._location_context:
                 regime = engine._location_context.regime.upper()
             
-            # Only apply in non-trending regimes
+            # 🔧 FIX #130: Skip anchor check entirely in trending regimes
+            # In TREND, we WANT to enter even near levels - the trend will break them
             if regime not in ['RANGE', 'CHOPPY_DEAD', 'MEAN_REVERSION']:
+                return True, ""
+            
+            # 🔧 FIX #130: Also skip if TREND_EXPANSION is active
+            trend_expansion_active = getattr(engine, '_trend_expansion_active', False)
+            if trend_expansion_active:
                 return True, ""
             
             if bias == 'LONG':

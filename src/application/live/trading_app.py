@@ -105,11 +105,11 @@ from src.domain.trading.scoring import EntryScorer, get_entry_scorer
 # Extracted helper modules (Jan 20, 2026 - Phase 4 refactoring)
 # 🔥 CLEANED Feb 04: Removed 4 unused imports (_check_trend_pure, _check_volatility_expansion_pure, 
 #                    _check_anti_reversal_pure, _check_volume_delta_pure)
-from src.domain.trading.execution_logic.filter_checks import (
-    check_bos_against_position as _check_bos_pure,
-    # 🔥 REMOVED Feb 04: check_atr_regime_allows_entry, check_volatility_minimum, 
-    #                    check_not_post_impulse, check_sweep_occurred - unused
+# 🔥 FIX #127 (Feb 09, 2026): Unified BOS detection - use position_manager version
+from src.application.live.position_manager import (
+    check_bos_against_position as _check_bos_unified,
 )
+# NOTE: filter_checks.check_bos_against_position is now deprecated
 from src.shared.indicator_helpers import (
     calculate_atr_1m as _calc_atr_1m_pure,
     calculate_atr_5m as _calc_atr_5m_pure,
@@ -649,6 +649,10 @@ class SignalEngine:
         self._last_edge_state_log: str | None = None  # Last edge state string (only log on change)
         self._log_rate_limit_interval = timedelta(minutes=2)  # Default rate limit interval
         
+        # 🔧 FIX #129 (Feb 09, 2026): Throttle repetitive evaluation logs
+        self._last_vol_divergence_log: datetime | None = None  # Rate limit VOLUME DIVERGENCE logs
+        self._last_transition_mode_log: datetime | None = None  # Rate limit TRANSITION_MODE logs
+        
         # =====================================================================
         # 💰 SESSION TRACKING (Jan 28, 2026)
         # Track session start capital for PnL reporting
@@ -1009,6 +1013,21 @@ class SignalEngine:
         # to allow direction change. Prevents stuck SHORT edge in bullish market.
         # =========================================================================
         self._obstinacy_block_count: int = 0
+        
+        # =========================================================================
+        # 🔥 FIX #109 (Feb 09, 2026): TRANSITION_MODE
+        # 
+        # PROBLEMA: Después de BIAS_FLIP o DISPLACEMENT, el sistema aplica
+        # demasiados penalties (volume, correlation, fade) que matan el edge.
+        # 
+        # SOLUCIÓN: Activar TRANSITION_MODE por 15 min post-transición:
+        # - Durante este modo, el floor de penalties sube de 50% a 70%
+        # - Permite capturar el edge de la transición sin sobre-filtrar
+        # =========================================================================
+        self._transition_mode_active: bool = False
+        self._transition_mode_direction: str | None = None  # LONG/SHORT
+        self._transition_mode_expires: datetime | None = None
+        self._transition_mode_duration_minutes: int = 15
         
         # =========================================================================
         # 🔥 NEW (Jan 26, 2026): FALSE EXPANSION TRACKING
@@ -1957,6 +1976,25 @@ class SignalEngine:
                     eval_count = getattr(self, '_idle_eval_count', 0)
                     logger.info(f"[BEAT] HEARTBEAT: tick #{tick_count}, state={self.state_machine.state.name}, pos={pos_status} | edge={edge_state} | evals={eval_count}{cooldown_info}")
                     
+                    # 🔧 FIX #128 (Feb 09, 2026): Agregar info de precio y niveles clave cada 2 heartbeats
+                    if tick_count % 80 == 0:  # Cada ~80 segundos
+                        try:
+                            candles = self.market_data.get_candles('1m')
+                            if candles and len(candles) > 0:
+                                price = candles[-1].get('close', 0)
+                                swing_high = getattr(self, '_last_swing_high', 0)
+                                swing_low = getattr(self, '_last_swing_low', 0)
+                                swing_mid = (swing_high + swing_low) / 2 if swing_high > 0 and swing_low > 0 else price
+                                pct_in_range = ((price - swing_low) / (swing_high - swing_low) * 100) if swing_high > swing_low else 50
+                                
+                                logger.info(
+                                    f"📊 PRICE: ${price:.0f} | "
+                                    f"SwingH=${swing_high:.0f} SwingL=${swing_low:.0f} | "
+                                    f"Position in range: {pct_in_range:.0f}%"
+                                )
+                        except Exception:
+                            pass
+                    
                     # 🤖 ML STATUS (every 5 minutes = 300s = tick_count % 300 == 0)
                     if tick_count % 300 == 0:
                         ml_stats = self._ml_inference.get_stats()
@@ -2720,6 +2758,62 @@ class SignalEngine:
                 self._bias_invalidation_level = self._bias_low_since + invalidation_result.threshold_used * 0.5
             self._bias_before_invalidation = invalidation_result.forbidden_direction
             self._current_trade_tags['reclaim_level'] = self._bias_invalidation_level
+            
+            # =====================================================================
+            # 🔥 FIX #109 (Feb 09, 2026): Activar TRANSITION_MODE en BIAS_FLIP
+            #
+            # Cuando hay BIAS_FLIP, activamos TRANSITION_MODE por 15 minutos.
+            # Durante este período, el floor de penalties sube de 50% a 70%
+            # para capturar el edge de la transición sin sobre-filtrar.
+            # 
+            # 🔥 FIX #121 (Feb 09): THROTTLE - Solo log si realmente es NUEVO
+            # =====================================================================
+            new_direction = 'LONG' if invalidation_result.forbidden_direction == 'SHORT' else 'SHORT'
+            was_already_active = self._transition_mode_active and self._transition_mode_direction == new_direction
+            self._transition_mode_active = True
+            self._transition_mode_direction = new_direction
+            self._transition_mode_expires = datetime.now() + timedelta(
+                minutes=self._transition_mode_duration_minutes
+            )
+            # 🔥 FIX #121: Solo log si no estaba activo o cambió dirección
+            if not was_already_active:
+                logger.info(
+                    f"🚀 TRANSITION_MODE: {new_direction} for {self._transition_mode_duration_minutes}min | Penalty floor 70%"
+                )
+            
+            # =====================================================================
+            # 🔥 FIX #114 (Feb 09, 2026): TRANSITION_MODE CLEARS COOLDOWNS
+            #
+            # PROBLEMA (P4): Cooldown + Bias + Lock = PARÁLISIS
+            # Cuando el mercado gira y tenemos BIAS_FLIP, el sistema debería
+            # estar LISTO para entrar en la nueva dirección. Pero si hay cooldowns
+            # activos de la dirección anterior, perdemos el edge de transición.
+            #
+            # SOLUCIÓN: Al activar TRANSITION_MODE, limpiar cooldowns no críticos.
+            # - Mantener: CATASTROPHIC, DAILY_LIMIT
+            # - Limpiar: POST_TRADE, COUNTERTREND, EDGE_CONTEXT, etc.
+            # =====================================================================
+            if hasattr(self, '_cooldown_manager') and self._cooldown_manager:
+                from src.application.live.cooldown_manager import CooldownType
+                cleared_cooldowns = []
+                
+                # List of cooldowns to clear during transition
+                clearable_types = [
+                    CooldownType.POST_TRADE,
+                    CooldownType.COUNTERTREND,
+                    CooldownType.EDGE_CONTEXT,
+                    CooldownType.REVERSAL,
+                ]
+                
+                for cd_type in clearable_types:
+                    if self._cooldown_manager.is_cooldown_active(cd_type):
+                        self._cooldown_manager._cooldowns[cd_type].active = False
+                        cleared_cooldowns.append(cd_type.value)
+                
+                if cleared_cooldowns:
+                    logger.info(
+                        f"🔓 FIX #114: Cleared cooldowns for TRANSITION_MODE: {', '.join(cleared_cooldowns)}"
+                    )
             
             # Save displacement memory if needed
             if invalidation_result.displacement_memory_saved:
@@ -3535,7 +3629,8 @@ class SignalEngine:
         if fast_adx >= 35:
             # 5m shows STRONG TREND - this IS the trend, don't wait for 1h
             effective_adx = fast_adx  # Trust the faster timeframe
-            if self._idle_eval_count % 60 == 1:
+            # 🔥 FIX #122: Throttle 60 → 180 ticks
+            if self._idle_eval_count % 180 == 1:
                 logger.info(
                     f"⚡ FAST TREND: ADX 5m={fast_adx:.1f} ≥ 35 → Using 5m for trend detection"
                 )
@@ -3590,7 +3685,8 @@ class SignalEngine:
         adx_suggested_mode = regime_result.adx_suggested_mode
         
         # Log mode changes with full context (rate limited)
-        if self._idle_eval_count % 30 == 1:
+        # 🔥 FIX #122: Throttle 30 → 120 ticks
+        if self._idle_eval_count % 120 == 1:
             override_note = ""
             if adx_suggested_mode != trading_mode:
                 override_note = f" ⚡ OVERRIDE from {adx_suggested_mode}"
@@ -3724,7 +3820,8 @@ class SignalEngine:
                     # Low volume = riskier, so reduce size instead of blocking
                     low_vol_penalty = max(0.3, volume_ratio / MIN_VOLUME_RATIO_RANGE)
                     self._current_trade_tags['low_volume_penalty'] = low_vol_penalty
-                    if self._idle_eval_count % 60 == 1:
+                    # 🔥 FIX #122: Throttle 60 → 180 ticks
+                    if self._idle_eval_count % 180 == 1:
                         logger.info(
                             f"⚠️ RANGE: Low volume | vol_ratio={volume_ratio:.0%} < {MIN_VOLUME_RATIO_RANGE:.0%} | "
                             f"PENALTY: size_mult={low_vol_penalty:.2f}"
@@ -3831,8 +3928,8 @@ class SignalEngine:
                         price_change = 0.0
                         confirm_reason = f"RANGE: {direction} at pct={pct_60d:.0f}% (extremes trusted)"
                         
-                        # 🔥 Throttle: solo log cada 120 ticks para reducir spam
-                        if self._idle_eval_count % 120 == 1:
+                        # 🔥 FIX #122: Throttle 120 → 300 ticks para reducir spam
+                        if self._idle_eval_count % 300 == 1:
                             logger.info(
                                 f"✅ RANGE MID: {source} | direction={direction} | conf={confidence:.0%} | "
                                 f"price: {confirm_reason} | pct={pct_60d:.0f}% | Size=40% | TRADING"
@@ -3846,7 +3943,8 @@ class SignalEngine:
                         self._regime_blocked = True
                         self._regime_block_reason = f"RANGE_MID_NO_CONSENSUS (source={source}, conf={confidence:.0%})"
                         
-                        if self._idle_eval_count % 60 == 1:
+                        # 🔥 FIX #122: Throttle 60 → 300 ticks
+                        if self._idle_eval_count % 300 == 1:
                             logger.info(
                                 f"📊 RANGE MID: NO CONSENSUS | source={source} | conf={confidence:.0%} | "
                                 f"pct={pct_60d:.0f}% | NO TRADE"
@@ -3994,8 +4092,8 @@ class SignalEngine:
                     price_confirms, price_change, confirm_reason = self._price_confirms_direction(direction)
                     
                     if not price_confirms:
-                        # 🔥 FIX (Feb 05): Rate-limit this warning - spams logs
-                        if self._idle_eval_count % 60 == 1:
+                        # 🔥 FIX #122: Throttle 60 → 120 ticks
+                        if self._idle_eval_count % 120 == 1:
                             logger.warning(f"⚠️ TREND: {source} BLOCKED BY PRICE | {confirm_reason}")
                         self._current_trade_tags['trend_reason'] = 'PRICE_CONTRADICTED'
                         return
@@ -4004,8 +4102,8 @@ class SignalEngine:
                 adx_strength = min(1.0, (effective_adx - ADX.TREND_MIN) / 30)
                 trend_size = SIZING.TREND_BASE + adx_strength * SIZING.TREND_ADX_BONUS
                 
-                # 🔥 FIX #47 (Feb 05): Rate-limit TREND status log to reduce spam
-                if self._idle_eval_count % 60 == 1:
+                # 🔥 FIX #122: Throttle 60 → 180 ticks
+                if self._idle_eval_count % 180 == 1:
                     logger.info(
                         f"✅ TREND: {source} | dir={direction} | conf={confidence:.0%} | "
                         f"ADX={effective_adx:.1f} | Size={trend_size:.0%} | TRADING"
@@ -4039,7 +4137,8 @@ class SignalEngine:
                 # Waiting for edge
                 self._current_trade_tags['trend_reason'] = 'WAITING_EDGE'
                 
-                if self._idle_eval_count % 60 == 1:
+                # 🔥 FIX #122: Throttle 60 → 180 ticks
+                if self._idle_eval_count % 180 == 1:
                     logger.info(
                         f"📊 TREND: WAITING EDGE | source={source} | conf={confidence:.0%} | "
                         f"ADX={effective_adx:.1f} | Need BOS/breakout"
@@ -4143,11 +4242,15 @@ class SignalEngine:
             if swing_high_price != self._last_swing_high:
                 self._prev_swing_high = self._last_swing_high
                 self._last_swing_high = swing_high_price
+                # 🔧 FIX #128: Log nuevo swing high (informativo para detección de edge)
+                logger.info(f"📍 NEW SWING HIGH: ${swing_high_price:.0f} (prev: ${self._prev_swing_high:.0f})")
         
         if swing_low_detected and swing_low_price > 0:
             if swing_low_price != self._last_swing_low:
                 self._prev_swing_low = self._last_swing_low
                 self._last_swing_low = swing_low_price
+                # 🔧 FIX #128: Log nuevo swing low (informativo para detección de edge)
+                logger.info(f"📍 NEW SWING LOW: ${swing_low_price:.0f} (prev: ${self._prev_swing_low:.0f})")
         
         # Inicializar swings si aún no están (usar highs/lows recientes)
         if self._last_swing_high == 0:
@@ -4223,7 +4326,8 @@ class SignalEngine:
                     # If we reached here with mismatch, it means EXPANSION_MODE (100) overrode.
                     # Log but do NOT invalidate - expansion mode should still use the edge.
                     if edge_type in [EdgeType.BREAKOUT, EdgeType.DISPLACEMENT]:
-                        if self._idle_eval_count % 60 == 1:
+                        # 🔥 FIX #122: Throttle 60 → 120 ticks
+                        if self._idle_eval_count % 120 == 1:
                             logger.debug(
                                 f"📊 Edge-Direction divergence: Edge={edge_direction} vs "
                                 f"Orchestrated={self._active_direction} | Edge type={edge_type.value} | "
@@ -4232,7 +4336,8 @@ class SignalEngine:
                         # NOTE: Direction override REMOVED - orchestrator already decided
                     # ANTICIPATION PENDING: Don't invalidate
                     elif has_anticipation_breakout:
-                        if self._idle_eval_count % 60 == 1:
+                        # 🔥 FIX #122: Throttle 60 → 120 ticks
+                        if self._idle_eval_count % 120 == 1:
                             logger.debug(
                                 f"🎯 ANTICIPATION BREAKOUT PENDING: Skipping edge invalidation | "
                                 f"Old edge will be replaced by BREAKOUT {anticipation_direction}"
@@ -4600,6 +4705,25 @@ class SignalEngine:
                             f"📊 Syncing local bias with orchestrated direction: {old_bias}→{edge_direction}"
                         )
         
+        # 🔧 FIX #128 (Feb 09, 2026): Actualizar razón de NO_EDGE para logging informativo
+        if self._edge_manager.state == EdgeState.NO_EDGE:
+            # Determinar razón basada en el contexto actual
+            percentile_60d = self._current_trade_tags.get('percentile_60d', 50.0)
+            regime = self._current_trade_tags.get('regime_mode', self._htf_cache_regime_mode)
+            anticipation = self._current_trade_tags.get('anticipation_signal')
+            
+            if regime == 'RANGE':
+                if 15 < percentile_60d < 85:
+                    reason = f"RANGE pero pct={percentile_60d:.0f}% no extremo (need <15 o >85)"
+                else:
+                    reason = "RANGE extremo pero sin sweep+rejection"
+            elif anticipation:
+                reason = f"ANTICIPATION {anticipation} sin confirmación micro-swing"
+            else:
+                reason = "Sin BOS/displacement detectado"
+            
+            self._edge_manager._no_edge_reason = reason
+        
         # 5. Si NO hay edge activo → skip evaluación (el core del cambio)
         # PERO: Permitir modo PROBING para diagnóstico (0.25x size)
         # 🔥 FIX (Jan 28, 2026): PROBE mode puede operar sin edge activo
@@ -4610,9 +4734,41 @@ class SignalEngine:
         if not self._edge_manager.can_evaluate_entry():
             block_reason = self._edge_manager.get_block_reason()
             
-            # Log cada 2 minutos
-            if self._idle_eval_count % 120 == 1:
-                logger.info(f"⏸️ {block_reason}")
+            # 🔧 FIX #128 (Feb 09, 2026): Log diagnóstico informativo cada minuto
+            if self._idle_eval_count % 60 == 1:
+                # Recopilar información diagnóstica
+                diag_parts = []
+                
+                # Modo de trading
+                regime = self._current_trade_tags.get('regime_mode', self._htf_cache_regime_mode)
+                diag_parts.append(f"mode={regime}")
+                
+                # Percentil de precio (ubicación)
+                percentile = self._current_trade_tags.get('percentile_60d', 50.0)
+                diag_parts.append(f"pct={percentile:.0f}%")
+                
+                # ADX (tendencia)
+                adx_eff = self._current_trade_tags.get('adx_effective', 20.0)
+                diag_parts.append(f"ADX={adx_eff:.0f}")
+                
+                # Anticipation si hay
+                anticipation = self._current_trade_tags.get('anticipation_signal')
+                if anticipation:
+                    ant_dir = self._current_trade_tags.get('anticipation_direction', '?')
+                    ant_conf = self._current_trade_tags.get('anticipation_confidence', 0)
+                    diag_parts.append(f"ANT={anticipation}_{ant_dir}@{ant_conf:.0%}")
+                
+                # BB width (compresión)
+                bb_pct = self._current_trade_tags.get('bb_width_percentile', 50.0)
+                if bb_pct <= 10:
+                    diag_parts.append(f"⚡SQUEEZE={bb_pct:.0f}%")
+                
+                # Bias
+                bias = self._active_direction or 'NONE'
+                diag_parts.append(f"bias={bias}")
+                
+                diag_str = " | ".join(diag_parts)
+                logger.info(f"⏸️ {block_reason} | {diag_str}")
                 
                 # Log expectancy stats si hay datos
                 stats = self._edge_manager.stats
@@ -4631,8 +4787,8 @@ class SignalEngine:
         if self._edge_manager.can_trade():
             bos = self._edge_manager.current_bos
             if bos:
-                # 🔥 FIX #47 (Feb 05): Rate-limit EDGE ACTIVE log to reduce spam
-                if self._idle_eval_count % 60 == 1:
+                # 🔥 FIX #122: Throttle 60 → 180 ticks
+                if self._idle_eval_count % 180 == 1:
                     logger.info(
                         f"🎯 EDGE ACTIVE: {bos.direction} | BOS level: {bos.bos_level:.2f} | "
                         f"Trades: {bos.trades_attempted}/{self._edge_manager.MAX_TRADES_PER_EDGE}"
@@ -5008,7 +5164,12 @@ class SignalEngine:
         # Volume divergence = reduce conviction
         if ti_state.volume_on_moves == "diverges":
             self._ti_size_multiplier *= 0.7
-            logger.info(f"📉 VOLUME DIVERGENCE: Reducing size by 30%")
+            # 🔧 FIX #129: Throttle log to once per 2 minutes
+            market_time = self.market_data.get_market_time()
+            if self._last_vol_divergence_log is None or \
+               (market_time - self._last_vol_divergence_log).total_seconds() >= 120:
+                logger.info(f"📉 VOLUME DIVERGENCE: Reducing size by 30%")
+                self._last_vol_divergence_log = market_time
             self._current_trade_tags['ti_volume_penalty'] = True
         
         # Structure alignment bonus
@@ -5879,7 +6040,8 @@ class SignalEngine:
             if bias != edge_direction_final:
                 # Solo sincronizar bias local, NO modificar _active_direction
                 # (ya fue seteado correctamente por el orchestrator)
-                if self._idle_eval_count % 60 == 1:
+                # 🔥 FIX #122: Throttle 60 → 180 ticks
+                if self._idle_eval_count % 180 == 1:
                     logger.debug(
                         f"📊 Syncing local bias with edge: {bias} → {edge_direction_final}"
                     )
@@ -6213,6 +6375,30 @@ class SignalEngine:
             else:
                 if result.reason:
                     logger.debug(f"📊 Entry not executed: {result.reason}")
+                
+                # =========================================================================
+                # 🔥 FIX #111 (Feb 09, 2026): EXECUTION SLA VIOLATION DETECTION
+                #
+                # PROBLEMA: El sistema ve trades (EDGE_ACTIVE + SETUP_COMPLETE) pero
+                # no los toma por penalties acumulativos. Esto viola el SLA de ejecución.
+                #
+                # SOLUCIÓN: Si hay EDGE_ACTIVE y conf >= 70% pero no entramos,
+                # loguear ERROR para análisis posterior. Esto ayuda a detectar
+                # sobre-filtraje sistémico.
+                # =========================================================================
+                edge_state = getattr(self._edge_manager, 'state', None)
+                from src.domain.trading.edge_state_manager import EdgeState
+                if edge_state in [EdgeState.EDGE_ACTIVE]:
+                    # Check confidence and other factors
+                    current_conf = self._current_trade_tags.get('direction_confidence', 0)
+                    transition_mode = getattr(self, '_transition_mode_active', False)
+                    
+                    if current_conf >= 70:
+                        logger.error(
+                            f"🚨 EXECUTION SLA VIOLATION: Edge={edge_state.value}, "
+                            f"Conf={current_conf}%, bias={self.current_bias} | "
+                            f"Reason: {result.reason} | TransitionMode={transition_mode}"
+                        )
                     
         except Exception as e:
             # 🔥 FIX #86 (Feb 09, 2026): NEVER cooldown for CODE ERRORS
@@ -8542,26 +8728,26 @@ class SignalEngine:
         return _find_tp2_pure(df_5m, direction or 'LONG')
     
     def _check_bos_against_position(self, direction: str, candles_5m: list) -> bool:
-        """BOS detection - delegates to filter_checks module with edge-triggered logging"""
-        result = _check_bos_pure(direction, candles_5m)
+        """BOS detection - delegates to position_manager with edge-triggered logging
+        
+        🔧 FIX #127 (Feb 09, 2026): Use unified BOS detection from position_manager
+        """
+        if not candles_5m or len(candles_5m) < 5:
+            return False
+            
+        df = pd.DataFrame(candles_5m)
+        has_bos, bos_level = _check_bos_unified(df, direction)
         
         # Edge-triggered logging (only log once per new BOS level)
-        if result and candles_5m:
-            df = pd.DataFrame(candles_5m)
-            if direction == 'LONG':
-                level = df['low'].iloc[-1]
-                if self._last_bos_level != level or self._last_bos_direction != 'LONG':
-                    logger.info(f"📉 BOS detectado (LONG): LL @ {level:.2f}")
-                    self._last_bos_level = level
-                    self._last_bos_direction = 'LONG'
-            else:
-                level = df['high'].iloc[-1]
-                if self._last_bos_level != level or self._last_bos_direction != 'SHORT':
-                    logger.info(f"📈 BOS detectado (SHORT): HH @ {level:.2f}")
-                    self._last_bos_level = level
-                    self._last_bos_direction = 'SHORT'
+        if has_bos and bos_level != 0.0:
+            if self._last_bos_level != bos_level or self._last_bos_direction != direction:
+                icon = "📉" if direction == 'LONG' else "📈"
+                bos_type = "LL" if direction == 'LONG' else "HH"
+                logger.info(f"{icon} BOS detectado ({direction}): {bos_type} @ {bos_level:.2f}")
+                self._last_bos_level = bos_level
+                self._last_bos_direction = direction
         
-        return result
+        return has_bos
     
     async def emergency_close_all(self):
         """Emergency close all positions (market order)"""

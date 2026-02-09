@@ -1418,6 +1418,11 @@ class EdgeStateManager:
         self._stats = EdgeStats()
         self._bos_history: List[BOSEvent] = []
         
+        # 🔧 FIX #128 (Feb 09, 2026): Track reason for NO_EDGE state
+        # This allows informative logging about why no edge is detected
+        self._no_edge_reason: str = "Initializing..."
+        self._last_edge_check_result: Dict[str, Any] = {}  # Details from last check
+        
         # Transition history for debugging
         self._transition_history: List[EdgeTransition] = []
         
@@ -1643,9 +1648,13 @@ class EdgeStateManager:
         return self._current_bos.can_trade()
     
     def get_block_reason(self) -> Optional[str]:
-        """Razón por la que no se puede operar - compact format"""
+        """Razón por la que no se puede operar - informative format
+        
+        🔧 FIX #128 (Feb 09, 2026): Added detailed NO_EDGE reason
+        """
         if self._state == EdgeState.NO_EDGE:
-            return "NO_EDGE"
+            # Provide informative reason instead of just "NO_EDGE"
+            return f"NO_EDGE: {self._no_edge_reason}"
         elif self._state == EdgeState.EDGE_ARMED:
             return f"ARMED:wait_confirm"
         elif self._state == EdgeState.EDGE_PROVISIONAL:
@@ -3874,7 +3883,7 @@ class EdgeStateManager:
             (min_mult, max_mult, edge_info): Size range and description
         """
         if self._current_bos is None:
-            return (0.40, 0.60, "NO_EDGE")  # Conservative default
+            return (0.50, 0.70, "NO_EDGE")  # 🔥 FIX #121b: 0.40-0.60 → 0.50-0.70
         
         edge_type = self._current_bos.edge_type
         trend_path = getattr(self._current_bos, 'trend_path', None)
@@ -3898,12 +3907,12 @@ class EdgeStateManager:
         elif edge_type == EdgeType.TREND:
             if trend_path == TrendEdgePath.BOS_PULLBACK:
                 # Confirmed BOS entry
-                base_min, base_max = 0.60, 0.80
-                edge_info = "TREND_BOS"
+                base_min, base_max = 0.70, 0.90
+                edge_info = "TREND_BOS"  # 🔥 FIX #121b: 0.60-0.80 → 0.70-0.90
             else:  # CONSENSUS_DIRECT or None
-                # No BOS, just alignment
-                base_min, base_max = 0.40, 0.60
-                edge_info = "TREND_CONSENSUS"
+                # No BOS, just alignment - 🔥 FIX #121b: Use more capital
+                base_min, base_max = 0.60, 0.80
+                edge_info = "TREND_CONSENSUS"  # 🔥 FIX #121b: 0.40-0.60 → 0.60-0.80
                 
         else:
             # Unknown edge type - conservative

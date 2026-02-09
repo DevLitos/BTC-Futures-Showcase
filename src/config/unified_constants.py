@@ -262,8 +262,8 @@ class ScoreThresholds:
     MIN_SCORE_TREND: float = 4.5
     MIN_SCORE_EXPANSION: float = 4.0   # Lower for momentum trades
     
-    # Fast path minimum
-    FAST_PATH_MIN_SCORE: float = 6.0   # Was 7.0, too strict
+    # Fast path minimum (Feb 04 analysis: 7.0 = MAS CONSERVADOR, reduces TIME_INVALIDATION)
+    FAST_PATH_MIN_SCORE: float = 7.0
     
     # Confidence thresholds
     HIGH_CONFIDENCE: float = 0.70

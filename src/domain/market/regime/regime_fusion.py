@@ -143,10 +143,13 @@ class RegimeFusion:
     DI_MIN_DIFF = 3.0                 # Diferencia mínima +DI/-DI para contar
     
     # Reglas de fusión
+    # 🔥 FIX #120 (Feb 09, 2026): Subir multipliers para permitir trades en cuentas pequeñas
+    # ANTES: MISALIGNED=0.3, NEUTRAL=0.6 → con otros penalties llegaba a 0.000400 BTC
+    # AHORA: MISALIGNED=0.5, NEUTRAL=0.75 → permite profit_net > $0.25
     ALIGNED_SIZE_MULT = 1.0           # Alineado con macro
     ALIGNED_RR_MIN = 1.0
     
-    MISALIGNED_SIZE_MULT = 0.3        # Contra macro (fade)
+    MISALIGNED_SIZE_MULT = 0.3        # Contra macro (fade) - reducido
     MISALIGNED_RR_MIN = 2.0
     
     NEUTRAL_SIZE_MULT = 0.6           # Macro neutral
