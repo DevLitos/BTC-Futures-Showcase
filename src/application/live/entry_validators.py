@@ -158,20 +158,34 @@ class ChaseValidator:
         )
         
         # =====================================================================
-        # 🔥 FIX #102c (Feb 09, 2026): HARD BLOCK for extreme chase without pullback
+        # 🔥 FIX #102c (Feb 09): HARD BLOCK for extreme chase without pullback
+        # 🔥 FIX #160 (Feb 10): MODE_EXPANSION desactiva este bloqueo
         # =====================================================================
-        # PROBLEMA: chase 1.78 ATR se perdona con "trend expansion" → FOMO codificado
-        # 
-        # REGLA DURA: Chase > 1.5 ATR = BLOQUEO sin excepciones
-        # EXCEPCIÓN ÚNICA: Si hubo pullback significativo (> 0.3 ATR desde max/min)
-        # 
-        # RAZÓN: A 1.5+ ATR de chase, la probabilidad de reversión es alta
-        # No importa si hay "trend expansion" - estás comprando el top/vendiendo el bottom
+        # PROBLEMA: En EXPANSION, bloquear chase destruye el edge
+        # En RANGE, chase block es correcto (previene FOMO)
+        #
+        # MODE_EXPANSION (trend_expansion_active=True):
+        #   - NO hard block por chase ATR
+        #   - Solo penalización de score
+        #
+        # MODE_RANGE (trend_expansion_active=False):
+        #   - Hard block en chase > 1.5 ATR sin pullback
         # =====================================================================
-        HARD_CHASE_LIMIT = 1.5  # ATR múltiples - sin negociación
-        PULLBACK_EXCEPTION = 0.3  # ATR - solo si hubo retroceso significativo
+        HARD_CHASE_LIMIT = 1.5  # Solo aplica en MODE_RANGE
+        PULLBACK_EXCEPTION = max(0.4, result.chase_atr * 0.30)
         
-        if result.chase_atr > HARD_CHASE_LIMIT:
+        # 🔥 FIX #160: En EXPANSION, NO bloquear por chase
+        if trend_expansion_active:
+            if result.chase_atr > HARD_CHASE_LIMIT:
+                logger.info(
+                    f"🚀 MODE_EXPANSION: Chase {result.chase_atr:.2f} ATR ignored | "
+                    f"Trend expansion activo - entrando en momentum"
+                )
+                result.tags['expansion_chase_override'] = True
+            # En EXPANSION: aplicar penalización reducida pero NO bloquear
+            result.chase_penalty = min(result.chase_penalty, 0.3)  # Cap penalty
+        
+        elif result.chase_atr > HARD_CHASE_LIMIT:
             # Check for pullback exception
             has_pullback = False
             try:

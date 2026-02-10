@@ -220,68 +220,62 @@ class RiskPenaltyAccumulator:
         """
         Calculate final accumulated penalties.
         
-        Returns RiskPenaltyResult with:
-        - final_size_mult: Product of all size multipliers
-        - total_score_adj: Sum of all score adjustments
-        - should_block: True only if catastrophic or size < minimum
+        🔥 FIX #140 (Feb 10, 2026): LIMIT PENALTY STACKING
         
-        🔥 FIX #88 (Feb 09, 2026): TREND_EXPANSION OVERRIDE
-        When trend_expansion_active AND ADX>45, we use a higher floor (0.60)
-        because these are A++ setups that MUST trade.
+        PROBLEMA: 16 guards aplicando penalties → trade muerto.
+        Aunque FIX #112 implementó softmax, el resultado final seguía siendo
+        demasiado bajo porque:
+        - min(penalties) × (1 - 0.05 × (n-1)) con n=10 → 0.5 × 0.55 = 0.27
+        - Floor de 0.50 salvaba pero TODOS los trades terminaban a 50%
         
-        🔥 FIX #109 (Feb 09, 2026): TRANSITION_MODE OVERRIDE
-        When transition_mode_active, use 70% floor to capture transition edge.
+        SOLUCIÓN: Solo considerar las 3 peores penalties.
+        - Filosofía: Si 3 guards dicen "cuidado", eso es suficiente información
+        - El resto de guards aportan ruido, no señal
+        - Penalty final = promedio ponderado de las 3 peores
         
-        🔥 FIX #112 (Feb 09, 2026): SOFTMAX PENALTIES
-        Changed from pure multiplication (Π) to softmax approach:
-        - Use worst penalty as base
-        - Add small decay per additional penalty
-        - Never go below floor
-        This prevents 5 small penalties from killing the trade.
+        RESULTADO:
+        - Menos trades a 50% floor
+        - Sizing más diverso según riesgo real
         """
         result = RiskPenaltyResult()
         result.penalties = self._penalties.copy()
         
         # =====================================================================
-        # 🔥 FIX #112: SOFTMAX PENALTIES
-        #
-        # ANTES: final = Π(penalties) → 0.7^5 = 0.17 → trade muerto
-        # AHORA: final = min(penalties) * (1 - 0.05 * (n-1)) → más justo
-        #
-        # Filosofía:
-        # - El PEOR penalty domina (si uno dice 0.5x, ese es el base)
-        # - Cada penalty adicional resta un 5% extra
-        # - Nunca baja del floor (50%/70% según contexto)
+        # 🔥 FIX #140: LIMIT TO TOP-3 PENALTIES
         # =====================================================================
         active_penalties = [p for p in self._penalties if p.size_mult < 1.0]
         
         if not active_penalties:
             final_mult = 1.0
         else:
-            # El peor penalty domina
-            min_mult = min(p.size_mult for p in active_penalties)
+            # Ordenar por severidad (menor mult = más severo)
+            sorted_penalties = sorted(active_penalties, key=lambda p: p.size_mult)
             
-            # Decay suave por cada penalty adicional (5% cada uno)
-            num_additional = max(0, len(active_penalties) - 1)
-            decay = 0.05 * num_additional
+            # 🔥 FIX #140: Solo tomar las 3 peores
+            top_n = min(3, len(sorted_penalties))
+            top_penalties = sorted_penalties[:top_n]
             
-            # Calcular final con decay
-            final_mult = min_mult * (1.0 - decay)
+            # Promedio ponderado: 60% peor, 25% segundo, 15% tercero
+            weights = [0.60, 0.25, 0.15]
+            weighted_sum = 0.0
+            total_weight = 0.0
             
-            # Log si hay diferencia significativa vs método antiguo
-            old_mult = 1.0
-            for p in active_penalties:
-                old_mult *= p.size_mult
+            for i, p in enumerate(top_penalties):
+                weight = weights[i] if i < len(weights) else 0.0
+                weighted_sum += p.size_mult * weight
+                total_weight += weight
             
-            if abs(final_mult - old_mult) > 0.05:
+            final_mult = weighted_sum / total_weight if total_weight > 0 else 1.0
+            
+            # Log para debugging
+            if len(active_penalties) > 3:
+                ignored_count = len(active_penalties) - 3
                 logger.debug(
-                    f"📊 FIX #112 SOFTMAX: {len(active_penalties)} penalties | "
-                    f"Old={old_mult:.0%} → New={final_mult:.0%} (saved {(final_mult-old_mult)*100:.0f}pp)"
+                    f"📊 FIX #140 TOP-3: {len(active_penalties)} penalties → using top 3 "
+                    f"(ignored {ignored_count}) | Final mult: {final_mult:.0%}"
                 )
         
         # 🔥 FIX #94: SIMPLIFIED OVERRIDE - Always allow trades
-        # The system was killing ALL trades with stacking penalties.
-        # Now: if there's displacement, FORCE minimum 50% size.
         effective_min = self.MIN_VIABLE_MULT  # 0.50
         
         # 🔥 FIX #109: TRANSITION_MODE gets highest floor (70%)

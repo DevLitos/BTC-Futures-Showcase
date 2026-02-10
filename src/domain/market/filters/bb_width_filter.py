@@ -210,22 +210,16 @@ class BBWidthFilter(BaseFilter):
                     tags=tags
                 )
             
-            # PASSIVE extreme compression - No trade zone (unless informative mode)
+            # PASSIVE extreme compression - No trade zone
             tags['range_type'] = 'PASSIVE'
             tags['range_by_bbwidth'] = True
             tags['bb_regime'] = 'EXTREME_COMPRESSION'
             
-            # PHASE A FIX: In informative mode, allow with penalty instead of blocking
-            if self.range_informative_mode:
-                logger.info(f"📊 BB WIDTH INFO: {bb_width*100:.2f}% (extreme compression) - PENALTY only, not blocking")
-                return FilterDecision(
-                    allow=True,
-                    score_adjust=self.INFORMATIVE_MODE_PENALTY,
-                    regime="COMPRESSION",
-                    reasons=[f"BB extreme compression (info): {bb_width*100:.2f}%"],
-                    tags=tags
-                )
-            elif self.EXTREME_COMPRESSION_BLOCK:
+            # 🔥 FIX #153 (Feb 10, 2026): EXTREME compression ALWAYS blocks
+            # BEFORE: range_informative_mode bypassed the block
+            # NOW: < 0.5% BB width = HARD BLOCK (no exceptions)
+            # This trade lost -0.44R because it entered in 0.45% compression
+            if self.EXTREME_COMPRESSION_BLOCK:
                 logger.warning(f"⛔ BB WIDTH BLOCK: {bb_width*100:.2f}% (extreme compression < {self.BB_EXTREME_COMPRESSION*100}%)")
                 return FilterDecision(
                     allow=False,

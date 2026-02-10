@@ -1459,6 +1459,26 @@ class EdgeStateManager:
         self._location_extreme_cooldown_direction: Optional[str] = None  # 'SHORT' or 'LONG'
         
         # =========================================================================
+        # 🔥 FIX #159 (Feb 10, 2026): POST-DISPLACEMENT COOLDOWN
+        # 
+        # PROBLEMA: Cuando un DISPLACEMENT expira (edge_type=DISPLACEMENT),
+        # el sistema crea inmediatamente un nuevo edge (CONSENSUS/TREND) y entra
+        # tarde cuando el momentum ya murió.
+        # 
+        # CASO REAL (Feb 10, 2026):
+        #   15:39 - DISPLACEMENT $919 detectado → STALE/CHASE BLOCK
+        #   15:45 - LATE DISPLACEMENT: 21 bars > 20 - NO CHASE → edge expira
+        #   15:46 - Nuevo TREND_EXPANSION_LOCK edge → permite entrar
+        #   15:50 - Entrada SHORT a $68,000 → precio rebota → PIERDE
+        #
+        # SOLUCIÓN: Cuando un DISPLACEMENT expira, activar cooldown de 10 min
+        # para NO crear nuevos edges CONSENSUS en esa dirección.
+        # El mercado necesita mostrar NUEVA estructura, no la vieja.
+        # =========================================================================
+        self._post_displacement_cooldown_until: Optional[datetime] = None
+        self._post_displacement_cooldown_direction: Optional[str] = None  # 'SHORT' or 'LONG'
+        
+        # =========================================================================
         # 🔥 FIX #59 (Feb 06, 2026): Direction staleness tracking
         # 
         # PROBLEMA: Cuando edge expira, _active_direction en trading_app queda
@@ -1728,6 +1748,62 @@ class EdgeStateManager:
             self._location_extreme_cooldown_direction = None
             logger.debug(f"🔓 LOCATION EXTREME COOLDOWN manually cleared for {direction}")
     
+    # =========================================================================
+    # 🔥 FIX #159: POST-DISPLACEMENT COOLDOWN METHODS
+    # =========================================================================
+    
+    def set_post_displacement_cooldown(
+        self, 
+        direction: str, 
+        market_time: datetime,
+        cooldown_minutes: int = 10
+    ) -> None:
+        """
+        Set cooldown after DISPLACEMENT edge expires.
+        
+        🔥 FIX #159 (Feb 10, 2026): Prevents creating new CONSENSUS edge
+        immediately after a displacement expires. The market needs to
+        show NEW structure, not just re-arm on the same stale setup.
+        
+        Args:
+            direction: 'SHORT' or 'LONG' - the displacement direction that expired
+            market_time: Current timestamp
+            cooldown_minutes: How long to wait (default 10 min)
+        """
+        self._post_displacement_cooldown_until = market_time + timedelta(minutes=cooldown_minutes)
+        self._post_displacement_cooldown_direction = direction
+        logger.warning(
+            f"🔥 FIX #159: POST-DISPLACEMENT COOLDOWN | {direction} blocked for {cooldown_minutes}min | "
+            f"Momentum expired - wait for NEW structure"
+        )
+    
+    def is_post_displacement_cooldown_active(self, direction: str, market_time: datetime) -> bool:
+        """
+        Check if post-displacement cooldown is active for given direction.
+        
+        Returns True if we should NOT arm a CONSENSUS edge in this direction.
+        """
+        if self._post_displacement_cooldown_until is None:
+            return False
+        if self._post_displacement_cooldown_direction != direction:
+            return False
+        if market_time >= self._post_displacement_cooldown_until:
+            # Cooldown expired - clear it
+            self._post_displacement_cooldown_until = None
+            self._post_displacement_cooldown_direction = None
+            logger.info(f"🔓 POST-DISPLACEMENT COOLDOWN expired for {direction} | New edges allowed")
+            return False
+        return True
+    
+    def clear_post_displacement_cooldown(self, direction: str) -> None:
+        """
+        Clear post-displacement cooldown (e.g., if opposite displacement happens).
+        """
+        if self._post_displacement_cooldown_direction == direction:
+            self._post_displacement_cooldown_until = None
+            self._post_displacement_cooldown_direction = None
+            logger.debug(f"🔓 POST-DISPLACEMENT COOLDOWN manually cleared for {direction}")
+
     # =========================================================================
     # 🌊 PROVISIONAL STATE METHODS - Starter positions
     # =========================================================================
@@ -3253,6 +3329,20 @@ class EdgeStateManager:
             )
             return False
         
+        # =====================================================================
+        # 🔥 FIX #159 (Feb 10): Post-displacement cooldown check
+        # If a DISPLACEMENT edge recently expired, don't create new CONSENSUS edge
+        # The market needs to show NEW structure, not re-arm on stale momentum
+        # =====================================================================
+        if self.is_post_displacement_cooldown_active(direction, market_time):
+            cooldown_remaining = (self._post_displacement_cooldown_until - market_time).seconds // 60 if self._post_displacement_cooldown_until else 0
+            logger.warning(
+                f"🔥 FIX #159: CONSENSUS BLOCKED by POST-DISPLACEMENT COOLDOWN | "
+                f"{direction} | ~{cooldown_remaining}min remaining | "
+                f"Wait for NEW structure after displacement expired"
+            )
+            return False
+        
         # 🔥 FIX #36 (Feb 05): Reset from EXPIRED state to allow re-arming
         # Without this, once an edge expires, CONSENSUS can never arm again
         if self._state == EdgeState.EDGE_EXPIRED:
@@ -3573,6 +3663,9 @@ class EdgeStateManager:
         - BREAKOUT falla → TREND cooldown 15min
         - TREND falla → BREAKOUT cooldown 15min
         - RANGE no afecta otros (contexto independiente)
+        
+        🔥 FIX #159b (Feb 10): Si es DISPLACEMENT, SIEMPRE activar post-displacement cooldown
+        para evitar que CONSENSUS entre después de momentum muerto.
         """
         edge_type_str = "UNKNOWN"
         direction = "-"
@@ -3582,6 +3675,24 @@ class EdgeStateManager:
             self._bos_history.append(self._current_bos)
             edge_type_str = self._current_bos.edge_type.value
             direction = self._current_bos.direction
+            
+            # =====================================================================
+            # 🔥 FIX #159b (Feb 10): POST-DISPLACEMENT COOLDOWN AUTOMÁTICO
+            # 
+            # Si expira un DISPLACEMENT por CUALQUIER razón (timeout, flip, chase, etc),
+            # SIEMPRE activar cooldown para evitar que CONSENSUS entre después.
+            # Esto centraliza la protección y cierra TODOS los paths de expiración.
+            # =====================================================================
+            if self._current_bos.edge_type == EdgeType.DISPLACEMENT:
+                logger.warning(
+                    f"🔥 FIX #159b: DISPLACEMENT expired ({reason}) → "
+                    f"Activating 10min POST-DISPLACEMENT COOLDOWN for {direction}"
+                )
+                self.set_post_displacement_cooldown(
+                    direction=direction,
+                    market_time=datetime.utcnow(),
+                    cooldown_minutes=10
+                )
             
             # COOLDOWN POR CONTEXTO: bloquear edges relacionados
             if set_context_cooldown and self._current_bos.trades_lost > 0:

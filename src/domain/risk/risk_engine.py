@@ -777,63 +777,91 @@ class Position:
         
         mfe_r = self.calculate_mfe_r()
         
+        # =====================================================================
+        # 🔥 FIX #139 (Feb 10, 2026): IMPROVED STEPPED TRAILING
+        # 
+        # CAMBIOS vs anterior:
+        # 1. Añadido nivel 1.8R → lock +1.2R (cierra gap 1.5-2.2)
+        # 2. Mejorado nivel 1.0R para TREND: ahora lock +0.2R (no esperar hasta 1.2R)
+        # 3. Los gaps ahora son max 0.3R vs 0.5R anterior
+        #
         # STEPPED TRAILING LEVELS (based on MFE reached, not current price)
         # Once MFE hits a level, lock in that stop - don't give it back
+        # =====================================================================
         
         if mfe_r >= 2.2:
-            # Lock in +1.6R (new level for big runners)
+            # Lock in +1.6R (big runners)
+            lock_r = 1.6
             if self.direction == 'LONG':
-                new_stop = self.initial_entry_price + (risk * 1.6)
+                new_stop = self.initial_entry_price + (risk * lock_r)
                 self.trailing_stop = max(self.trailing_stop, new_stop)
             else:
-                new_stop = self.initial_entry_price - (risk * 1.6)
+                new_stop = self.initial_entry_price - (risk * lock_r)
                 self.trailing_stop = min(self.trailing_stop, new_stop)
-            logger.debug(f"📈 TRAILING STEP 4: MFE {mfe_r:.2f}R >= 2.2R → Lock +1.6R")
+            logger.debug(f"📈 TRAILING STEP 5: MFE {mfe_r:.2f}R >= 2.2R → Lock +{lock_r}R")
+        
+        elif mfe_r >= 1.8:
+            # 🔥 FIX #139: Nuevo nivel para cerrar gap 1.5-2.2
+            lock_r = 1.2
+            if self.direction == 'LONG':
+                new_stop = self.initial_entry_price + (risk * lock_r)
+                self.trailing_stop = max(self.trailing_stop, new_stop)
+            else:
+                new_stop = self.initial_entry_price - (risk * lock_r)
+                self.trailing_stop = min(self.trailing_stop, new_stop)
+            logger.debug(f"📈 TRAILING STEP 4: MFE {mfe_r:.2f}R >= 1.8R → Lock +{lock_r}R")
         
         elif mfe_r >= 1.5:
             # Lock in +0.9R
+            lock_r = 0.9
             if self.direction == 'LONG':
-                new_stop = self.initial_entry_price + (risk * 0.9)
+                new_stop = self.initial_entry_price + (risk * lock_r)
                 self.trailing_stop = max(self.trailing_stop, new_stop)
             else:
-                new_stop = self.initial_entry_price - (risk * 0.9)
+                new_stop = self.initial_entry_price - (risk * lock_r)
                 self.trailing_stop = min(self.trailing_stop, new_stop)
-            logger.debug(f"📈 TRAILING STEP 3: MFE {mfe_r:.2f}R >= 1.5R → Lock +0.9R")
+            logger.debug(f"📈 TRAILING STEP 3: MFE {mfe_r:.2f}R >= 1.5R → Lock +{lock_r}R")
         
         elif mfe_r >= 1.2:
-            # 🔥 FIX (Jan 22, 2026): BE level depends on regime_mode
-            # TREND: BE at 1.2R (give runners room)
-            # RANGE: BE at this level already (was 1.0R but now at 1.2R for RANGE)
-            # Lock in +0.4R for TREND, BE for RANGE
+            # Regime-dependent: RANGE=BE, TREND=+0.4R
             if self.regime_mode == 'RANGE':
-                # RANGE: Lock BE earlier (less runners expected)
                 if self.direction == 'LONG':
                     self.trailing_stop = max(self.trailing_stop, self.initial_entry_price)
                 else:
                     self.trailing_stop = min(self.trailing_stop, self.initial_entry_price)
                 logger.debug(f"📈 TRAILING (RANGE): MFE {mfe_r:.2f}R >= 1.2R → Lock BE")
             else:
-                # TREND/BREAKOUT: Lock +0.4R (give room)
+                lock_r = 0.5  # 🔥 FIX #139: Subido de 0.4R a 0.5R
                 if self.direction == 'LONG':
-                    new_stop = self.initial_entry_price + (risk * 0.4)
+                    new_stop = self.initial_entry_price + (risk * lock_r)
                     self.trailing_stop = max(self.trailing_stop, new_stop)
                 else:
-                    new_stop = self.initial_entry_price - (risk * 0.4)
+                    new_stop = self.initial_entry_price - (risk * lock_r)
                     self.trailing_stop = min(self.trailing_stop, new_stop)
-                logger.debug(f"📈 TRAILING STEP 2: MFE {mfe_r:.2f}R >= 1.2R → Lock +0.4R")
+                logger.debug(f"📈 TRAILING STEP 2: MFE {mfe_r:.2f}R >= 1.2R → Lock +{lock_r}R")
         
         elif mfe_r >= 1.0:
-            # 🔥 FIX: RANGE locks BE at 1.0R (more defensive)
+            # 🔥 FIX #139: TREND ahora protege a 1.0R (no espera hasta 1.2R)
             if self.regime_mode == 'RANGE':
+                # RANGE: Lock at -0.1R (slightly protective)
+                lock_r = -0.1  # 🔥 FIX #139: Mejorado de -0.2R a -0.1R
                 if self.direction == 'LONG':
-                    # Lock at -0.2R (slightly protective but not full BE)
-                    new_stop = self.initial_entry_price - (risk * 0.2)
+                    new_stop = self.initial_entry_price - (risk * abs(lock_r))
                     self.trailing_stop = max(self.trailing_stop, new_stop)
                 else:
-                    new_stop = self.initial_entry_price + (risk * 0.2)
+                    new_stop = self.initial_entry_price + (risk * abs(lock_r))
                     self.trailing_stop = min(self.trailing_stop, new_stop)
-                logger.debug(f"📈 TRAILING (RANGE): MFE {mfe_r:.2f}R >= 1.0R → Lock -0.2R")
-            # TREND: no action at 1.0R, wait for 1.2R
+                logger.debug(f"📈 TRAILING (RANGE): MFE {mfe_r:.2f}R >= 1.0R → Lock {lock_r}R")
+            else:
+                # 🔥 FIX #139: TREND protege +0.2R a 1.0R (nuevo)
+                lock_r = 0.2
+                if self.direction == 'LONG':
+                    new_stop = self.initial_entry_price + (risk * lock_r)
+                    self.trailing_stop = max(self.trailing_stop, new_stop)
+                else:
+                    new_stop = self.initial_entry_price - (risk * lock_r)
+                    self.trailing_stop = min(self.trailing_stop, new_stop)
+                logger.debug(f"📈 TRAILING (TREND): MFE {mfe_r:.2f}R >= 1.0R → Lock +{lock_r}R")
         
         # =====================================================================
         # 🔥 NEW (Feb 2, 2026): AGGRESSIVE TRAILING AT +0.7R
@@ -999,7 +1027,8 @@ class Position:
                                delta_ratio: float | None = None,
                                session: str | None = None,
                                atr_1m: float | None = None,
-                               atr_avg: float | None = None) -> dict | None:
+                               atr_avg: float | None = None,
+                               micro_trend: str | None = None) -> dict | None:
         """
         🔥🔥🔥 FIX #101 v3 (Feb 09, 2026): CONTEXTUAL EARLY EXIT SYSTEM
         🔥 FIX #106 (Feb 09, 2026): PROFIT DRAWDOWN PROTECTION
@@ -1087,44 +1116,74 @@ class Position:
             }
         
         # =====================================================================
-        # 🔥 FIX #106: PROFIT DRAWDOWN PROTECTION (antes de P1)
-        # 
-        # PROBLEMA: Trade llegó a +0.47R pero P1 lo protegió hasta caer a -0.03R
-        # porque "R > 0 → no salir". Devolvió 100% de las ganancias.
-        #
-        # SOLUCIÓN: Si MFE >= 0.35R y perdemos > 60% del MFE, salir con lo restante
-        # - MFE = 0.47R, drawdown_threshold = 0.47 * 0.6 = 0.28R
-        # - Si current_r < 0.47 - 0.28 = 0.19R → salir con ~0.19R
-        #
-        # CONDICIONES:
-        # 1. MFE >= 0.35R (trade mostró dirección correcta)
-        # 2. Drawdown desde MFE > 60% del MFE
-        # 3. Current R < 0.15R (ya devolvió casi todo)
         # =====================================================================
-        PROFIT_PROTECTION_MFE_THRESHOLD = 0.35  # Mínimo MFE para activar
-        PROFIT_PROTECTION_DRAWDOWN_PCT = 0.60   # Máximo drawdown permitido (60% del MFE)
-        PROFIT_PROTECTION_MIN_R = 0.15          # Debajo de esto ya perdió demasiado
+        # 🔥 FIX #144b (Feb 10, 2026): TAKE PROFIT ON MICRO REVERSAL
+        # 
+        # PROBLEMA: Trade 1 hoy - MFE=0.60R pero micro se volvió alcista.
+        # El precio hizo pullback y el sistema esperó demasiado.
+        # Debió haber tomado beneficios cuando la micro se volvió contraria.
+        #
+        # SOLUCIÓN:
+        # Si MFE >= 0.50R Y current_r >= 0.40R Y micro es CONTRARIA:
+        # → TOMAR BENEFICIOS INMEDIATAMENTE (no esperar a que caiga más)
+        #
+        # Lógica: Si ya ganaste 0.50R+ y la micro te dice "el move terminó",
+        # asegurar beneficios en lugar de devolver todo.
+        # =====================================================================
+        MICRO_TP_MFE_THRESHOLD = 0.50   # Necesitas haber llegado a 0.50R
+        MICRO_TP_CURRENT_MIN = 0.40     # Necesitas estar al menos a 0.40R
         
-        if mfe_r >= PROFIT_PROTECTION_MFE_THRESHOLD:
-            drawdown_from_mfe = mfe_r - current_r
-            max_allowed_drawdown = mfe_r * PROFIT_PROTECTION_DRAWDOWN_PCT
-            
-            if drawdown_from_mfe > max_allowed_drawdown and current_r < PROFIT_PROTECTION_MIN_R:
-                logger.warning(
-                    f"🛡️ PROFIT_DRAWDOWN_EXIT: MFE={mfe_r:.2f}R → now={current_r:.2f}R | "
-                    f"Drawdown {drawdown_from_mfe:.2f}R > {max_allowed_drawdown:.2f}R (60% of MFE) | "
-                    f"Protecting remaining profit"
-                )
-                return {
-                    'action': 'CLOSE',
-                    'reason': 'PROFIT_DRAWDOWN_EXIT',
-                    'mfe_r': mfe_r,
-                    'current_r': current_r,
-                    'candles': self.candle_count,
-                    'exit_type': 'PROFIT_PROTECTION',
-                    'drawdown_from_mfe': drawdown_from_mfe,
-                    'max_allowed': max_allowed_drawdown
-                }
+        # Verificar si micro es contraria a nuestra posición
+        micro_is_contrary = False
+        if self.direction == 'SHORT' and micro_trend == 'BULLISH':
+            micro_is_contrary = True
+        elif self.direction == 'LONG' and micro_trend == 'BEARISH':
+            micro_is_contrary = True
+        
+        if mfe_r >= MICRO_TP_MFE_THRESHOLD and current_r >= MICRO_TP_CURRENT_MIN and micro_is_contrary:
+            logger.warning(
+                f"🎯 MICRO_REVERSAL_TP: MFE={mfe_r:.2f}R, current={current_r:.2f}R | "
+                f"Micro={micro_trend} CONTRARY to {self.direction} | "
+                f"Taking profit before reversal"
+            )
+            return {
+                'action': 'CLOSE',
+                'reason': 'MICRO_REVERSAL_TP',
+                'mfe_r': mfe_r,
+                'current_r': current_r,
+                'candles': self.candle_count,
+                'exit_type': 'MICRO_TREND_PROFIT',
+                'micro_trend': micro_trend
+            }
+        
+        # =====================================================================
+        # 🔥 FIX #148 (Feb 10, 2026): PROFIT_DRAWDOWN_EXIT ELIMINADO
+        # =====================================================================
+        # PROBLEMA: Esto era HINDSIGHT BIAS algorítmico puro.
+        # 
+        # Ejemplo real: MFE=0.49R → retrocede a 0.05R → sale con migajas.
+        # Resultado: RR teórico = 1.0, RR real = 0.05. Destruye expectancy.
+        # 
+        # El mercado NO sabe que nosotros íbamos +0.49R.
+        # Usar MFE como base para decidir salida = information leakage temporal.
+        # 
+        # Esto creaba mentalidad de scalper en sistema de momentum:
+        # - Dejaba correr a 0.49R → retrocedía → "me asusto" → salgo.
+        # 
+        # SOLUCIÓN: Confiar en el ATR trailing y en las salidas por estructura.
+        # Si la estructura sigue válida, el trade sigue válido.
+        # El pullback dentro del ATR trailing es NORMAL en trend following.
+        # 
+        # Los únicos exits válidos ahora son:
+        # - SL (protección de capital)
+        # - TP (objetivo alcanzado)
+        # - ATR Trailing (protección de ganancia REAL, no MFE)
+        # - STRUCTURE_EXIT (invalidación de tesis)
+        # - TIME_INVALIDATION (el mercado no se movió)
+        # =====================================================================
+        # ELIMINADO: PROFIT_DRAWDOWN_EXIT
+        # El código antiguo comparaba mfe_r con current_r y cortaba.
+        # Eso mata winners sistemáticamente.
         
         # =====================================================================
         # CAPA P1: SI ESTÁ EN PROFIT → NUNCA CERRAR TEMPRANO
@@ -1212,8 +1271,18 @@ class Position:
         # =====================================================================
         # CAPA X2: STRUCTURE BREAK SIN DELTA (fallback más agresivo)
         # Si no hay delta pero drawdown es muy grande, salir igual
+        # 
+        # 🔥 FIX #142 (Feb 10, 2026): Requiere MFE mínimo antes de activar
+        # PROBLEMA: Con MFE=0.09R, drawdown_from_mfe=0.51R cortaba el trade
+        # sin darle chance. Ahora requiere que el trade haya mostrado algo
+        # de vida (MFE > 0.15R) antes de considerarlo "estructura rota".
+        # 
+        # Si MFE < 0.15R, el trade nunca funcionó → NO es "estructura rota",
+        # es simplemente un mal entry. Dejar que el SL haga su trabajo.
         # =====================================================================
-        if drawdown_from_mfe > 0.5:
+        MFE_MIN_FOR_STRUCTURE_EXIT = 0.15  # Solo si el trade funcionó algo
+        
+        if drawdown_from_mfe > 0.5 and mfe_r >= MFE_MIN_FOR_STRUCTURE_EXIT:
             logger.warning(
                 f"⚡ STRUCTURE_EXIT_NO_DELTA: Drawdown {drawdown_from_mfe:.2f}R > 0.5R | "
                 f"Delta unavailable/neutral but structure clearly broken"
@@ -1900,29 +1969,15 @@ class Position:
         """
         DYNAMIC SIZING: Add 0.5x position when trade proves continuation
         
-        🔥 FIX (Feb 4, 2026): REQUIRE CONTINUATION CONFIRMATION
-        Not just MFE >= 0.6R, but also proof that move is continuing:
-        - Pullback was shallow (didn't give back >40% of MFE)
-        - Making new highs/lows (continuation)
-        - Or momentum still aligned (delta not contradicting hard)
-        
-        🔥 FIX (Feb 4, 2026): MODE SWITCH - NO ADD ON EVENT_DRIVEN TRADES
-        DISPLACEMENT/FAST_PATH trades use Early Partial instead.
-        
-        Returns: dict with add_size if should add, None otherwise
+        🔥 FIX #145 (Feb 10, 2026): DISABLED TEMPORARILY
+        Reason: ADD_TO_WINNER amplificó pérdida en Trade 1 hoy.
+        El trade subió a MFE=0.60R, añadimos tamaño, luego PROFIT_DRAWDOWN_EXIT
+        cortó TODO cuando retrocedió. El problema es que después de añadir,
+        el trailing no se ajustó adecuadamente para proteger la posición ampliada.
+        Desactivamos hasta implementar trailing más inteligente post-add.
         """
-        if self.added_to_winner:
-            return None  # Already added
-        
-        # 🔥 FIX (Feb 4, 2026): NO ADD_TO_WINNER on EVENT_DRIVEN trades
-        # These are shock trades - use Early Partial instead
-        if self.is_event_driven:
-            logger.debug(f"🔄 ADD TO WINNER blocked: EVENT_DRIVEN trade (edge={self.edge_type}) uses Early Partial")
-            return None
-        
-        # 🔥 FIX (Jan 28, 2026): DISABLE ADD_TO_WINNER in RANGE mode
-        if self.regime_mode == 'RANGE':
-            return None
+        # 🔥 FIX #145: DISABLED - Return None immediately
+        return None
         
         mfe_r = self.calculate_mfe_r()
         
@@ -2418,21 +2473,33 @@ class Position:
     # SMART EXITS - 5 Advanced Exit Strategies (Jan 13, 2026)
     # =========================================================================
     
-    def check_scaled_partial_exit(self) -> Optional[Dict]:
+    def check_scaled_partial_exit(self, current_price: float) -> Optional[Dict]:
         """
         SMART EXIT #1: Scaled partial profit taking.
+        
+        🔥 FIX #150 (Feb 10, 2026): Usa current_r, NO MFE
         
         Exit progressively at multiple R levels instead of binary TP1/TP2.
         This locks in profits while letting a portion run.
         
+        CAMBIO CRÍTICO: Ahora usa current_r (PnL actual) en lugar de MFE.
+        - Antes: Si MFE=0.49R pero ahora=0.05R → cerraba (mal)
+        - Ahora: Solo cierra cuando precio ACTUAL está en el nivel
+        
         Returns:
             Dict with exit details if should take partial, None otherwise
-            {'action': 'PARTIAL_EXIT', 'exit_pct': 0.33, 'mfe_r': 0.8, 'reason': str}
+            {'action': 'PARTIAL_EXIT', 'exit_pct': 0.33, 'current_r': 0.8, 'reason': str}
         """
         if not SmartExits.SCALED_PARTIALS_ENABLED:
             return None
         
-        mfe_r = self.calculate_mfe_r()
+        # 🔥 FIX #150: Usar current_r, NO MFE
+        # Queremos cerrar cuando AHORA estamos en profit, no cuando estuvimos antes
+        current_r = self.calculate_r_realized(current_price)
+        
+        # No cerrar si estamos en pérdida
+        if current_r < 0:
+            return None
         
         # Check each scale-out level
         for level_r, exit_pct in SmartExits.SCALE_OUT_LEVELS:
@@ -2441,8 +2508,8 @@ class Position:
             if already_done:
                 continue
             
-            # Check if MFE reached this level
-            if mfe_r >= level_r:
+            # 🔥 FIX #150: Check if CURRENT profit reached this level
+            if current_r >= level_r:
                 # Check if we have enough position left
                 if self.remaining_size_pct <= SmartExits.MIN_RUNNER_PCT:
                     logger.debug(f"📊 SCALED PARTIAL: Skip level {level_r}R - only {self.remaining_size_pct:.0%} remaining (min runner)")
@@ -2456,15 +2523,18 @@ class Position:
                     self.partial_exits_done.append((level_r, actual_exit_pct))
                     self.remaining_size_pct -= actual_exit_pct
                     
-                    logger.info(f"💰 SCALED PARTIAL: Exit {actual_exit_pct:.0%} @ MFE {mfe_r:.2f}R (level: {level_r}R) | Remaining: {self.remaining_size_pct:.0%}")
+                    logger.info(
+                        f"💰 FIX #150 SCALED PARTIAL: Exit {actual_exit_pct:.0%} @ current {current_r:.2f}R | "
+                        f"Level: {level_r}R | Remaining: {self.remaining_size_pct:.0%}"
+                    )
                     
                     return {
                         'action': 'PARTIAL_EXIT',
                         'exit_pct': actual_exit_pct,
-                        'mfe_r': mfe_r,
+                        'current_r': current_r,
                         'level_r': level_r,
                         'remaining_pct': self.remaining_size_pct,
-                        'reason': f'Scaled partial at {level_r}R'
+                        'reason': f'FIX #150 Scaled partial at {level_r}R'
                     }
         
         return None
@@ -2918,8 +2988,8 @@ class Position:
         lock_result = self.check_time_profit_lock()
         # Note: This modifies stop, doesn't trigger full exit
         
-        # Priority 2: Scaled partial exits
-        partial_result = self.check_scaled_partial_exit()
+        # Priority 2: Scaled partial exits (🔥 FIX #150: now uses current_price)
+        partial_result = self.check_scaled_partial_exit(current_price)
         if partial_result:
             return partial_result
         
@@ -3470,6 +3540,20 @@ class RiskEngine:
             pos = self.position
             pos.update_unrealized_pnl(current_price)
             
+            # 🔥 FIX #150: Log periódico del R actual (cada ~30s)
+            current_r_log = pos.current_r_multiple if hasattr(pos, 'current_r_multiple') else 0
+            mfe_r_log = pos.calculate_mfe_r() if hasattr(pos, 'calculate_mfe_r') else 0
+            import time
+            now = time.time()
+            last_log = getattr(self, '_last_r_log_time', 0)
+            if now - last_log >= 30.0:  # Log cada 30 segundos
+                logger.info(
+                    f"📈 POSITION R: current={current_r_log:.3f}R | MFE={mfe_r_log:.3f}R | "
+                    f"price={current_price:.1f} | entry={pos.entry_price:.1f} | "
+                    f"dir={pos.direction}"
+                )
+                self._last_r_log_time = now
+            
             # ================================================================
             # 🔥 PROBE MODE: TP O SL, NADA MÁS (Jan 28, 2026)
             # 
@@ -3707,6 +3791,9 @@ class RiskEngine:
                 trade_tags = getattr(pos, 'trade_tags', {}) or {}
                 delta_ratio = trade_tags.get('volume_delta_ratio', None)
                 
+                # 🔥 FIX #144b: Get micro_trend from position tags
+                micro_trend = trade_tags.get('micro_trend', None)
+                
                 # ATR average (use atr_1m as proxy for avg if not available)
                 atr_avg_val = pos.atr_1m * 1.0 if pos.atr_1m else None  # TODO: track rolling avg
                 
@@ -3717,7 +3804,8 @@ class RiskEngine:
                     delta_ratio=delta_ratio,
                     session=session_str,
                     atr_1m=atr_1m,
-                    atr_avg=atr_avg_val
+                    atr_avg=atr_avg_val,
+                    micro_trend=micro_trend
                 )
                 if early_mfe_check and early_mfe_check.get('action') == 'CLOSE':
                     exit_reason = early_mfe_check.get('reason', 'EARLY_MFE_EXIT')

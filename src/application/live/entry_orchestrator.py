@@ -338,6 +338,9 @@ class GuardOrchestrator:
             transition_mode_active=transition_mode_active
         )
         
+        # 🔥 FIX #147: Initialize absorption_contrary (will be set later in flow)
+        engine._current_trade_tags['absorption_contrary'] = False
+        
         # =====================================================================
         # PHASE 1: HARD BLOCKS (truly blocking conditions)
         # These are infrastructure/concurrency issues, not market conditions
@@ -469,75 +472,62 @@ class GuardOrchestrator:
         result.tags['spread_size_factor'] = spread_result.size_factor
         
         # =====================================================================
-        # 🚨 GUARD 9: DELTA CONTRADICT - 🔥 FIX #102b (Feb 09, 2026)
+        # 🚨 GUARD 9: DELTA CONTRADICT - 🔥 FIX #147 (Feb 10, 2026)
         # =====================================================================
-        # BALANCE: No bloquear (lagging indicator) pero SÍ penalizar
+        # 🔥 FIX #147: HARD BLOCK cuando delta SEVERE + ABSORPTION
         # 
-        # PROBLEMA ORIGINAL (Feb 04): Delta bloqueaba y causaba timing catastrófico
-        # PROBLEMA NUEVO (Feb 09): Ignorar completamente = arrogancia algorítmica
+        # NOTA: El combo check (delta + absorption) se hace MÁS ADELANTE,
+        # después de que absorption_detector haya evaluado (línea ~800+).
+        # Aquí solo registramos el estado de delta para el combo check.
         # 
-        # SOLUCIÓN: Aplicar PENALTY gradual según magnitud del contradict:
-        # - |ratio| < 2.0: No penalty (ruido normal)
-        # - |ratio| 2.0-3.0: Size × 0.8, score -0.3 (cautela ligera)
-        # - |ratio| 3.0-5.0: Size × 0.7, score -0.5 (cautela moderada)
-        # - |ratio| > 5.0: Size × 0.5, score -1.0 (cautela severa)
+        # Si solo delta → penalizar pero permitir (puede ser lagging).
+        # Si delta + absorption → el combo check bloqueará más adelante.
         # =====================================================================
         delta_ratio = engine._current_trade_tags.get('volume_delta_ratio', 0)
         
-        # Check if delta actually contradicts the trade direction
-        # For LONG: negative delta (sellers) contradicts
-        # For SHORT: positive delta (buyers) contradicts
-        delta_contradicts = (
-            (ctx.bias == 'LONG' and delta_ratio < -2.0) or
-            (ctx.bias == 'SHORT' and delta_ratio > 2.0)
+        delta_severe_contradict = (
+            (ctx.bias == 'LONG' and delta_ratio < -5.0) or
+            (ctx.bias == 'SHORT' and delta_ratio > 5.0)
+        )
+        delta_moderate_contradict = (
+            (ctx.bias == 'LONG' and -5.0 <= delta_ratio < -3.0) or
+            (ctx.bias == 'SHORT' and 3.0 < delta_ratio <= 5.0)
         )
         
-        if delta_contradicts:
-            abs_ratio = abs(delta_ratio)
+        # 🔥 Guardar estado de delta para el combo check más adelante
+        engine._current_trade_tags['delta_severe_contradict'] = delta_severe_contradict
+        
+        # Solo delta severe (sin absorption aún) → penalizar fuerte pero permitir
+        if delta_severe_contradict:
             engine._current_trade_tags['delta_info_contradict'] = True
             engine._current_trade_tags['delta_info_ratio'] = delta_ratio
-            
-            # 🔥 FIX #102b: Gradual penalty instead of ignore
-            if abs_ratio >= 5.0:
-                # Severe contradict - halve size
-                penalties.add_penalty(
-                    source=PenaltySource.DELTA_CONTRADICT,
-                    size_mult=0.50,
-                    score_adj=-1.0,
-                    reason=f"Delta SEVERE contradict: {delta_ratio:+.2f}x vs {ctx.bias}"
-                )
-                logger.warning(
-                    f"⚠️ FIX #102b: Delta SEVERE contradict {delta_ratio:+.2f}x vs {ctx.bias} | "
-                    f"Size × 0.50, Score -1.0"
-                )
-            elif abs_ratio >= 3.0:
-                # Moderate contradict
-                penalties.add_penalty(
-                    source=PenaltySource.DELTA_CONTRADICT,
-                    size_mult=0.70,
-                    score_adj=-0.5,
-                    reason=f"Delta MODERATE contradict: {delta_ratio:+.2f}x vs {ctx.bias}"
-                )
-                logger.warning(
-                    f"⚠️ FIX #102b: Delta MODERATE contradict {delta_ratio:+.2f}x vs {ctx.bias} | "
-                    f"Size × 0.70, Score -0.5"
-                )
-            else:  # 2.0-3.0
-                # Light contradict
-                penalties.add_penalty(
-                    source=PenaltySource.DELTA_CONTRADICT,
-                    size_mult=0.80,
-                    score_adj=-0.3,
-                    reason=f"Delta LIGHT contradict: {delta_ratio:+.2f}x vs {ctx.bias}"
-                )
-                logger.info(
-                    f"📊 FIX #102b: Delta LIGHT contradict {delta_ratio:+.2f}x vs {ctx.bias} | "
-                    f"Size × 0.80, Score -0.3"
-                )
+            penalties.add_penalty(
+                source=PenaltySource.DELTA_CONTRADICT,
+                size_mult=0.50,
+                score_adj=-1.0,
+                reason=f"Delta SEVERE contradict: {delta_ratio:+.2f}x vs {ctx.bias}"
+            )
+            logger.warning(
+                f"⚠️ FIX #147: Delta SEVERE {delta_ratio:+.2f}x vs {ctx.bias} | "
+                f"Size × 0.50, Score -1.0"
+            )
+        elif delta_moderate_contradict:
+            # Moderate → penalizar moderado
+            engine._current_trade_tags['delta_info_contradict'] = True
+            engine._current_trade_tags['delta_info_ratio'] = delta_ratio
+            penalties.add_penalty(
+                source=PenaltySource.DELTA_CONTRADICT,
+                size_mult=0.70,
+                score_adj=-0.5,
+                reason=f"Delta MODERATE contradict: {delta_ratio:+.2f}x vs {ctx.bias}"
+            )
+            logger.info(
+                f"📊 FIX #147: Delta MODERATE {delta_ratio:+.2f}x vs {ctx.bias} | "
+                f"Size × 0.70, Score -0.5"
+            )
         else:
             engine._current_trade_tags['delta_info_contradict'] = False
         
-        # Clear any hard block flag from earlier code
         engine._current_trade_tags['delta_block'] = False
         
         # =====================================================================
@@ -762,6 +752,68 @@ class GuardOrchestrator:
             )
             engine._current_trade_tags['absorption_detector_result'] = absorption_result.reason
             engine._current_trade_tags['absorption_detector_signals'] = absorption_result.signal_count
+            
+            # =================================================================
+            # 🔥 FIX #143 + FIX #147: ABSORPTION/DELTA COMBO BLOCK
+            # =================================================================
+            # FIX #143: Absorption con conf >= 50% → BLOQUEAR
+            # FIX #147: Si delta SEVERE + absorption (cualquier conf) → BLOQUEAR
+            # 🔥 FIX #152 (Feb 10, 2026): DELTA MODERATE + ABSORPTION = ALSO BLOCK
+            # 
+            # La idea: delta moderate (3-5x) + absorption = mercado contradice
+            # No es lagging, es confirmación de que el lado contrario está activo.
+            # Entrar contra eso es "jugar a la lotería".
+            # =================================================================
+            absorption_conf = absorption_result.confidence if hasattr(absorption_result, 'confidence') else 50
+            delta_severe = engine._current_trade_tags.get('delta_severe_contradict', False)
+            delta_moderate = engine._current_trade_tags.get('delta_info_contradict', False) and not delta_severe
+            delta_any = delta_severe or delta_moderate
+            delta_ratio = engine._current_trade_tags.get('volume_delta_ratio', 0)
+            
+            # 🔥 FIX #152: Delta ANY + absorption = BLOCK (not just severe)
+            # Delta SEVERE + absorption (any conf) → threshold 30
+            # Delta MODERATE + absorption → threshold 40 (más estricto que antes)
+            # Solo absorption (no delta) → threshold 50
+            if delta_severe:
+                effective_absorption_threshold = 30
+            elif delta_moderate:
+                effective_absorption_threshold = 40  # 🔥 FIX #152: MODERATE + absorption = también peligroso
+            else:
+                effective_absorption_threshold = 50
+            
+            engine._current_trade_tags['absorption_contrary'] = has_absorption and absorption_conf >= effective_absorption_threshold
+            
+            if has_absorption and absorption_conf >= effective_absorption_threshold:
+                log_key = 'ABSORPTION_BLOCK'
+                last_log = _last_guard_log.get(log_key)
+                should_log = last_log is None or (ctx.market_time - last_log) > _guard_log_interval
+                
+                # 🔥 FIX #152: Mensaje diferenciado para combo
+                if delta_severe:
+                    block_type = "DELTA_SEVERE+ABSORPTION"
+                elif delta_moderate:
+                    block_type = "DELTA_MODERATE+ABSORPTION"  # 🔥 FIX #152
+                else:
+                    block_type = "ABSORPTION_ONLY"
+                
+                if should_log:
+                    _last_guard_log[log_key] = ctx.market_time
+                    logger.warning(
+                        f"🛑 FIX #152: {block_type} BLOCK | {ctx.bias} blocked by "
+                        f"{'BULLISH' if ctx.bias == 'SHORT' else 'BEARISH'} absorption | "
+                        f"conf={absorption_conf}% (threshold={effective_absorption_threshold}%) | "
+                        f"delta={delta_ratio:+.2f}x | signals={absorption_result.signal_count} | "
+                        f"reason={absorption_result.reason}"
+                    )
+                
+                engine._current_trade_tags['absorption_blocked'] = True
+                engine._current_trade_tags['absorption_block_reason'] = absorption_result.reason
+                
+                # HARD BLOCK - no penalización, directamente no entrar
+                return result._replace(
+                    can_trade=False,
+                    block_reason=f"ABSORPTION_BLOCK: {absorption_result.reason}"
+                )
             
             # 🔥 BREAKOUT OVERRIDE: Still allow if clear structure break
             allow_short_breakout = (
@@ -1012,142 +1064,49 @@ class GuardOrchestrator:
                     engine._current_trade_tags['fakeout_retracement'] = retracement_pct
         
         # =====================================================================
-        # 🚨 GUARD 15: MULTI-WARNING KILL CHECK (Fix #22 - Feb 02, 2026)
+        # � FIX #133 (Feb 09, 2026): GUARD 15 DISABLED - LOGGING ONLY
         # =====================================================================
-        # PROBLEMA: Trades con MÚLTIPLES warnings igual fueron ejecutados
-        # Ejemplo: bias_invalidated + forbidden_direction + delta_contradicts = 3 red flags
-        # Si hay >=2 señales de peligro → HARD BLOCK
+        # PROBLEMA IDENTIFICADO: Este guard causa DOUBLE-COUNTING de penalties.
+        # 
+        # EVIDENCIA: Las señales que cuenta (bias_invalidated, forbidden_direction,
+        # delta_contradicts) YA aplicaron penalties individuales antes de llegar aquí.
+        # Después, este guard aplica OTRA penalty encima.
+        # 
+        # EJEMPLO: 
+        #   - delta_contradicts → -0.5 score (Guard 10)
+        #   - forbidden_direction → -2.0 score + 30% size (Guard 11)
+        #   - Kill Check cuenta 2 signals → -1.0 score + 50% size ADICIONAL
+        #   - TOTAL: -3.5 score (cuando max lógico sería -2.5)
         #
-        # 🔥 FIX #26 (Feb 04): Make kill check EdgeType and direction aware
-        # - forbidden_direction OPPOSITE to bias is NOT a danger signal for our trade
-        # - expansion_mode_activated for DISPLACEMENT edge is expected behavior
-        # - bias_invalidated before displacement is normal
+        # SOLUCIÓN: Convertir a logging-only para diagnóstico, sin penalties.
+        # El FIX #131 (MAX_TOTAL_PENALTY = -3.0) ya protege contra acumulación.
         # =====================================================================
         danger_signals = 0
         danger_reasons = []
-        
-        # Check all accumulated danger tags
         current_tags = getattr(engine, '_current_trade_tags', {})
         
-        # 🔥 FIX #26: Get current context for intelligent filtering
-        current_bias = ctx.bias
-        forbidden_dir = current_tags.get('forbidden_direction')
-        
-        # Get edge type if active
-        edge_mgr = getattr(engine, '_edge_manager', None)
-        current_edge_type = None
-        force_direct_entry = False
-        if edge_mgr and edge_mgr.current_bos:
-            current_edge_type = edge_mgr.current_bos.edge_type
-            force_direct_entry = getattr(edge_mgr.current_bos, 'force_direct_entry', False)
-        
-        # List of danger signals to count - with intelligent filtering
+        # Still count for logging/diagnostics
         danger_tag_checks = [
-            ('bias_invalidated', 'Bias was invalidated'),
-            ('forbidden_direction', 'Direction is forbidden'),
-            ('delta_contradicts', 'Delta contradicts direction'),
-            ('fast_path_blocked_by_delta', 'Fast Path blocked by delta'),
-            ('expansion_mode_activated', 'Expansion against direction'),
-            ('structure_break_against', 'Structure broke against us'),
-            ('momentum_exhaustion', 'Momentum is exhausted'),
+            ('bias_invalidated', 'Bias invalidated'),
+            ('forbidden_direction', 'Forbidden dir'),
+            ('delta_contradicts', 'Delta contra'),
+            ('expansion_mode_activated', 'Expansion'),
+            ('structure_break_against', 'Structure break'),
         ]
         
         for tag_name, reason_text in danger_tag_checks:
             if current_tags.get(tag_name):
-                # 🔥 FIX #26: Intelligent filtering by context
-                should_count = True
-                
-                # 🔥 FIX #4 (Feb 04): forbidden_direction OPPOSITE to our bias is NOT dangerous
-                # e.g., forbidden_direction='SHORT' when trading LONG is FINE for the LONG trade
-                if tag_name == 'forbidden_direction':
-                    if forbidden_dir and forbidden_dir != current_bias:
-                        should_count = False  # Opposite direction is forbidden, not ours
-                
-                # 🔥 FIX #5 (Feb 04): DISPLACEMENT edge context
-                if current_edge_type and current_edge_type.value == 'DISPLACEMENT':
-                    # expansion_mode_activated is EXPECTED for DISPLACEMENT - it's part of the event
-                    if tag_name == 'expansion_mode_activated':
-                        should_count = False  # Normal for displacement
-                    
-                    # bias_invalidated is NORMAL before displacement (displacement comes after invalidation)
-                    if tag_name == 'bias_invalidated' and force_direct_entry:
-                        should_count = False  # Expected - displacement overrides
-                
-                if should_count:
-                    danger_signals += 1
-                    danger_reasons.append(tag_name)
+                danger_signals += 1
+                danger_reasons.append(reason_text)
         
-        # Also check result.tags accumulated so far
-        result_tag_checks = [
-            'bias_invalidated',
-            'forbidden_direction',
-            'delta_contradicts_direction',
-        ]
-        for tag_name in result_tag_checks:
-            if result.tags.get(tag_name) and tag_name not in danger_reasons:
-                # Apply same intelligent filtering
-                should_count = True
-                if tag_name == 'forbidden_direction':
-                    tag_value = result.tags.get(tag_name)
-                    if tag_value and tag_value != current_bias:
-                        should_count = False
-                
-                if should_count:
-                    danger_signals += 1
-                    danger_reasons.append(tag_name)
-        
-        # =====================================================================
-        # 🔥 FIX #80 (Feb 07, 2026): GRADUATED KILL CHECK instead of binary
-        # =====================================================================
-        # OLD: ≥2 signals → HARD BLOCK (unless special bypass)
-        # NEW: Graduated penalty based on danger count
-        #   - 2 signals: 50% size, -1 score (was already SOFT in some cases)
-        #   - 3 signals: 35% size, -2 score
-        #   - 4 signals: 20% size, -3 score
-        #   - 5+ signals: HARD BLOCK (too risky)
-        #
-        # WHY: Trading is about probability. 2-3 warning signals means
-        # "be careful" not "impossible to win". Reduce exposure instead.
-        # =====================================================================
+        # Log for diagnostics but NO PENALTY (FIX #133)
         if danger_signals >= 2:
-            # Always calculate graduated penalty
-            if danger_signals >= 5:
-                # TRUE DANGER - hard block
-                logger.warning(
-                    f"🚫🚫🚫 GUARD BLOCKED: KILL CHECK ({danger_signals} signals) | "
-                    f"Signals: {', '.join(danger_reasons)} | Too risky"
-                )
-                result.passed = False
-                result.reason = f"Kill check: {danger_signals} danger signals ({', '.join(danger_reasons)})"
-                result.tags['block_category'] = 'multi_warning_kill'
-                result.tags['danger_signal_count'] = danger_signals
-                result.tags['danger_reasons'] = danger_reasons
-                engine._current_trade_tags['guard_blocked_by_kill_check'] = True
-                return result
-            else:
-                # 🔥 FIX #80 + #81: Use penalty accumulator
-                if danger_signals == 4:
-                    kill_size_mult = 0.20
-                    kill_score_penalty = -3.0
-                elif danger_signals == 3:
-                    kill_size_mult = 0.35
-                    kill_score_penalty = -2.0
-                else:  # 2 signals
-                    kill_size_mult = 0.50
-                    kill_score_penalty = -1.0
-                
-                logger.warning(
-                    f"⚠️ FIX #80 KILL SOFT: {danger_signals} signals ({', '.join(danger_reasons)}) | "
-                    f"size×{kill_size_mult:.0%}, score{kill_score_penalty:+.1f}"
-                )
-                penalties.add_penalty(
-                    source=PenaltySource.DANGER_SIGNALS,
-                    size_mult=kill_size_mult,
-                    score_adj=kill_score_penalty,
-                    reason=f"Kill check: {danger_signals} signals ({', '.join(danger_reasons[:3])})"
-                )
-                engine._current_trade_tags['kill_check_soft_mode'] = True
-                # Continue with penalties - don't block
+            logger.debug(
+                f"📊 FIX #133 KILL CHECK (LOGGING ONLY): {danger_signals} signals | "
+                f"{', '.join(danger_reasons)} | No penalty applied (handled by individual guards)"
+            )
+            engine._current_trade_tags['danger_signal_count_diagnostic'] = danger_signals
+            # NO penalties.add_penalty() - individual guards already handled these
         
         # 15. Session limits (just flag - override checked later)
         # 🔥 FIX (Feb 02, 2026): Apply mode-based cap to session limit
@@ -1451,12 +1410,9 @@ class ScoreOrchestrator:
             result.tags['fakeout_penalty'] = fakeout_score_penalty
             logger.info(f"⚠️ FIX #79 FAKEOUT SCORE: Applied penalty {fakeout_score_penalty}")
         
-        # FIX #80: Kill check graduated penalty
-        kill_check_score_penalty = engine._current_trade_tags.get('kill_check_score_penalty', 0)
-        if kill_check_score_penalty < 0:
-            result.score = max(0, result.score + kill_check_score_penalty)
-            result.tags['kill_check_penalty'] = kill_check_score_penalty
-            logger.info(f"⚠️ FIX #80 KILL CHECK SCORE: Applied penalty {kill_check_score_penalty}")
+        # 🔥 FIX #133 (Feb 09, 2026): Kill check disabled - was causing double-counting
+        # The individual guards (delta, forbidden, etc.) already applied penalties
+        # No additional kill_check_score_penalty needed
         
         # =====================================================================
         
@@ -1499,7 +1455,8 @@ class ScoreOrchestrator:
         if trading_mode == 'TRANSITION':
             transition_min = RiskManagement.TRANSITION_MIN_SCORE
             if threshold < transition_min:
-                logger.info(f"📊 TRANSITION MODE: Raising threshold from {threshold:.1f} to {transition_min:.1f}")
+                # 🔥 FIX #151: Rate-limit to avoid log spam (only debug level)
+                logger.debug(f"📊 TRANSITION MODE: Raising threshold from {threshold:.1f} to {transition_min:.1f}")
                 threshold = transition_min
         
         # =====================================================================
@@ -1912,11 +1869,9 @@ class SizingOrchestrator:
             logger.info(f"⚠️ FIX #79 FAKEOUT SIZE: Applying {fakeout_size_mult:.0%}")
         result.multipliers['fakeout_penalty'] = fakeout_size_mult
         
-        # FIX #80: Kill check graduated penalty
-        kill_check_size_mult = engine._current_trade_tags.get('kill_check_size_cap', 1.0)
-        if kill_check_size_mult < 1.0:
-            logger.info(f"⚠️ FIX #80 KILL CHECK SIZE: Applying {kill_check_size_mult:.0%}")
-        result.multipliers['kill_check_penalty'] = kill_check_size_mult
+        # 🔥 FIX #133 (Feb 09, 2026): Kill check disabled - was causing double-counting
+        # Individual guards already applied size penalties
+        # No additional kill_check_size_cap needed
         
         # =====================================================================
         
@@ -2101,6 +2056,10 @@ async def _displacement_fast_path(
     """
     FAST PATH para DISPLACEMENT - bypasea validación normal.
     
+    🔥 FIX #160 (Feb 10): MODE_EXPANSION elimina frenos por barras
+    En expansión de tendencia, no hay "chase block" por número de velas.
+    Solo se bloquea si la ESTRUCTURA se invalida (precio cruza origen).
+    
     Returns:
         EntryResult si debe ejecutar fast path
         None si debe continuar con pipeline normal
@@ -2123,55 +2082,84 @@ async def _displacement_fast_path(
         return None
     
     # Solo para DISPLACEMENT edge type
-    # 🔧 FIX: Comparar con EdgeType.DISPLACEMENT (enum), no string
     if current_bos.edge_type != EdgeType.DISPLACEMENT:
         return None
     
     bars_since = current_bos.bars_since_displacement
     
     # =====================================================================
-    # 🔥 VENTANA DURA: bars <= 1 solamente (no 2)
-    # Si pasó más de 1 vela, ya es pipeline normal (pullback entry)
+    # 🔥 FIX #160 (Feb 10): MODE_EXPANSION vs MODE_RANGE
+    # 
+    # PROBLEMA CRÍTICO: El sistema trataba TODOS los trades igual.
+    # En RANGE: cooldowns, waits, chase blocks → correcto
+    # En EXPANSION: los mismos frenos → DESTRUYE el edge
+    #
+    # SOLUCIÓN: Dos modos de operación completamente diferentes:
+    #
+    # MODE_RANGE (trend_expansion_active=False):
+    #   - FAST_PATH_MAX_BARS = 3 (entrada rápida)
+    #   - bars 4-10: Zona pullback
+    #   - bars > 10: CHASE BLOCK
+    #
+    # MODE_EXPANSION (trend_expansion_active=True):
+    #   - FAST_PATH_MAX_BARS = 10 (ventana extendida)
+    #   - NO chase block por barras
+    #   - Solo invalidar si ESTRUCTURA rompe (precio cruza origen)
     # =====================================================================
-    FAST_PATH_MAX_BARS = 1  # DURO: solo 0-1 velas
+    trend_expansion_active = getattr(engine, '_trend_expansion_active', False)
     
-    if bars_since > FAST_PATH_MAX_BARS:
-        # =====================================================================
-        # 🚫 FAST PATH PERDIDO - El tren se fue
-        # 
-        # Regla profesional: "Si no entraste en 0-1 velas, NO es trade de displacement"
-        # 
-        # Opciones:
-        # - bars 2-5: Pipeline normal puede buscar PULLBACK (diferente setup)
-        # - bars > 5: CHASE BLOCK - No perseguir
-        # =====================================================================
+    if trend_expansion_active:
+        # ═══════════════════════════════════════════════════════════════════
+        # MODE_EXPANSION: Ventana extendida, sin chase block por barras
+        # ═══════════════════════════════════════════════════════════════════
+        FAST_PATH_MAX_BARS = 10  # Ventana mucho más amplia en expansión
         
-        # Marcar que ya no es entrada directa
-        if current_bos.force_direct_entry:
-            current_bos.force_direct_entry = False
-            logger.warning(
-                f"🚂 DISPLACEMENT FAST PATH MISSED | bars={bars_since} > {FAST_PATH_MAX_BARS} | "
-                f"El tren se fue - ahora solo PULLBACK entry permitida"
-            )
-            engine._current_trade_tags['displacement_fast_path_missed'] = True
-            engine._current_trade_tags['displacement_missed_at_bars'] = bars_since
+        if bars_since > FAST_PATH_MAX_BARS:
+            if current_bos.force_direct_entry:
+                current_bos.force_direct_entry = False
+                logger.info(
+                    f"🚀 MODE_EXPANSION: bars={bars_since} > {FAST_PATH_MAX_BARS} | "
+                    f"Fast path cerrado pero PIPELINE NORMAL permitido (sin chase block)"
+                )
+                engine._current_trade_tags['expansion_mode_entry'] = True
+            # En EXPANSION: NO cerramos entry_window, permitimos pipeline normal
+            return None
         
-        if bars_since <= 5:
-            # Zona 2: Pullback posible (pero ya no es displacement puro)
-            logger.debug(
-                f"🌊 DISPLACEMENT: bars={bars_since} - PULLBACK ZONE | "
-                f"Pipeline normal evaluará pullback entry"
-            )
-        else:
-            # Zona 3: CHASE BLOCK - No perseguir
-            logger.info(
-                f"🚫 DISPLACEMENT CHASE BLOCK | bars={bars_since} > 5 | "
-                f"Edge expirado - no perseguir"
-            )
-            # Marcar edge como entry_window_closed
-            current_bos.entry_window_open = False
+        logger.info(
+            f"🚀 MODE_EXPANSION FAST PATH | bars={bars_since} | "
+            f"Trend expansion activo - ventana extendida"
+        )
+    else:
+        # ═══════════════════════════════════════════════════════════════════
+        # MODE_RANGE: Frenos normales, ventana corta
+        # ═══════════════════════════════════════════════════════════════════
+        FAST_PATH_MAX_BARS = 3
+        PULLBACK_ZONE_MAX = 10  # Usar config en vez de hardcode 5
         
-        return None
+        if bars_since > FAST_PATH_MAX_BARS:
+            if current_bos.force_direct_entry:
+                current_bos.force_direct_entry = False
+                logger.warning(
+                    f"🚂 DISPLACEMENT FAST PATH MISSED | bars={bars_since} > {FAST_PATH_MAX_BARS} | "
+                    f"El tren se fue - ahora solo PULLBACK entry permitida"
+                )
+                engine._current_trade_tags['displacement_fast_path_missed'] = True
+                engine._current_trade_tags['displacement_missed_at_bars'] = bars_since
+            
+            if bars_since <= PULLBACK_ZONE_MAX:
+                logger.debug(
+                    f"🌊 DISPLACEMENT: bars={bars_since} - PULLBACK ZONE | "
+                    f"Pipeline normal evaluará pullback entry"
+                )
+            else:
+                # MODE_RANGE: Sí aplicar CHASE BLOCK
+                logger.info(
+                    f"🚫 MODE_RANGE CHASE BLOCK | bars={bars_since} > {PULLBACK_ZONE_MAX} | "
+                    f"Edge expirado - no perseguir"
+                )
+                current_bos.entry_window_open = False
+            
+            return None
     
     # =====================================================================
     # 🔥 CHECK 1.5: ANTICIPATION EDGE PRIORITY (FIX #29)
@@ -2611,57 +2599,37 @@ async def _displacement_fast_path(
         return None
     
     # =====================================================================
-    # CHECK 2.5f: REAL-TIME STALE CHECK (Feb 04, 2026)
+    # CHECK 2.5f: REAL-TIME STALE CHECK 
     # =====================================================================
-    # PROBLEMA: El tag 'stale_displacement' se pone en trading_app.py
-    # cuando se DETECTA el displacement, pero el FAST PATH se ejecuta en
-    # ticks POSTERIORES cuando el tag puede no estar.
+    # 🔥 FIX #157 (Feb 10, 2026): ELIMINADO - STALE CHECK ERA CONTRAPRODUCENTE
+    # 
+    # PROBLEMA REAL (Feb 10, 2026):
+    #   15:39:19 - DISPLACEMENT $919 detectado
+    #   15:39:19 - STALE BLOCK porque precio cerca del low
+    #   15:40-45 - CHASE BLOCK x21 veces
+    #   15:50:00 - Entra tarde cuando momentum murió → PIERDE
     #
-    # CASO REAL (Feb 04, 2026):
-    #   09:24:33 - STALE detectado (precio = low)
-    #   09:26-27 - Precio baja a nuevo low $75,977
-    #   09:28:16 - Precio rebota a $76,074 - FAST PATH ejecuto SHORT
+    # ANÁLISIS:
+    # La regla "no vendas el low" tiene sentido en REVERSALS, no en DISPLACEMENT.
+    # En un DISPLACEMENT real, el momentum está ACTIVO precisamente cuando
+    # el precio está cerca del extremo. Bloquear ahí mata el trade.
     #
-    # FIX: RECALCULAR STALE en tiempo real dentro del FAST PATH
-    #      Para SHORT: distance = current_price - _bias_low_since
-    #      Para LONG: distance = _bias_high_since - current_price
-    #      Si distance < 0.5 * ATR_5m -> STALE (momentum agotado)
+    # NUEVO ENFOQUE:
+    # - Si hay DISPLACEMENT real (detectado), el momentum ES el extremo
+    # - El FAST PATH ya tiene protección con bars_since <= MAX_BARS
+    # - Si el edge expiró (bars > 5), el pipeline normal decide
+    # - NO agregar otro bloqueo que contradice la señal primaria
     #
-    # Regla: "No vendas el low, no compres el high"
+    # Este check generó más pérdidas que las que evitó porque:
+    # 1. Bloqueaba entradas CON momentum
+    # 2. Permitía entradas SIN momentum (después que expiró)
     # =====================================================================
-    STALE_ATR_MULTIPLIER = 0.5
-    stale_threshold = ctx.atr_5m * STALE_ATR_MULTIPLIER
-    is_stale_realtime = False
-    stale_distance = 0.0
-    stale_extreme = 0.0
-    
-    if disp_direction == 'SHORT':
-        bias_low = getattr(engine, '_bias_low_since', None)
-        if bias_low and bias_low > 0:
-            stale_distance = current_price - bias_low
-            stale_extreme = bias_low
-            if stale_distance < stale_threshold:
-                is_stale_realtime = True
-    else:
-        bias_high = getattr(engine, '_bias_high_since', None)
-        if bias_high and bias_high > 0:
-            stale_distance = bias_high - current_price
-            stale_extreme = bias_high
-            if stale_distance < stale_threshold:
-                is_stale_realtime = True
-    
-    if is_stale_realtime:
-        extreme_type = 'Low' if disp_direction == 'SHORT' else 'High'
-        logger.warning(
-            f"🚫 FAST PATH BLOCKED: STALE (REAL-TIME) | "
-            f"Direction={disp_direction} | Price=${current_price:.0f} | "
-            f"{extreme_type}=${stale_extreme:.0f} | "
-            f"Distance=${stale_distance:.0f} < threshold=${stale_threshold:.0f} (0.5 ATR) | "
-            f"Momentum exhausted - only PULLBACK entry allowed"
-        )
-        engine._current_trade_tags['fast_path_blocked_stale_realtime'] = True
-        engine._current_trade_tags['fast_path_stale_distance'] = stale_distance
-        return None
+    # STALE CHECK ELIMINADO - Confiamos en el displacement detection
+    logger.debug(
+        f"FIX #157: STALE CHECK DISABLED in FAST PATH | "
+        f"Price={current_price:.0f} | direction={disp_direction} | "
+        f"Trusting displacement momentum"
+    )
     
     # =====================================================================
     # CHECK 2.5g: MOMENTUM == 0 -> BLOCK FAST PATH (Feb 04, 2026)
@@ -3878,25 +3846,37 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         'score_breakdown': score_result.breakdown.copy(),
     }
     
-    # 🔥 FIX (Jan 30): Check for DISPLACEMENT DIRECT ENTRY for aggressive execution
-    # During DIRECT ENTRY WINDOW, post-only is counterproductive - use IOC
+    # 🔥 FIX #146 (Feb 10, 2026): AGGRESSIVE ENTRY FOR TREND_BIRTH
+    # PROBLEM: POST-ONLY LIMIT orders fail when market moves in your favor
+    #   - Example: SHORT signal, price drops, SELL LIMIT never fills (needs price to rise)
+    #   - System stuck in WAIT_FILL for 30s+ with timeouts
+    # SOLUTION: Use IOC (taker order) for TREND_BIRTH - these are fast-moving entries
     aggressive_execution = False
-    edge_mgr = getattr(engine, '_edge_manager', None)
-    if edge_mgr is not None:
-        from src.domain.trading.edge_state_manager import EdgeState, EdgeType
-        is_displacement_edge = (
-            edge_mgr.state == EdgeState.EDGE_ACTIVE and 
-            edge_mgr.current_bos is not None and
-            edge_mgr.current_bos.edge_type == EdgeType.DISPLACEMENT
-        )
-        # Check if still in DIRECT ENTRY WINDOW (0-2 bars)
-        if is_displacement_edge:
-            bars_since_disp = edge_mgr.current_bos.bars_since_displacement
-            if bars_since_disp is not None and bars_since_disp <= 2:
-                aggressive_execution = True
-                logger.warning(
-                    f"🚀 DISPLACEMENT DIRECT ENTRY: bar {bars_since_disp}/2 → AGGRESSIVE EXECUTION ENABLED"
-                )
+    
+    # Check 1: TREND_BIRTH phase → market is moving, post-only will miss
+    ti_phase = engine._current_trade_tags.get('ti_phase', '')
+    if ti_phase == 'TREND_BIRTH':
+        aggressive_execution = True
+        logger.warning(f"🚀 FIX #146 TREND_BIRTH AGGRESSIVE: Using IOC (taker) for {bias}")
+    
+    # Check 2: DISPLACEMENT DIRECT ENTRY (original logic)
+    if not aggressive_execution:
+        edge_mgr = getattr(engine, '_edge_manager', None)
+        if edge_mgr is not None:
+            from src.domain.trading.edge_state_manager import EdgeState, EdgeType
+            is_displacement_edge = (
+                edge_mgr.state == EdgeState.EDGE_ACTIVE and 
+                edge_mgr.current_bos is not None and
+                edge_mgr.current_bos.edge_type == EdgeType.DISPLACEMENT
+            )
+            # Check if still in DIRECT ENTRY WINDOW (0-2 bars)
+            if is_displacement_edge:
+                bars_since_disp = edge_mgr.current_bos.bars_since_displacement
+                if bars_since_disp is not None and bars_since_disp <= 2:
+                    aggressive_execution = True
+                    logger.warning(
+                        f"🚀 DISPLACEMENT DIRECT ENTRY: bar {bars_since_disp}/2 → AGGRESSIVE EXECUTION"
+                    )
     
     order_result = await OrderExecutor.place_order(
         engine, ctx, sizing_result.size, stop_loss, take_profit,

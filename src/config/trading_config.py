@@ -1084,13 +1084,11 @@ class OperatingMode:
     MODE = property(lambda self: OperatingMode.get_mode())
     
     # Mode-specific thresholds
-    # 🔥 FIX (Feb 01, 2026): Data-driven threshold adjustment
-    # Analysis of 62 trades shows:
-    # - Score < 5: 16.7% win rate, -1.36R net (6 trades)
-    # - Score >= 5: ~50% win rate, positive edge
-    # - FAST_PATH (score=0): 37.5% win rate, +0.42R (separate edge, exempt)
-    # Optimal threshold from simulation: 5.0 saves +1.36R
-    DISCOVERY_SCORE_THRESHOLD = 5   # 🔥 Raised from 4 based on log analysis (Feb 01)
+    # 🔥 FIX #155 (Feb 10, 2026): Score threshold raised from 5 to 6
+    # Analysis shows score 5.5 trades have MFE=0.00R (never go in favor)
+    # Example: Trade 14:17:43 entered with score 5.5, lost -0.44R
+    # Trades with score < 6 are lottery tickets, not trades.
+    DISCOVERY_SCORE_THRESHOLD = 6   # 🔥 Raised from 5 - marginal trades must not enter
     PRODUCTION_SCORE_THRESHOLD = 7  # Stricter
     
     # Risk per trade by mode
@@ -1218,17 +1216,26 @@ class OperatingMode:
         return cls.DAY_OF_WEEK_MULTIPLIERS.get(day_of_week, 1.0)
     
     # SMART COOLDOWN - Based on exit reason and PnL size
-    # 🔥 FIX (Jan 22, 2026): Smart cooldown based on exit QUALITY not just type
-    # - Planned exits (VPOC_EXIT, TP) = short cooldown (setup can still be valid)
-    # - SL_HIT = medium cooldown (need to re-evaluate)
-    # - EMERGENCY = longer cooldown (system issue)
-    COOLDOWN_TIME_INVALIDATION = 3   # 3 min - market was dead, not error
-    COOLDOWN_PLANNED_EXIT = 5        # 🔥 NEW: VPOC_EXIT, TP with small profit = 5 min
-    COOLDOWN_SL_SMALL_LOSS = 8       # 8 min - small loss (< 0.5R)
-    COOLDOWN_SL_NORMAL = 12          # 🔥 REDUCED from 15: normal SL hit
-    COOLDOWN_SL_LARGE_LOSS = 20      # 🔥 REDUCED from 25: large loss (> 1R)
+    # 🔥 FIX #149 (Feb 10, 2026): NO COOLDOWN TRAS PROFIT
+    # 
+    # PROBLEMA: Cooldown tras profit pequeño = "miedo codificado"
+    # Sales bien → 5min cooldown → pierdes continuación → frustración.
+    # 
+    # SOLUCIÓN INSTITUCIONAL:
+    # - Profit (pnl_r > 0) = 0 cooldown (el edge sigue, entra de nuevo)
+    # - BE/scratch = 1 min (reset mental)
+    # - Pequeña pérdida = normal (recalibrar)
+    # - Grande pérdida = más largo (protección emocional)
+    # =====================================================================
+    COOLDOWN_PROFIT = 0              # 🔥 FIX #149: Sin cooldown tras profit
+    COOLDOWN_SCRATCH = 1             # 🔥 FIX #149: BE/scratch = 1 min reset
+    COOLDOWN_TIME_INVALIDATION = 2   # 🔥 Reducido de 3: mercado muerto, no error
+    COOLDOWN_PLANNED_EXIT = 0        # 🔥 FIX #149: TP = 0 cooldown (captura continuación)
+    COOLDOWN_SL_SMALL_LOSS = 5       # 🔥 Reducido de 8: pequeña pérdida
+    COOLDOWN_SL_NORMAL = 10          # 🔥 Reducido de 12: pérdida normal
+    COOLDOWN_SL_LARGE_LOSS = 15      # 🔥 Reducido de 20: pérdida grande
     COOLDOWN_EMERGENCY = 30          # 30 min - emergency close
-    COOLDOWN_DEFAULT = 10            # 🔥 REDUCED from 15: unknown reason
+    COOLDOWN_DEFAULT = 5             # 🔥 Reducido de 10: default más bajo
     
     # If signal still aligned with HTF after loss, reduce cooldown
     COOLDOWN_ALIGNED_REDUCTION = 0.5  # 50% reduction if still aligned
@@ -1237,7 +1244,7 @@ class OperatingMode:
     PLANNED_EXIT_REASONS = {
         'VPOC_EXIT', 'TP_HIT', 'TAKE_PROFIT', 'TP1', 'TP2',
         'EXCHANGE_TAKE_PROFIT', 'MOMENTUM_EXHAUSTION', 'SMART_EXIT',
-        'VOLATILITY_SQUEEZE_EXIT', 'EARLY_MFE_EXIT'  # 🔥 FIX (Feb 07): If profitable, short cooldown
+        'VOLATILITY_SQUEEZE_EXIT', 'EARLY_MFE_EXIT', 'MICRO_REVERSAL_TP'
     }
     
     @classmethod
@@ -1245,35 +1252,39 @@ class OperatingMode:
         """
         Calculate cooldown based on exit reason and loss size.
         
-        🔥 FIX (Jan 22, 2026): Differentiate planned exits from losses
-        - VPOC_EXIT with profit = 5 min (was 15)
-        - SL hit = depends on loss size
-        🔥 FIX (Feb 07, 2026): EARLY_MFE_EXIT with profit = short cooldown
-        🔥🔥🔥 FIX #86 (Feb 07, 2026): EARLY_MFE_EXIT = MINIMO cooldown
-        PROBLEMA: Después de EARLY_MFE_EXIT, 8min de cooldown mientras 
-        el mercado sigue moviéndose = PERDER el movimiento real.
-        EARLY_MFE_EXIT significa que cortamos temprano por precaución,
-        NO que hubo un error → cooldown mínimo de 2 minutos.
+        🔥 FIX #149 (Feb 10, 2026): NO COOLDOWN TRAS PROFIT
+        
+        PROBLEMA: Cooldown tras profit = miedo codificado
+        - Sales con +0.05R → 5min cooldown → el mercado continúa → pierdes.
+        
+        SOLUCIÓN INSTITUCIONAL:
+        - Profit > 0 → 0 cooldown (el edge sigue activo)
+        - Scratch/BE → 1 min (reset mental mínimo)
+        - Pérdida pequeña → cooldown moderado
+        - Pérdida grande → cooldown largo
+        
+        El sistema debe estar LISTO para reentrar si el edge sigue.
         """
         exit_upper = exit_reason.upper()
         
-        # 🔥 FIX #86: EARLY_MFE_EXIT = cooldown MINIMO de 2 minutos
-        # Ya cortamos temprano, no tiene sentido castigarse más
-        if exit_upper == 'EARLY_MFE_EXIT':
-            return 2  # 2 minutos MAXIMO - no perdemos el movimiento
+        # 🔥 FIX #149: SI HAY PROFIT → 0 COOLDOWN
+        # El edge funcionó. Puede haber continuación.
+        if pnl_r > 0.02:  # >0.02R = profit real (no dust)
+            return cls.COOLDOWN_PROFIT  # 0 minutos
         
-        # Planned exits with profit/small loss = short cooldown
+        # Scratch/BE (-0.02 a +0.02)
+        if -0.02 <= pnl_r <= 0.02:
+            return cls.COOLDOWN_SCRATCH  # 1 minuto
+        
+        # Planned exits (TP, VPOC, etc.)
         if exit_upper in cls.PLANNED_EXIT_REASONS or any(r in exit_upper for r in ['VPOC', 'TP', 'PROFIT']):
-            if pnl_r >= 0:
-                return cls.COOLDOWN_PLANNED_EXIT
-            # Planned exit but ended in loss (unusual)
-            return cls.COOLDOWN_SL_SMALL_LOSS
+            return cls.COOLDOWN_PLANNED_EXIT
         
         if exit_reason == 'TIME_INVALIDATION':
             return cls.COOLDOWN_TIME_INVALIDATION
         elif 'EMERGENCY' in exit_reason:
             return cls.COOLDOWN_EMERGENCY
-        elif 'SL' in exit_reason or 'STOP' in exit_reason:
+        elif 'SL' in exit_reason or 'STOP' in exit_reason or 'STRUCTURE' in exit_reason:
             # Size-based cooldown for stop losses
             if abs(pnl_r) < 0.5:
                 return cls.COOLDOWN_SL_SMALL_LOSS
@@ -1456,18 +1467,17 @@ class EntryGateConfig:
     # 
     # 🔥 FIX (Feb 01, 2026): Data-driven score thresholds from 62 trade analysis
     # Analysis results:
-    # - Score < 4.5: 4 trades, 0% win rate, -1.18R net → BLOCK
-    # - Score 4.5-5.0: 2 trades, 50% win rate, -0.18R net → PROBE only
-    # - Score >= 5.0: ~50% win rate, positive edge
-    # - FAST_PATH (score=0): 37.5% win rate, +0.42R (exempt, separate logic)
+    # 🔥 FIX #156 (Feb 10, 2026): Score thresholds raised
+    # BEFORE: BLOCK=4.5, PROBE=5.0, REDUCED=5.5, FULL>=5.5
+    # NOW: BLOCK=5.5, PROBE=6.0, REDUCED=6.5, FULL>=6.5
     #
-    # CHANGE: Raised SCORE_BLOCK_FLOOR from 3.5 → 4.5 based on empirical data
-    # This blocks the 4 losing trades while keeping the 1 winner in probe
+    # Trade 14:17:43 entered with score 5.5, MFE=0.00R, lost -0.44R
+    # Score 5.5 is lottery, not trading. Raising floors.
     #
-    SCORE_BLOCK_FLOOR = 4.5          # 🔥 Raised from 3.5 based on log analysis
-    SCORE_PROBE_MAX = 5.0            # 4.5-5.0 = probe (0.25x) - marginal quality
-    SCORE_REDUCED_MAX = 5.5          # 5.0-5.5 = reduced (0.5x)
-    # Above 5.5 = full size (1.0x)
+    SCORE_BLOCK_FLOOR = 5.5          # 🔥 Raised from 4.5 - marginal trades must not enter
+    SCORE_PROBE_MAX = 6.0            # 5.5-6.0 = probe (0.25x)
+    SCORE_REDUCED_MAX = 6.5          # 6.0-6.5 = reduced (0.5x)
+    # Above 6.5 = full size (1.0x)
     
     # RR-BASED SIZING
     # Graduated sizing based on risk:reward quality
@@ -2143,21 +2153,32 @@ class SmartExits:
     # =========================================================================
     # 1. SCALED PARTIAL EXITS - Take profits progressively
     # =========================================================================
+    # 🔥 FIX #150 (Feb 10, 2026): SALIDAS ESCALONADAS INSTITUCIONALES
+    # 
+    # PROBLEMA ANTERIOR: Esperaba +1.0R para primer parcial → rara vez llegaba
+    # RESULTADO: MFE=0.49R pero cerraba todo junto o muy tarde.
+    # 
+    # SOLUCIÓN INSTITUCIONAL (3 tramos):
+    # - 30% @ +0.30R → Paga el riesgo temprano
+    # - 40% @ +0.80R → Captura el core del movimiento
+    # - 30% runner → Deja correr con trailing (sin límite superior)
+    # 
+    # BENEFICIOS:
+    # 1. "Pagas el riesgo" rápido → psicología mejorada
+    # 2. Core del movimiento capturado antes de reversión
+    # 3. Runner aprovecha continuaciones (sin cortar)
+    # =========================================================================
     SCALED_PARTIALS_ENABLED = True
     
     # Exit levels: (MFE in R, % of position to exit)
-    # 🔥 FIX (Jan 25, 2026): Be patient - let trades reach TP1 (1.0R)
-    # Data: Most trades exit at 0.3-0.5R MFE → we need to hold longer
-    # Only start scaling out AFTER TP1 is hit
     SCALE_OUT_LEVELS = [
-        (1.0, 0.50),   # Exit 50% at +1.0R (TP1 level) - MUST reach here
-        (1.5, 0.25),   # Exit 25% at +1.5R  
-        (2.5, 0.15),   # Exit 15% at +2.5R 
-        # Remaining 10% runs with trailing stop
+        (0.30, 0.30),   # 🔥 FIX #150: Exit 30% @ +0.30R (paga el riesgo)
+        (0.80, 0.40),   # 🔥 FIX #150: Exit 40% @ +0.80R (core del movimiento)
+        # Remaining 30% runs with trailing stop → NO EXIT AUTOMÁTICO
     ]
     
     # Minimum position to keep for runner
-    MIN_RUNNER_PCT = 0.10  # 10% as runner
+    MIN_RUNNER_PCT = 0.30  # 🔥 FIX #150: 30% como runner (era 10%)
     
     # =========================================================================
     # 2. MOMENTUM EXIT - Exit when momentum dies BEFORE price falls

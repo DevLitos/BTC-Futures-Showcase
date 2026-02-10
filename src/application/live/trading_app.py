@@ -304,26 +304,18 @@ SIGNALS_GENERATED = Counter(
 ENTRY_TIMEOUT_MINUTES = 3  # 3 candles at 1m = 3 minutes
 
 # =============================================================================
-# 🔥 SIMPLE MODE CONFIGURATION (Feb 06, 2026)
+# 🔥 FIX #135: SIMPLE_MODE ELIMINATED (Feb 10, 2026)
 # =============================================================================
-# PROBLEM: System has 36+ filters, most are LAGGING (56%).
-# They block good trades AFTER the opportunity passed, then let bad trades 
-# through via complex bypasses. Net result: bad trades, missed opportunities.
+# The SIMPLE_MODE flag disabled several features that were causing bad trades.
+# Those features have now been COMPLETELY REMOVED from the codebase:
+# - ❌ REMOVED: SHORT OBSTINACY blocks
+# - ❌ REMOVED: BIAS INVERSION
+# - ❌ REMOVED: EMA Distance VETO (converted to context tagging)
+# - ❌ REMOVED: Micro Trend VETO (converted to context tagging)
 #
-# SOLUTION: SIMPLE_MODE removes lagging filters, keeps only intelligent ones:
-# - ✅ KEEP: Location VETO (percentil 60d - structural)
-# - ✅ KEEP: TrendPhase blocks (EXHAUSTION + STRONG - cycle awareness)
-# - ✅ KEEP: CT Session Limits (risk management)
-# - ✅ KEEP: RANGE HIGH/LOW directional blocks (location intelligence)
-# - ❌ REMOVE: EMA Distance VETO (lagging - EMAs follow price)
-# - ❌ REMOVE: Micro Trend VETO (lagging - 5m structure is noise in trends)
-# - ❌ REMOVE: SHORT OBSTINACY blocks (lagging signals blocking good trades)
-# - ❌ REMOVE: BIAS INVERSION (creates bad CT trades on micro-rebounds)
-#
-# The removed filters still CALCULATE their values for context (tags/logging)
-# but do NOT block trades. This gives us data to analyze without blocking.
+# The constant SIMPLE_MODE = True is no longer needed.
+# Code now runs directly without conditional branches.
 # =============================================================================
-SIMPLE_MODE = True  # Set to False to restore all filters
 
 
 def _create_safe_task(coro, name: str = "anonymous"):
@@ -3894,7 +3886,28 @@ class SignalEngine:
                     )
                     self._current_trade_tags['range_bypass_reason'] = bypass_reason
                     self._current_trade_tags['range_size_mult'] = 0.60  # Slightly reduced size for range-break
-                    # Don't return - continue to trade
+                    
+                    # 🔥 FIX #160 (Feb 10): ARM EDGE ON RANGE BYPASS
+                    # Si hay bypass (displacement/expansion), armar edge
+                    bypass_direction = self._active_direction or self._expansion_direction
+                    if bypass_direction:
+                        macro_str = self._current_bias_strength.value if self._current_bias_strength else None
+                        edge_armed = self._edge_manager.arm_consensus_edge(
+                            direction=bypass_direction,
+                            current_price=current_price,
+                            atr=atr_1m,
+                            market_time=market_time,
+                            reason=f"RANGE_BYPASS ({bypass_reason})",
+                            macro_bias_strength=macro_str,
+                            has_momentum_override=self.has_momentum_override
+                        )
+                        if edge_armed:
+                            self._current_trade_tags['range_edge_armed'] = True
+                            self._current_trade_tags['edge_source'] = f'RANGE_BYPASS'
+                            logger.info(
+                                f"🎯 EDGE ARMED: RANGE_BYPASS {bypass_direction} | {bypass_reason}"
+                            )
+                    # Continue to trade
                 else:
                     # =========================================================================
                     # 🔥 SIMPLIFIED RANGE_MID LOGIC (Feb 05, 2026)
@@ -3936,6 +3949,27 @@ class SignalEngine:
                             )
                         self._current_trade_tags['range_size_mult'] = 0.40
                         self._current_trade_tags['range_mid_reason'] = source
+                        
+                        # 🔥 FIX #160 (Feb 10): ARM EDGE IN RANGE MODE
+                        # Problema: RANGE nunca armaba edge → can_evaluate_entry() False → no trades
+                        # Solución: Si hay CONSENSUS en RANGE, armar edge igual que en TREND
+                        macro_str = self._current_bias_strength.value if self._current_bias_strength else None
+                        edge_armed = self._edge_manager.arm_consensus_edge(
+                            direction=direction,
+                            current_price=current_price,
+                            atr=atr_1m,
+                            market_time=market_time,
+                            reason=f"RANGE_CONSENSUS (pct={pct_60d:.0f}%, conf={confidence:.0%})",
+                            macro_bias_strength=macro_str,
+                            has_momentum_override=self.has_momentum_override
+                        )
+                        if edge_armed:
+                            self._current_trade_tags['range_edge_armed'] = True
+                            self._current_trade_tags['edge_source'] = f'RANGE_{source}'
+                            logger.info(
+                                f"🎯 EDGE ARMED: RANGE_{source} {direction} | pct={pct_60d:.0f}% | "
+                                f"conf={confidence:.0%} | Size=40%"
+                            )
                         # Continue to evaluate trade
                     else:
                         # No consensus - no trade
@@ -3967,6 +4001,28 @@ class SignalEngine:
                 size_mult = 0.35 + extremity * 0.25  # Range: 35-60%
                 self._current_trade_tags['range_size_mult'] = size_mult
                 self._current_trade_tags['range_extremity'] = round(extremity, 2)
+                
+                # 🔥 FIX #160 (Feb 10): ARM EDGE IN RANGE EXTREME
+                # Problema: RANGE EXTREME nunca armaba edge → no trades
+                # En extremos, armar edge en dirección contraria (mean reversion)
+                range_direction = 'SHORT' if extreme_type == 'HIGH' else 'LONG'
+                macro_str = self._current_bias_strength.value if self._current_bias_strength else None
+                edge_armed = self._edge_manager.arm_consensus_edge(
+                    direction=range_direction,
+                    current_price=current_price,
+                    atr=atr_1m,
+                    market_time=market_time,
+                    reason=f"RANGE_EXTREME_{extreme_type} (pct={pct_60d:.0f}%, extremity={extremity:.0%})",
+                    macro_bias_strength=macro_str,
+                    has_momentum_override=self.has_momentum_override
+                )
+                if edge_armed:
+                    self._current_trade_tags['range_edge_armed'] = True
+                    self._current_trade_tags['edge_source'] = f'RANGE_EXTREME_{extreme_type}'
+                    logger.info(
+                        f"🎯 EDGE ARMED: RANGE_EXTREME_{extreme_type} {range_direction} | "
+                        f"pct={pct_60d:.0f}% | extremity={extremity:.0%} | Size={size_mult:.0%}"
+                    )
                 
                 if self._idle_eval_count % 60 == 1:
                     logger.info(
@@ -4021,10 +4077,22 @@ class SignalEngine:
                         self._regime_block_reason = f"PRICE_CONTRADICTS: {confirm_reason}"
                         return
                 
-                logger.info(
-                    f"✅ TRANSITION: {source} | dir={direction} | conf={confidence:.0%} | "
-                    f"Score={regime_score:.2f} | Size={gradual_size:.0%} | TRADING"
+                # 🔥 FIX #151 (Feb 10, 2026): Rate-limit TRANSITION log to 60s
+                now = market_time
+                last_trans_log = getattr(self, '_last_transition_log', None)
+                last_trans_dir = getattr(self, '_last_transition_dir', None)
+                should_log = (
+                    last_trans_log is None or 
+                    (now - last_trans_log).total_seconds() >= 60 or
+                    last_trans_dir != direction  # Always log direction changes
                 )
+                if should_log:
+                    logger.info(
+                        f"✅ TRANSITION: {source} | dir={direction} | conf={confidence:.0%} | "
+                        f"Score={regime_score:.2f} | Size={gradual_size:.0%} | TRADING"
+                    )
+                    self._last_transition_log = now
+                    self._last_transition_dir = direction
                 self._current_trade_tags['transition_reason'] = source
                 
                 # 🔥 FIX #35 (Feb 05): ARM EDGE for TRANSITION - handle all sources
@@ -4278,13 +4346,17 @@ class SignalEngine:
         # 
         # Si hay DISPLACEMENT edge activo, actualizar la ventana de entrada
         # y matar el edge si está demasiado tarde (NO PERSEGUIR)
+        # 
+        # 🔥 FIX #159b: El cooldown ahora se activa automáticamente en _expire_edge()
+        # No es necesario llamar set_post_displacement_cooldown() aquí.
         # =====================================================================
         if self._edge_manager.current_bos and self._edge_manager.current_bos.edge_type == EdgeType.DISPLACEMENT:
             should_kill, kill_reason = self._edge_manager.update_displacement_entry_window(market_time)
             if should_kill:
                 logger.warning(f"🚫 {kill_reason}")
-                self._edge_manager._expire_edge(kill_reason)
+                self._edge_manager._expire_edge(kill_reason)  # Cooldown auto-activado
                 self._current_trade_tags['displacement_killed_late'] = True
+                self._current_trade_tags['post_displacement_cooldown'] = True
         
         # =====================================================================
         # 🔥 CRITICAL FIX (Jan 29, 2026): ANTICIPATION/EDGE NOW HANDLED BY ORCHESTRATOR
@@ -4729,7 +4801,8 @@ class SignalEngine:
         # 🔥 FIX (Jan 28, 2026): PROBE mode puede operar sin edge activo
         #    ProbeValidator valida rentabilidad mínima
         # 🔥 FIX (Jan 28): PROBE mode eliminado en RANGE
-        # Solo TREND/TRANSITION/BREAKOUT pueden tener edge activo
+        # 🔥 FIX #160 (Feb 10): RANGE ahora arma edges con CONSENSUS/EXTREME/BYPASS
+        #    Si llegamos aquí con NO_EDGE, significa que no hubo CONSENSUS ni condición válida
         
         if not self._edge_manager.can_evaluate_entry():
             block_reason = self._edge_manager.get_block_reason()
@@ -5188,13 +5261,18 @@ class SignalEngine:
             self._ti_size_multiplier *= 0.85
             logger.debug(f"📉 ADX DECELERATION: Size reduction (accel={ti_state.adx_acceleration:.2f})")
         
-        # Log significant recommendations
+        # Log significant recommendations (rate-limited to avoid spam)
         if entry_recommendation['entry_mode'] == 'AGGRESSIVE':
-            logger.info(
-                f"🚀 TI AGGRESSIVE MODE: {entry_recommendation['phase']} | "
-                f"Direction: {entry_recommendation['direction_bias']} | "
-                f"Best entry opportunity!"
-            )
+            # 🔥 FIX #151 (Feb 10, 2026): Rate-limit AGGRESSIVE log to 60s
+            now = market_time
+            last_agg_log = getattr(self, '_last_ti_aggressive_log', None)
+            if last_agg_log is None or (now - last_agg_log).total_seconds() >= 60:
+                logger.info(
+                    f"🚀 TI AGGRESSIVE MODE: {entry_recommendation['phase']} | "
+                    f"Direction: {entry_recommendation['direction_bias']} | "
+                    f"Best entry opportunity!"
+                )
+                self._last_ti_aggressive_log = now
         elif entry_recommendation['entry_mode'] == 'WAIT':
             # Even if allowed, WAIT mode = lower conviction
             logger.debug(f"⏳ TI WAIT MODE: {entry_recommendation['phase']} - proceed with reduced size")
@@ -5325,157 +5403,19 @@ class SignalEngine:
                 self._current_trade_tags['regime_size_mult'] *= 0.5
         
         # =====================================================================
-        # 5. Short Obstinacy Check (for shorts only - uses extracted calculator)
+        # 5. Short Obstinacy Check - 🔥 FIX #135: ELIMINATED (Feb 10, 2026)
         # =====================================================================
-        # 🔥 SIMPLE_MODE (Feb 06): SHORT OBSTINACY completely DISABLED
-        # ANALYSIS: SHORT OBSTINACY was the #1 cause of missed good trades.
-        # It checked lagging signals (VWAP, EMA20>EMA50, etc.) that react AFTER
-        # price has already moved. This blocked SHORT entries during pullbacks
-        # within a downtrend - exactly when we SHOULD be entering.
-        #
-        # The signals it checked (price>VWAP, VWAP_slope+, EMA20>EMA50) are
-        # LAGGING by nature - they describe what ALREADY happened, not what
-        # WILL happen. In a trend, these will often be "bullish" during brief
-        # pullbacks, but that doesn't mean the trend is over.
-        #
-        # With SIMPLE_MODE=True, we skip this entire check. The STRUCTURE GATE
-        # (EMA50_1h alignment) is the correct filter for trend direction.
+        # REASON FOR REMOVAL: SHORT OBSTINACY checked lagging signals (VWAP, 
+        # EMA20>EMA50) that react AFTER price moved. This blocked good trades.
+        # The STRUCTURE GATE (EMA50_1h alignment) is the correct filter.
+        # This entire feature was disabled via SIMPLE_MODE=True since Feb 06.
+        # Now removed completely to reduce code complexity.
         # =====================================================================
-        short_obstinacy_penalty = 0.0
-        if SIMPLE_MODE:
-            # SIMPLE_MODE: Skip SHORT OBSTINACY entirely
-            self._current_trade_tags['short_obstinacy_disabled'] = True
-            logger.debug("📊 [SIMPLE_MODE] SHORT OBSTINACY disabled - lagging signals not used")
-        elif bias == 'SHORT' and df_5m_pre is not None:
-            atr_5m_pre = calculate_atr(df_5m_pre['high'].to_numpy(), df_5m_pre['low'].to_numpy(), df_5m_pre['close'].to_numpy(), 14)
-            atr_5m_val = atr_5m_pre[-1] if len(atr_5m_pre) > 0 else current_price * 0.005
-            
-            # 🧠 FIX #20: Pass df_1m for price impulse detection
-            df_1m_for_obstinacy = None
-            try:
-                candles_1m = self.market_data.get_candles('1m')
-                if candles_1m and len(candles_1m) >= 5:
-                    df_1m_for_obstinacy = pd.DataFrame(candles_1m[-10:])
-            except Exception:
-                pass
-            
-            short_obstinacy_penalty, bullish_signals, obstinacy_reason, all_lagging, price_impulse_down = self._short_obstinacy_calculator.calculate(
-                df_5m_pre, current_price, atr_5m_val, df_1m_for_obstinacy
-            )
-            
-            self._current_trade_tags['short_obstinacy_penalty'] = short_obstinacy_penalty
-            self._current_trade_tags['bullish_signals'] = bullish_signals
-            self._current_trade_tags['obstinacy_reason'] = obstinacy_reason
-            self._current_trade_tags['obstinacy_all_lagging'] = all_lagging
-            self._current_trade_tags['price_impulse_down'] = price_impulse_down
-            
-            # 🧠 FIX #20: Check displacement memory and set SOFT mode flag
-            displacement_memory_active = (
-                self._displacement_memory_direction == 'SHORT' and
-                self._displacement_memory_expires_at is not None and
-                datetime.now() < self._displacement_memory_expires_at
-            )
-            
-            if displacement_memory_active:
-                self._current_trade_tags['displacement_memory_active'] = True
-                self._current_trade_tags['displacement_memory_direction'] = self._displacement_memory_direction
-                
-                # SOFT mode conditions:
-                # 1. Displacement memory active for SHORT
-                # 2. All bullish signals are LAGGING
-                # 3. Price impulse confirms downward movement OR strong HTF trend (ADX > 45)
-                #
-                # 🧠 FIX #55 (Feb 06, 2026): Added strong trend override
-                # PROBLEM: impulse_down is too sensitive to micro-rebotes on 1m candles.
-                # When all signals are LAGGING (VWAP, EMAs) and there's a STRONG HTF trend
-                # (ADX 1h > 45), the lagging signals should NOT block the trade.
-                # The trend strength on HTF is a more reliable indicator than 1m impulse.
-                STRONG_TREND_ADX_OVERRIDE = 45.0
-                strong_htf_trend = adx_1h >= STRONG_TREND_ADX_OVERRIDE
-                soft_mode_eligible = all_lagging and (price_impulse_down or strong_htf_trend)
-                self._current_trade_tags['obstinacy_soft_mode_eligible'] = soft_mode_eligible
-                self._current_trade_tags['obstinacy_strong_trend_override'] = strong_htf_trend
-                
-                if soft_mode_eligible:
-                    reason = "price impulse down" if price_impulse_down else f"strong HTF ADX={adx_1h:.1f}"
-                    logger.info(
-                        f"🧠 OBSTINACY SOFT MODE: Displacement memory active, "
-                        f"all signals lagging, {reason} → SOFT mode enabled"
-                    )
-            else:
-                # 🧠 FIX #55b (Feb 06, 2026): STRONG TREND OVERRIDE without displacement_memory
-                # PROBLEM: System stuck in infinite loop when:
-                # - SHORT edge armed with 100% confidence
-                # - SHORT OBSTINACY blocks with lagging signals
-                # - Edge invalidated after 3x blocks
-                # - Re-armed immediately, blocked again → infinite loop
-                #
-                # When there's a VERY STRONG HTF trend (ADX > 50) and ALL signals are
-                # LAGGING, the lagging indicators should NOT hard-block. They're simply
-                # catching up to the actual trend.
-                #
-                # 🔥 FIX #69 (Feb 06, 2026): RELAXED THRESHOLD when impulse_down is True
-                # PROBLEM: ADX 43.6 with impulse_down=True and all_lagging=True 
-                # still gets blocked. The impulse confirms the direction is real.
-                # When there's actual price movement in the right direction,
-                # lagging signals should not block.
-                VERY_STRONG_TREND_OVERRIDE = 50.0
-                STRONG_TREND_WITH_IMPULSE = 35.0  # Lower threshold if impulse confirms
-                
-                # FIX #69: Either very strong ADX OR strong ADX + impulse confirms
-                strong_trend_bypass = (
-                    (all_lagging and adx_1h >= VERY_STRONG_TREND_OVERRIDE) or
-                    (all_lagging and price_impulse_down and adx_1h >= STRONG_TREND_WITH_IMPULSE)
-                )
-                
-                if strong_trend_bypass:
-                    self._current_trade_tags['displacement_memory_active'] = False
-                    self._current_trade_tags['obstinacy_soft_mode_eligible'] = True
-                    self._current_trade_tags['obstinacy_strong_trend_override'] = True
-                    
-                    if price_impulse_down:
-                        logger.info(
-                            f"🧠 FIX #69 OBSTINACY BYPASS: All lagging + ADX={adx_1h:.1f} >= {STRONG_TREND_WITH_IMPULSE} "
-                            f"+ impulse_down=True → SOFT mode (trend confirmed by price action)"
-                        )
-                    else:
-                        logger.info(
-                            f"🧠 OBSTINACY SOFT MODE (NO DISPLACEMENT): "
-                            f"All signals lagging + VERY STRONG HTF ADX={adx_1h:.1f} >= {VERY_STRONG_TREND_OVERRIDE} → "
-                            f"SOFT mode enabled (lagging signals catching up to trend)"
-                        )
-            
-            # Check short cooldown
-            # 🔄 REFACTORED Feb 04: Use CooldownManager for unified cooldown check
-            # 🔥 SIMPLE_MODE (Feb 06): SHORT OBSTINACY cooldown desactivado
-            if self.cooldown_manager.is_short_obstinacy_active(market_time):
-                state = self.cooldown_manager._cooldowns.get(
-                    __import__('src.application.live.cooldown_manager', fromlist=['CooldownType']).CooldownType.SHORT_OBSTINACY
-                )
-                remaining = state.remaining_seconds(market_time) / 60 if state else 0
-                self._current_trade_tags['short_obstinacy_cooldown_active'] = True
-                self._current_trade_tags['short_obstinacy_cooldown_remaining'] = remaining
-                
-                if not SIMPLE_MODE:
-                    logger.info(f"⏳ SHORT OBSTINACY COOLDOWN: {remaining:.0f}min remaining")
-                    self._current_trade_tags['skip_reason'] = 'short_obstinacy_cooldown'
-                    return
-                else:
-                    logger.debug(f"📊 [CONTEXT] Short Obstinacy cooldown active ({remaining:.0f}min) but SIMPLE_MODE ignores it")
+        self._current_trade_tags['short_obstinacy_disabled'] = True
         
-        # ===== BLOQUE 2.5: MICRO TREND FILTER (5m) - NEW (Jan 15, 2026) =====
-        # PROBLEM: Bot enters LONGs during micro-bearish trends within macro-bullish,
-        # leading to consecutive SL hits that erode gains.
-        # SOLUTION: Detect micro-trend (5m structure) and block/penalize opposing entries.
-        #
-        # Workflow:
-        # 1. Check if micro-trend opposes HTF bias
-        # 2. If HARD BLOCK: veto entry completely
-        # 3. If SOFT BLOCK: apply score penalty (tracked in _micro_trend_state)
-        # 4. Score penalty applied in _calculate_entry_score via score_adjustment
-        
-        candles_5m_list = self.market_data.get_candles('5m')
+        # ===== BLOQUE 2.5: MICRO TREND FILTER (5m) =====
         candles_1m_list = self.market_data.get_candles('1m')
+        candles_5m_list = self.market_data.get_candles('5m')
         
         # Initialize to None for type safety
         df_5m_micro: pd.DataFrame | None = None
@@ -5569,20 +5509,11 @@ class SignalEngine:
                     logger.info(f"⛔ MICRO TREND: HTF ADX={adx_1h:.1f} < 15 (weak trend, full block)")
                 
                 if not adx_override:
-                    # 🔥 SIMPLE_MODE (Feb 06): MICRO TREND VETO desactivado - solo contexto
+                    # 🔥 FIX #135: MICRO TREND VETO disabled - only context tagging, no blocking
                     self._current_trade_tags['micro_trend_veto'] = True
                     self._current_trade_tags['micro_veto_reason'] = micro_reason
-                    
-                    if not SIMPLE_MODE:
-                        # Log micro trend veto (once per state change)
-                        if self._last_micro_state is None or self._last_micro_state != f'vetoed_{bias}':
-                            logger.warning(f"⛔ MICRO TREND VETO: {micro_reason}")
-                            logger.info(f"   📊 5m Structure: EMA20={self._micro_trend_state.ema20_5m:.0f} | EMA50={self._micro_trend_state.ema50_5m:.0f} | RSI={self._micro_trend_state.rsi_5m:.1f}")
-                            logger.info(f"   📉 Signals: LL={self._micro_trend_state.has_lower_low} | LH={self._micro_trend_state.has_lower_high} | BelowEMA20={self._micro_trend_state.is_below_ema20}")
-                            self._last_micro_state = f'vetoed_{bias}'
-                        return
-                    else:
-                        logger.debug(f"📊 [CONTEXT] Micro Trend opposes {bias} but SIMPLE_MODE active (no block)")
+                    # No block - just log for context
+                    logger.debug(f"📊 [CONTEXT] Micro Trend opposes {bias} - no block (FIX #135)")
             else:
                 self._last_micro_state = f'allowed_{bias}'
                 if self._micro_trend_state and self._micro_trend_state.score_adjustment != 0:
@@ -5593,140 +5524,29 @@ class SignalEngine:
             logger.debug("⚠️ MICRO TREND: Insufficient 5m data - skipping filter")
         
         # =========================================================================
-        # 🔥 BIAS INVERSION (Jan 27, 2026)
-        # PROBLEM: HTF bias (EMA50_1h) is slow to react to intraday trend changes.
-        # When price drops $1000, EMA50 barely moves, so system keeps trying LONG.
-        # SOLUTION: If micro-trend is STRONG and OPPOSES HTF bias, INVERT the bias.
-        # 
-        # This allows the system to trade the actual trend, not a lagging indicator.
-        # 
-        # ⚠️ CRITICAL FIX (Jan 29, 2026): NEVER invert when BREAKOUT EDGE is armed!
-        # The EDGE has sovereign authority over direction. ANTICIPATION detected
-        # a specific pattern that says "this direction" - micro_trend MUST NOT override.
-        #
-        # 🔥 SIMPLE_MODE (Feb 06): BIAS INVERSION desactivado completamente.
-        # Esta funcionalidad causaba trades countertrend malos cuando micro-trend
-        # era "fuerte" pero era solo un rebote dentro de una tendencia mayor.
-        # En SIMPLE_MODE, el sistema SIEMPRE respeta el HTF bias.
         # =========================================================================
-        MICRO_STRENGTH_FOR_INVERSION = 0.65  # Need 65%+ micro-trend strength to invert
-        original_bias = bias
-        bias_inverted = False
-        
-        # 🔥 SIMPLE_MODE: Skip entire bias inversion logic
-        if SIMPLE_MODE:
-            # Still log context for analysis
-            if self._micro_trend_state is not None and hasattr(self._micro_trend_state, 'strength'):
-                if self._micro_trend_state.strength >= MICRO_STRENGTH_FOR_INVERSION:
-                    micro_trend = self._micro_trend_state.micro_trend
-                    if (bias == 'LONG' and micro_trend == 'BEARISH') or (bias == 'SHORT' and micro_trend == 'BULLISH'):
-                        self._current_trade_tags['bias_inversion_would_trigger'] = True
-                        self._current_trade_tags['micro_trend_opposing'] = micro_trend
-                        self._current_trade_tags['micro_trend_strength'] = self._micro_trend_state.strength
-                        logger.debug(
-                            f"📊 [CONTEXT] BIAS INVERSION would trigger: HTF={bias}, micro={micro_trend} "
-                            f"(strength={self._micro_trend_state.strength:.0%}) - SIMPLE_MODE keeps HTF bias"
-                        )
-        else:
-            # 🔥 CHECK: Is there an armed BREAKOUT/DISPLACEMENT edge? If so, SKIP bias inversion entirely
-            has_sovereign_edge_armed = False
-            sovereign_edge_type = None
-            if self._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
-                if self._edge_manager.current_bos:
-                    if self._edge_manager.current_bos.edge_type in [EdgeType.BREAKOUT, EdgeType.DISPLACEMENT]:
-                        has_sovereign_edge_armed = True
-                        sovereign_edge_type = self._edge_manager.current_bos.edge_type
-                        sovereign_edge_direction = self._edge_manager.current_bos.direction
-                        logger.debug(
-                            f"🛡️ BIAS INVERSION BLOCKED: {sovereign_edge_type.value} edge armed ({sovereign_edge_direction}) - "
-                            f"edge has sovereign authority over direction"
-                        )
-            
-            if has_sovereign_edge_armed:
-                # BREAKOUT/DISPLACEMENT edge armed - DO NOT allow micro_trend to change direction
-                edge_dir = self._edge_manager.current_bos.direction if self._edge_manager.current_bos else bias
-                logger.info(f"🛡️ MICRO_TREND BYPASS: {sovereign_edge_type.value} EDGE {edge_dir} has authority")
-            # =====================================================================
-            # 🔥 FIX #71: Block BIAS INVERSION when HTF is STRONG
-            # =====================================================================
-            # PROBLEM: System inverts bias (e.g., SHORT→LONG) when micro-trend is 
-            # bullish with high strength (90%+). But during a STRONG trend (BEAR_STRONG),
-            # these micro-rebounds are normal pullbacks, NOT trend reversals.
-            #
-            # EVIDENCE: Log showed HTF=SHORT, ADX=43.6, BEAR_STRONG, but micro=BULLISH 
-            # strength 97% → inverted to LONG → bad trade during TREND_EXHAUSTION.
-            #
-            # ROOT CAUSE: BIAS INVERSION was designed for when HTF is WRONG (lagging).
-            # But when HTF is STRONG and CONFIRMED by high ADX, micro-rebounds are noise.
-            #
-            # SOLUTION: Block BIAS INVERSION when:
-            # - HTF bias_strength is STRONG (BEAR_STRONG or BULL_STRONG)
-            # - Trust the HTF trend, trade with it, ignore micro-noise
-            # =====================================================================
-            elif self._current_bias_strength is not None and self._current_bias_strength.value in ['BEAR_STRONG', 'BULL_STRONG']:
-                # HTF is STRONG - DO NOT allow micro_trend to invert bias
-                logger.info(
-                    f"🛡️ FIX #71 BIAS INVERSION BLOCKED: HTF is {self._current_bias_strength.value} | "
-                    f"Strong trends don't get inverted by micro-noise - trade WITH the trend"
-                )
-            # 🔥 FIX (Jan 29, 2026 - AUDIT BUG 8): Add explicit null check before accessing .micro_trend
-            # 🔥 FIX #51 (Feb 5, 2026): Don't invert if inverted direction would be blocked by location extreme
-            # - If LONG→SHORT but we're at extreme LOW (percentile < 10%), SHORT will be blocked anyway
-            # - If SHORT→LONG but we're at extreme HIGH (percentile > 90%), LONG will be blocked anyway
-            # This prevents the absurd scenario of: LONG edge active at 1.7% percentile → invert to SHORT → blocked
-            elif self._micro_trend_state is not None and hasattr(self._micro_trend_state, 'strength') and self._micro_trend_state.strength >= MICRO_STRENGTH_FOR_INVERSION:
+        # 🔥 FIX #135: BIAS INVERSION - ELIMINATED (Feb 10, 2026)
+        # =========================================================================
+        # REASON FOR REMOVAL: BIAS INVERSION caused countertrend trades when 
+        # micro-trend was "strong" but was just a pullback within a larger trend.
+        # The HTF bias (EMA50_1h) is the correct directional filter.
+        # This feature was disabled via SIMPLE_MODE=True since Feb 06.
+        # Now removed completely to reduce code complexity.
+        # 
+        # Context tagging preserved for analysis:
+        # =========================================================================
+        MICRO_STRENGTH_FOR_INVERSION = 0.65
+        if self._micro_trend_state is not None and hasattr(self._micro_trend_state, 'strength'):
+            if self._micro_trend_state.strength >= MICRO_STRENGTH_FOR_INVERSION:
                 micro_trend = self._micro_trend_state.micro_trend
-                
-                # Check location context to prevent absurd inversions
-                location_pct = self._location_context.percentile_60d if self._location_context else 50.0
-                in_extreme_low = location_pct < 10  # Would block SHORT
-                in_extreme_high = location_pct > 90  # Would block LONG
-                
-                # HTF says LONG but micro is BEARISH → invert to SHORT
-                if bias == 'LONG' and micro_trend == 'BEARISH':
-                    # 🔥 FIX #51: Don't invert to SHORT if we're at the BOTTOM - it's absurd
-                    if in_extreme_low:
-                        logger.info(
-                            f"🛡️ BIAS INVERSION BLOCKED: HTF=LONG, micro=BEARISH but at BOTTOM ({location_pct:.1f}%) | "
-                            f"SHORT would be blocked by location_extreme - keeping LONG"
-                        )
-                    else:
-                        bias = 'SHORT'
-                        bias_inverted = True
-                        logger.info(
-                            f"🔄 BIAS INVERTED: HTF={original_bias} but micro={micro_trend} "
-                            f"(strength={self._micro_trend_state.strength:.0%}) → trading {bias}"
-                        )
-                        self._current_trade_tags['bias_inverted'] = True
-                        self._current_trade_tags['bias_inversion_reason'] = f'micro_{micro_trend.lower()}'
-                        self._current_trade_tags['original_htf_bias'] = original_bias
-                        # Reset micro-trend penalty since we're now aligned
-                        self._micro_trend_state.score_adjustment = 0.0
-                
-                # HTF says SHORT but micro is BULLISH → invert to LONG
-                elif bias == 'SHORT' and micro_trend == 'BULLISH':
-                    # 🔥 FIX #51: Don't invert to LONG if we're at the TOP - it's absurd
-                    if in_extreme_high:
-                        logger.info(
-                            f"🛡️ BIAS INVERSION BLOCKED: HTF=SHORT, micro=BULLISH but at TOP ({location_pct:.1f}%) | "
-                            f"LONG would be blocked by location_extreme - keeping SHORT"
-                        )
-                    else:
-                        bias = 'LONG'
-                        bias_inverted = True
-                        logger.info(
-                            f"🔄 BIAS INVERTED: HTF={original_bias} but micro={micro_trend} "
-                            f"(strength={self._micro_trend_state.strength:.0%}) → trading {bias}"
-                        )
-                        self._current_trade_tags['bias_inverted'] = True
-                        self._current_trade_tags['bias_inversion_reason'] = f'micro_{micro_trend.lower()}'
-                        self._current_trade_tags['original_htf_bias'] = original_bias
-                        # Reset micro-trend penalty since we're now aligned
-                        self._micro_trend_state.score_adjustment = 0.0
-            
-            # Update current_bias if inverted
-            if bias_inverted:
-                self.current_bias = bias
+                if (bias == 'LONG' and micro_trend == 'BEARISH') or (bias == 'SHORT' and micro_trend == 'BULLISH'):
+                    self._current_trade_tags['bias_inversion_would_trigger'] = True
+                    self._current_trade_tags['micro_trend_opposing'] = micro_trend
+                    self._current_trade_tags['micro_trend_strength'] = self._micro_trend_state.strength
+                    logger.debug(
+                        f"📊 [CONTEXT] BIAS INVERSION would trigger: HTF={bias}, micro={micro_trend} "
+                        f"(strength={self._micro_trend_state.strength:.0%}) - disabled (FIX #135)"
+                    )
         
         # ===== BLOQUE 2.6: EMA DISTANCE GUARD (Jan 15, 2026) =====
         # PROBLEM: Bot enters LONGs when price is significantly below EMA20/EMA50 on 5m,
@@ -5767,22 +5587,14 @@ class SignalEngine:
                             )
                             self._current_trade_tags['ema_distance_bypassed'] = True
                         else:
-                            # 🔥 SIMPLE_MODE (Feb 06): EMA Distance VETO desactivado - solo contexto
-                            self._current_trade_tags['ema_distance_veto'] = True
+                            # 🔥 FIX #135: EMA Distance VETO eliminated - context tagging only
+                            # REASON: This veto was too aggressive and blocked entries at mean-reversion opportunities
+                            self._current_trade_tags['ema_distance_veto_would_trigger'] = True
                             self._current_trade_tags['ema20_distance_pct'] = distance_to_ema20 * 100
                             self._current_trade_tags['ema50_distance_pct'] = distance_to_ema50 * 100
-                            if not SIMPLE_MODE:
-                                logger.warning(
-                                    f"⛔ EMA DISTANCE VETO: LONG blocked - price {current_price:.0f} is "
-                                    f"{abs(distance_to_ema20)*100:.1f}% below EMA20({ema20_5m_val:.0f}) "
-                                    f"and {abs(distance_to_ema50)*100:.1f}% below EMA50({ema50_5m_val:.0f})"
-                                )
-                                self._set_rejection_cooldown("EMA distance veto - price too far below EMAs", candles=5)
-                                return
-                            else:
-                                logger.debug(
-                                    f"📊 [CONTEXT] EMA Distance: LONG {abs(distance_to_ema20)*100:.1f}% below EMA20 (SIMPLE_MODE: no block)"
-                                )
+                            logger.debug(
+                                f"📊 [CONTEXT] EMA Distance: LONG {abs(distance_to_ema20)*100:.1f}% below EMA20 (veto disabled FIX #135)"
+                            )
                     
                     # WARNING: Price 0.5-1% below EMA20 - apply extra penalty (handled in micro_trend)
                     elif distance_to_ema20 < -EMA_DISTANCE_WARNING_PCT:
@@ -5812,22 +5624,14 @@ class SignalEngine:
                             )
                             self._current_trade_tags['ema_distance_bypassed'] = True
                         else:
-                            # 🔥 SIMPLE_MODE (Feb 06): EMA Distance VETO desactivado - solo contexto
-                            self._current_trade_tags['ema_distance_veto'] = True
+                            # 🔥 FIX #135: EMA Distance VETO eliminated - context tagging only
+                            # REASON: This veto was too aggressive and blocked entries at mean-reversion opportunities
+                            self._current_trade_tags['ema_distance_veto_would_trigger'] = True
                             self._current_trade_tags['ema20_distance_pct'] = distance_to_ema20 * 100
                             self._current_trade_tags['ema50_distance_pct'] = distance_to_ema50 * 100
-                            if not SIMPLE_MODE:
-                                logger.warning(
-                                    f"⛔ EMA DISTANCE VETO: SHORT blocked - price {current_price:.0f} is "
-                                    f"{distance_to_ema20*100:.1f}% above EMA20({ema20_5m_val:.0f}) "
-                                    f"and {distance_to_ema50*100:.1f}% above EMA50({ema50_5m_val:.0f})"
-                                )
-                                self._set_rejection_cooldown("EMA distance veto - price too far above EMAs", candles=5)
-                                return
-                            else:
-                                logger.debug(
-                                    f"📊 [CONTEXT] EMA Distance: SHORT {distance_to_ema20*100:.1f}% above EMA20 (SIMPLE_MODE: no block)"
-                                )
+                            logger.debug(
+                                f"📊 [CONTEXT] EMA Distance: SHORT {distance_to_ema20*100:.1f}% above EMA20 (veto disabled FIX #135)"
+                            )
         
         # ===== BLOQUE 2.7: UNIFIED FILTER PIPELINE (Jan 15, 2026) =====
         # Runs all new filters: BB Width, Volatility Shock, Macro Trend, 
@@ -5936,6 +5740,31 @@ class SignalEngine:
                 logger.info(f"   🎯 Bias: {bias} | Impulse High: ${self.impulse_high:.2f} | Low: ${self.impulse_low:.2f}")
                 
                 self._last_ltf_state = f'rejected_{ltf_reason}'
+            return
+        
+        # 🔥 FIX #154 (Feb 10, 2026): LTF confirmations < 2 = HARD BLOCK
+        # BEFORE: ltf_passed=True with 1/3 confirmations was allowed
+        # NOW: Require at least 2/3 confirmations
+        # Example: Trade 14:17:43 entered with LTF(1/3), MFE=0.00R, lost -0.44R
+        # 
+        # 🔥 FIX #162 (Feb 10): BYPASS en EXPANSION/CONSENSUS fuerte
+        # Problema: LTF WEAK BLOCK bloqueaba trades válidos en tendencia
+        # Solución: En EXPANSION o con edge fuerte, aceptar 1/3 confirmaciones
+        ltf_confs = ltf_info.get('confirmations', 0) if ltf_info else 0
+        min_ltf_required = 2  # Default
+        
+        # Reducir requisito en condiciones favorables
+        if self._trend_expansion_active or self._expansion_mode:
+            min_ltf_required = 2  # EXPANSION: 1/3 is enough
+        elif self._edge_manager.state == EdgeState.EDGE_ACTIVE:
+            bos = self._edge_manager.current_bos
+            if bos and bos.trend_path and 'DISPLACEMENT' in str(bos.trend_path):
+                min_ltf_required = 2  # DISPLACEMENT edge: 1/3 is enough
+        
+        if ltf_confs < min_ltf_required:
+            if self._last_ltf_state != 'weak_ltf':
+                logger.warning(f"⛔ LTF WEAK BLOCK: {ltf_confs}/3 confirmations < {min_ltf_required} minimum | Entry blocked")
+                self._last_ltf_state = 'weak_ltf'
             return
         
         if self._last_ltf_state != 'passed':
@@ -6053,10 +5882,18 @@ class SignalEngine:
         # Note: LTF is "score-based" not "gate-based" so we show actual confirmations
         ltf_confs = self._current_trade_tags.get('ltf_confirmations', '?')
         
+        # 🔥 FIX #151 (Feb 10, 2026): Rate-limit SETUP COMPLETE log to 60s
+        # This log was spamming when guards block after filter pass
+        now = market_time
+        last_setup_log = getattr(self, '_last_setup_complete_log', None)
+        should_log_setup = last_setup_log is None or (now - last_setup_log).total_seconds() >= 60
+        
         # Quick edge context check BEFORE showing "SETUP COMPLETE"
         # This prevents confusing logs where setup appears complete but is then blocked
         if self._edge_context and not self._edge_context.is_valid():
-            logger.info(f"🎯 FILTERS PASSED - {bias} | HTF✓ MTF✓ LTF({ltf_confs}/3) | ⚠️ Edge context pending validation")
+            if should_log_setup:
+                logger.info(f"🎯 FILTERS PASSED - {bias} | HTF✓ MTF✓ LTF({ltf_confs}/3) | ⚠️ Edge context pending validation")
+                self._last_setup_complete_log = now
         else:
             # 🔥 FIX: Log edge info if present
             edge_info = ""
@@ -6064,7 +5901,9 @@ class SignalEngine:
                 # edge_type_final may be string or Enum
                 edge_type_str = edge_type_final.value if hasattr(edge_type_final, 'value') else edge_type_final
                 edge_info = f" | Edge: {edge_type_str} {edge_direction_final}"
-            logger.info(f"🎯 SETUP COMPLETE - {bias} | HTF✓ MTF✓ LTF({ltf_confs}/3){edge_info}")
+            if should_log_setup:
+                logger.info(f"🎯 SETUP COMPLETE - {bias} | HTF✓ MTF✓ LTF({ltf_confs}/3){edge_info}")
+                self._last_setup_complete_log = now
         self._current_trade_type = TradeType.LONG_MAIN if bias == 'LONG' else TradeType.SHORT_STRUCTURAL
         try:
             await self._execute_entry(current_price, atr_1m, market_time)

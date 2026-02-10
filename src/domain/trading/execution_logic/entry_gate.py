@@ -135,15 +135,16 @@ class EntryGateEvaluator:
     
     # =========================================================================
     # SCORING THRESHOLDS FOR SOFT GATES
-    # 🔥 FIX (Feb 01, 2026): Raised based on 62-trade empirical analysis
-    # Data shows score < 4.5 has 0% win rate → should be BLOCKED
+    # 🔥 FIX #156 (Feb 10, 2026): Raised thresholds
+    # Trade 14:17:43 entered with score 5.5, MFE=0.00R, lost -0.44R
+    # Score < 5.5 is lottery. Score 5.5-6.5 is probe territory.
     # =========================================================================
     
     # Score-based sizing (replaces binary threshold)
-    SCORE_BLOCK_FLOOR = 4.5           # 🔥 Raised from 3.5: score<4.5 = 0% win rate
-    SCORE_PROBE_MAX = 5.0             # 4.5-5.0 = probe (0.25x) - marginal edge
-    SCORE_REDUCED_MAX = 5.5           # 5.0-5.5 = reduced (0.5x)
-    # Above 5.5 = full size
+    SCORE_BLOCK_FLOOR = 5.5           # 🔥 Raised from 4.5: marginal trades blocked
+    SCORE_PROBE_MAX = 6.0             # 5.5-6.0 = probe (0.25x)
+    SCORE_REDUCED_MAX = 6.5           # 6.0-6.5 = reduced (0.5x)
+    # Above 6.5 = full size
     
     # RR-based sizing
     RR_BLOCK_FLOOR = 0.5              # Below 0.5 = mathematical roulette (was 0.6)

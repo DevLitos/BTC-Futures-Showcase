@@ -70,15 +70,17 @@ class AdaptiveParams:
     volatility_ratio: float = 1.0
     expansion_timeout_minutes: int = 20
     direction_lock_timeout_minutes: int = 15
-    # FEB06: Bajado de 3.0 a 1.5 - era demasiado conservador
-    # 3.0x mataba oportunidades intraday (ej: $174 inicial → necesitaba $522 para invalidar)
-    asymmetric_invalidation_mult: float = 1.5
+    # 🔥 FIX #161 (Feb 10): Reducido de 1.5 a 1.2 para unlock más rápido
+    # El usuario tiene razón: el sistema se queda "casado con el bias"
+    # En microestructura, 15 minutos es mucho tiempo - el mercado cambia
+    asymmetric_invalidation_mult: float = 1.2
     displacement_atr_mult: float = 2.8
     strong_displacement_mult: float = 1.5
     
     # FEB06: Nuevos parámetros para invalidación inteligente
     lock_time_decay_half_life_min: float = 8.0  # Lock pierde 50% fuerza cada 8min
-    momentum_override_threshold: float = 0.6  # Si opuesto > 60% inicial + momentum alto → invalidar
+    # 🔥 FIX #161: Reducido de 0.6 a 0.5 para momentum override más rápido
+    momentum_override_threshold: float = 0.5  # Si opuesto > 50% inicial + momentum alto → invalidar
     
     # For debugging
     vol_displacement_adj: float = 1.0
@@ -96,7 +98,10 @@ class DirectionStateManager:
     # Configuration constants
     EXPANSION_TIMEOUT_BASE: int = 20  # Base timeout in minutes
     DIRECTION_LOCK_TIMEOUT_BASE: int = 15  # Base timeout in minutes
-    ASYMMETRIC_INVALIDATION_BASE: float = 3.0  # 3x evidence to invalidate
+    # 🔥 FIX #161 (Feb 10): Reducido de 3.0 a 1.8
+    # 3.0x era demasiado conservador - mataba reversiones legítimas
+    # 1.8x permite invalidar con movimiento opuesto más razonable
+    ASYMMETRIC_INVALIDATION_BASE: float = 1.8
     DISPLACEMENT_MEMORY_WINDOW_MINUTES: int = 10  # Memory window
     FORBIDDEN_MIN_DURATION_TICKS: int = 120  # Hysteresis for forbidden
     

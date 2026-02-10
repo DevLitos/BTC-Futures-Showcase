@@ -114,30 +114,34 @@ class HybridATRTrailing:
     # - TREND: Pullbacks de 0.4-0.6R son normales, locks más holgados
     # - RANGE/SCALP: Necesita protección temprana, locks más ajustados
     #
-    # 🔥 FIX #64: RANGE/SCALP - Tiers agresivos (proteger rápido)
+    # 🔥 FIX #139 (Feb 10, 2026): RANGE tiers mejorados
+    # - Nivel 1.0R ahora lock -0.1R (was +0.3R - más defensive)
+    # - 1.8R tier añadido para cerrar gaps
     R_LOCK_TIERS_RANGE = [
         (0.2, -0.25, 0),  # +0.2R MFE → max loss -0.25R 
         (0.3, -0.20, 1),  # +0.3R → max loss -0.20R
         (0.5, -0.10, 2),  # +0.5R → max loss -0.10R
         (0.8, 0.0, 3),    # BE at 0.8R
-        (1.0, 0.3, 4),    # Lock +0.3R at 1.0R MFE
-        (1.3, 0.5, 5),    # Lock +0.5R at 1.3R MFE
-        (1.5, 0.8, 6),    # Lock +0.8R at 1.5R MFE
-        (2.0, 1.2, 7),    # Lock +1.2R at 2.0R MFE
+        (1.0, -0.10, 4),  # 🔥 FIX #139: Lock -0.1R at 1.0R (was +0.3R - más defensive)
+        (1.2, 0.0, 5),    # Lock BE at 1.2R MFE (RANGE conservative)
+        (1.5, 0.40, 6),   # Lock +0.4R at 1.5R MFE
+        (1.8, 0.70, 7),   # 🔥 FIX #139: NEW - Lock +0.7R at 1.8R MFE
+        (2.2, 1.10, 8),   # Lock +1.1R at 2.2R MFE
     ]
     
-    # 🔥 FIX #64: TREND - Tiers más holgados (dejar correr)
+    # 🔥 FIX #139 (Feb 10, 2026): TREND tiers mejorados
+    # - Añadido nivel 1.8R → +1.2R (cierra gap 1.5-2.2)
+    # - 1.0R ahora lock +0.2R (no esperar hasta 1.2R)
+    # - Gaps reducidos a max 0.3R
     R_LOCK_TIERS_TREND = [
-        # En TREND, no bloquear hasta que MFE sea significativo
-        # Los pullbacks de 0.3-0.5R son NORMALES y saludables
         (0.5, -0.40, 0),  # Solo proteger de full loss en +0.5R MFE
-        (0.8, -0.20, 1),  # +0.8R → max loss -0.20R (antes era BE!)
-        (1.0, 0.0, 2),    # BE at 1.0R (no antes!)
-        (1.3, 0.3, 3),    # Lock +0.3R at 1.3R MFE
-        (1.5, 0.5, 4),    # Lock +0.5R at 1.5R MFE
-        (2.0, 0.8, 5),    # Lock +0.8R at 2.0R MFE
-        (3.0, 1.5, 6),    # Lock +1.5R at 3.0R MFE
-        (5.0, 3.0, 7),    # Lock +3.0R at 5.0R MFE (runners)
+        (0.8, -0.20, 1),  # +0.8R → max loss -0.20R 
+        (1.0, 0.20, 2),   # 🔥 FIX #139: Lock +0.2R at 1.0R (was BE)
+        (1.2, 0.50, 3),   # 🔥 FIX #139: Lock +0.5R at 1.2R (was +0.4R at 1.3R)
+        (1.5, 0.90, 4),   # Lock +0.9R at 1.5R MFE
+        (1.8, 1.20, 5),   # 🔥 FIX #139: NEW - Lock +1.2R at 1.8R MFE
+        (2.2, 1.60, 6),   # Lock +1.6R at 2.2R MFE
+        (3.0, 2.20, 7),   # Lock +2.2R at 3.0R MFE (runners)
     ]
     
     # Fallback (usado si régimen no está definido)

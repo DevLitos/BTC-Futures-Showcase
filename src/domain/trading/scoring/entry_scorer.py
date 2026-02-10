@@ -652,11 +652,14 @@ class EntryScorer:
         # Log if hierarchy saved us from excessive penalties
         original_total = sum(context_penalties.values()) + sum(execution_penalties.values())
         if abs(original_total) > abs(total_hierarchical) + 0.1:
-            logger.info(
-                f"🛡️ PENALTY HIERARCHY: Reduced {original_total:+.1f} → {total_hierarchical:+.1f} "
-                f"| CONTEXT: {worst_context_source}={worst_context:+.1f} "
-                f"| EXECUTION: {worst_execution_source}={worst_execution:+.1f}"
-            )
+            # 🔧 FIX #161 (Feb 10): Cambiar a DEBUG para reducir spam
+            # Solo logear si hay diferencia significativa (> 0.5 points saved)
+            if abs(original_total - total_hierarchical) > 0.5:
+                logger.debug(
+                    f"🛡️ PENALTY HIERARCHY: Reduced {original_total:+.1f} → {total_hierarchical:+.1f} "
+                    f"| CONTEXT: {worst_context_source}={worst_context:+.1f} "
+                    f"| EXECUTION: {worst_execution_source}={worst_execution:+.1f}"
+                )
             self._trade_tags.penalty_hierarchy_saved = abs(original_total - total_hierarchical)
         
         self._trade_tags.worst_context_penalty = worst_context_source
@@ -810,13 +813,15 @@ class EntryScorer:
                     htf_aligned = True
                     htf_slope_override = True
                     zone_quality = "DIP_BUY"
-                    logger.info(f"📈 STRUCTURE: LONG allowed - near EMA50 ({price_distance_pct:.2%}) with positive slope ({ema50_slope:.3f}%)")
+                    # 🔥 FIX #151: Downgrade to debug (spam reduction)
+                    logger.debug(f"📈 STRUCTURE: LONG allowed - near EMA50 ({price_distance_pct:.2%}) with positive slope ({ema50_slope:.3f}%)")
                 # Very strong upward slope → allow even slightly below
                 elif ema50_slope > 0.05:
                     htf_aligned = True
                     htf_slope_override = True
                     zone_quality = "STRONG_UP"
-                    logger.info(f"📈 STRUCTURE: LONG allowed - strong positive slope ({ema50_slope:.3f}%) overrides position")
+                    # 🔥 FIX #151: Downgrade to debug (spam reduction)
+                    logger.debug(f"📈 STRUCTURE: LONG allowed - strong positive slope ({ema50_slope:.3f}%) overrides position")
                 # 🔥 FIX #80: Within 3% below EMA50 → allow with score penalty
                 # This is a "reversal zone" where bounce plays can work
                 # The entry scoring will naturally give lower scores due to HTF misalignment
@@ -859,7 +864,8 @@ class EntryScorer:
                 htf_aligned = True
                 htf_slope_override = True
                 zone_quality = "BREAKDOWN"
-                logger.info(f"📉 STRUCTURE: SHORT allowed - near EMA50 ({price_distance_pct:.2%}) with negative slope ({ema50_slope:.3f}%)")
+                # 🔥 FIX #151: Downgrade to debug (spam reduction)
+                logger.debug(f"📉 STRUCTURE: SHORT allowed - near EMA50 ({price_distance_pct:.2%}) with negative slope ({ema50_slope:.3f}%)")
             
             # ALSO GOOD: Strong bearish slope overrides (fast crash in progress)
             # 🔥 FIX #79: Relaxed from -0.05 to -0.02 (less restrictive)
@@ -867,7 +873,8 @@ class EntryScorer:
                 htf_aligned = True
                 htf_slope_override = True
                 zone_quality = "TREND_DOWN"
-                logger.info(f"📉 STRUCTURE: SHORT allowed - negative slope ({ema50_slope:.3f}%) indicates active downtrend")
+                # 🔥 FIX #151: Downgrade to debug (spam reduction)
+                logger.debug(f"📉 STRUCTURE: SHORT allowed - negative slope ({ema50_slope:.3f}%) indicates active downtrend")
             
             # 🔥 FIX #79: BAD ZONE only when REALLY extended AND momentum fading
             # Changed from: price < -2% → block
