@@ -2583,6 +2583,31 @@ async def _displacement_fast_path(
         engine._score_breakdown = {}
     
     # =====================================================================
+    # CHECK 2.5d: ML INFERENCE FOR FAST PATH (Feb 10, 2026)
+    # =====================================================================
+    # Call ML inference in FAST PATH too for consistent data collection
+    try:
+        if hasattr(engine, '_ml_inference') and engine._ml_inference is not None:
+            feature_snapshot = engine._build_ml_feature_snapshot() if hasattr(engine, '_build_ml_feature_snapshot') else {}
+            ml_adjusted_score, ml_prob, ml_reason = engine._ml_inference.get_entry_adjustment(
+                rule_score=int(fast_path_score),
+                feature_snapshot=feature_snapshot
+            )
+            engine._current_trade_tags['ml_win_prob'] = round(ml_prob, 4)
+            engine._current_trade_tags['ml_adjusted_score'] = ml_adjusted_score
+            engine._current_trade_tags['ml_reason'] = ml_reason
+            engine._current_trade_tags['ml_phase'] = engine._ml_inference.phase.name
+            
+            # In HYBRID/PRIMARY, adjust the score
+            if engine._ml_inference.affects_decisions:
+                fast_path_score = float(ml_adjusted_score)
+                engine._entry_score = fast_path_score
+                logger.info(f"🤖 FAST PATH ML: {engine._current_trade_tags.get('entry_score', 0):.1f}→{fast_path_score:.1f} | {ml_reason}")
+    except Exception as ml_err:
+        logger.debug(f"FAST PATH ML skipped: {ml_err}")
+        engine._current_trade_tags['ml_win_prob'] = 0.5
+    
+    # =====================================================================
     # CHECK 2.5e: SCORE MÍNIMO PARA FAST PATH (Feb 03, 2026)
     # =====================================================================
     # 🔥 FIX #129 (Feb 09, 2026): Use centralized constant from unified_constants
@@ -3400,6 +3425,40 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     
     # Update score with chase penalty
     final_score = chase_result.adjusted_score
+    
+    # ========== PHASE 4.5: ML SCORE ADJUSTMENT (Feb 10, 2026) ==========
+    # Call ML inference engine to get score adjustment.
+    # In SHADOW mode: logs prediction without affecting final_score
+    # In HYBRID mode: adjusts score ±1 based on ML confidence
+    # In PRIMARY mode: ML drives the score directly
+    try:
+        if hasattr(engine, '_ml_inference') and engine._ml_inference is not None:
+            # Build feature snapshot for ML
+            feature_snapshot = engine._build_ml_feature_snapshot() if hasattr(engine, '_build_ml_feature_snapshot') else {}
+            
+            # Get ML adjustment
+            ml_adjusted_score, ml_prob, ml_reason = engine._ml_inference.get_entry_adjustment(
+                rule_score=int(final_score),
+                feature_snapshot=feature_snapshot
+            )
+            
+            # Store ML results in trade tags
+            engine._current_trade_tags['ml_win_prob'] = round(ml_prob, 4)
+            engine._current_trade_tags['ml_adjusted_score'] = ml_adjusted_score
+            engine._current_trade_tags['ml_reason'] = ml_reason
+            engine._current_trade_tags['ml_phase'] = engine._ml_inference.phase.name
+            
+            # Only apply adjustment if ML affects decisions (HYBRID or PRIMARY)
+            if engine._ml_inference.affects_decisions:
+                final_score = float(ml_adjusted_score)
+                logger.info(f"🤖 ML ADJUSTMENT: {score_result.score:.1f}→{final_score:.1f} | {ml_reason}")
+            # In SHADOW mode, just log for data collection
+            elif engine._ml_inference.phase.name == 'SHADOW' and ml_prob != 0.5:
+                logger.debug(f"🤖 ML SHADOW: P(win)={ml_prob:.2f} [score={int(final_score)}→{ml_adjusted_score}]")
+    except Exception as ml_err:
+        logger.debug(f"ML inference skipped: {ml_err}")
+        engine._current_trade_tags['ml_win_prob'] = 0.5
+        engine._current_trade_tags['ml_reason'] = 'ML_ERROR'
     
     # ========== PHASE 5: SL/TP CALCULATION ==========
     # Find support/resistance
