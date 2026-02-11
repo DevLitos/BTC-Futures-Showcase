@@ -27,6 +27,10 @@ class BiasInvalidationConfig:
     - Normal: $60 * 2.5 = $150 threshold (was $90)
     - Direction Lock: $150 * 1.5 = $225 
     - Expansion: $150 * 2.0 = $300
+    
+    FIX #168 (Feb 11, 2026): Added flip_cooldown_ticks to prevent spam
+    Log showed 9 BIAS FLIPs in 3 hours - too noisy. Now requires 300 ticks 
+    (~5 min) between consecutive flips to the SAME forbidden direction.
     """
     base_atr_mult: float = 2.5  # Base threshold = ATR_1m * 2.5 (FIX #89: was 1.5)
     min_threshold: float = 80.0  # Minimum $80 (FIX #89: was $50)
@@ -34,6 +38,7 @@ class BiasInvalidationConfig:
     expansion_mult: float = 2.0  # Harder to invalidate during expansion
     direction_lock_mult: float = 1.5  # Harder during direction lock
     hysteresis_ticks: int = 180  # Min ticks before clearing forbidden (FIX #89: was 120)
+    flip_cooldown_ticks: int = 300  # 🔥 FIX #168: Min ticks between same-direction flips (~5 min)
 
 
 @dataclass
@@ -90,6 +95,7 @@ class BiasInvalidationHandler:
     3. Protection during EXPANSION_MODE or DIRECTION_LOCK
     4. Structural confirmation required (price must break swing)
     5. Hysteresis prevents rapid oscillation
+    6. FIX #168: Cooldown between same-direction flips (prevents spam)
     """
     
     def __init__(self, config: Optional[BiasInvalidationConfig] = None):
@@ -97,6 +103,9 @@ class BiasInvalidationHandler:
         self.config = config or BiasInvalidationConfig()
         self._forbidden_set_at_tick: int = 0
         self._previous_forbidden: Optional[str] = None
+        # 🔥 FIX #168 (Feb 11, 2026): Track last flip per direction for cooldown
+        self._last_flip_tick_long: int = 0  # Last tick we flipped to FORBID LONG
+        self._last_flip_tick_short: int = 0  # Last tick we flipped to FORBID SHORT
     
     def calculate_threshold(
         self,
@@ -289,6 +298,17 @@ class BiasInvalidationHandler:
                 )
             return result
         
+        # 🔥 FIX #168 (Feb 11, 2026): Check cooldown before flipping
+        ticks_since_last_flip = tick_count - self._last_flip_tick_long
+        if self._last_flip_tick_long > 0 and ticks_since_last_flip < self.config.flip_cooldown_ticks:
+            # Still in cooldown from recent flip to FORBID LONG
+            if tick_count % 120 == 1:  # Log once every ~2 min
+                logger.debug(
+                    f"🔄 BIAS FLIP SUPPRESSED: LONG flip in cooldown "
+                    f"({ticks_since_last_flip}/{self.config.flip_cooldown_ticks} ticks)"
+                )
+            return result  # Don't flip, return without forbidding
+        
         # FORBID CASE: Threshold exceeded AND structure broken (5m OR micro)
         result.should_forbid = True
         result.forbidden_direction = 'LONG'
@@ -299,6 +319,7 @@ class BiasInvalidationHandler:
             f"and below {structure_type} ${structure_level:.0f}"
         )
         self._forbidden_set_at_tick = tick_count
+        self._last_flip_tick_long = tick_count  # 🔥 FIX #168: Track this flip
         
         # Save displacement memory (SHORT displacement caused the drop)
         if expansion_initial_displacement > 0 or direction_lock_initial_move > 0:
@@ -386,6 +407,17 @@ class BiasInvalidationHandler:
                 )
             return result
         
+        # 🔥 FIX #168 (Feb 11, 2026): Check cooldown before flipping
+        ticks_since_last_flip = tick_count - self._last_flip_tick_short
+        if self._last_flip_tick_short > 0 and ticks_since_last_flip < self.config.flip_cooldown_ticks:
+            # Still in cooldown from recent flip to FORBID SHORT
+            if tick_count % 120 == 1:  # Log once every ~2 min
+                logger.debug(
+                    f"🔄 BIAS FLIP SUPPRESSED: SHORT flip in cooldown "
+                    f"({ticks_since_last_flip}/{self.config.flip_cooldown_ticks} ticks)"
+                )
+            return result  # Don't flip, return without forbidding
+        
         # FORBID CASE: Threshold exceeded AND structure broken (5m OR micro)
         result.should_forbid = True
         result.forbidden_direction = 'SHORT'
@@ -396,6 +428,7 @@ class BiasInvalidationHandler:
             f"and above {structure_type} ${structure_level:.0f}"
         )
         self._forbidden_set_at_tick = tick_count
+        self._last_flip_tick_short = tick_count  # 🔥 FIX #168: Track this flip
         
         # Save displacement memory (LONG displacement caused the rise)
         if expansion_initial_displacement > 0 or direction_lock_initial_move > 0:

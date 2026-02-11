@@ -2023,12 +2023,14 @@ class SignalEngine:
                 # 🔒 FIX (Jan 21, 2026): Add global timeout to _process_tick
                 # Prevents infinite blocking if any async call hangs
                 # 🔒 FIX (Jan 22, 2026): Use shield + wait to properly cancel subtasks
+                # 🔥 FIX #167 (Feb 11, 2026): Reduced from 30s to 15s
+                # With API timeout now 10s, tick should complete faster
                 tick_task = None
                 try:
                     tick_task = asyncio.create_task(self._process_tick())
-                    await asyncio.wait_for(asyncio.shield(tick_task), timeout=30.0)
+                    await asyncio.wait_for(asyncio.shield(tick_task), timeout=15.0)
                 except asyncio.TimeoutError:
-                    logger.error("⏰ _process_tick TIMEOUT (30s) - cancelling subtasks...")
+                    logger.error("⏰ _process_tick TIMEOUT (15s) - cancelling subtasks...")
                     if tick_task and not tick_task.done():
                         tick_task.cancel()
                         try:
@@ -4305,28 +4307,69 @@ class SignalEngine:
         swing_high_detected, swing_high_price, _ = detect_swing_high(highs_1h, lows_1h, closes_1h, lookback=SWING_LOOKBACK_1H)
         swing_low_detected, swing_low_price, _ = detect_swing_low(highs_1h, lows_1h, closes_1h, lookback=SWING_LOOKBACK_1H)
         
-        # Actualizar swings si se detectaron nuevos
+        # =====================================================================
+        # 🔥 FIX #166 (Feb 10, 2026): VALIDATE BEFORE UPDATING SWINGS
+        # 
+        # PROBLEMA: detect_swing_* puede retornar swings de hace semanas ($90K)
+        # que están "técnicamente" bien, pero son irrelevantes para el precio actual.
+        # El código antiguo sobrescribía el swing corregido con el malo en cada tick.
+        # 
+        # SOLUCIÓN: Solo aceptar swings nuevos si están dentro del 15% del precio.
+        # Esto evita el bucle infinito de: detectar malo → corregir → detectar malo...
+        # =====================================================================
+        MAX_SWING_DISTANCE_PCT = 0.15  # 15% max distance from current price
+        
+        def is_swing_relevant(swing_price: float, ref_price: float) -> bool:
+            """Check if swing is within relevant distance of reference price"""
+            if swing_price <= 0 or ref_price <= 0:
+                return False
+            distance_pct = abs(swing_price - ref_price) / ref_price
+            return distance_pct <= MAX_SWING_DISTANCE_PCT
+        
+        # Actualizar swings si se detectaron nuevos Y SON RELEVANTES
         if swing_high_detected and swing_high_price > 0:
             if swing_high_price != self._last_swing_high:
-                self._prev_swing_high = self._last_swing_high
-                self._last_swing_high = swing_high_price
-                # 🔧 FIX #128: Log nuevo swing high (informativo para detección de edge)
-                logger.info(f"📍 NEW SWING HIGH: ${swing_high_price:.0f} (prev: ${self._prev_swing_high:.0f})")
+                # 🔥 FIX #166: Solo aceptar si está dentro del rango relevante
+                if is_swing_relevant(swing_high_price, current_price):
+                    self._prev_swing_high = self._last_swing_high
+                    self._last_swing_high = swing_high_price
+                    logger.info(f"📍 NEW SWING HIGH: ${swing_high_price:.0f} (prev: ${self._prev_swing_high:.0f})")
+                # else: ignorar swing obsoleto silenciosamente
         
         if swing_low_detected and swing_low_price > 0:
             if swing_low_price != self._last_swing_low:
-                self._prev_swing_low = self._last_swing_low
-                self._last_swing_low = swing_low_price
-                # 🔧 FIX #128: Log nuevo swing low (informativo para detección de edge)
-                logger.info(f"📍 NEW SWING LOW: ${swing_low_price:.0f} (prev: ${self._prev_swing_low:.0f})")
+                # 🔥 FIX #166: Solo aceptar si está dentro del rango relevante
+                if is_swing_relevant(swing_low_price, current_price):
+                    self._prev_swing_low = self._last_swing_low
+                    self._last_swing_low = swing_low_price
+                    logger.info(f"📍 NEW SWING LOW: ${swing_low_price:.0f} (prev: ${self._prev_swing_low:.0f})")
+                # else: ignorar swing obsoleto silenciosamente
         
-        # Inicializar swings si aún no están (usar highs/lows recientes)
-        if self._last_swing_high == 0:
-            self._last_swing_high = np.max(highs_1h[-10:]) if len(highs_1h) >= 10 else current_price
-            self._prev_swing_high = np.max(highs_1h[-20:-10]) if len(highs_1h) >= 20 else self._last_swing_high
-        if self._last_swing_low == 0:
-            self._last_swing_low = np.min(lows_1h[-10:]) if len(lows_1h) >= 10 else current_price
-            self._prev_swing_low = np.min(lows_1h[-20:-10]) if len(lows_1h) >= 20 else self._last_swing_low
+        # =====================================================================
+        # 🔥 FIX #166b: FALLBACK INITIALIZATION
+        # 
+        # Si los swings siguen en 0 o inválidos (primer inicio), inicializar
+        # desde datos recientes. Esto solo corre UNA VEZ al inicio.
+        # =====================================================================
+        if self._last_swing_high == 0 or not is_swing_relevant(self._last_swing_high, current_price):
+            RECENT_BARS = 48
+            if len(highs_1h) >= RECENT_BARS:
+                self._last_swing_high = float(np.max(highs_1h[-RECENT_BARS:]))
+                self._prev_swing_high = self._last_swing_high
+                logger.info(f"📍 INIT SWING HIGH: ${self._last_swing_high:.0f} (from last {RECENT_BARS} bars)")
+            else:
+                self._last_swing_high = current_price * 1.02
+                self._prev_swing_high = self._last_swing_high
+        
+        if self._last_swing_low == 0 or not is_swing_relevant(self._last_swing_low, current_price):
+            RECENT_BARS = 48
+            if len(lows_1h) >= RECENT_BARS:
+                self._last_swing_low = float(np.min(lows_1h[-RECENT_BARS:]))
+                self._prev_swing_low = self._last_swing_low
+                logger.info(f"📍 INIT SWING LOW: ${self._last_swing_low:.0f} (from last {RECENT_BARS} bars)")
+            else:
+                self._last_swing_low = current_price * 0.98
+                self._prev_swing_low = self._last_swing_low
         
         # 🔥 FIX #32 (Feb 05, 2026): Edge invalidation MOVED to top of _handle_idle_state
         # The check below is now REDUNDANT - the early check runs on EVERY tick unconditionally.

@@ -156,7 +156,17 @@ class StateMachine:
 
     def start_cooldown(self, duration_minutes: Optional[int] = None):
         """Start post-trade cooldown"""
-        duration = duration_minutes or self.cooldown_duration_minutes
+        # 🔥 FIX #170 (Feb 11, 2026): 0 is a valid duration, don't use 'or' which treats 0 as falsy
+        # BUG: "duration_minutes or default" → 0 becomes default (15 min)
+        # FIX: Explicit None check
+        duration = self.cooldown_duration_minutes if duration_minutes is None else duration_minutes
+        
+        if duration <= 0:
+            # 🔥 FIX #170: No cooldown = clear any existing cooldown
+            self.cooldown_until = None
+            logger.info(f"Cooldown cleared (duration=0)")
+            return
+            
         self.cooldown_until = self._get_time() + timedelta(minutes=duration)
         logger.info(f"Cooldown started for {duration} minutes until {self.cooldown_until.strftime('%H:%M:%S')}")
 

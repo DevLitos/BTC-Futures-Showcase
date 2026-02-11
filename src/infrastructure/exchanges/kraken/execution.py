@@ -111,9 +111,12 @@ class PositionMismatchError(ExecutionError):
 
 # Timeouts para operaciones de exchange (segundos)
 # These can be overridden via Settings if needed
-EXCHANGE_TIMEOUT_SHORT = 10.0   # Para consultas simples
-EXCHANGE_TIMEOUT_MEDIUM = 30.0  # Para órdenes
-EXCHANGE_TIMEOUT_LONG = 60.0    # Para operaciones complejas
+# 🔥 FIX #167 (Feb 11, 2026): Reduced MEDIUM from 30s to 10s
+# 30s was causing system hangs during API issues. 10s is enough for 
+# order operations and with existing retry+backoff, transient failures recover.
+EXCHANGE_TIMEOUT_SHORT = 5.0    # Para consultas simples (was 10s)
+EXCHANGE_TIMEOUT_MEDIUM = 10.0  # Para órdenes (was 30s - too long)
+EXCHANGE_TIMEOUT_LONG = 30.0    # Para operaciones complejas (was 60s)
 
 
 def get_exchange_timeouts():

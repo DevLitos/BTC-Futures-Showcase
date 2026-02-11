@@ -1490,6 +1490,24 @@ class EdgeStateManager:
         self._direction_stale_since: Optional[datetime] = None  # Cuando se volvió stale
         self._last_valid_direction: Optional[str] = None  # Última dirección válida
         
+        # =========================================================================
+        # 🔥 FIX #171 (Feb 11, 2026): SIGNAL AGE TRACKING
+        # 
+        # PROBLEMA: El sistema VE el movimiento al inicio pero ESPERA.
+        # Mientras el precio avanza, el sistema "perfecciona" sus filtros.
+        # Cuando todo está "perfecto", el movimiento ya terminó y entra al FINAL.
+        # 
+        # SOLUCIÓN: Trackear cuándo se activó el edge (EDGE_ACTIVE).
+        # - Edge FRESH (< 3 min): Listo para entrar, no penalizar
+        # - Edge STALE (> 5 min): Señal vieja, el movimiento probablemente ya pasó
+        #   → Aplicar penalty de -1.5 al score para RECHAZAR entradas tardías
+        # 
+        # Esto hace que el sistema:
+        # - Entre MÁS RÁPIDO al inicio del movimiento (antes de acumular chase)
+        # - RECHACE entradas cuando el edge lleva demasiado tiempo sin ejecutarse
+        # =========================================================================
+        self._edge_activated_at: Optional[datetime] = None  # Timestamp de activación
+        
         _edge_log("NO_EDGE", "TREND", "-", "EdgeStateManager initialized | BE WATER MY FRIEND")
     
     # =========================================================================
@@ -1548,9 +1566,19 @@ class EdgeStateManager:
             if direction:  # Solo si había dirección
                 self._direction_stale_since = market_time or datetime.utcnow()
                 self._last_valid_direction = direction
+            # 🔥 FIX #171: Clear activation timestamp on expiry
+            self._edge_activated_at = None
         elif new_state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
             # Nueva edge activa - dirección ya no es stale
             self._direction_stale_since = None
+            # 🔥 FIX #171: Track when edge was activated (always naive UTC)
+            if new_state == EdgeState.EDGE_ACTIVE and self._edge_activated_at is None:
+                ts = market_time or datetime.utcnow()
+                # 🔥 FIX #171b: Force naive UTC to avoid timezone comparison issues
+                if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                    ts = ts.replace(tzinfo=None)
+                self._edge_activated_at = ts
+                logger.info(f"🎯 FIX #171: Edge activated at {self._edge_activated_at.strftime('%H:%M:%S')}")
         
         # Keep history bounded
         if len(self._transition_history) > 100:
@@ -1655,6 +1683,77 @@ class EdgeStateManager:
         ACTIVE o PROVISIONAL permiten evaluación.
         """
         return self._state in [EdgeState.EDGE_ACTIVE, EdgeState.EDGE_PROVISIONAL]
+    
+    # =========================================================================
+    # 🔥 FIX #171: SIGNAL AGE METHODS (Feb 11, 2026)
+    # 
+    # Permite calcular cuánto tiempo lleva activo el edge para aplicar
+    # penalty a entradas tardías ("stale signal penalty")
+    # =========================================================================
+    
+    def get_edge_age_minutes(self, now: Optional[datetime] = None) -> float:
+        """
+        Calcula cuántos minutos lleva el edge en estado EDGE_ACTIVE.
+        
+        Returns:
+            float: Minutos desde activación, o 0.0 si no está activo
+        """
+        # 🔥 FIX #171b: Defensive checks FIRST
+        try:
+            if self._edge_activated_at is None:
+                return 0.0
+            if self._state not in [EdgeState.EDGE_ACTIVE, EdgeState.EDGE_PROVISIONAL]:
+                return 0.0
+            
+            # Get current time - always use naive UTC
+            current = now or datetime.utcnow()
+            
+            # Normalize both to naive UTC for comparison (handle timezone mismatch)
+            activated = self._edge_activated_at
+            if hasattr(activated, 'tzinfo') and activated.tzinfo is not None:
+                activated = activated.replace(tzinfo=None)
+            if hasattr(current, 'tzinfo') and current.tzinfo is not None:
+                current = current.replace(tzinfo=None)
+            
+            age_seconds = (current - activated).total_seconds()
+            return max(0.0, age_seconds / 60.0)
+        except Exception as e:
+            # Log silently and return safe default
+            return 0.0
+    
+    def get_signal_freshness_penalty(self, now: Optional[datetime] = None) -> float:
+        """
+        Calcula penalty por señal stale (vieja).
+        
+        LÓGICA:
+        - Edge < 3 min: FRESH → 0.0 penalty (listo para entrar)
+        - Edge 3-5 min: WARNING → -0.5 penalty (advertencia)
+        - Edge > 5 min: STALE → -1.5 penalty (señal vieja, rechazar)
+        
+        RATIONALE:
+        Si el edge lleva más de 5 minutos activo y aún no entró,
+        probablemente significa que el precio se alejó (chase) o
+        que las condiciones no eran óptimas. Entrar ahora sería
+        "entrar al final del movimiento" → PÉRDIDA probable.
+        
+        Returns:
+            float: Penalty (negativo) o 0.0 si está fresh
+        """
+        age_min = self.get_edge_age_minutes(now)
+        
+        if age_min < 3.0:
+            # FRESH: No penalty
+            return 0.0
+        elif age_min < 5.0:
+            # WARNING: Light penalty
+            return -0.5
+        else:
+            # STALE: Heavy penalty - reject late entries
+            return -1.5
+    
+    def is_signal_stale(self, now: Optional[datetime] = None) -> bool:
+        """Returns True if the edge has been active for > 5 minutes"""
+        return self.get_edge_age_minutes(now) > 5.0
     
     def can_trade(self) -> bool:
         """

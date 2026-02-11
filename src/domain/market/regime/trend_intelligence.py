@@ -553,17 +553,20 @@ class TrendIntelligence:
         # 🔥 FIX M1 (Feb 07, 2026): Less sensitive divergence detection
         # Previous: Any volume below average = diverges
         # Now: Need SIGNIFICANT divergence (>20% below average on meaningful move)
+        # 🔥 FIX #169 (Feb 11, 2026): Made divergence threshold stricter
+        # 0.7x was triggering in every low-liquidity session (night UTC)
+        # Now: 0.5x (50% below average) is required for true divergence
         if len(self._price_history) >= 5:
             price_change = self._price_history[-1] - self._price_history[-5]
             price_change_pct = abs(price_change) / self._price_history[-5] if self._price_history[-5] > 0 else 0
             vol_ratio = vol_recent / vol_avg if vol_avg > 0 else 1.0
             
-            # 🔥 FIX M1: Only flag divergence if:
-            # 1. Meaningful price move (>0.1%)
-            # 2. Volume significantly below average (<0.7x)
-            is_meaningful_move = price_change_pct > 0.001  # 0.1% minimum
-            is_significant_vol_drop = vol_ratio < 0.7  # 30% below average
-            is_significant_vol_rise = vol_ratio > 1.3  # 30% above average
+            # 🔥 FIX M1 + #169: Only flag divergence if:
+            # 1. Meaningful price move (>0.15%)
+            # 2. Volume VERY significantly below average (<0.5x instead of 0.7x)
+            is_meaningful_move = price_change_pct > 0.0015  # 0.15% minimum (was 0.1%)
+            is_significant_vol_drop = vol_ratio < 0.5  # 50% below average (was 0.7)
+            is_significant_vol_rise = vol_ratio > 1.5  # 50% above average (was 1.3)
             
             if is_meaningful_move:
                 if is_significant_vol_rise:

@@ -1,0 +1,2 @@
+{"timestamp": "2026-02-11T01:27:15.549745+00:00", "event_type": "tp1_hit", "entry": 69124.0, "price": 68914.0, "size_closed": 0.00069, "pnl_realized": 0, "reason": "FIX #150 Scaled partial at 0.3R"}
+{"timestamp": "2026-02-11T02:46:01.746152+00:00", "event_type": "trade_closed", "entry": 69124.0, "exit": 68710.0, "size": 0.0017, "pnl": 0.7038, "reason": "EXCHANGE_TAKE_PROFIT", "r": 0.5989236733985256, "mfe_r": 0.5873502690816459, "mae_r": 0, "direction": "SHORT", "regime": "NORMAL"}

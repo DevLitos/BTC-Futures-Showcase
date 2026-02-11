@@ -1030,34 +1030,35 @@ class Position:
                                atr_avg: float | None = None,
                                micro_trend: str | None = None) -> dict | None:
         """
-        🔥🔥🔥 FIX #101 v3 (Feb 09, 2026): CONTEXTUAL EARLY EXIT SYSTEM
-        🔥 FIX #106 (Feb 09, 2026): PROFIT DRAWDOWN PROTECTION
+        🔥🔥🔥 FIX #160 (Feb 10, 2026): SIMPLIFIED EXIT SYSTEM
         
-        BALANCE: Protección contra salidas prematuras + Seguridad contra pérdidas excesivas
+        PROBLEMA RAÍZ: 9 capas de exit que se pisan entre sí, matando trades buenos.
+        - STRUCTURE_EXIT_NO_DELTA: Trade score 8.6, MFE 0.09R, cortado en 4.5min
+        - EARLY_VELOCITY_EXIT: 4 de 8 trades hoy cortados por esto
+        - Resultado: Win rate 25%, avg winner 0.18R, avg loser -0.39R
         
-        ARQUITECTURA EQUILIBRADA:
+        FILOSOFÍA NUEVA: El SL existe por una razón. CONFIAR en él.
         
-        CAPAS DE EMERGENCIA (ignoran todo, salen inmediatamente):
-        E1. MAE CRÍTICO: current_r < -0.6R → EXIT (ya perdió demasiado)
-        E2. FLASH CRASH: caída > 0.5R en < 3 candles → EXIT
+        Solo 2 condiciones de early exit válidas:
+        1. FLASH_CRASH: Caída > 0.7R en < 3 candles → algo muy malo pasó
+        2. En profit con micro reversing → asegurar ganancia (opcional)
         
-        🔥 NUEVA CAPA - PROFIT DRAWDOWN:
-        PD. Si MFE >= 0.35R y drawdown_from_mfe > 60% del MFE → EXIT con profit restante
-            Ejemplo: MFE=0.47R, drawdown>0.28R (60%) → sale con ~0.19R
+        TODO LO DEMÁS: Dejar que el SL/TP/TRAILING hagan su trabajo.
+        Los pullbacks son NORMALES. El MFE bajo inicial es NORMAL.
         
-        CAPAS DE PROTECCIÓN (bloquean exit, pero con TIMEOUT):
-        P1. PROFITABLE: R > 0 → no salir (SOLO si no aplica PD)
-        P2. COMPRESSION: BB < 20% → esperar MAX 12 candles, luego timeout
-        P3. ABSORPTION: vol bajo + precio aguantando → esperar MAX 10 candles
-        P4. ANTI-TRAP: MFE >= 0.2R + pullback → esperar MAX 8 candles
+        ELIMINADO:
+        - STRUCTURE_EXIT_NO_DELTA (hindsight bias, mata trades jóvenes)
+        - EARLY_VELOCITY_EXIT (mata trades que necesitan tiempo para desarrollar)
+        - DETERIORATION_EXIT (asume que "lento = malo", falso en BTC)
+        - PROFIT_DRAWDOWN_EXIT (devuelve todo el edge a pullbacks normales)
+        - Todas las capas de "protección" con timeouts
         
-        CAPAS DE EXIT (requieren confirmación estructural):
-        X1. STRUCTURE BREAK: drawdown > 0.4R + delta confirma
-        X2. STRUCTURE BREAK SIN DELTA: drawdown > 0.5R (delta no requerido)
-        X3. VELOCITY DEAD: candles extremas + sin momentum + pérdida
-        X4. DETERIORO PROGRESIVO: cada 5 candles peor → exit
+        RESULTADO ESPERADO:
+        - Trades duran más (avg 30min vs 7min actual)
+        - SL hace su trabajo cuando tesis se invalida
+        - Winners corren hasta TP o trailing
         """
-        # Skip adopted positions
+        # Skip adopted positions - we don't know their history
         if self.is_adopted:
             return None
         
@@ -1065,7 +1066,7 @@ class Position:
             return None
         
         # =====================================================================
-        # CAPA 0: Calcular R actual y MFE
+        # CALCULAR R ACTUAL
         # =====================================================================
         initial_risk = abs(self.entry_price - self.initial_stop_loss)
         if initial_risk <= 0:
@@ -1077,34 +1078,17 @@ class Position:
             current_r = (self.entry_price - current_price) / initial_risk
         
         mfe_r = self.calculate_mfe_r()
-        mae_r = self.calculate_mae_r()
         
         # =====================================================================
-        # 🚨 EMERGENCIA E1: MAE CRÍTICO (ignora todo)
-        # Si ya perdió > 0.6R, no tiene sentido esperar más
+        # 🚨 ÚNICO EXIT DE EMERGENCIA: FLASH CRASH
+        # Si perdió > 0.7R en < 3 candles, algo catastrófico pasó
+        # (exchange glitch, flash crash, etc.)
+        # Umbral subido de 0.5R a 0.7R - queremos solo verdaderas emergencias
         # =====================================================================
-        if current_r < -0.6:
-            logger.warning(
-                f"🚨 EMERGENCY_MAE_EXIT: Current R={current_r:.2f} < -0.6R | "
-                f"Trade already lost too much, cutting before SL"
-            )
-            return {
-                'action': 'CLOSE',
-                'reason': 'EMERGENCY_MAE_EXIT',
-                'mfe_r': mfe_r,
-                'current_r': current_r,
-                'candles': self.candle_count,
-                'exit_type': 'EMERGENCY'
-            }
-        
-        # =====================================================================
-        # 🚨 EMERGENCIA E2: FLASH CRASH (caída rápida)
-        # Si perdió > 0.5R en menos de 3 candles, algo malo pasó
-        # =====================================================================
-        if self.candle_count <= 3 and current_r < -0.5:
+        if self.candle_count <= 3 and current_r < -0.7:
             logger.warning(
                 f"🚨 FLASH_CRASH_EXIT: Lost {current_r:.2f}R in only {self.candle_count} candles | "
-                f"Rapid adverse move, exiting immediately"
+                f"Catastrophic move, exiting immediately"
             )
             return {
                 'action': 'CLOSE',
@@ -1116,244 +1100,41 @@ class Position:
             }
         
         # =====================================================================
-        # =====================================================================
-        # 🔥 FIX #144b (Feb 10, 2026): TAKE PROFIT ON MICRO REVERSAL
+        # 🎯 OPCIONAL: MICRO REVERSAL TP (solo si está en profit)
+        # Si MFE >= 0.60R Y current_r >= 0.50R Y micro es CONTRARIA:
+        # → TOMAR BENEFICIOS
         # 
-        # PROBLEMA: Trade 1 hoy - MFE=0.60R pero micro se volvió alcista.
-        # El precio hizo pullback y el sistema esperó demasiado.
-        # Debió haber tomado beneficios cuando la micro se volvió contraria.
-        #
-        # SOLUCIÓN:
-        # Si MFE >= 0.50R Y current_r >= 0.40R Y micro es CONTRARIA:
-        # → TOMAR BENEFICIOS INMEDIATAMENTE (no esperar a que caiga más)
-        #
-        # Lógica: Si ya ganaste 0.50R+ y la micro te dice "el move terminó",
-        # asegurar beneficios en lugar de devolver todo.
+        # Esto es OPCIONAL - solo asegura ganancias que ya tienes
+        # NO corta trades que van mal (eso lo hace el SL)
         # =====================================================================
-        MICRO_TP_MFE_THRESHOLD = 0.50   # Necesitas haber llegado a 0.50R
-        MICRO_TP_CURRENT_MIN = 0.40     # Necesitas estar al menos a 0.40R
-        
-        # Verificar si micro es contraria a nuestra posición
-        micro_is_contrary = False
-        if self.direction == 'SHORT' and micro_trend == 'BULLISH':
-            micro_is_contrary = True
-        elif self.direction == 'LONG' and micro_trend == 'BEARISH':
-            micro_is_contrary = True
-        
-        if mfe_r >= MICRO_TP_MFE_THRESHOLD and current_r >= MICRO_TP_CURRENT_MIN and micro_is_contrary:
-            logger.warning(
-                f"🎯 MICRO_REVERSAL_TP: MFE={mfe_r:.2f}R, current={current_r:.2f}R | "
-                f"Micro={micro_trend} CONTRARY to {self.direction} | "
-                f"Taking profit before reversal"
-            )
-            return {
-                'action': 'CLOSE',
-                'reason': 'MICRO_REVERSAL_TP',
-                'mfe_r': mfe_r,
-                'current_r': current_r,
-                'candles': self.candle_count,
-                'exit_type': 'MICRO_TREND_PROFIT',
-                'micro_trend': micro_trend
-            }
-        
-        # =====================================================================
-        # 🔥 FIX #148 (Feb 10, 2026): PROFIT_DRAWDOWN_EXIT ELIMINADO
-        # =====================================================================
-        # PROBLEMA: Esto era HINDSIGHT BIAS algorítmico puro.
-        # 
-        # Ejemplo real: MFE=0.49R → retrocede a 0.05R → sale con migajas.
-        # Resultado: RR teórico = 1.0, RR real = 0.05. Destruye expectancy.
-        # 
-        # El mercado NO sabe que nosotros íbamos +0.49R.
-        # Usar MFE como base para decidir salida = information leakage temporal.
-        # 
-        # Esto creaba mentalidad de scalper en sistema de momentum:
-        # - Dejaba correr a 0.49R → retrocedía → "me asusto" → salgo.
-        # 
-        # SOLUCIÓN: Confiar en el ATR trailing y en las salidas por estructura.
-        # Si la estructura sigue válida, el trade sigue válido.
-        # El pullback dentro del ATR trailing es NORMAL en trend following.
-        # 
-        # Los únicos exits válidos ahora son:
-        # - SL (protección de capital)
-        # - TP (objetivo alcanzado)
-        # - ATR Trailing (protección de ganancia REAL, no MFE)
-        # - STRUCTURE_EXIT (invalidación de tesis)
-        # - TIME_INVALIDATION (el mercado no se movió)
-        # =====================================================================
-        # ELIMINADO: PROFIT_DRAWDOWN_EXIT
-        # El código antiguo comparaba mfe_r con current_r y cortaba.
-        # Eso mata winners sistemáticamente.
-        
-        # =====================================================================
-        # CAPA P1: SI ESTÁ EN PROFIT → NUNCA CERRAR TEMPRANO
-        # El trade va en la dirección correcta, dejarlo correr
-        # (Solo llega aquí si no aplica PROFIT_DRAWDOWN_EXIT)
-        # =====================================================================
-        if current_r > 0:
-            return None  # Silencioso, no necesita log
-        
-        # =====================================================================
-        # CAPA P2: COMPRESSION CHECK (BB Squeeze) - CON TIMEOUT
-        # Squeeze es pre-explosión, pero máximo 12 candles de espera
-        # =====================================================================
-        bb_compressed = bb_width_percentile is not None and bb_width_percentile < 20
-        COMPRESSION_TIMEOUT = 12
-        
-        if bb_compressed and self.candle_count < COMPRESSION_TIMEOUT:
-            # Solo bloquear si no estamos en pérdida grave
-            if current_r > -0.4:
-                logger.debug(
-                    f"🔒 EARLY EXIT blocked: BB SQUEEZE (percentile={bb_width_percentile:.0f}%) | "
-                    f"Waiting for explosion ({self.candle_count}/{COMPRESSION_TIMEOUT} candles)"
-                )
-                return None
-            # Si pérdida > 0.4R, el squeeze ya no protege
-        
-        # =====================================================================
-        # CAPA P3: ABSORPTION CHECK - CON TIMEOUT Y VALIDACIÓN
-        # Volumen bajo + precio aguantando, pero debe MEJORAR con tiempo
-        # =====================================================================
-        volume_declining = volume_ratio is not None and volume_ratio < 0.7
-        price_holding = abs(current_r) < 0.3  # Dentro de 0.3R del entry
-        ABSORPTION_TIMEOUT = 10
-        
-        if volume_declining and price_holding and self.candle_count < ABSORPTION_TIMEOUT:
-            logger.debug(
-                f"🔒 EARLY EXIT blocked: ABSORPTION detected | "
-                f"vol_ratio={volume_ratio:.2f} < 0.7, R={current_r:.2f} | "
-                f"Waiting ({self.candle_count}/{ABSORPTION_TIMEOUT} candles)"
-            )
-            return None
-        
-        # =====================================================================
-        # CAPA P4: ANTI-TRAP DETECTION - CON TIMEOUT
-        # MFE >= 0.2R mostró momentum, pullback puede ser stop-hunt
-        # Pero máximo 8 candles de espera
-        # =====================================================================
-        ANTITRAP_TIMEOUT = 8
-        
-        if mfe_r >= 0.20 and current_r > -0.3 and self.candle_count < ANTITRAP_TIMEOUT:
-            logger.debug(
-                f"🔒 EARLY EXIT blocked: ANTI-TRAP | "
-                f"MFE={mfe_r:.2f}R, now={current_r:.2f}R | "
-                f"Waiting ({self.candle_count}/{ANTITRAP_TIMEOUT} candles)"
-            )
-            return None
-        
-        # =====================================================================
-        # CAPA X1: STRUCTURE BREAK (con delta confirmation)
-        # Perdió estructura + delta confirma debilidad
-        # =====================================================================
-        drawdown_from_mfe = mfe_r - current_r
-        delta_confirms_weakness = False
-        
-        if delta_ratio is not None:
-            if self.direction == 'LONG' and delta_ratio < -0.25:
-                delta_confirms_weakness = True
-            elif self.direction == 'SHORT' and delta_ratio > 0.25:
-                delta_confirms_weakness = True
-        
-        if drawdown_from_mfe > 0.4 and delta_confirms_weakness:
-            logger.warning(
-                f"⚡ EARLY_STRUCTURE_EXIT: Drawdown {drawdown_from_mfe:.2f}R + delta confirms ({delta_ratio:.2f})"
-            )
-            return {
-                'action': 'CLOSE',
-                'reason': 'EARLY_STRUCTURE_EXIT',
-                'mfe_r': mfe_r,
-                'current_r': current_r,
-                'candles': self.candle_count,
-                'exit_type': 'STRUCTURE_BREAK',
-                'delta_ratio': delta_ratio
-            }
-        
-        # =====================================================================
-        # CAPA X2: STRUCTURE BREAK SIN DELTA (fallback más agresivo)
-        # Si no hay delta pero drawdown es muy grande, salir igual
-        # 
-        # 🔥 FIX #142 (Feb 10, 2026): Requiere MFE mínimo antes de activar
-        # PROBLEMA: Con MFE=0.09R, drawdown_from_mfe=0.51R cortaba el trade
-        # sin darle chance. Ahora requiere que el trade haya mostrado algo
-        # de vida (MFE > 0.15R) antes de considerarlo "estructura rota".
-        # 
-        # Si MFE < 0.15R, el trade nunca funcionó → NO es "estructura rota",
-        # es simplemente un mal entry. Dejar que el SL haga su trabajo.
-        # =====================================================================
-        MFE_MIN_FOR_STRUCTURE_EXIT = 0.15  # Solo si el trade funcionó algo
-        
-        if drawdown_from_mfe > 0.5 and mfe_r >= MFE_MIN_FOR_STRUCTURE_EXIT:
-            logger.warning(
-                f"⚡ STRUCTURE_EXIT_NO_DELTA: Drawdown {drawdown_from_mfe:.2f}R > 0.5R | "
-                f"Delta unavailable/neutral but structure clearly broken"
-            )
-            return {
-                'action': 'CLOSE',
-                'reason': 'STRUCTURE_EXIT_NO_DELTA',
-                'mfe_r': mfe_r,
-                'current_r': current_r,
-                'candles': self.candle_count,
-                'exit_type': 'STRUCTURE_BREAK_NO_DELTA'
-            }
-        
-        # =====================================================================
-        # CAPA X3: VELOCITY CHECK (trade realmente muerto)
-        # =====================================================================
-        # Candles dinámicas por contexto
-        base_min_candles = 8  # Reducido de 10
-        session_mult = 1.3 if session == 'ASIA' else (1.5 if session == 'DEAD_HOURS' else 1.0)
-        
-        # Si está muy mal, reducir paciencia
-        if current_r < -0.4:
-            base_min_candles = 5  # Menos paciencia si ya perdió mucho
-        
-        velocity_min_candles = int(base_min_candles * session_mult)
-        velocity_min_candles = max(5, min(15, velocity_min_candles))
-        
-        is_truly_dead = (
-            self.candle_count >= velocity_min_candles and
-            mfe_r < 0.15 and
-            current_r < -0.2 and
-            not bb_compressed
-        )
-        
-        if is_truly_dead:
-            logger.warning(
-                f"⚡ EARLY_VELOCITY_EXIT: Dead after {self.candle_count} candles | "
-                f"MFE={mfe_r:.2f}R, Current={current_r:.2f}R"
-            )
-            return {
-                'action': 'CLOSE',
-                'reason': 'EARLY_VELOCITY_EXIT',
-                'mfe_r': mfe_r,
-                'current_r': current_r,
-                'candles': self.candle_count,
-                'exit_type': 'VELOCITY_DEAD'
-            }
-        
-        # =====================================================================
-        # CAPA X4: DETERIORO PROGRESIVO
-        # Si cada 5 candles el trade está PEOR, es tendencia en contra
-        # =====================================================================
-        # Usamos el tracking de R histórico si está disponible
-        if self.candle_count >= 10 and current_r < -0.3:
-            # Si después de 10 candles estamos en -0.3R o peor Y nunca llegamos a profit
-            if mfe_r < 0.1:
-                logger.warning(
-                    f"⚡ DETERIORATION_EXIT: {self.candle_count} candles, never profitable (MFE={mfe_r:.2f}R) | "
-                    f"Current={current_r:.2f}R | Slow bleed detected"
+        if mfe_r >= 0.60 and current_r >= 0.50:
+            micro_is_contrary = False
+            if self.direction == 'SHORT' and micro_trend == 'BULLISH':
+                micro_is_contrary = True
+            elif self.direction == 'LONG' and micro_trend == 'BEARISH':
+                micro_is_contrary = True
+            
+            if micro_is_contrary:
+                logger.info(
+                    f"🎯 MICRO_REVERSAL_TP: MFE={mfe_r:.2f}R, current={current_r:.2f}R | "
+                    f"Micro={micro_trend} reversing | Securing profit"
                 )
                 return {
                     'action': 'CLOSE',
-                    'reason': 'DETERIORATION_EXIT',
+                    'reason': 'MICRO_REVERSAL_TP',
                     'mfe_r': mfe_r,
                     'current_r': current_r,
                     'candles': self.candle_count,
-                    'exit_type': 'SLOW_BLEED'
+                    'exit_type': 'PROFIT_SECURED',
+                    'micro_trend': micro_trend
                 }
         
         # =====================================================================
-        # NINGUNA CONDICIÓN DE EXIT MET → CONTINUAR HOLDING
+        # FIN - NINGUNA CONDICIÓN DE EARLY EXIT MET
+        # 
+        # El SL, TP, y ATR Trailing manejarán la salida normal.
+        # Los pullbacks son normales. Los trades lentos son normales.
+        # La única emergencia real es un flash crash (> 0.7R en 3 candles).
         # =====================================================================
         return None
     

@@ -415,41 +415,44 @@ class EntryScorer:
         # 🔥 FIX #79: Reduce penalties to 25% instead of 50% when strong trend
         penalty_reduction = 0.25 if strong_trend_adx >= STRONG_EDGE_ADX_THRESHOLD else 1.0
         
-        # 6️⃣ MICRO TREND ADJUSTMENT
+        # =====================================================================
+        # 🔥 FIX #162 (Feb 10, 2026): MICRO TREND PENALTY ELIMINADO EN TRENDS
+        # 
+        # PROBLEMA RAÍZ: Un pullback bullish en un downtrend NO es malo.
+        # ES LA OPORTUNIDAD DE ENTRADA que buscamos.
+        # 
+        # El sistema penalizaba SHORTs cuando micro=BULLISH, pero eso es
+        # exactamente cuando DEBERÍAS entrar SHORT - en el pullback.
+        # 
+        # FILOSOFÍA NUEVA:
+        # - ADX >= 35: El mercado tiene dirección clara. Micro contrario = pullback = BUENO
+        # - ADX < 35: Ranging, micro contrario podría significar reversión
+        # 
+        # RESULTADO: Solo aplicar micro penalty cuando ADX < 35
+        # =====================================================================
         if micro_trend_state is not None:
             micro_adj = micro_trend_state.score_adjustment
             if micro_adj != 0:
-                # 🔥 FIX #74: Reduce penalties when strong edge active
-                if micro_adj < 0 and penalty_reduction < 1.0:
-                    original_adj = micro_adj
-                    micro_adj = micro_adj * penalty_reduction
-                    # 🔧 FIX #129: Throttle this log - only show significant reductions
-                    global _last_micro_trend_log
-                    now = datetime.now()
-                    if _last_micro_trend_log is None or (now - _last_micro_trend_log).total_seconds() >= _SCORER_LOG_THROTTLE_SECONDS:
-                        logger.info(
-                            f"🔥 FIX #74: Micro penalty reduced {original_adj:+.1f} → {micro_adj:+.1f} "
-                            f"(ADX={strong_trend_adx:.1f} edge confirms trend)"
-                        )
-                        _last_micro_trend_log = now
-                self._breakdown.micro_trend_adj = micro_adj
-                # 🔧 FIX #129: Throttle micro trend logs - they repeat every evaluation
-                now = datetime.now()
-                if _last_micro_trend_log is None or (now - _last_micro_trend_log).total_seconds() >= _SCORER_LOG_THROTTLE_SECONDS:
+                # FIX #162: NO penalty en trends fuertes - pullback = oportunidad
+                if strong_trend_adx >= STRONG_EDGE_ADX_THRESHOLD:
+                    # En trend fuerte, micro contrario es pullback = BONUS no penalty
                     if micro_adj < 0:
-                        logger.warning(
-                            f"📉 Micro trend penalty: {micro_adj:+.1f} "
-                            f"(micro={micro_trend_state.micro_trend}, "
-                            f"strength={micro_trend_state.strength:.0%})"
+                        logger.debug(
+                            f"🔥 FIX #162: Micro penalty IGNORED (ADX={strong_trend_adx:.1f}≥35) | "
+                            f"Pullback = entry opportunity, not problem"
                         )
-                    else:
-                        logger.info(
-                            f"📈 Micro trend bonus: {micro_adj:+.1f} "
-                            f"(micro={micro_trend_state.micro_trend})"
-                        )
-                    _last_micro_trend_log = now
+                        micro_adj = 0.0  # No penalty en trend
+                
+                self._breakdown.micro_trend_adj = micro_adj
+                # Solo loguear bonus, no penalties (ya no hay penalties en trends)
         
         # 6.5️⃣ FILTER PIPELINE ADJUSTMENT with PENALTY HIERARCHY
+        # =====================================================================
+        # 🔥 FIX #163 (Feb 10, 2026): FILTER PIPELINE SIMPLIFICADO
+        # 
+        # En trends fuertes (ADX >= 35), los filtros de "contexto" son ruido.
+        # El mercado ya votó. Solo mantener hard blocks (cost, overtrade).
+        # =====================================================================
         if filter_pipeline is not None:
             last_decision = filter_pipeline.get_last_decision()
             if last_decision and last_decision.score_adjust != 0:
@@ -458,28 +461,21 @@ class EntryScorer:
                     last_decision,
                     self._breakdown.micro_trend_adj
                 )
-                # 🔥 FIX #74: Reduce penalties when strong edge active
-                if fp_adj < 0 and penalty_reduction < 1.0:
-                    original_adj = fp_adj
-                    fp_adj = fp_adj * penalty_reduction
-                    # 🔧 FIX #129: Throttle this log
-                    global _last_filter_pipeline_log
-                    now = datetime.now()
-                    if _last_filter_pipeline_log is None or (now - _last_filter_pipeline_log).total_seconds() >= _SCORER_LOG_THROTTLE_SECONDS:
-                        logger.info(
-                            f"🔥 FIX #74: Filter penalty reduced {original_adj:+.1f} → {fp_adj:+.1f} "
-                            f"(ADX={strong_trend_adx:.1f} edge confirms trend)"
-                        )
-                        _last_filter_pipeline_log = now
+                # FIX #163: En trend fuerte, eliminar penalties de contexto
+                if strong_trend_adx >= STRONG_EDGE_ADX_THRESHOLD and fp_adj < 0:
+                    # Solo mantener penalty si es de ejecución (cost, overtrade)
+                    execution_only_adj = 0.0
+                    if self._breakdown.penalty_hierarchy:
+                        worst_exec = self._breakdown.penalty_hierarchy.get('worst_execution', (None, 0.0))
+                        if worst_exec[0] is not None:
+                            execution_only_adj = worst_exec[1]
+                    logger.debug(
+                        f"🔥 FIX #163: Context penalties IGNORED (ADX={strong_trend_adx:.1f}≥35) | "
+                        f"Only execution: {execution_only_adj:+.1f}"
+                    )
+                    fp_adj = execution_only_adj
+                
                 self._breakdown.filter_pipeline_adj = fp_adj
-                # 🔧 FIX #129: Throttle filter pipeline logs
-                now = datetime.now()
-                if _last_filter_pipeline_log is None or (now - _last_filter_pipeline_log).total_seconds() >= _SCORER_LOG_THROTTLE_SECONDS:
-                    if fp_adj < 0:
-                        logger.warning(f"📉 Filter pipeline penalty (hierarchical): {fp_adj:+.1f}")
-                    else:
-                        logger.info(f"📈 Filter pipeline bonus: {fp_adj:+.1f}")
-                    _last_filter_pipeline_log = now
         
         # =====================================================================
         # 7️⃣ LATE CONFIRMATION PENALTY (Jan 24, 2026)

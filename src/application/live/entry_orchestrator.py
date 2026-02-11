@@ -1410,6 +1410,32 @@ class ScoreOrchestrator:
             result.tags['fakeout_penalty'] = fakeout_score_penalty
             logger.info(f"⚠️ FIX #79 FAKEOUT SCORE: Applied penalty {fakeout_score_penalty}")
         
+        # =========================================================================
+        # 🔥 FIX #171 (Feb 11, 2026): SIGNAL STALENESS PENALTY
+        # 
+        # PROBLEMA: El sistema ve el movimiento → espera → cuando todo está
+        # "perfecto" entra al FINAL del movimiento → PIERDE por rebote.
+        #
+        # SOLUCIÓN: Penalizar entradas cuando el edge lleva mucho tiempo activo.
+        # - Edge < 3 min: FRESH → sin penalty
+        # - Edge 3-5 min: WARNING → -0.5
+        # - Edge > 5 min: STALE → -1.5 (rechazar entrada tardía)
+        #
+        # Esto fuerza al sistema a entrar RÁPIDO o NO ENTRAR.
+        # =========================================================================
+        stale_score_penalty = 0.0
+        if hasattr(engine, '_edge_manager'):
+            stale_score_penalty = engine._edge_manager.get_signal_freshness_penalty()
+            if stale_score_penalty < 0:
+                edge_age = engine._edge_manager.get_edge_age_minutes()
+                result.score = max(0, result.score + stale_score_penalty)
+                result.tags['stale_signal_penalty'] = stale_score_penalty
+                result.tags['edge_age_minutes'] = round(edge_age, 1)
+                logger.warning(
+                    f"⚠️ FIX #171 STALE SIGNAL: Edge age {edge_age:.1f}min → "
+                    f"penalty {stale_score_penalty} → score {result.score:.1f}"
+                )
+        
         # 🔥 FIX #133 (Feb 09, 2026): Kill check disabled - was causing double-counting
         # The individual guards (delta, forbidden, etc.) already applied penalties
         # No additional kill_check_score_penalty needed

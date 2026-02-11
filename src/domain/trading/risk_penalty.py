@@ -278,8 +278,28 @@ class RiskPenaltyAccumulator:
         # 🔥 FIX #94: SIMPLIFIED OVERRIDE - Always allow trades
         effective_min = self.MIN_VIABLE_MULT  # 0.50
         
-        # 🔥 FIX #109: TRANSITION_MODE gets highest floor (70%)
-        if self._transition_mode_active:
+        # =====================================================================
+        # 🔥 FIX #165 (Feb 10, 2026): STRONG TREND = HIGH FLOOR
+        # 
+        # PROBLEMA: Cuando ADX >= 35, el mercado ha votado claramente.
+        # Los penalties (micro_trend, location, etc.) son RUIDO no señal.
+        # Un floor de 50% sigue siendo demasiado restrictivo.
+        # 
+        # SOLUCIÓN: ADX >= 35 → floor de 80%. El mercado tiene dirección,
+        # DEBEMOS tomar tamaño significativo.
+        # =====================================================================
+        STRONG_TREND_ADX = 35.0
+        STRONG_TREND_FLOOR = 0.80
+        
+        if self._adx_value >= STRONG_TREND_ADX:
+            final_mult = max(final_mult, STRONG_TREND_FLOOR)
+            if len(active_penalties) > 0:
+                logger.info(
+                    f"🔥 FIX #165 STRONG TREND FLOOR: ADX={self._adx_value:.1f}≥35 | "
+                    f"Floor raised to {STRONG_TREND_FLOOR:.0%} (was {min(p.size_mult for p in active_penalties):.0%})"
+                )
+        # 🔥 FIX #109: TRANSITION_MODE gets second highest floor (70%)
+        elif self._transition_mode_active:
             effective_min = self.TRANSITION_MODE_MULT  # 0.70
             if final_mult < 0.70:
                 logger.info(
