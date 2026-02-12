@@ -30,7 +30,7 @@ class BBWidthFilter(BaseFilter):
     BB Width = (Upper - Lower) / Middle
     
     Thresholds (calibrated for BTC 5m):
-    - < 0.5% = EXTREME COMPRESSION → BLOCK (unless range_informative_mode)
+    - < 0.4% = EXTREME COMPRESSION → BLOCK (unless range_informative_mode)
     - < 0.8% = RANGE → Penalize (-2) + require higher score
     - < 1.2% = NARROW → Warning penalty (-1)
     - >= 1.2% = NORMAL → No penalty
@@ -38,10 +38,16 @@ class BBWidthFilter(BaseFilter):
     
     PHASE A (Jan 18, 2026): range_informative_mode=True makes compression
     return allow=True with penalty instead of blocking.
+    
+    🔥 FIX #174 (Feb 11, 2026): Relajar BB_EXTREME_COMPRESSION de 0.5% a 0.4%
+    ANTES: 0.5% bloqueaba trades válidos en compresión moderada (ej: 0.50%)
+    AHORA: Solo bloquea en compresión extrema < 0.4%
+    Log Feb 11: ~30 bloqueos entre 03:46-03:49 por 0.50% justo en el umbral
     """
     
     # Thresholds (as decimal, not percentage)
-    BB_EXTREME_COMPRESSION = 0.005   # 0.5%
+    # 🔥 FIX #174: 0.005 → 0.004 (0.5% → 0.4%)
+    BB_EXTREME_COMPRESSION = 0.004   # 0.4% (was 0.5%)
     BB_RANGE_THRESHOLD = 0.008       # 0.8%
     BB_NARROW_THRESHOLD = 0.012      # 1.2%
     BB_HIGH_VOL_THRESHOLD = 0.025    # 2.5%

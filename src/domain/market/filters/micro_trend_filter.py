@@ -809,7 +809,8 @@ class MicroTrendFilter:
                     # In RANGE with decent ADX: only penalty
                     should_hard_block = False
                     if state.confirmed_strength >= self.STRENGTH_SOFT_BLOCK:
-                        logger.debug(f"[WARN] RANGE soft block: str={state.confirmed_strength:.0%}, ADX={adx_value:.1f if adx_value else 'N/A'}")
+                        adx_str = f"{adx_value:.1f}" if adx_value else "N/A"
+                        logger.debug(f"[WARN] RANGE soft block: str={state.confirmed_strength:.0%}, ADX={adx_str}")
             elif regime_mode == 'TREND':
                 # TREND: Never hard block, only penalty
                 should_hard_block = False

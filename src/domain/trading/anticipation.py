@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import logging
 
@@ -583,7 +583,7 @@ class AnticipationEngine:
             entry_price=entry,
             stop_loss=stop_loss,
             expected_target=target,
-            time_valid_until=datetime.now() + timedelta(minutes=15),
+            time_valid_until=datetime.now(timezone.utc) + timedelta(minutes=15),
             reasons=[
                 f"TREND_PULLBACK: {direction} trend (ADX={adx_1h:.1f})",
                 f"Price at EMA zone ({ema20:.0f}/{ema50:.0f})",
@@ -686,7 +686,7 @@ class AnticipationEngine:
                 entry_price=entry,
                 stop_loss=stop_loss,
                 expected_target=target,
-                time_valid_until=datetime.now() + timedelta(minutes=10),
+                time_valid_until=datetime.now(timezone.utc) + timedelta(minutes=10),
                 reasons=[
                     f"FAILED_TEST: {direction} after rejection @ {level:.0f}",
                     f"Distance from level: {dist_atr:.2f} ATR",
@@ -808,7 +808,7 @@ class AnticipationEngine:
             entry_price=entry,
             stop_loss=stop_loss,
             expected_target=target,
-            time_valid_until=datetime.now() + timedelta(minutes=10),
+            time_valid_until=datetime.now(timezone.utc) + timedelta(minutes=10),
             reasons=reasons,
             structure_level=structure_level
         )

@@ -1467,17 +1467,18 @@ class EntryGateConfig:
     # 
     # 🔥 FIX (Feb 01, 2026): Data-driven score thresholds from 62 trade analysis
     # Analysis results:
-    # 🔥 FIX #156 (Feb 10, 2026): Score thresholds raised
-    # BEFORE: BLOCK=4.5, PROBE=5.0, REDUCED=5.5, FULL>=5.5
-    # NOW: BLOCK=5.5, PROBE=6.0, REDUCED=6.5, FULL>=6.5
+    # 🔥 FIX #232 (Feb 15, 2026): Score thresholds REBALANCED
+    # PROBLEM: BLOCK=5.5 was too high. Edge floor gives 4.0 minimum,
+    # so scores 4.0-5.4 were ALWAYS blocked = system never trades.
+    # Combined with probe sizing + MIN_PROFIT check = death trap.
     #
-    # Trade 14:17:43 entered with score 5.5, MFE=0.00R, lost -0.44R
-    # Score 5.5 is lottery, not trading. Raising floors.
+    # NEW: BLOCK=4.5, PROBE=5.5, REDUCED=6.0, FULL>=6.0
+    # This lets edge-floor trades enter as probes and decent setups trade.
     #
-    SCORE_BLOCK_FLOOR = 5.5          # 🔥 Raised from 4.5 - marginal trades must not enter
-    SCORE_PROBE_MAX = 6.0            # 5.5-6.0 = probe (0.25x)
-    SCORE_REDUCED_MAX = 6.5          # 6.0-6.5 = reduced (0.5x)
-    # Above 6.5 = full size (1.0x)
+    SCORE_BLOCK_FLOOR = 4.5          # 🔥 FIX #232: Lowered from 5.5 - allow marginal as probe
+    SCORE_PROBE_MAX = 5.5            # 4.5-5.5 = probe (0.25x)
+    SCORE_REDUCED_MAX = 6.0          # 5.5-6.0 = reduced (0.5x)
+    # Above 6.0 = full size (1.0x)
     
     # RR-BASED SIZING
     # Graduated sizing based on risk:reward quality
@@ -2809,14 +2810,16 @@ class DynamicScoreThreshold:
     # Base threshold by regime
     # FIX (Jan 24, 2026): Lowered all thresholds - bot was at 0 trades in 9h
     # 🔥 FIX (Feb 04, 2026): Added TRANSITION explicitly with low threshold
-    # TRANSITION with structural consensus should be tradeable!
+    # 🔥 FIX #211 (Feb 12, 2026): Lowered ALL thresholds to allow exploitation
+    # PROBLEMA: EDGE_FLOOR = 4.0 pero threshold >= 4.5 → nunca entra
+    # SOLUCIÓN: Threshold = 4.0 base (momentum adjustments still apply)
     REGIME_THRESHOLD = {
-        "RANGE": 5.0,            # Was 6.5 - too strict for range trading
-        "TREND": 4.5,            # Was 6.0 - let momentum carry us
-        "TRANSITION": 4.5,       # 🔥 NEW: Same as TREND - structural consensus allows
-        "TREND_EXPANSION": 5.0,  # Was 6.5 - breakouts need fast entry
-        "TREND_EXHAUSTION": 5.5, # Was 7.0 - still be careful
-        "CONSOLIDATION": 5.0,    # Was 6.5
+        "RANGE": 4.5,            # 🔥 FIX #211: Was 5.0 - can't reach with floor 4.0
+        "TREND": 4.0,            # 🔥 FIX #211: Was 4.5 - momentum should exploit
+        "TRANSITION": 4.0,       # 🔥 FIX #211: Was 4.5 - transition edge is validated
+        "TREND_EXPANSION": 4.0,  # 🔥 FIX #211: Was 5.0 - breakouts need FAST entry
+        "TREND_EXHAUSTION": 5.0, # 🔥 FIX #211: Was 5.5 - still be careful
+        "CONSOLIDATION": 4.5,    # 🔥 FIX #211: Was 5.0
     }
     
     # Session adjustment (added to base threshold)
@@ -2859,7 +2862,9 @@ class DynamicScoreThreshold:
         threshold = base + adjustment
         
         # Clamp to reasonable range
-        return max(5.0, min(8.0, threshold))
+        # 🔥 FIX #211 (Feb 12, 2026): Lowered minimum from 5.0 to 4.0
+        # EDGE_FLOOR = 4.0, threshold must allow trading at floor
+        return max(4.0, min(8.0, threshold))
 
 
 # ============================================================================

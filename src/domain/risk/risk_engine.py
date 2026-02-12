@@ -95,7 +95,7 @@ class Position:
         self.exchange_qty: Optional[float] = None  # What exchange confirmed
         self.reduce_only_validated = False  # True once SL/TP confirmed as reduce-only
         self.integrity_validated = False  # True once all invariants pass
-        self.integrity_errors: list = []  # List of integrity issues
+        self.integrity_errors: list[str] = []  # List of integrity issues
         self.position_state = PositionState.PENDING  # Explicit position state tracking
         
         # ===== EXCHANGE SL TRACKING (CRITICAL FIX) =====
@@ -1138,13 +1138,18 @@ class Position:
         # =====================================================================
         return None
     
-    def check_mediocre_trade_exit(self, n_candles: int = 6, mfe_threshold: float = 0.3,
+    def check_mediocre_trade_exit(self, n_candles: int = 12, mfe_threshold: float = 0.3,
                                      adx: float | None = None, atr_ratio: float | None = None,
                                      current_price: float | None = None,
                                      vwap: float | None = None, last_lh: float | None = None,
                                      vah: float | None = None) -> dict | None:
         """
         TIME_INVALIDATION INTELIGENTE (Jan 23, 2026)
+        
+        🔥 FIX #242 (Feb 16, 2026): n_candles 6→12
+        BTC necesita 10-20 min para desarrollar movimientos. 6 candles (6 min)
+        mataba trades que habrían sido ganadores. 12 candles (~12 min) da room
+        suficiente para pullbacks normales sin permitir trades muertos.
         
         CAMBIO CRÍTICO: Timeout = checkpoint, NO gatillo ciego.
         
@@ -2994,6 +2999,24 @@ class RiskEngine:
         UPDATED (Feb 03, 2026): Added bos_quality for dynamic trailing adjustment
         UPDATED (Feb 04, 2026): Added displacement_origin for reclaim exit
         """
+        # =====================================================================
+        # 🔥 FIX #183b (Feb 11, 2026): IDEMPOTENT GUARD
+        # If position already exists with same direction/entry, return it
+        # This prevents duplicate position creation during timeout recovery
+        # =====================================================================
+        if self.position is not None:
+            existing = self.position
+            # Check if this is the same position (same direction, similar price)
+            price_match = abs(existing.entry_price - entry_price) < 1.0  # $1 tolerance
+            direction_match = existing.direction == direction
+            if price_match and direction_match:
+                logger.warning(f"🔄 FIX #183b: Position already exists - returning existing ({existing.direction} @ {existing.entry_price:.2f})")
+                return existing
+            else:
+                logger.warning(f"⚠️ FIX #183b: Position exists but different! Existing: {existing.direction} @ {existing.entry_price:.2f}, New: {direction} @ {entry_price:.2f}")
+                # Return existing to prevent overwrite
+                return existing
+        
         self.position = Position(
             symbol=symbol or 'UNKNOWN',
             direction=direction or 'UNKNOWN',
@@ -3191,8 +3214,9 @@ class RiskEngine:
         EDGE FIX: Use minimum 1.2 ATR distance to avoid noise stops
         The SL is the FURTHER of: structure level OR ATR minimum
         
-        CAPA 2: SL is CAPPED at max_atr_multiple to avoid false RR
-        - SL cannot exceed 4.0 ATR from entry (prevents fake high RR trades)
+        🔥 FIX #188 (Feb 11, 2026): SL is CAPPED at 3.0 ATR (reduced from 4.0)
+        - SL cannot exceed 3.0 ATR from entry (prevents absurd 1R distances)
+        - Trade that lost: swing_high at 3.4× ATR → 1R=$1,200 → MFE 0.26R → TIME_INVALIDATION
         
         REGIME-AWARE SL (Jan 12, 2026):
         - RANGE: tighter SL (1.5 ATR) - quick scalps to value
@@ -3223,8 +3247,14 @@ class RiskEngine:
         else:
             atr_multiplier = base_atr_multiplier
         
-        # CAPA 2: Maximum SL distance cap (prevents fake high RR)
-        max_atr_multiple = 4.0  # Never exceed 4 ATR from entry
+        # 🔥 FIX #188 (Feb 11, 2026): CAP SL DISTANCE MORE AGGRESSIVELY
+        # PROBLEMA: SL cap de 4× ATR era demasiado laxo.
+        # - Con ATR=$354, max SL = $1,416 → 1R muy grande
+        # - Si swing_high está a $1,200, 1R = $1,200
+        # - MFE de $300 = solo 0.25R → TIME_INVALIDATION a -0.40R
+        # SOLUCIÓN: Reducir cap a 3× ATR (en lugar de 4×)
+        # - Con ATR=$354, max SL = $1,062 → trailing se activa más rápido
+        max_atr_multiple = 3.0  # 🔥 FIX #188: Reduced from 4.0 to 3.0
         max_sl_distance = max_atr_multiple * atr_1m
         
         # Minimum SL distance = dynamic ATR (survive noise in BTC)
@@ -3236,10 +3266,10 @@ class RiskEngine:
             atr_stop = entry_price - min_sl_distance
             stop = min(structure_stop, atr_stop)  # Use the LOWER (further) one
             
-            # CAPA 2: Apply max cap
+            # 🔥 FIX #188: Apply max cap (3× ATR instead of 4×)
             max_stop = entry_price - max_sl_distance
             if stop < max_stop:
-                logger.warning(f"⚠️ SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple} ATR)")
+                logger.warning(f"⚠️ FIX #188 SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple}× ATR)")
                 stop = max_stop
         else:  # SHORT
             structure_stop = support_resistance + buffer
@@ -3247,10 +3277,10 @@ class RiskEngine:
             atr_stop = entry_price + min_sl_distance
             stop = max(structure_stop, atr_stop)  # Use the HIGHER (further) one
             
-            # CAPA 2: Apply max cap
+            # 🔥 FIX #188: Apply max cap (3× ATR instead of 4×)
             max_stop = entry_price + max_sl_distance
             if stop > max_stop:
-                logger.warning(f"⚠️ SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple} ATR)")
+                logger.warning(f"⚠️ FIX #188 SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple}× ATR)")
                 stop = max_stop
         
         logger.info(f"Stop loss calculated: {stop:.2f} (Structure: {support_resistance:.2f}±{buffer:.2f}, ATR min: {min_sl_distance:.2f} [{atr_multiplier}x])")
@@ -3599,9 +3629,10 @@ class RiskEngine:
                     return await self._close_position(current_price, exit_reason)
                 
                 # 0. Check mediocre trade exit (TIME_INVALIDATION INTELIGENTE)
-                # 🔥 FIX (Jan 23, 2026): Now returns dict with action, not bool
+                # 🔥 FIX #242 (Feb 16, 2026): n_candles 6→12
+                # BTC needs 10-20 min for moves to develop. 6 min was too aggressive.
                 time_check = pos.check_mediocre_trade_exit(
-                    n_candles=6, 
+                    n_candles=12, 
                     adx=adx, 
                     atr_ratio=atr_ratio,
                     current_price=current_price,

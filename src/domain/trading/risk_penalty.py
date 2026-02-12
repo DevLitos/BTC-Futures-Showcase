@@ -20,9 +20,25 @@ FILOSOFÍA:
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
+from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
+
+# =========================================================================
+# 🔥 FIX #180 (Feb 11, 2026): LOG RATE LIMITING
+# =========================================================================
+_penalty_rate_limiter: dict[str, datetime] = {}
+_PENALTY_RATE_LIMIT_SECONDS = 60
+
+def _should_log_penalty(source: str) -> bool:
+    """Rate limit penalty logs - only log once per minute per source."""
+    now = datetime.utcnow()
+    last_log = _penalty_rate_limiter.get(source)
+    if last_log is None or (now - last_log).total_seconds() >= _PENALTY_RATE_LIMIT_SECONDS:
+        _penalty_rate_limiter[source] = now
+        return True
+    return False
 
 
 class PenaltySource(Enum):
@@ -63,6 +79,9 @@ class PenaltySource(Enum):
     
     # Spread
     HIGH_SPREAD = "high_spread"
+    
+    # Absorption
+    ABSORPTION_CONTRARY = "absorption_contrary"
     
     # Other
     COUNTERTREND = "countertrend"
@@ -210,11 +229,12 @@ class RiskPenaltyAccumulator:
             self._has_catastrophic = True
             self._catastrophic_reason = reason
         
-        # Log significant penalties
+        # Log significant penalties - 🔥 FIX #180: Rate limited
         if size_mult < 0.8 or score_adj < -0.5:
-            logger.info(
-                f"⚠️ PENALTY: {source.value} | size×{size_mult:.0%}, score{score_adj:+.1f} | {reason}"
-            )
+            if _should_log_penalty(source.value):
+                logger.info(
+                    f"⚠️ PENALTY: {source.value} | size×{size_mult:.0%}, score{score_adj:+.1f} | {reason}"
+                )
     
     def get_result(self) -> RiskPenaltyResult:
         """
@@ -293,7 +313,7 @@ class RiskPenaltyAccumulator:
         
         if self._adx_value >= STRONG_TREND_ADX:
             final_mult = max(final_mult, STRONG_TREND_FLOOR)
-            if len(active_penalties) > 0:
+            if len(active_penalties) > 0 and _should_log_penalty('strong_trend_floor'):
                 logger.info(
                     f"🔥 FIX #165 STRONG TREND FLOOR: ADX={self._adx_value:.1f}≥35 | "
                     f"Floor raised to {STRONG_TREND_FLOOR:.0%} (was {min(p.size_mult for p in active_penalties):.0%})"
@@ -301,7 +321,7 @@ class RiskPenaltyAccumulator:
         # 🔥 FIX #109: TRANSITION_MODE gets second highest floor (70%)
         elif self._transition_mode_active:
             effective_min = self.TRANSITION_MODE_MULT  # 0.70
-            if final_mult < 0.70:
+            if final_mult < 0.70 and _should_log_penalty('transition_mode_override'):
                 logger.info(
                     f"🚀 TRANSITION_MODE OVERRIDE: Raising penalty floor from "
                     f"{final_mult:.0%} to 70%"

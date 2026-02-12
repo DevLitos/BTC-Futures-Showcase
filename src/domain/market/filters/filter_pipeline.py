@@ -178,6 +178,13 @@ class EntryFilterPipeline:
                 return aggregate
         
         # ===== 2. BB WIDTH (compression detection) =====
+        # 🔥 FIX #178 (Feb 11, 2026): ANTICIPATION BYPASS para BB WIDTH
+        # PROBLEMA CRÍTICO: ANTICIPATION detecta COMPRESSION_BREAKOUT (squeeze)
+        # pero BB WIDTH filter bloquea porque ve la misma compresión.
+        # Esto es CONTRADICTORIO: el squeeze ES lo que queremos anticipar!
+        #
+        # SOLUCIÓN: Si anticipation_bypass=True, convertir BB WIDTH BLOCK
+        # en penalty en lugar de bloqueo. Esto permite entrar con size reducido.
         if self.bb_width_filter.enabled:
             decision = self.bb_width_filter.evaluate(
                 df=df_5m
@@ -188,10 +195,19 @@ class EntryFilterPipeline:
             aggregate = aggregate.merge_dedup(decision)
             
             if not decision.allow and early_exit:
-                aggregate.tags['blocked_by'] = 'bb_width'
-                self._last_aggregate = aggregate
-                logger.warning(f"[BLOCK] FILTER [bb_width]: {decision.reasons[0] if decision.reasons else 'compression'}")
-                return aggregate
+                # 🔥 FIX #178: Si anticipation_bypass, convertir BLOCK → PENALTY
+                if anticipation_bypass:
+                    logger.info(f"📊 FIX #178: BB WIDTH BLOCK bypassed by ANTICIPATION (COMPRESSION_BREAKOUT) → converting to penalty")
+                    # No bloquear, pero aplicar penalty severo
+                    aggregate.allow = True
+                    aggregate.score_adjust -= 2.0  # Penalty por compresión
+                    aggregate.size_multiplier = min(aggregate.size_multiplier, 0.5)  # Max 50% size
+                    aggregate.tags['bb_width_bypassed'] = True
+                else:
+                    aggregate.tags['blocked_by'] = 'bb_width'
+                    self._last_aggregate = aggregate
+                    logger.warning(f"[BLOCK] FILTER [bb_width]: {decision.reasons[0] if decision.reasons else 'compression'}")
+                    return aggregate
         
         # ===== 3. MACRO TREND (15m + 1h EMA200 + slope) =====
         # CONTEXT category - use merge_dedup to avoid double penalty with other context filters
@@ -326,9 +342,11 @@ class EntryFilterPipeline:
         # +1.5 is common, only log >= 2.0 or blocks
         if aggregate.score_adjust != 0:
             adj_str = f"{aggregate.score_adjust:+.1f}"
-            if abs(aggregate.score_adjust) >= 2.0 or not aggregate.allow:
+            if not aggregate.allow:
                 logger.info(f"[DATA] FILTER: adj={adj_str}, {aggregate.reasons[0] if aggregate.reasons else 'ok'}")
-            # else: too common, skip logging
+            else:
+                logger.debug(f"[DATA] FILTER: adj={adj_str}, {aggregate.reasons[0] if aggregate.reasons else 'ok'}")
+            # Non-blocking adjustments are debug-level (too frequent for console)
         
         return aggregate
     

@@ -574,10 +574,11 @@ class PullbackShortEngine:
         # Signal is valid!
         signal.valid = True
         
+        tp2_str = f"{signal.tp2_price:.2f}" if signal.tp2_price else "N/A"
         logger.info(
             f"[PULLBACK] ✅ SIGNAL VALID | "
             f"Entry={entry_price:.2f} ({entry_mode}) | SL={stop_loss:.2f} | "
-            f"TP1={tp1_price:.2f} (VWAP) | TP2={signal.tp2_price:.2f if signal.tp2_price else 'N/A'} | "
+            f"TP1={tp1_price:.2f} (VWAP) | TP2={tp2_str} | "
             f"ext_z={extension_z:.2f} | trigger={trigger_type}"
         )
         

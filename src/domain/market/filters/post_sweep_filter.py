@@ -22,6 +22,21 @@ from src.domain.market.filters.filter_interface import BaseFilter, FilterDecisio
 
 logger = logging.getLogger(__name__)
 
+# =========================================================================
+# 🔥 FIX #180 (Feb 11, 2026): LOG RATE LIMITING
+# =========================================================================
+_sweep_rate_limiter: dict[str, datetime] = {}
+_SWEEP_RATE_LIMIT_SECONDS = 60
+
+def _should_log_sweep(key: str) -> bool:
+    """Rate limit sweep logs - only log once per minute per key."""
+    now = datetime.utcnow()
+    last_log = _sweep_rate_limiter.get(key)
+    if last_log is None or (now - last_log).total_seconds() >= _SWEEP_RATE_LIMIT_SECONDS:
+        _sweep_rate_limiter[key] = now
+        return True
+    return False
+
 
 @dataclass
 class SweepZone:
@@ -67,10 +82,18 @@ class PostSweepConfirmationFilter(BaseFilter):
     # ANTES: Timeout fijo de 15 velas = 15 minutos en cualquier volatilidad
     # AHORA: Timeout basado en ATR - alta vol = más tiempo para confirmar
     # Filosofía: El mercado dicta el tiempo, no un número mágico
-    CONFIRMATION_TIMEOUT_CANDLES = 15  # Fallback (legacy)
-    CONFIRMATION_TIMEOUT_MIN_MINUTES = 5   # Mínimo 5 minutos
-    CONFIRMATION_TIMEOUT_MAX_MINUTES = 20  # Máximo 20 minutos
+    #
+    # 🔥 FIX #176 (Feb 11, 2026): REDUCIR TIMEOUT MÁXIMO
+    # ANTES: Max 20 minutos → bloqueos de hasta 45 velas (45 min!) observados
+    # AHORA: Max 10 minutos = 10 velas → evitar bloqueos excesivos
+    # Log Feb 11: BULLISH sweep bloqueó SHORTs por 45 velas (05:18-05:56)
+    CONFIRMATION_TIMEOUT_CANDLES = 10  # Fallback (legacy) - was 15
+    CONFIRMATION_TIMEOUT_MIN_MINUTES = 3   # Mínimo 3 minutos (was 5)
+    CONFIRMATION_TIMEOUT_MAX_MINUTES = 10  # Máximo 10 minutos (was 20)
     CONFIRMATION_ATR_MULT = 2.0  # Timeout = ATR * mult / volatilidad esperada
+    
+    # 🔥 FIX #176: Límite absoluto de velas para cross-blocking
+    CROSS_BLOCK_MAX_CANDLES = 10  # Máximo 10 velas para bloqueo cruzado
     
     # Score adjustments
     PENDING_SWEEP_PENALTY = -2.0    # While waiting for confirmation
@@ -386,6 +409,11 @@ class PostSweepConfirmationFilter(BaseFilter):
             # 🔥 CRITICAL FIX (Jan 17, 2026): Cross-direction blocking
             # BEARISH sweep = upside liquidity grab → DON'T BUY (bulls trapped)
             # BULLISH sweep = downside liquidity grab → DON'T SHORT (bears trapped)
+            #
+            # 🔥 FIX #176 (Feb 11, 2026): Límite de tiempo para cross-blocking
+            # ANTES: Cross-blocking duraba hasta que el sweep expiraba (hasta 45+ velas)
+            # AHORA: Cross-blocking máximo 10 velas, luego permite con penalty
+            # Log Feb 11: BULLISH sweep bloqueó SHORTs por 45 velas innecesariamente
             # =========================================================================
             elif bias == 'LONG' and sweep.sweep_type == 'BEARISH' and not sweep.confirmation_complete:
                 # BEARISH sweep = bears in control, bulls trapped → BLOCK LONGS
@@ -393,6 +421,18 @@ class PostSweepConfirmationFilter(BaseFilter):
                 tags['sweep_type'] = 'BEARISH'
                 tags['sweep_break_confirmed'] = sweep.break_confirmed
                 tags['sweep_candles_pending'] = sweep.candles_since_sweep
+                
+                # 🔥 FIX #176: Después de CROSS_BLOCK_MAX_CANDLES, permitir con penalty
+                if sweep.candles_since_sweep > self.CROSS_BLOCK_MAX_CANDLES:
+                    # 🔥 FIX #180: Rate limit - only log once per minute
+                    if _should_log_sweep('cross_block_expired_long'):
+                        logger.info(f"⚠️ FIX #176: Cross-block expired after {sweep.candles_since_sweep} candles → allowing LONG with penalty")
+                    return FilterDecision(
+                        allow=True,
+                        score_adjust=self.PENDING_SWEEP_PENALTY,  # -2.0 penalty
+                        reasons=[f"⚠️ BEARISH sweep cross-block EXPIRED ({sweep.candles_since_sweep} > {self.CROSS_BLOCK_MAX_CANDLES}) → allowing with penalty"],
+                        tags=tags
+                    )
                 
                 return FilterDecision(
                     allow=False,
@@ -406,6 +446,18 @@ class PostSweepConfirmationFilter(BaseFilter):
                 tags['sweep_type'] = 'BULLISH'
                 tags['sweep_break_confirmed'] = sweep.break_confirmed
                 tags['sweep_candles_pending'] = sweep.candles_since_sweep
+                
+                # 🔥 FIX #176: Después de CROSS_BLOCK_MAX_CANDLES, permitir con penalty
+                if sweep.candles_since_sweep > self.CROSS_BLOCK_MAX_CANDLES:
+                    # 🔥 FIX #180: Rate limit - only log once per minute
+                    if _should_log_sweep('cross_block_expired_short'):
+                        logger.info(f"⚠️ FIX #176: Cross-block expired after {sweep.candles_since_sweep} candles → allowing SHORT with penalty")
+                    return FilterDecision(
+                        allow=True,
+                        score_adjust=self.PENDING_SWEEP_PENALTY,  # -2.0 penalty
+                        reasons=[f"⚠️ BULLISH sweep cross-block EXPIRED ({sweep.candles_since_sweep} > {self.CROSS_BLOCK_MAX_CANDLES}) → allowing with penalty"],
+                        tags=tags
+                    )
                 
                 return FilterDecision(
                     allow=False,

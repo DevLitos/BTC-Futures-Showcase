@@ -135,35 +135,46 @@ def check_candle_gate(
     # =========================================================================
     # 4. PRICE MOVEMENT EVENT: Evaluate if significant price move
     # =========================================================================
+    # 🔥 FIX #240 (Feb 15, 2026): ADAPTIVE THRESHOLD DURING ACTIVE EDGE
+    # When an edge is active, lower the threshold to 0.2 ATR and max ticks to 10.
+    # This gives 3× more evaluation opportunities during live setups.
+    # Without active edge: 0.5 ATR threshold, 30 ticks max (normal).
+    edge_mgr = getattr(engine, '_edge_manager', None)
+    has_active_edge = False
+    if edge_mgr:
+        from src.domain.trading.edge_state_manager import EdgeState
+        has_active_edge = edge_mgr.state in (EdgeState.EDGE_ACTIVE, EdgeState.EDGE_PROVISIONAL)
+    
+    price_threshold_mult = 0.2 if has_active_edge else EVENT_GATE_CONFIG["PRICE_MOVE_ATR_THRESHOLD"]
+    max_ticks = 10 if has_active_edge else EVENT_GATE_CONFIG["MAX_TICKS_WITHOUT_EVAL"]
+    
     if atr_1m > 0:
         last_eval_price = getattr(engine, '_last_eval_price', current_price)
         price_delta = abs(current_price - last_eval_price)
-        threshold = atr_1m * EVENT_GATE_CONFIG["PRICE_MOVE_ATR_THRESHOLD"]
+        threshold = atr_1m * price_threshold_mult
         
         if price_delta >= threshold:
             direction = "↑" if current_price > last_eval_price else "↓"
             _update_last_eval_price(engine, current_price)
             engine._ticks_since_last_eval = 0
-            # 🔧 FIX #129 (Feb 09, 2026): Cambiado a DEBUG para reducir spam
-            # Con threshold 0.5 ATR ya filtra bien, pero aún puede ser muchos logs
-            # La información importante es si ENTRA o no, no cada evaluación
             logger.debug(
-                f"📈 PRICE EVENT {direction} → EVALUATING | "
+                f"[UP] PRICE EVENT {direction} → EVALUATING | "
                 f"Move: ${price_delta:.2f} (threshold: ${threshold:.2f}) | "
                 f"Price: ${last_eval_price:.2f} → ${current_price:.2f}"
+                f"{' | 🔥 ACTIVE EDGE fast-eval' if has_active_edge else ''}"
             )
             return True, new_count
     
     # =========================================================================
     # 5. MAX TICKS FALLBACK: Evaluate every N ticks regardless
     # =========================================================================
-    if ticks_since_last_eval >= EVENT_GATE_CONFIG["MAX_TICKS_WITHOUT_EVAL"]:
+    if ticks_since_last_eval >= max_ticks:
         _update_last_eval_price(engine, current_price)
         engine._ticks_since_last_eval = 0
-        # FIX #84: Reducido a DEBUG para eliminar spam
         logger.debug(
-            f"⏰ MAX TICKS ({EVENT_GATE_CONFIG['MAX_TICKS_WITHOUT_EVAL']}) → EVALUATING | "
+            f"⏰ MAX TICKS ({max_ticks}) → EVALUATING | "
             f"Price: ${current_price:.2f} | ATR: {atr_1m:.2f}"
+            f"{' | 🔥 ACTIVE EDGE fast-eval' if has_active_edge else ''}"
         )
         return True, new_count
     
@@ -532,17 +543,29 @@ def check_anticipation_signal(
         # SOLUCIÓN: Quality gate antes de procesar:
         # - Si conf < 60% AND (ADX < 5 OR phase = UNKNOWN) → skip
         # - Señales de baja confianza sin contexto son ruido puro
+        #
+        # 🔥 FIX #177 (Feb 11, 2026): EXCEPCIÓN para COMPRESSION_BREAKOUT
+        # PROBLEMA: El quality gate filtraba señales de COMPRESSION_BREAKOUT
+        # porque durante el squeeze el ADX es típicamente bajo (<5).
+        # PERO eso es PRECISAMENTE cuando queremos anticipation!
+        #
+        # SOLUCIÓN: Si signal == COMPRESSION_BREAKOUT, ignorar quality gate.
+        # El squeeze confirmado (BB percentile bajo) ES la calidad.
         # =========================================================================
         adx_5m = getattr(engine, '_last_effective_adx', 0.0)
         trend_phase = getattr(engine, '_current_trend_phase', 'UNKNOWN')
         
         if anticipation.signal != AnticipationSignal.NONE:
+            # 🔥 FIX #177: NO filtrar COMPRESSION_BREAKOUT por low ADX
+            # El squeeze implica ADX bajo - eso es esperado, no ruido
+            is_compression_breakout = anticipation.signal == AnticipationSignal.COMPRESSION_BREAKOUT
+            
             is_low_quality = (
                 anticipation.confidence < 0.60 and 
                 (adx_5m < 5.0 or trend_phase == 'UNKNOWN')
             )
             
-            if is_low_quality:
+            if is_low_quality and not is_compression_breakout:
                 logger.debug(
                     f"⏭️ FIX #113: ANTICIPATION skipped (low quality): conf={anticipation.confidence:.0%}, "
                     f"ADX={adx_5m:.1f}, phase={trend_phase}"

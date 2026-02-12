@@ -97,6 +97,7 @@ class SimplifiedSizingResult:
     toxic_combo_mult: float = 1.0  # 🔥 NEW: Toxic combo multiplier (REDUCE mode)
     momentum_mult: float = 1.0  # Momentum predictor multiplier
     regime_fusion_mult: float = 1.0  # 🔥 FIX #83: RegimeFusion macro/micro alignment
+    score_mult: float = 1.0  # 🔥 FIX #245: Score-to-sizing multiplier
     
     # Final
     combined_multiplier: float = 1.0
@@ -508,6 +509,8 @@ class SimplifiedSizer:
         momentum_score: float = 1.0,  # 0-2 score from entry_scorer
         # 🔥 FIX #83 (Feb 7, 2026): RegimeFusion macro/micro alignment
         regime_fusion_mult: float = 1.0,  # 0.3 for fades, 1.0 for aligned
+        # 🔥 FIX #245 (Feb 16, 2026): Score-to-sizing multiplier
+        entry_score: float = 5.0,  # Entry score for sizing graduation
     ) -> SimplifiedSizingResult:
         """
         Calculate position size using simplified 5-multiplier system.
@@ -597,6 +600,33 @@ class SimplifiedSizer:
         result.momentum_mult = MomentumSizingMultiplier.get_multiplier(momentum_score)
         result.tags['momentum_score'] = momentum_score
         result.tags['momentum_mult'] = result.momentum_mult
+        
+        # =====================================================================
+        # 🔥 FIX #245 (Feb 16, 2026): SCORE-TO-SIZING MULTIPLIER
+        # 
+        # PROBLEMA: Score era gate binario (block/pass). Score 5.0 y 9.0
+        # daban el mismo tamaño. Score decorrelado de outcomes porque no
+        # influía en sizing — solo bloqueaba trades < threshold.
+        #
+        # SOLUCIÓN: Score gradúa el tamaño de posición:
+        # - Score < 5.0 → 0.50x (probe size, low conviction)
+        # - Score 5.0-6.0 → 0.70x (reduced, moderate conviction)
+        # - Score 6.0-7.0 → 0.85x (near full)
+        # - Score >= 7.0 → 1.00x (full conviction)
+        #
+        # FILOSOFÍA: Un score bajo que pasa el gate NO debería tener el
+        # mismo sizing que un score alto. Score 5 = "maybe", Score 8 = "yes".
+        # =====================================================================
+        if entry_score < 5.0:
+            result.score_mult = 0.50
+        elif entry_score < 6.0:
+            result.score_mult = 0.70
+        elif entry_score < 7.0:
+            result.score_mult = 0.85
+        else:
+            result.score_mult = 1.00
+        result.tags['entry_score'] = entry_score
+        result.tags['score_mult'] = result.score_mult
         
         # =====================================================================
         # 🔥 INTRADAY vs INSTITUTIONAL: Filtros diferentes
@@ -780,7 +810,8 @@ class SimplifiedSizer:
             result.toxic_hour_mult *    # Toxic hour multiplier
             result.toxic_combo_mult *   # Toxic combo multiplier (REDUCE mode)
             result.momentum_mult *      # Momentum predictor multiplier
-            result.regime_fusion_mult   # 🔥 FIX #83: Macro/Micro alignment (0.3-1.0)
+            result.regime_fusion_mult * # 🔥 FIX #83: Macro/Micro alignment (0.3-1.0)
+            result.score_mult           # 🔥 FIX #245: Score-to-sizing (0.5-1.0)
         )
         
         # =====================================================================
@@ -830,6 +861,7 @@ class SimplifiedSizer:
         toxic_combo_log = f" × TOXIC_COMBO={result.toxic_combo_mult:.2f}" if result.toxic_combo_mult < 1.0 else ""
         momentum_log = f" × MOM={result.momentum_mult:.2f}" if result.momentum_mult != 1.0 else ""
         fusion_log = f" × FUSION={result.regime_fusion_mult:.2f}" if result.regime_fusion_mult < 1.0 else ""
+        score_log = f" × SCORE={result.score_mult:.2f}" if result.score_mult < 1.0 else ""
         logger.info(
             f"📊 SIMPLIFIED SIZING [{edge_mode}]: "
             f"RR={result.rr_mult:.2f} × "
@@ -837,7 +869,7 @@ class SimplifiedSizer:
             f"LOSS={result.loss_streak_mult:.2f} × "
             f"SESS={result.session_mult:.2f} × "
             f"EDGE={result.edge_mult:.2f}"
-            f"{toxic_hour_log}{toxic_combo_log}{momentum_log}{fusion_log} = "
+            f"{toxic_hour_log}{toxic_combo_log}{momentum_log}{fusion_log}{score_log} = "
             f"{result.combined_multiplier:.2f} → "
             f"{result.final_size:.6f} BTC"
         )
@@ -878,6 +910,14 @@ class SimplifiedExitConfig:
     TP_R_TREND = 1.2    # 1.2R en tendencia (equilibrio calidad/frecuencia)
     TP_R_RANGE = 0.8    # 0.8R en rango (scalp conservador)
     
+    # 🔥 NEW FEB 11: TP ADAPTATIVO basado en volatilidad
+    # - Baja volatilidad (atr_ratio < 0.8): TP conservador
+    # - Alta volatilidad (atr_ratio > 1.3): TP extendido
+    TP_VOLATILITY_LOW_THRESHOLD = 0.8   # ATR actual / ATR avg
+    TP_VOLATILITY_HIGH_THRESHOLD = 1.3
+    TP_LOW_VOL_MULT = 0.8    # Reduce TP 20% en baja vol
+    TP_HIGH_VOL_MULT = 1.25  # Aumenta TP 25% en alta vol
+    
     # 🔥 BREAKOUT edge - Alto TP porque baja frecuencia
     TP_R_BREAKOUT = 1.8       # BREAKOUT target (calidad > cantidad)
     TP_R_BREAKOUT_IDEAL = 2.5 # Ideal target for BREAKOUT
@@ -911,31 +951,39 @@ class SimplifiedExitConfig:
     SL_STRUCTURAL = True  # Use structural SL always
     
     @classmethod
-    def get_tp_r(cls, regime_str: str, adx: Optional[float] = None, edge_type: Optional[str] = None, edge_mode: Optional[str] = None) -> float:
+    def get_tp_r(cls, regime_str: str, adx: Optional[float] = None, edge_type: Optional[str] = None, edge_mode: Optional[str] = None, atr_expansion_ratio: Optional[float] = None) -> float:
         """
-        Get TP target in R based on regime, edge type, and edge mode.
+        Get TP target in R based on regime, edge type, edge mode, and volatility.
         
         🔥 FIX (Jan 28, 2026): TP basado PRINCIPALMENTE en régimen de mercado
         - El edge_type es informativo pero no debe cambiar el TP
         - Evita inconsistencia donde mismo contexto da diferente TP
         
+        🔥 NEW (Feb 11, 2026): TP ADAPTATIVO según volatilidad
+        - atr_expansion_ratio < 0.8 → TP × 0.8 (baja volatilidad, targets conservadores)
+        - atr_expansion_ratio > 1.3 → TP × 1.25 (alta volatilidad, targets extendidos)
+        
         Regla simple:
-        - RANGE regime → 1.0R (mean reversion)
-        - TREND regime → 1.5R (momentum)
-        - BREAKOUT edge → 2.0R (expansion play)
-        - DISPLACEMENT edge → 2.0R (institutional momentum)
+        - RANGE regime → 0.8R (mean reversion)
+        - TREND regime → 1.2R (momentum)
+        - BREAKOUT edge → 1.8R (expansion play)
+        - DISPLACEMENT edge → 1.5R (institutional momentum)
         
         IMPORTANTE: edge_type=None vs edge_type=INTRADAY NO debe cambiar TP
         """
         # BREAKOUT edge overrides everything - requires high RR to justify low winrate
         if edge_type and edge_type.upper() == 'BREAKOUT':
-            logger.info(f"📊 BREAKOUT edge detected - using minimum TP {cls.TP_R_BREAKOUT}R")
-            return cls.TP_R_BREAKOUT
+            base_tp = cls.TP_R_BREAKOUT
+            final_tp = cls._apply_volatility_adjustment(base_tp, atr_expansion_ratio)
+            logger.info(f"📊 BREAKOUT edge - TP: {base_tp}R → {final_tp:.2f}R (vol_adj)")
+            return final_tp
         
         # 🔥 DISPLACEMENT edge (Jan 30, 2026) - institutional momentum needs room
         if edge_type and edge_type.upper() == 'DISPLACEMENT':
-            logger.info(f"📊 DISPLACEMENT edge detected - using minimum TP {cls.TP_R_DISPLACEMENT}R")
-            return cls.TP_R_DISPLACEMENT
+            base_tp = cls.TP_R_DISPLACEMENT
+            final_tp = cls._apply_volatility_adjustment(base_tp, atr_expansion_ratio)
+            logger.info(f"📊 DISPLACEMENT edge - TP: {base_tp}R → {final_tp:.2f}R (vol_adj)")
+            return final_tp
         
         # 🔥 FIX: REGIME is primary, NOT edge_type
         # This prevents TP inconsistency between ticks
@@ -943,10 +991,36 @@ class SimplifiedExitConfig:
         from src.config.trading_config import ADXThresholds
         if regime_str.upper() in ('RANGE', 'RANGING') or (adx is not None and adx < ADXThresholds.RANGE):
             # RANGE mode - conservative TP
-            return cls.TP_R_RANGE  # 1.0R
+            base_tp = cls.TP_R_RANGE
+        else:
+            # TREND mode - larger TP
+            base_tp = cls.TP_R_TREND
         
-        # TREND mode - larger TP
-        return cls.TP_R_TREND  # 1.5R
+        final_tp = cls._apply_volatility_adjustment(base_tp, atr_expansion_ratio)
+        if atr_expansion_ratio is not None and abs(base_tp - final_tp) > 0.01:
+            logger.info(f"📊 ADAPTIVE TP: {base_tp}R → {final_tp:.2f}R (atr_ratio={atr_expansion_ratio:.2f})")
+        return final_tp
+    
+    @classmethod
+    def _apply_volatility_adjustment(cls, base_tp: float, atr_expansion_ratio: Optional[float]) -> float:
+        """
+        🔥 NEW (Feb 11, 2026): Apply volatility-based TP adjustment.
+        
+        - Low volatility (atr_ratio < 0.8): Conservative targets (×0.8)
+        - High volatility (atr_ratio > 1.3): Extended targets (×1.25)
+        - Normal volatility: No adjustment
+        """
+        if atr_expansion_ratio is None:
+            return base_tp
+        
+        if atr_expansion_ratio < cls.TP_VOLATILITY_LOW_THRESHOLD:
+            # Baja volatilidad: reducir TP para capturar ganancias antes
+            return base_tp * cls.TP_LOW_VOL_MULT
+        elif atr_expansion_ratio > cls.TP_VOLATILITY_HIGH_THRESHOLD:
+            # Alta volatilidad: extender TP, hay más espacio
+            return base_tp * cls.TP_HIGH_VOL_MULT
+        else:
+            return base_tp
     
     @classmethod
     def get_sl_r_max(cls, edge_mode: Optional[str] = None) -> float:

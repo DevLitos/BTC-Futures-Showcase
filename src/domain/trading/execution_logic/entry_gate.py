@@ -141,10 +141,11 @@ class EntryGateEvaluator:
     # =========================================================================
     
     # Score-based sizing (replaces binary threshold)
-    SCORE_BLOCK_FLOOR = 5.5           # 🔥 Raised from 4.5: marginal trades blocked
-    SCORE_PROBE_MAX = 6.0             # 5.5-6.0 = probe (0.25x)
-    SCORE_REDUCED_MAX = 6.5           # 6.0-6.5 = reduced (0.5x)
-    # Above 6.5 = full size
+    # 🔥 FIX #232: Rebalanced — 5.5 was too high, system never traded
+    SCORE_BLOCK_FLOOR = 4.5           # 🔥 FIX #232: Lowered from 5.5
+    SCORE_PROBE_MAX = 5.5             # 4.5-5.5 = probe (0.25x)
+    SCORE_REDUCED_MAX = 6.0           # 5.5-6.0 = reduced (0.5x)
+    # Above 6.0 = full size
     
     # RR-based sizing
     RR_BLOCK_FLOOR = 0.5              # Below 0.5 = mathematical roulette (was 0.6)
@@ -534,11 +535,11 @@ class EntryGateEvaluator:
         """
         Evaluate score gate with graduated sizing - SOFT.
         
-        Sizing (updated Jan 24, 2026):
-        - score < 3.5: Block (floor breach)
-        - 3.5 <= score < 4.5: Probe (0.25x)
-        - 4.5 <= score < 5.5: Reduced (0.5x)
-        - score >= 5.5: Full (1.0x)
+        🔥 FIX #232: Rebalanced tiers:
+        - score < 4.5: Block (floor breach)
+        - 4.5 <= score < 5.5: Probe (0.25x)
+        - 5.5 <= score < 6.0: Reduced (0.5x)
+        - score >= 6.0: Full (1.0x)
         """
         if score < self.SCORE_BLOCK_FLOOR:
             return GateResult(

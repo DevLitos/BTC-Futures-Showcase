@@ -101,6 +101,11 @@ class ActivityTracker:
         self._last_loss_time: Optional[datetime] = None
         self._pnl_today_r: float = 0.0
         
+        # 🔥 FIX #195: Idempotencia para record_trade_executed
+        # Previene que timeouts en el loop causen conteo duplicado
+        self._last_execution_recorded_time: Optional[datetime] = None
+        self._execution_idempotency_window_seconds: int = 30  # Ignora llamadas duplicadas en 30s
+        
         # 🔥 FIX #10: Hot Hand - track last trade result
         self._last_trade_was_win: bool = False
         self._current_session: Optional[str] = None  # Track session for reset
@@ -138,7 +143,24 @@ class ActivityTracker:
         
         Args:
             market_time: The time the trade was executed
+            
+        🔥 FIX #195: IDEMPOTENCY GUARD
+        Si se llama múltiples veces en el mismo window (30s), ignora llamadas duplicadas.
+        Esto previene el bug donde timeouts en el loop causan 8+ conteos para 1 trade.
         """
+        # 🔥 FIX #195: Idempotencia - ignorar llamadas duplicadas en ventana de 30s
+        if self._last_execution_recorded_time is not None:
+            seconds_since_last = (market_time - self._last_execution_recorded_time).total_seconds()
+            if seconds_since_last < self._execution_idempotency_window_seconds:
+                logger.debug(
+                    f"📊 Activity Tracker: IDEMPOTENT SKIP | "
+                    f"Called {seconds_since_last:.1f}s after last record (window={self._execution_idempotency_window_seconds}s)"
+                )
+                return  # Ignorar llamada duplicada
+        
+        # Actualizar tiempo de última ejecución registrada
+        self._last_execution_recorded_time = market_time
+        
         old_time = self._last_trade_time
         self._last_trade_time = market_time
         self._total_trades_session += 1

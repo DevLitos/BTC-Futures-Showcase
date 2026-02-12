@@ -492,6 +492,7 @@ class SignalEngine:
         # =====================================================================
         self._trend_intelligence = get_trend_intelligence()
         self._trend_phase: TrendPhase = TrendPhase.RANGE_BOUND
+        self._trend_direction_from_ti: str | None = None  # 🔥 FIX #222: Track trend direction
         self._trend_last_update: datetime | None = None
         
         # Regime classifier for volume-aware filtering
@@ -1588,6 +1589,9 @@ class SignalEngine:
         # Reset exhaustion tightening flag
         self._exhaustion_tightened = False
         
+        # 🔥 FEB 11: Reset exhaustion partial flag
+        self._exhaustion_partial_taken = False
+        
         # 🔥 FIX (Jan 29, 2026 - AUDIT BUG 4): Reset EXPANSION_MODE and DIRECTION_LOCK
         # Prevents state leakage between trades
         self._expansion_mode = False
@@ -1960,8 +1964,9 @@ class SignalEngine:
                         edge_state = self._edge_manager.state.value
                     
                     cooldown_info = ""
-                    if hasattr(self.state_machine, '_cooldown_until') and self.state_machine._cooldown_until:
-                        remaining = (self.state_machine._cooldown_until - tick_start).total_seconds()
+                    cooldown_until = getattr(self.state_machine, '_cooldown_until', None)
+                    if cooldown_until:
+                        remaining = (cooldown_until - tick_start).total_seconds()
                         if remaining > 0:
                             cooldown_info = f" | ⏳ cooldown={remaining:.0f}s"
                     
@@ -2442,6 +2447,12 @@ class SignalEngine:
                 old_phase = self._trend_phase
                 self._trend_phase = trend_state.current_phase
                 
+                # 🔥 FIX #222: Also store trend direction for displacement checks
+                self._trend_direction_from_ti = trend_state.direction.value  # 'BULLISH', 'BEARISH', 'NEUTRAL'
+                
+                # 🔥 FIX #223: Share trend_phase with edge_manager for TREND_BIRTH bypass
+                self._edge_manager._trend_phase_from_engine = self._trend_phase
+                
                 if old_phase != self._trend_phase:
                     logger.info(
                         f"📈 TREND PHASE: {self._trend_intelligence.get_phase_description()}"
@@ -2502,10 +2513,29 @@ class SignalEngine:
                 self._bias_high_since = rolling_high
                 self._bias_low_since = rolling_low
             else:
-                # Contraer gradualmente hacia la ventana móvil
-                # Pero permitir que se expanda si el precio actual rompe
-                self._bias_high_since = max(rolling_high, current_price)
-                self._bias_low_since = min(rolling_low, current_price)
+                # =========================================================
+                # 🔥 FIX #244 (Feb 16, 2026): CRITICAL DIRECTION FIX
+                # 
+                # PROBLEMA: max(rolling_high, current_price) hacía que 
+                # _bias_high_since SIEMPRE = current_price en un uptrend.
+                # Entonces distance_from_high = high - price = 0 → STALE.
+                # LONG displacement NUNCA se armaba → 13/13 SHORT en Feb 10.
+                #
+                # ROOT CAUSE: En uptrend, current_price >= rolling_high,
+                # así que max() = current_price. distance_from_high = 0.
+                # El stale check (< 0.5 ATR) SIEMPRE disparaba para LONG.
+                #
+                # SOLUCIÓN: Usar SOLO rolling_high/rolling_low del window
+                # de 10 velas cerradas. NO incluir current_price (tick vivo).
+                # Esto permite que:
+                # - En uptrend: distance_from_high < 0 (price above high)
+                #   → condición >= 0 NO se cumple → LONG NOT stale ✓
+                # - Tras pullback: distance_from_high > 0 
+                #   → stale check funciona correctamente ✓
+                # - Para SHORT: simétrico, funciona igual ✓
+                # =========================================================
+                self._bias_high_since = rolling_high
+                self._bias_low_since = rolling_low
         else:
             # Fallback: comportamiento anterior si no hay suficientes velas
             if self._bias_high_since > 0:
@@ -2754,6 +2784,75 @@ class SignalEngine:
             self._current_trade_tags['reclaim_level'] = self._bias_invalidation_level
             
             # =====================================================================
+            # 🔥 FIX #190 (Feb 11, 2026): BIAS FLIP EXPIRA EL EDGE EN DIRECCIÓN OPUESTA
+            #
+            # PROBLEMA: El log mostró BIAS FLIP "LONG detection ENABLED" pero:
+            # 1. El edge SHORT siguió activo 57+ minutos (con penalty -99)
+            # 2. Cuando expiró por precio, se generó OTRO SHORT
+            # 3. Nunca se generó el edge LONG que el mercado pedía
+            #
+            # SOLUCIÓN: Cuando hay BIAS FLIP, expirar INMEDIATAMENTE el edge
+            # si es de la dirección que ahora está PROHIBIDA.
+            # Esto permite que se cree un nuevo edge en la dirección correcta.
+            # =====================================================================
+            if hasattr(self, '_edge_manager') and self._edge_manager:
+                # Obtener dirección del edge actual
+                current_edge_dir = None
+                if self._edge_manager.current_bos:
+                    current_edge_dir = self._edge_manager.current_bos.direction
+                
+                if current_edge_dir and current_edge_dir == invalidation_result.forbidden_direction:
+                    new_direction = 'LONG' if invalidation_result.forbidden_direction == 'SHORT' else 'SHORT'
+                    self._edge_manager.force_expire(
+                        f"🔥 FIX #190 BIAS_FLIP: {invalidation_result.forbidden_direction} edge expired | "
+                        f"{new_direction} detection now ENABLED"
+                    )
+                    logger.warning(
+                        f"🔥 FIX #190: BIAS FLIP expired {current_edge_dir} edge | "
+                        f"Reason: {invalidation_result.forbid_reason} | "
+                        f"{new_direction} edge can now be created"
+                    )
+                    
+                    # =====================================================================
+                    # 🔥 FIX #206 (Feb 12, 2026): CLEAR COOLDOWN FOR NEW DIRECTION
+                    # PROBLEMA: Después de BIAS_FLIP, la nueva dirección puede estar
+                    # en cooldown por un DEAD_EDGE anterior, bloqueando el edge nuevo:
+                    #   - SHORT muere por DEAD_EDGE → cooldown SHORT
+                    #   - BIAS_FLIP → LONG detection enabled
+                    #   - Pero LONG también tiene cooldown de ciclo anterior
+                    #   - Resultado: No se puede crear ningún edge
+                    # SOLUCIÓN: Limpiar cooldown de la nueva dirección tras BIAS_FLIP.
+                    # =====================================================================
+                    if hasattr(self._edge_manager, '_direction_cooldown') and new_direction in self._edge_manager._direction_cooldown:
+                        del self._edge_manager._direction_cooldown[new_direction]
+                        logger.info(
+                            f"🔥 FIX #206: Cleared DEAD_EDGE cooldown for {new_direction} after BIAS_FLIP | "
+                            f"New edge can be created immediately"
+                        )
+            
+            # =====================================================================
+            # 🔥 FIX #192 (Feb 11, 2026): BIAS FLIP ACTUALIZA ACTIVE_DIRECTION
+            #
+            # PROBLEMA: Cuando hay BIAS FLIP (ej: "FORBID SHORT, LONG detection ENABLED"):
+            # 1. FIX #190 expira el edge SHORT ✓
+            # 2. FIX #191 bloquea nuevos edges SHORT ✓
+            # 3. PERO _active_direction sigue siendo SHORT
+            # 4. _get_effective_direction() retorna None porque todas las fuentes son SHORT
+            # 5. RESULTADO: No se genera ningún edge → pérdida de oportunidad LONG
+            #
+            # SOLUCIÓN: Al detectar BIAS FLIP, actualizar _active_direction 
+            # a la dirección OPUESTA (la que ahora está permitida).
+            # Esto permite que _get_effective_direction() retorne la nueva dirección.
+            # =====================================================================
+            new_direction_for_active = 'LONG' if invalidation_result.forbidden_direction == 'SHORT' else 'SHORT'
+            old_active = self._active_direction
+            self._active_direction = new_direction_for_active
+            logger.warning(
+                f"🔥 FIX #192: BIAS FLIP changed _active_direction: {old_active} → {new_direction_for_active} | "
+                f"System can now detect {new_direction_for_active} signals"
+            )
+            
+            # =====================================================================
             # 🔥 FIX #109 (Feb 09, 2026): Activar TRANSITION_MODE en BIAS_FLIP
             #
             # Cuando hay BIAS_FLIP, activamos TRANSITION_MODE por 15 minutos.
@@ -2820,16 +2919,54 @@ class SignalEngine:
             # Clear forbidden after hysteresis
             self._forbidden_direction = None
         
+        # =====================================================================
+        # 🔥 FIX #250 (Feb 16, 2026): CLEAR FORBIDDEN ON TRANSITION EXPIRY
+        #
+        # PROBLEMA: BIAS FLIP establece _forbidden_direction + transition_mode (15min).
+        # Cuando transition expira, forbidden_direction NO se limpiaba.
+        # Además, el handler puede RE-SET forbidden en cada tick si rise_from_low > threshold,
+        # así que forbidden quedaba activa INDEFINIDAMENTE.
+        #
+        # CRITICAL: Esta lógica DEBE estar en el main loop, NO en entry_orchestrator.
+        # Si forbidden bloquea arm_consensus_edge → no hay edge → no hay entry eval
+        # → run_all_guards nunca ejecuta → forbidden nunca se limpia = DEADLOCK.
+        #
+        # SOLUCIÓN: Al expirar transition mode, limpiar forbidden Y poner
+        # forbidden_immunity para que el handler no la re-establezca inmediatamente.
+        # =====================================================================
+        if self._transition_mode_active and self._transition_mode_expires:
+            if datetime.now() > self._transition_mode_expires:
+                old_forbidden = self._forbidden_direction
+                self._transition_mode_active = False
+                self._transition_mode_direction = None
+                self._transition_mode_expires = None
+                if old_forbidden:
+                    self._forbidden_direction = None
+                    # Set forbidden_set_at_tick to far future so hysteresis check
+                    # (can_clear_forbidden) passes immediately if handler tries to clear
+                    self._forbidden_set_at_tick = max(0, self._idle_eval_count - FORBIDDEN_MIN_DURATION_TICKS - 1)
+                    logger.warning(
+                        f"🔥 FIX #250: TRANSITION expired → FORBIDDEN {old_forbidden} CLEARED | "
+                        f"Direction free - market structure will guide"
+                    )
+                else:
+                    logger.info("TRANSITION_MODE expired (no forbidden was active)")
+        
         # Merge trade tags
         self._current_trade_tags.update(invalidation_result.to_tags())
         self._current_trade_tags['bias_invalidation_threshold'] = invalidation_result.threshold_used
         
         # =====================================================================
         # 🔥 BIAS RESTORATION (reversible invalidation)
+        # 🔥 FIX #207 (Feb 12, 2026): FAST RECOVERY for mini-pullbacks
+        # IMPROVED: Added "strong momentum" fast path - if current candle body 
+        # is >0.3% in reclaim direction, don't wait for 2-candle confirmation.
+        # This allows immediate recovery from false flips.
         # =====================================================================
         if self._bias_before_invalidation and self._bias_invalidation_level > 0:
             momentum_ok = False
             reclaim_ok = False
+            strong_momentum_ok = False  # 🔥 FIX #207: Fast path
             
             # Check if price reclaimed the level
             if self._bias_before_invalidation == 'LONG':
@@ -2837,7 +2974,7 @@ class SignalEngine:
             elif self._bias_before_invalidation == 'SHORT':
                 reclaim_ok = current_price <= self._bias_invalidation_level
             
-            # Check momentum (2 closes in the right direction)
+            # Check momentum (2 closes in the right direction OR strong single candle)
             if reclaim_ok:
                 try:
                     candles_1m_check = self.market_data.get_candles('1m')
@@ -2845,23 +2982,35 @@ class SignalEngine:
                         last_3_closes = [c['close'] for c in candles_1m_check[-3:]]
                         last_3_opens = [c['open'] for c in candles_1m_check[-3:]]
                         
+                        # 🔥 FIX #207: Check for STRONG single candle (>0.3% body)
+                        current_candle = candles_1m_check[-1]
+                        candle_body = current_candle['close'] - current_candle['open']
+                        body_pct = abs(candle_body) / current_candle['open'] * 100 if current_candle['open'] > 0 else 0
+                        STRONG_MOMENTUM_THRESHOLD = 0.3  # 0.3% body = ~$300 on BTC
+                        
                         if self._bias_before_invalidation == 'LONG':
                             bullish_count = sum(1 for i in range(len(last_3_closes)) 
                                                 if last_3_closes[i] > last_3_opens[i])
                             momentum_ok = bullish_count >= 2
+                            # Strong single bullish candle = fast path
+                            strong_momentum_ok = candle_body > 0 and body_pct >= STRONG_MOMENTUM_THRESHOLD
                         else:
                             bearish_count = sum(1 for i in range(len(last_3_closes)) 
                                                 if last_3_closes[i] < last_3_opens[i])
                             momentum_ok = bearish_count >= 2
+                            # Strong single bearish candle = fast path
+                            strong_momentum_ok = candle_body < 0 and body_pct >= STRONG_MOMENTUM_THRESHOLD
                 except Exception:
                     pass
             
-            # RESTORE BIAS if conditions met
-            if reclaim_ok and momentum_ok:
+            # RESTORE BIAS if conditions met (normal OR fast path)
+            if reclaim_ok and (momentum_ok or strong_momentum_ok):
                 restored_bias = self._bias_before_invalidation
+                recovery_mode = "FAST" if strong_momentum_ok and not momentum_ok else "NORMAL"
                 logger.info(
-                    f"🔄 BIAS RESTORED: {restored_bias} | Price reclaimed ${self._bias_invalidation_level:.0f} "
-                    f"+ momentum confirmed | Clearing forbidden direction"
+                    f"🔄 BIAS RESTORED ({recovery_mode}): {restored_bias} | "
+                    f"Price reclaimed ${self._bias_invalidation_level:.0f} | "
+                    f"{'Strong candle momentum' if strong_momentum_ok else '2-candle confirmation'}"
                 )
                 bias = restored_bias
                 self._structural_bias = restored_bias
@@ -2870,6 +3019,47 @@ class SignalEngine:
                 self._bias_before_invalidation = None
                 self._current_trade_tags['bias_restored'] = True
                 self._current_trade_tags['bias_restored_direction'] = restored_bias
+                self._current_trade_tags['bias_recovery_mode'] = recovery_mode
+                
+                # =====================================================================
+                # 🔥 FIX #207 (Feb 12, 2026): FAST RECOVERY AFTER MINI-PULLBACK
+                # PROBLEMA: Después de BIAS_FLIP por mini-pullback, si el precio reclaim
+                # rápidamente, el sistema queda bloqueado por:
+                #   1. TRANSITION_MODE activo en dirección opuesta
+                #   2. Cooldowns de la dirección original
+                #   3. _active_direction apuntando a dirección incorrecta
+                # SOLUCIÓN: Al restaurar bias, limpiar TODO para permitir recovery rápido:
+                #   - Cancelar TRANSITION_MODE si está en dirección opuesta
+                #   - Limpiar cooldown de la dirección restaurada
+                #   - Restaurar _active_direction
+                # =====================================================================
+                
+                # 1. Cancel TRANSITION_MODE if it was for the opposite direction
+                if self._transition_mode_active and self._transition_mode_direction != restored_bias:
+                    logger.info(
+                        f"🔥 FIX #207: Canceling TRANSITION_MODE {self._transition_mode_direction} "
+                        f"due to BIAS RECOVERY to {restored_bias}"
+                    )
+                    self._transition_mode_active = False
+                    self._transition_mode_direction = None
+                    self._transition_mode_expires = None
+                
+                # 2. Clear cooldown for restored direction
+                if hasattr(self._edge_manager, '_direction_cooldown') and restored_bias in self._edge_manager._direction_cooldown:
+                    del self._edge_manager._direction_cooldown[restored_bias]
+                    logger.info(
+                        f"🔥 FIX #207: Cleared cooldown for {restored_bias} after BIAS RECOVERY"
+                    )
+                
+                # 3. Restore _active_direction to the recovered bias
+                if self._active_direction != restored_bias:
+                    old_active = self._active_direction
+                    self._active_direction = restored_bias
+                    logger.info(
+                        f"🔥 FIX #207: Restored _active_direction {old_active} → {restored_bias}"
+                    )
+                
+                self._current_trade_tags['bias_fast_recovery'] = True
 
         
         # =====================================================================
@@ -2981,6 +3171,38 @@ class SignalEngine:
                     # Treat as stale for the purpose of blocking
                     is_stale_displacement = True
                 
+                # =========================================================
+                # 🚫 FIX #222: NO ARMAR EDGE EN FASES MALAS
+                # 
+                # PROBLEMA: El sistema arma edge al detectar displacement, pero
+                # si la tendencia está en EXHAUSTION/DISTRIBUTION/DEATH, ese
+                # displacement es el FINAL del movimiento, no el inicio.
+                # Entrar aquí = entrar al final de la tendencia = pérdida.
+                #
+                # SOLUCIÓN: Para SHORT, verificar que la tendencia BAJISTA no
+                # esté en fase terminal. TrendPhase usa la tendencia mayor,
+                # así que TREND_EXHAUSTION en tendencia bajista = final de caída.
+                # =========================================================
+                is_bad_phase_for_short = trend_phase_check in [
+                    TrendPhase.TREND_EXHAUSTION, 
+                    TrendPhase.DISTRIBUTION, 
+                    TrendPhase.TREND_DEATH
+                ]
+                # Solo bloquear si la tendencia detectada es BEARISH (estamos persiguiendo short al final)
+                trend_dir_from_ti = getattr(self, '_trend_direction_from_ti', None)
+                if is_bad_phase_for_short and trend_dir_from_ti == 'BEARISH':
+                    self._current_trade_tags['bad_phase_block_short'] = True
+                    self._current_trade_tags['bad_phase'] = trend_phase_check.value if hasattr(trend_phase_check, 'value') else str(trend_phase_check)
+                    if self._idle_eval_count % 30 == 1 or not hasattr(self, '_last_bad_phase_log_short'):
+                        logger.warning(
+                            f"🚫 FIX #222 BAD PHASE BLOCK SHORT: TrendPhase={trend_phase_check.value if hasattr(trend_phase_check, 'value') else trend_phase_check} "
+                            f"+ Trend=BEARISH | Displacement ${drop_from_high:.0f} detected but trend is DYING | "
+                            f"NOT arming edge - would enter at END of bearish move"
+                        )
+                        self._last_bad_phase_log_short = True
+                    # Treat as stale to prevent edge arming
+                    is_stale_displacement = True
+                
                 if is_stale_displacement and not is_at_range_floor:
                     self._current_trade_tags['stale_displacement'] = True
                     self._current_trade_tags['stale_distance_from_extreme'] = distance_from_low
@@ -3046,6 +3268,12 @@ class SignalEngine:
                             f"🌊 DISPLACEMENT EDGE ARMED: SHORT | "
                             f"Displacement ${drop_from_high:.0f} | Initial ${self._bias_high_since:.0f}"
                         )
+                    else:
+                        # 🔥 FIX #241: Edge already active — refresh origin if same direction
+                        # This keeps the edge "fresh" when continuation signals occur
+                        if (self._edge_manager.state == EdgeState.EDGE_ACTIVE and 
+                            self._edge_manager.direction == 'SHORT'):
+                            self._edge_manager.refresh_edge_origin(current_price, market_time)
                 
                 # Clear forbidden direction - displacement wins
                 if self._forbidden_direction == 'SHORT':
@@ -3121,6 +3349,38 @@ class SignalEngine:
                     # Treat as stale for the purpose of blocking
                     is_stale_displacement_long = True
                 
+                # =========================================================
+                # 🚫 FIX #222: NO ARMAR EDGE EN FASES MALAS (LONG)
+                # 
+                # PROBLEMA: El sistema arma edge al detectar displacement, pero
+                # si la tendencia está en EXHAUSTION/DISTRIBUTION/DEATH, ese
+                # displacement es el FINAL del movimiento, no el inicio.
+                # Entrar aquí = entrar al final de la tendencia = pérdida.
+                #
+                # SOLUCIÓN: Para LONG, verificar que la tendencia ALCISTA no
+                # esté en fase terminal. TrendPhase usa la tendencia mayor,
+                # así que TREND_EXHAUSTION en tendencia alcista = final de subida.
+                # =========================================================
+                is_bad_phase_for_long = trend_phase_check_long in [
+                    TrendPhase.TREND_EXHAUSTION, 
+                    TrendPhase.DISTRIBUTION, 
+                    TrendPhase.TREND_DEATH
+                ]
+                # Solo bloquear si la tendencia detectada es BULLISH (estamos persiguiendo long al final)
+                trend_dir_from_ti_long = getattr(self, '_trend_direction_from_ti', None)
+                if is_bad_phase_for_long and trend_dir_from_ti_long == 'BULLISH':
+                    self._current_trade_tags['bad_phase_block_long'] = True
+                    self._current_trade_tags['bad_phase'] = trend_phase_check_long.value if hasattr(trend_phase_check_long, 'value') else str(trend_phase_check_long)
+                    if self._idle_eval_count % 30 == 1 or not hasattr(self, '_last_bad_phase_log_long'):
+                        logger.warning(
+                            f"🚫 FIX #222 BAD PHASE BLOCK LONG: TrendPhase={trend_phase_check_long.value if hasattr(trend_phase_check_long, 'value') else trend_phase_check_long} "
+                            f"+ Trend=BULLISH | Displacement ${rise_from_low:.0f} detected but trend is DYING | "
+                            f"NOT arming edge - would enter at END of bullish move"
+                        )
+                        self._last_bad_phase_log_long = True
+                    # Treat as stale to prevent edge arming
+                    is_stale_displacement_long = True
+                
                 if is_stale_displacement_long and not is_at_range_ceiling:
                     self._current_trade_tags['stale_displacement'] = True
                     self._current_trade_tags['stale_distance_from_extreme'] = distance_from_high
@@ -3186,6 +3446,11 @@ class SignalEngine:
                             f"🌊 DISPLACEMENT EDGE ARMED: LONG | "
                             f"Displacement ${rise_from_low:.0f} | Initial ${self._bias_low_since:.0f}"
                         )
+                    else:
+                        # 🔥 FIX #241: Edge already active — refresh origin if same direction
+                        if (self._edge_manager.state == EdgeState.EDGE_ACTIVE and 
+                            self._edge_manager.direction == 'LONG'):
+                            self._edge_manager.refresh_edge_origin(current_price, market_time)
                 
                 # Clear forbidden direction - displacement wins
                 if self._forbidden_direction == 'LONG':
@@ -3901,7 +4166,8 @@ class SignalEngine:
                             market_time=market_time,
                             reason=f"RANGE_BYPASS ({bypass_reason})",
                             macro_bias_strength=macro_str,
-                            has_momentum_override=self.has_momentum_override
+                            has_momentum_override=self.has_momentum_override,
+                            forbidden_direction=self._forbidden_direction  # 🔥 FIX #191
                         )
                         if edge_armed:
                             self._current_trade_tags['range_edge_armed'] = True
@@ -3929,13 +4195,67 @@ class SignalEngine:
                     # 🔥 UNIFIED: Use _get_effective_direction instead of manual checks
                     direction, source, confidence = self._get_effective_direction()
                     
+                    # =============================================================
+                    # 🔥 FIX #247 (Feb 16, 2026): RANGE MEAN-REVERSION DIRECTION
+                    # 
+                    # PROBLEMA: _get_effective_direction() es trend-following.
+                    # En RANGE mode con pct=24% (cerca del suelo), devuelve SHORT
+                    # porque structural_bias=SHORT y active_direction=SHORT.
+                    # Esto es INCORRECTO para range trading: en soporte se compra,
+                    # en resistencia se vende.
+                    #
+                    # LOG EVIDENCIA (Feb 12):
+                    # - pct=24%, dirección=SHORT, delta +5.55x a +8.60x BULLISH
+                    # - El sistema quería shortear en soporte contra delta masivo
+                    # - ZERO trades en 20+ minutos de mercado activo
+                    #
+                    # SOLUCIÓN: En RANGE_MID, si pct_60d indica zona de soporte
+                    # o resistencia, OVERRIDE la dirección a mean-reversion:
+                    # - pct < 35% → LONG (comprar en soporte)
+                    # - pct > 65% → SHORT (vender en resistencia)
+                    # - 35-65% → mantener dirección original (zona neutra)
+                    # =============================================================
+                    RANGE_MR_LOW_PCT = 35.0
+                    RANGE_MR_HIGH_PCT = 65.0
+                    
+                    if direction and pct_60d < RANGE_MR_LOW_PCT and direction == 'SHORT':
+                        original_dir = direction
+                        direction = 'LONG'
+                        source = 'RANGE_MR_LOW'
+                        confidence = max(confidence, 0.65)
+                        # 🔥 FIX #247b: MUST update _active_direction to prevent
+                        # edge invalidation loop (Edge=LONG vs Active=SHORT → mismatch)
+                        self._active_direction = direction
+                        logger.info(
+                            f"🔄 FIX #247 RANGE MEAN-REVERSION: pct={pct_60d:.0f}% < {RANGE_MR_LOW_PCT}% | "
+                            f"Override {original_dir} → LONG (buy near support)"
+                        )
+                        self._current_trade_tags['range_mr_override'] = True
+                        self._current_trade_tags['range_mr_from'] = original_dir
+                        self._current_trade_tags['range_mr_pct'] = pct_60d
+                    elif direction and pct_60d > RANGE_MR_HIGH_PCT and direction == 'LONG':
+                        original_dir = direction
+                        direction = 'SHORT'
+                        source = 'RANGE_MR_HIGH'
+                        confidence = max(confidence, 0.65)
+                        # 🔥 FIX #247b: MUST update _active_direction to prevent
+                        # edge invalidation loop (Edge=SHORT vs Active=LONG → mismatch)
+                        self._active_direction = direction
+                        logger.info(
+                            f"🔄 FIX #247 RANGE MEAN-REVERSION: pct={pct_60d:.0f}% > {RANGE_MR_HIGH_PCT}% | "
+                            f"Override {original_dir} → SHORT (sell near resistance)"
+                        )
+                        self._current_trade_tags['range_mr_override'] = True
+                        self._current_trade_tags['range_mr_from'] = original_dir
+                        self._current_trade_tags['range_mr_pct'] = pct_60d
+                    
                     self._current_trade_tags['range_mid_mode'] = True
                     self._current_trade_tags['range_mid_direction'] = direction
                     self._current_trade_tags['range_mid_source'] = source
                     self._current_trade_tags['range_mid_confidence'] = confidence
                     
                     # Need consensus or high confidence for RANGE_MID
-                    if direction and (source == 'CONSENSUS' or confidence >= 0.6):
+                    if direction and (source in ('CONSENSUS', 'RANGE_MR_LOW', 'RANGE_MR_HIGH') or confidence >= 0.6):
                         # 🔥 FIX #83: In RANGE mode, we WANT to short at HIGH / long at LOW
                         # Don't use price_confirms_direction which blocks this exact behavior
                         # Instead, trust the range extremes (percentile_60d)
@@ -3963,7 +4283,8 @@ class SignalEngine:
                             market_time=market_time,
                             reason=f"RANGE_CONSENSUS (pct={pct_60d:.0f}%, conf={confidence:.0%})",
                             macro_bias_strength=macro_str,
-                            has_momentum_override=self.has_momentum_override
+                            has_momentum_override=self.has_momentum_override,
+                            forbidden_direction=self._forbidden_direction  # 🔥 FIX #191
                         )
                         if edge_armed:
                             self._current_trade_tags['range_edge_armed'] = True
@@ -4016,7 +4337,8 @@ class SignalEngine:
                     market_time=market_time,
                     reason=f"RANGE_EXTREME_{extreme_type} (pct={pct_60d:.0f}%, extremity={extremity:.0%})",
                     macro_bias_strength=macro_str,
-                    has_momentum_override=self.has_momentum_override
+                    has_momentum_override=self.has_momentum_override,
+                    forbidden_direction=self._forbidden_direction  # 🔥 FIX #191
                 )
                 if edge_armed:
                     self._current_trade_tags['range_edge_armed'] = True
@@ -4109,7 +4431,8 @@ class SignalEngine:
                     market_time=market_time,
                     reason=f"TRANSITION_{source} (Score={regime_score:.2f}, conf={confidence:.0%})",
                     macro_bias_strength=macro_str,
-                    has_momentum_override=self.has_momentum_override
+                    has_momentum_override=self.has_momentum_override,
+                    forbidden_direction=self._forbidden_direction  # 🔥 FIX #191
                 )
                 if edge_armed:
                     self._current_trade_tags['consensus_edge_armed'] = True
@@ -4194,7 +4517,8 @@ class SignalEngine:
                     market_time=market_time,
                     reason=f"TREND_{source} (ADX={effective_adx:.1f}, conf={confidence:.0%})",
                     macro_bias_strength=macro_str,
-                    has_momentum_override=self.has_momentum_override
+                    has_momentum_override=self.has_momentum_override,
+                    forbidden_direction=self._forbidden_direction  # 🔥 FIX #191
                 )
                 if edge_armed:
                     self._current_trade_tags['consensus_edge_armed'] = True
@@ -5240,7 +5564,14 @@ class SignalEngine:
             
             # 🔥 FIX (Feb 06, 2026): ANY EDGE should override TI block, not just BREAKOUT/DISPLACEMENT
             # If EdgeManager has a signal, trust it - that's the whole point of having EdgeManager
-            if has_edge_override or has_displacement_override:
+            # 🔥 FIX #221 (Feb 12, 2026): PERO NO si estamos en EXHAUSTION/DISTRIBUTION
+            # El edge se armó ANTES de detectar exhaustion - ahora no es válido
+            # NOTE: TrendPhase is imported globally at line 45 - DO NOT import locally here
+            # as it causes UnboundLocalError in earlier parts of this function
+            ti_phase_check = entry_recommendation.get('phase', '')
+            is_bad_phase_for_override = ti_phase_check in ['TREND_EXHAUSTION', 'DISTRIBUTION', 'TREND_DEATH']
+            
+            if (has_edge_override or has_displacement_override) and not is_bad_phase_for_override:
                 override_type = "DISPLACEMENT" if has_displacement_override else (
                     edge_bos.edge_type.value if edge_bos else "EDGE"
                 )
@@ -5248,9 +5579,18 @@ class SignalEngine:
                     f"🌊 TI OVERRIDE: {entry_recommendation['reason']} but {override_type} active → allowing"
                 )
                 self._current_trade_tags['ti_overridden'] = True
+            elif is_bad_phase_for_override:
+                # 🔥 FIX #221: HARD BLOCK even with edge - edge is stale
+                logger.warning(
+                    f"🚫 FIX #221: TI HARD BLOCK (BAD PHASE) | Phase={ti_phase_check} | "
+                    f"Edge present but phase is END-OF-TREND | NOT overriding"
+                )
+                self._current_trade_tags['skip_reason'] = f"ti_hard_block_{ti_phase_check}"
+                return
             else:
-                # Only block if confidence is high enough AND no edge
-                if entry_recommendation['confidence'] >= 0.8:  # Raised from 0.6 to 0.8
+                # 🔥 FIX #221: Lowered confidence threshold from 0.8 to 0.6
+                # 0.8 was too permissive - let through too many bad trades
+                if entry_recommendation['confidence'] >= 0.6:
                     logger.warning(
                         f"🧠 DECISION CENTER BLOCK: {entry_recommendation['reason']} | "
                         f"Confidence: {entry_recommendation['confidence']:.0%}"
@@ -5697,10 +6037,11 @@ class SignalEngine:
         # 🔥 FIX #46 (Feb 05): Check if ANTICIPATION bypass should be active
         # ANTICIPATION has its own confirmation - bypasses macro slope (reduces size, not blocks)
         # 🔥 FIX #95 (Feb 09): Aceptar todos los tipos de anticipation
+        # 🔥 FIX #179 (Feb 11): Alinear umbral con idle_state_handlers (0.50, no 0.55)
         valid_anticipation_signals = ['COMPRESSION_BREAKOUT', 'TREND_PULLBACK', 'FAILED_TEST', 'MOMENTUM_EXHAUSTION']
         anticipation_bypass = (
             self._current_trade_tags.get('anticipation_signal') in valid_anticipation_signals and
-            self._current_trade_tags.get('anticipation_confidence', 0) >= 0.55
+            self._current_trade_tags.get('anticipation_confidence', 0) >= 0.50  # 🔥 FIX #179: was 0.55
         )
         
         # 🔥 FIX #67 (Feb 06): Check if BIAS FLIP bypass should be active
@@ -5793,16 +6134,37 @@ class SignalEngine:
         # 🔥 FIX #162 (Feb 10): BYPASS en EXPANSION/CONSENSUS fuerte
         # Problema: LTF WEAK BLOCK bloqueaba trades válidos en tendencia
         # Solución: En EXPANSION o con edge fuerte, aceptar 1/3 confirmaciones
+        #
+        # 🔥 FIX #175 (Feb 11): REALMENTE relajar en DISPLACEMENT/EXPANSION
+        # ANTES: min_ltf_required siempre quedaba en 2 (bug: nunca se reducía)
+        # AHORA: En EXPANSION/DISPLACEMENT, aceptar 1/3 confirmaciones
+        # Log Feb 11: 7+ bloqueos "LTF WEAK BLOCK: 1/3 < 2" perdidos
+        #
+        # 🔥 FIX #223 (Feb 12): TREND_BIRTH = mejor momento para entrar
+        # PROBLEMA: LTF aún no confirma al inicio de tendencia (señales lagging)
+        # SOLUCIÓN: En TREND_BIRTH o TREND_ACCELERATION, aceptar 1/3 confirmaciones
         ltf_confs = ltf_info.get('confirmations', 0) if ltf_info else 0
         min_ltf_required = 2  # Default
         
-        # Reducir requisito en condiciones favorables
-        if self._trend_expansion_active or self._expansion_mode:
-            min_ltf_required = 2  # EXPANSION: 1/3 is enough
+        # 🔥 FIX #223: Check for TREND_BIRTH/ACCELERATION
+        is_trend_birth = self._trend_phase == TrendPhase.TREND_BIRTH
+        is_trend_acceleration = self._trend_phase == TrendPhase.TREND_ACCELERATION
+        
+        # 🔥 FIX #175 + #223: Reducir requisito en condiciones favorables
+        if is_trend_birth:
+            min_ltf_required = 1  # TREND_BIRTH: Entry is urgent!
+            logger.debug(f"🚀 FIX #223: LTF requirement reduced to 1/3 (TREND_BIRTH - optimal entry window)")
+        elif is_trend_acceleration:
+            min_ltf_required = 1  # TREND_ACCELERATION: Still good
+            logger.debug(f"📈 FIX #223: LTF requirement reduced to 1/3 (TREND_ACCELERATION)")
+        elif self._trend_expansion_active or self._expansion_mode:
+            min_ltf_required = 1  # EXPANSION: 1/3 is enough
+            logger.debug(f"📊 FIX #175: LTF requirement reduced to 1/3 (EXPANSION mode)")
         elif self._edge_manager.state == EdgeState.EDGE_ACTIVE:
             bos = self._edge_manager.current_bos
             if bos and bos.trend_path and 'DISPLACEMENT' in str(bos.trend_path):
-                min_ltf_required = 2  # DISPLACEMENT edge: 1/3 is enough
+                min_ltf_required = 1  # DISPLACEMENT edge: 1/3 is enough
+                logger.debug(f"📊 FIX #175: LTF requirement reduced to 1/3 (DISPLACEMENT edge)")
         
         if ltf_confs < min_ltf_required:
             if self._last_ltf_state != 'weak_ltf':
@@ -6314,6 +6676,26 @@ class SignalEngine:
     async def _handle_wait_fill_state(self, market_time: datetime):
         """WAIT_FILL state: monitor pending order"""
         
+        # =====================================================================
+        # 🔥 FIX #183 (Feb 11, 2026): IDEMPOTENT FILL GUARD
+        # CRITICAL: If position already exists, fill was already processed!
+        # The timeout interrupted before transition to MANAGE completed.
+        # This prevents the infinite loop: WAIT_FILL → detect fill → timeout → repeat
+        # =====================================================================
+        if self.risk_engine.position is not None:
+            logger.warning(f"🔄 FIX #183: WAIT_FILL with existing position detected - fast transition to MANAGE")
+            logger.info(f"🔄 FIX #183: Position: {self.risk_engine.position.direction} {self.risk_engine.position.size:.6f} @ {self.risk_engine.position.entry_price:.2f}")
+            
+            # Clear pending order tracking
+            if self.pending_order_id and self.pending_order_id in self.execution.open_orders:
+                self.execution.open_orders.pop(self.pending_order_id, None)
+            self.pending_order_id = None
+            self.entry_order_time = None
+            
+            # Transition immediately to MANAGE
+            self.state_machine.transition_to(BotState.MANAGE, "FIX #183: Position already exists")
+            return
+        
         if not self.pending_order_id:
             # 🔒 LIMPIEZA si no hay orden pendiente
             self._reset_trade_state("WAIT_FILL with no pending order")
@@ -6388,23 +6770,65 @@ class SignalEngine:
             # PASO 2 — MAKER ONLY REAL (SIN EXCEPCIONES)
             # No LIMIT→MARKET fallback. If it doesn't fill, we cancel on timeout.
             
+            # ================================================================
+            # 🔥 FIX #172b (Feb 11, 2026): HARD ESCAPE after 10 minutes
+            # If stuck in WAIT_FILL for > 10 min, force exit unconditionally
+            # This prevents the 3.5-hour zombie loop bug
+            # ================================================================
+            if elapsed > 600:  # 10 minutes = absolute max WAIT_FILL time
+                logger.critical(f"🚨 FIX #172b: HARD ESCAPE - stuck in WAIT_FILL for {elapsed:.0f}s (>10min)!")
+                logger.critical(f"🚨 FIX #172b: Forcing state cleanup and transition to IDLE")
+                
+                # Force cleanup
+                try:
+                    # Try to cancel if possible
+                    await self.execution.cancel_order(self.pending_order_id, self.symbol)
+                except Exception:
+                    pass  # Ignore - we're force escaping anyway
+                
+                # Clean local tracking
+                if self.pending_order_id and self.pending_order_id in self.execution.open_orders:
+                    self.execution.open_orders.pop(self.pending_order_id, None)
+                
+                self._reset_trade_state("FIX #172b: HARD ESCAPE from WAIT_FILL")
+                self.state_machine.transition_to(BotState.IDLE, "FIX #172b: Hard escape timeout")
+                
+                # Notify
+                if self.output_manager:
+                    _create_safe_task(
+                        self.output_manager.send_critical_alert(
+                            f"🚨 FIX #172b: HARD ESCAPE from WAIT_FILL after {elapsed/60:.1f}min"
+                        ),
+                        "hard_escape_alert"
+                    )
+                return
+            
             if elapsed > ENTRY_TIMEOUT_MINUTES * 60:
                 logger.warning(f"Entry timeout after {elapsed:.0f}s - attempting cancel")
                 
                 # ================================================================
                 # FIX #3 (Jan 13, 2026): Enhanced timeout cleanup with late fill detection
+                # 🔥 FIX #184 (Feb 11, 2026): Use SHORT timeout for pre-cancel check
+                # The original code used default 180s which blocked the tick!
                 # ================================================================
                 
-                # Step 1: Check if order was ALREADY filled before we cancel
+                # Step 1: Check if order was ALREADY filled before we cancel (SHORT check)
                 pre_cancel_filled = False
                 try:
-                    fill_status = await self.execution.poll_fill_status(
-                        self.pending_order_id, self.symbol
+                    # 🔥 FIX #184: Use 5s timeout, not the default 180s!
+                    # This is just a quick check, not a full poll
+                    fill_status = await asyncio.wait_for(
+                        self.execution.poll_fill_status(
+                            self.pending_order_id, self.symbol, timeout_seconds=5
+                        ),
+                        timeout=5.0  # Double protection
                     )
                     if fill_status.get('filled'):
                         logger.warning("⚠️ Order appears FILLED during timeout check - processing fill instead")
                         pre_cancel_filled = True
                         # Don't return - let the normal fill flow handle it below
+                except asyncio.TimeoutError:
+                    logger.debug("Pre-cancel fill check timed out (5s) - proceeding with cancel")
                 except Exception as e:
                     logger.debug(f"Pre-cancel fill check error: {e}")
                 
@@ -6471,10 +6895,16 @@ class SignalEngine:
                     return
         
         # Check if order was filled
+        # 🔥 FIX #184b (Feb 11, 2026): Use 10s timeout per tick instead of 180s default
+        # This prevents blocking the tick for too long
         try:
-            fill_status = await self.execution.poll_fill_status(
-                self.pending_order_id,
-                self.symbol
+            fill_status = await asyncio.wait_for(
+                self.execution.poll_fill_status(
+                    self.pending_order_id,
+                    self.symbol,
+                    timeout_seconds=10  # Short timeout - we'll retry next tick if needed
+                ),
+                timeout=12.0  # Outer timeout slightly larger as safety net
             )
             
             # Handle rejected order (POST_ONLY that crossed book)
@@ -6858,8 +7288,11 @@ class SignalEngine:
                         if not integrity_ok:
                             # Check what kind of error it was
                             pos = self.risk_engine.position
-                            has_side_mismatch = any('SIDE MISMATCH' in e for e in pos.integrity_errors)
-                            has_qty_mismatch = any('QTY MISMATCH' in e for e in pos.integrity_errors)
+                            has_side_mismatch = False
+                            has_qty_mismatch = False
+                            if pos is not None:
+                                has_side_mismatch = any('SIDE MISMATCH' in e for e in pos.integrity_errors)
+                                has_qty_mismatch = any('QTY MISMATCH' in e for e in pos.integrity_errors)
                             
                             if has_side_mismatch:
                                 # Real side mismatch - critical, block SL/TP
@@ -6877,6 +7310,18 @@ class SignalEngine:
                                         f"qty_mismatch: expected={pos.expected_qty:.6f} vs exchange={exchange_qty:.6f}",
                                         is_critical=False
                                     )
+                    
+                    # =================================================================
+                    # 🔥 FIX #233 (Feb 15, 2026): TRANSITION TO MANAGE *BEFORE* SL/TP
+                    # PROBLEM: SL/TP placement takes >15s (3 retries + backoff),
+                    # exceeding the tick timeout. State stays WAIT_FILL, next tick
+                    # re-detects the same fill → position created 8+ times.
+                    # FIX: Transition NOW so WAIT_FILL never re-processes this fill.
+                    # SL/TP will be placed after transition (still in same tick).
+                    # =================================================================
+                    self.pending_order_id = None
+                    self.state_machine.transition_to(BotState.MANAGE, "Order filled")
+                    logger.info("🔥 FIX #233: State → MANAGE before SL/TP placement")
                     
                     # 🔥 ESTABLECER SL/TP EN LA POSICIÓN ABIERTA (UNA SOLA VEZ)
                     if not self._stops_set:
@@ -6925,6 +7370,26 @@ class SignalEngine:
                             await self.emergency_close_all()
                             return
                     
+                    # 🔥 Send entry notification to Telegram (fire-and-forget)
+                    if self.output_manager and hasattr(self, '_last_entry_data') and self._last_entry_data:
+                        try:
+                            entry_data = self._last_entry_data
+                            logger.info(f"📲 Sending entry notification: {entry_data.get('bias')} @ {entry_data.get('entry_price')}")
+                            _create_safe_task(self.output_manager.send_entry_notification({
+                                'symbol': self.symbol,
+                                'direction': entry_data.get('bias', 'UNKNOWN'),
+                                'entry_price': entry_data.get('entry_price'),
+                                'stop_loss': entry_data.get('stop_loss'),
+                                'take_profit': entry_data.get('take_profit'),
+                                'size': entry_data.get('position_size'),
+                                'score': self._entry_score,
+                                'regime': self._current_trade_regime,
+                                'risk_usd': entry_data.get('tags', {}).get('risk_usd'),
+                                'timestamp': market_time.isoformat() if hasattr(market_time, 'isoformat') else str(market_time)
+                            }), "send_entry_notification")
+                        except Exception as notif_err:
+                            logger.warning(f"⚠️ Entry notification error: {notif_err}")
+                    
                 else:
                     # 🔥 AUDIT FIX: entry_data does not exist here - this is an error path
                     logger.error("No entry data available - Fill without entry tracking")
@@ -6932,34 +7397,13 @@ class SignalEngine:
                     self.pending_order_id = None
                     self.state_machine.transition_to(BotState.IDLE, "Fill without entry data")
                     return
-                
-                # 🔥 NEW (Jan 28, 2026): Send entry notification to Telegram
-                if self.output_manager and hasattr(self, '_last_entry_data') and self._last_entry_data:
-                    try:
-                        entry_data = self._last_entry_data
-                        # 🔥 FIX (Jan 29, 2026 - AUDIT BUG 11): Use entry_data directly instead of undefined locals
-                        _create_safe_task(self.output_manager.send_entry_notification({
-                            'symbol': self.symbol,
-                            'direction': entry_data.get('bias', 'UNKNOWN'),
-                            'entry_price': entry_data.get('entry_price'),
-                            'stop_loss': entry_data.get('stop_loss'),
-                            'take_profit': entry_data.get('take_profit'),
-                            'size': entry_data.get('position_size'),
-                            'score': self._entry_score,
-                            'regime': self._current_trade_regime,
-                            'risk_usd': entry_data.get('tags', {}).get('risk_usd'),
-                            'timestamp': market_time.isoformat() if hasattr(market_time, 'isoformat') else str(market_time)
-                        }), "send_entry_notification")
-                        logger.info("📲 Entry notification sent to Telegram")
-                    except Exception as notif_err:
-                        logger.debug(f"Entry notification error: {notif_err}")
-                
-                # Limpia pending_order_id PERO mantiene _last_entry_data para tracking
-                self.pending_order_id = None
-                self.state_machine.transition_to(BotState.MANAGE, "Order filled")
             else:
                 # Still pending - stay in WAIT_FILL
                 pass
+        
+        except asyncio.TimeoutError:
+            # 🔥 FIX #184b: Timeout is normal, will retry next tick
+            logger.debug(f"Poll fill status timeout (12s) - will retry next tick")
         
         except Exception as e:
             logger.error(f"Error checking fill status: {e}")
@@ -7110,6 +7554,13 @@ class SignalEngine:
                                 regime_mode=self._current_trade_regime,
                             )
                             
+                            # 🔥 FIX #185a (Feb 11, 2026): Reset gap history y prev_tick_price
+                            # en sync forzado para evitar PRICE_GAP_ANOMALY falso positivo
+                            # El sync puede ocurrir segundos después del fill, acumulando "gap"
+                            self._gap_history = []
+                            self._prev_tick_price = current_price
+                            logger.info(f"🔥 FIX #185a: Gap history reset on forced sync to prevent false PRICE_GAP_ANOMALY")
+                            
                             # Start cooldown to prevent immediate re-entry
                             self.state_machine.start_cooldown(3)
                             logger.info(f"✅ FIX #79: Position synced - staying in MANAGE with 3-candle cooldown")
@@ -7224,6 +7675,7 @@ class SignalEngine:
                 
                 elif exhaustion and exhaustion.level == ExhaustionLevel.MODERATE:
                     # 🔧 REFACTORED (Jan 27): Use ExhaustionTighteningChecker
+                    # 🔥 FEB 11: Added PARTIAL EXIT on 3+ exhaustion signals (lock profit)
                     candles_5m_trail = self.market_data.get_candles('5m')
                     trail_atr = None
                     if candles_5m_trail and len(candles_5m_trail) >= 14:
@@ -7235,6 +7687,7 @@ class SignalEngine:
                         )
                         trail_atr = trail_atr_vals[-1] if len(trail_atr_vals) > 0 else None
                     
+                    # 1) Tighten stop como antes
                     tighten_result = ExhaustionTighteningChecker.calculate_tightened_stop(
                         position, current_price, trail_atr, 
                         getattr(self, '_exhaustion_tightened', False)
@@ -7244,6 +7697,52 @@ class SignalEngine:
                         position.trailing_stop = tighten_result.new_stop
                         logger.info(f"🎯 Trailing tightened: {tighten_result.extra_data.get('old_stop', 0):.2f} → {tighten_result.new_stop:.2f}")
                         self._exhaustion_tightened = True
+                    
+                    # 2) 🔥 NEW: Force partial exit (30%) on 3+ exhaustion signals (once)
+                    if not getattr(self, '_exhaustion_partial_taken', False):
+                        # Calculate 30% of position to close
+                        partial_pct = 0.30
+                        close_size = round_size_to_exchange(position.size * partial_pct)
+                        remaining_size = position.size - close_size
+                        
+                        # Validate minimum sizes
+                        if close_size >= KRAKEN_BTC_MIN_SIZE and remaining_size >= KRAKEN_BTC_MIN_SIZE:
+                            logger.warning(f"⚡ EXHAUSTION PARTIAL: {exhaustion.signal_count} signals → closing {partial_pct*100:.0f}% ({close_size:.6f} BTC)")
+                            
+                            # Notify reconciler to prevent race conditions
+                            self.reconciler.notify_partial_close("EXHAUSTION_PARTIAL")
+                            
+                            # Execute partial close
+                            close_side = 'sell' if position.direction == 'LONG' else 'buy'
+                            await self.execution.close_position_market(
+                                symbol=self.symbol,
+                                side=close_side,
+                                amount=close_size,
+                                reason="EXHAUSTION_PARTIAL"
+                            )
+                            
+                            # Sync with exchange after close
+                            await asyncio.sleep(0.5)
+                            exchange_pos = await self.execution.get_position(self.symbol)
+                            if exchange_pos:
+                                exchange_size = abs(float(exchange_pos.get('contracts', 0) or 0))
+                                if exchange_size > 0:
+                                    position.size = exchange_size
+                                    logger.info(f"🔄 Size synced after exhaustion partial: {exchange_size:.6f}")
+                            
+                            # Mark partial as taken to prevent repeated partials
+                            self._exhaustion_partial_taken = True
+                            
+                            # Log event
+                            await self.trade_logger.log_event('tp1_hit', {
+                                'entry': position.entry_price,
+                                'price': current_price,
+                                'size_closed': close_size,
+                                'pnl_realized': 0,
+                                'reason': 'EXHAUSTION_PARTIAL'
+                            })
+                        else:
+                            logger.debug(f"Exhaustion partial skipped: close_size={close_size:.6f}, remaining={remaining_size:.6f}")
                         
             except Exception as e:
                 logger.warning(f"⚠️ Exhaustion detector error (non-fatal): {e}")
@@ -8025,8 +8524,25 @@ class SignalEngine:
             return _check_forbidden(self._active_direction, 'MOMENTUM', 0.5)
         
         # PRIORITY 7: Structural bias as fallback
+        # 🔥 FIX #246 (Feb 16, 2026): HTF_BIAS STALENESS GUARD
+        # 
+        # PROBLEMA: Cuando ninguna señal dispara (priorities 1-6 vacías),
+        # el sistema SIEMPRE cae a HTF_BIAS = _structural_bias (EMA 1h).
+        # Feb 10: 13/13 SHORT porque HTF_BIAS=SHORT y nada más disparaba.
+        #
+        # ROOT CAUSE: HTF_BIAS solo se actualiza cada 1h. Sin displacement
+        # ni edge ni momentum, el sistema opera ciegamente una señal de 1h.
+        #
+        # SOLUCIÓN: Si HTF_BIAS es la ÚNICA fuente de dirección (ningún
+        # priority 1-6 disparó), devolver None en lugar de operar.
+        # Un sistema que solo tiene HTF_BIAS NO tiene edge suficiente.
+        # Mejor esperar a que una señal real aparezca.
         if self._structural_bias:
-            return _check_forbidden(self._structural_bias, 'HTF_BIAS', 0.3)
+            logger.debug(
+                f"📊 FIX #246: HTF_BIAS={self._structural_bias} is the ONLY direction source | "
+                f"No displacement/edge/momentum active | Returning None (wait for real signal)"
+            )
+            return None, 'HTF_BIAS_ALONE', 0.0
         
         return None, 'NONE', 0.0
     
@@ -8407,6 +8923,20 @@ class SignalEngine:
         # 🔥 FIX #63: Get bias invalidation status (opposite direction forbidden)
         bias_invalidated = self._current_trade_tags.get('bias_invalidated', False) if hasattr(self, '_current_trade_tags') else False
         
+        # =========================================================================
+        # 🔥 FIX #230 (Feb 12, 2026): IMPULSE AGE + MOVE CONSUMPTION TRACKING
+        # =========================================================================
+        impulse_start_price: float | None = None
+        impulse_age_bars: int = 0
+        
+        if hasattr(self, '_edge_manager') and self._edge_manager is not None:
+            # Get impulse origin price from edge manager
+            impulse_start_price = self._edge_manager.get_edge_origin_price()
+            
+            # Calculate impulse age in bars (using 5m timeframe as reference)
+            edge_age_min = self._edge_manager.get_edge_age_minutes(market_time)
+            impulse_age_bars = int(edge_age_min / 5.0)  # 5m bars
+        
         # Delegate to EntryScorer
         score, breakdown, structure_blocks = self._entry_scorer.calculate_entry_score(
             df_1h=df_1h,
@@ -8421,6 +8951,8 @@ class SignalEngine:
             strong_trend_adx=effective_adx,               # 🔥 FIX #56
             bias_inverted=bias_inverted,                  # 🔥 FIX #61
             bias_invalidated=bias_invalidated,            # 🔥 FIX #63
+            impulse_start_price=impulse_start_price,      # 🔥 FIX #230
+            impulse_age_bars=impulse_age_bars,            # 🔥 FIX #230
         )
         
         # Copy trade tags from scorer to signal engine for backwards compatibility
@@ -9179,6 +9711,24 @@ class SignalEngine:
                 
                 if zombie_result.get('cancelled', 0) > 0:
                     logger.warning(f"🧟 Zombie cleanup: {zombie_result['cancelled']} orders cancelled")
+                    
+                    # =========================================================================
+                    # 🔥 FIX #173 (Feb 11, 2026): ZOMBIE CLEANUP STATE MACHINE SYNC
+                    # If zombie cleanup cancelled our pending entry order, we MUST:
+                    # 1. Clear pending_order_id
+                    # 2. Transition from WAIT_FILL → IDLE
+                    # Without this, state machine stays stuck in WAIT_FILL forever
+                    # =========================================================================
+                    for zombie in zombie_result.get('zombie_orders', []):
+                        zombie_id = zombie.get('id', '')
+                        if zombie.get('cancelled') and self.pending_order_id:
+                            # Check if zombie was our pending order
+                            if zombie_id == self.pending_order_id or (zombie_id and zombie_id.startswith(self.pending_order_id[:12])):
+                                logger.critical(f"🧟 FIX #173: ZOMBIE was our PENDING ORDER! Forcing WAIT_FILL → IDLE")
+                                self._reset_trade_state("Zombie cleanup cancelled our entry order")
+                                if self.state_machine.state == BotState.WAIT_FILL:
+                                    self.state_machine.transition_to(BotState.IDLE, "Zombie cleanup")
+                    
                     # Send notification for zombie orders
                     if self.output_manager and zombie_result.get('zombie_orders'):
                         for zombie in zombie_result['zombie_orders']:

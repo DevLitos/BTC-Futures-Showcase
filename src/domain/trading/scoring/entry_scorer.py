@@ -61,6 +61,25 @@ class ScoreBreakdown:
     # 🔥 FIX #131 (Feb 09): Edge floor protection - minimum score when edge is valid
     edge_floor_applied: bool = False
     
+    # =========================================================================
+    # 🔥 FIX #230 (Feb 12, 2026): MOVE CONSUMPTION PENALTY
+    # 
+    # PROBLEMA: Sistema es "confirmation-based" = entra TARDE.
+    # Cuando todo confirma, el movimiento ya se consumió.
+    # 
+    # FILOSOFÍA:
+    # - move_consumed = distancia_desde_impulse_start / (ATR * 1.2)
+    # - consumed > 0.75: penalizar -2 puntos
+    # - consumed > 0.90: BLOCK (no hay recorrido)
+    # =========================================================================
+    move_consumption_penalty: float = 0.0
+    move_consumed_ratio: float = 0.0  # Para diagnóstico
+    
+    # 🔥 FIX #230: IMPULSE AGE FILTER
+    # Si el impulso tiene > 12 bars, ya es viejo = LATE ENTRY
+    impulse_age_bars: int = 0
+    impulse_age_blocked: bool = False
+    
     # 🔥 FIX #131: Global penalty cap to prevent "death by a thousand cuts"
     MAX_TOTAL_PENALTY = -3.0  # Maximum total penalty allowed (was unbounded)
     
@@ -69,8 +88,13 @@ class ScoreBreakdown:
         """Calculate total score with FIX #131: Global penalty cap."""
         base = self.structure + self.timing + self.momentum + self.context + self.synergy
         
-        # Sum all penalties
-        total_penalty = self.micro_trend_adj + self.filter_pipeline_adj + self.late_confirmation_penalty
+        # Sum all penalties (including new move_consumption_penalty)
+        total_penalty = (
+            self.micro_trend_adj + 
+            self.filter_pipeline_adj + 
+            self.late_confirmation_penalty +
+            self.move_consumption_penalty  # 🔥 FIX #230
+        )
         
         # 🔥 FIX #131: Cap total penalty to prevent over-penalization
         if total_penalty < self.MAX_TOTAL_PENALTY:
@@ -91,6 +115,9 @@ class ScoreBreakdown:
             'micro_trend_adj': self.micro_trend_adj,
             'filter_pipeline_adj': self.filter_pipeline_adj,
             'late_confirmation_penalty': self.late_confirmation_penalty,
+            'move_consumption_penalty': self.move_consumption_penalty,  # 🔥 FIX #230
+            'move_consumed_ratio': self.move_consumed_ratio,  # 🔥 FIX #230
+            'impulse_age_bars': self.impulse_age_bars,  # 🔥 FIX #230
             'total': self.total
         }
 
@@ -126,6 +153,10 @@ class TradeTags:
     bos_quality: str = "UNKNOWN"     # 'STRONG', 'NORMAL', 'WEAK'
     bos_body_atr: float = 0.0        # BOS body size in ATR multiples
     bos_volume_ratio: float = 0.0    # BOS volume vs average
+    # 🔥 FIX #230 (Feb 12): Move consumption tracking
+    move_consumed_ratio: float = 0.0  # 0.0-1.0, >0.75 = late
+    impulse_age_bars: int = 0         # Bars since impulse, >12 = too old
+    impulse_age_blocked: bool = False  # If blocked by impulse age
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -207,7 +238,65 @@ class LateConfirmationConfig:
         # Cap penalty
         penalty = min(penalty, cls.MAX_LATE_PENALTY)
         
-        return -penalty
+
+
+# =============================================================================
+# 🔥 FIX #230 (Feb 12, 2026): IMPULSE AGE FILTER + MOVE CONSUMPTION
+# 
+# ANÁLISIS BRUTAL DEL USUARIO:
+# "TODO tu sistema es CONFIRMATION-BASED. Esperas confirmación para entrar.
+#  En crypto = ENTRAR TARDE. Entras cuando todo confirma = ya pasó."
+#
+# PROBLEMA: El sistema cree que si TODO está alineado, el movimiento
+# CONTINÚA. Pero el mercado hace: Impulse → Distribution → Fake continuation → Reversal
+#
+# SOLUCIONES:
+# 1. IMPULSE_AGE_FILTER: Bloquear si impulso > 12 bars (1h en 5m TF)
+# 2. MOVE_CONSUMPTION_SCORE: Penalizar si movimiento > 75% del esperado
+# =============================================================================
+class ImpulseAgeConfig:
+    """
+    Configuration for impulse age filter.
+    
+    FILOSOFÍA: Un impulso "viejo" ya distribuyó gran parte de su energía.
+    Entrar después de 12 bars (1h en 5m TF) = entrar en la "cola" del move.
+    
+    El mercado NECESITA momentum fresco para continuar.
+    Impulso viejo + confirmación = trampa de continuación.
+    """
+    # Maximum bars before impulse is "stale"
+    MAX_IMPULSE_AGE_BARS = 12  # 12 bars en 5m = 1 hora
+    
+    # If impulse is older, BLOCK entry (not just penalize)
+    HARD_BLOCK_IF_TOO_OLD = True
+    
+    # Penalty per "old" bar beyond threshold (if not hard blocking)
+    PENALTY_PER_OLD_BAR = 0.3
+    MAX_AGE_PENALTY = 2.0
+
+
+class MoveConsumptionConfig:
+    """
+    Configuration for move consumption score.
+    
+    FILOSOFÍA: Medir cuánto del movimiento esperado ya se consumió.
+    consumed = distancia_desde_impulse_start / (ATR * expected_move_mult)
+    
+    Si consumed > 0.75: El mercado ya dio 3/4 del move esperado.
+    Si consumed > 0.90: El mercado AGOTÓ el move. BLOCK.
+    
+    METÁFORA: Es como un carro de gasolina. Si ya consumió 90% del tanque,
+    no va a llegar a la meta por más que todo esté "alineado".
+    """
+    # ATR multiplier for expected move (1.2 ATR is typical BTC intraday move)
+    EXPECTED_MOVE_ATR_MULT = 1.2
+    
+    # Consumption thresholds
+    PENALIZE_THRESHOLD = 0.75   # Start penalizing at 75% consumed
+    BLOCK_THRESHOLD = 0.90      # Hard block at 90% consumed
+    
+    # Penalty when above PENALIZE_THRESHOLD but below BLOCK_THRESHOLD
+    CONSUMPTION_PENALTY = -2.0  # Severe penalty for "late" moves        return -penalty
 
 
 class EntryScorer:
@@ -247,6 +336,9 @@ class EntryScorer:
         strong_trend_adx: float = 0.0,           # 🔥 FIX #56: ADX for strong trend override
         bias_inverted: bool = False,             # 🔥 FIX #61: Bias was inverted by micro-trend
         bias_invalidated: bool = False,          # 🔥 FIX #63: Bias was flipped (opposite dir forbidden)
+        # 🔥 FIX #230 (Feb 12, 2026): Impulse age and move consumption tracking
+        impulse_start_price: Optional[float] = None,  # Price when impulse started
+        impulse_age_bars: int = 0,                     # Bars since impulse started
     ) -> Tuple[int, Dict[str, Any], bool]:
         """
         Calculate entry score using 4 blocks.
@@ -265,6 +357,8 @@ class EntryScorer:
             strong_trend_adx: ADX value for strong trend override (>50 = override)
             bias_inverted: If True, bypass STRUCTURE GATE (direction changed by micro-trend)
             bias_invalidated: If True, bypass STRUCTURE GATE (opposite direction forbidden by price action)
+            impulse_start_price: Price at impulse/edge creation time (for move consumption calc)
+            impulse_age_bars: How many bars since impulse was detected
         
         Returns:
             (total_score, breakdown_dict, structure_blocks)
@@ -511,6 +605,95 @@ class EntryScorer:
                 f"(candles_since_bos={candles_since_bos}, all_maxed={all_maxed})"
             )
             self._trade_tags.late_confirmation_penalty = late_penalty
+        
+        # =====================================================================
+        # 🔥 FIX #230 (Feb 12, 2026): IMPULSE AGE FILTER
+        # =====================================================================
+        # PROBLEMA: El sistema espera a que TODO confirme, pero para entonces
+        # el impulso ya tiene 15-20 bars y el movimiento está AGOTADO.
+        #
+        # FILOSOFÍA: Impulso viejo (>12 bars) = energía distribuida = late entry.
+        # BTC intradía se mueve en olas de 10-20 minutos, no horas.
+        #
+        # ACCIÓN: Si impulse_age_bars > 12 → BLOCK (estructura devuelve blocks=True)
+        # =====================================================================
+        self._breakdown.impulse_age_bars = impulse_age_bars
+        self._trade_tags.impulse_age_bars = impulse_age_bars
+        
+        if impulse_age_bars > ImpulseAgeConfig.MAX_IMPULSE_AGE_BARS:
+            logger.warning(
+                f"🚫 FIX #230 IMPULSE_AGE_BLOCK: {bias} blocked | "
+                f"impulse_age={impulse_age_bars} > {ImpulseAgeConfig.MAX_IMPULSE_AGE_BARS} bars | "
+                f"Impulso viejo = energía agotada = NO CHASE"
+            )
+            self._breakdown.impulse_age_blocked = True
+            self._trade_tags.impulse_age_blocked = True
+            # Return with structure_blocks=True to prevent entry
+            return 0, self._breakdown.to_dict(), True
+        
+        # =====================================================================
+        # 🔥 FIX #230 (Feb 12, 2026): MOVE CONSUMPTION SCORE
+        # 🔥 FIX #237 (Feb 15, 2026): BYPASS FOR DISPLACEMENT EDGES
+        # =====================================================================
+        # PROBLEMA ORIGINAL: El sistema entra cuando "todo confirma", pero para
+        # entonces el precio ya recorrió 80-90% del movimiento esperado.
+        #
+        # PROBLEMA FIX #237: Para DISPLACEMENT edges, la distancia ES la señal.
+        # El displacement threshold (2.8× ATR) ya supera el expected_move
+        # (1.2× ATR), así que TODA entrada por displacement sería bloqueada.
+        # Esto crea un bucle circular: detectar displacement → bloquear porque
+        # "el movimiento se consumió" → nunca entrar.
+        #
+        # SOLUCIÓN: Bypass move consumption cuando hay DISPLACEMENT edge activo.
+        # El chase penalty del guard 11 ya cubre este riesgo.
+        # =====================================================================
+        if impulse_start_price is not None and len(df_5m) >= 30 and not displacement_edge_active:
+            # Calculate ATR for expected move
+            closes_5m = df_5m['close'].to_numpy()
+            highs_5m = df_5m['high'].to_numpy()
+            lows_5m = df_5m['low'].to_numpy()
+            atr_5m = calculate_atr(highs_5m, lows_5m, closes_5m, period=14)
+            
+            if not np.isnan(atr_5m[-1]) and atr_5m[-1] > 0:
+                atr_val = atr_5m[-1]
+                expected_move = atr_val * MoveConsumptionConfig.EXPECTED_MOVE_ATR_MULT
+                
+                # Calculate how much of the expected move was already consumed
+                if bias == 'LONG':
+                    move_so_far = current_price - impulse_start_price
+                else:  # SHORT
+                    move_so_far = impulse_start_price - current_price
+                
+                # Only penalize if move is IN the correct direction (confirming)
+                if move_so_far > 0 and expected_move > 0:
+                    consumed = move_so_far / expected_move
+                    self._breakdown.move_consumed_ratio = consumed
+                    self._trade_tags.move_consumed_ratio = consumed
+                    
+                    # Check for BLOCK (move exhausted)
+                    if consumed >= MoveConsumptionConfig.BLOCK_THRESHOLD:
+                        logger.warning(
+                            f"🚫 FIX #230 MOVE_EXHAUSTED_BLOCK: {bias} blocked | "
+                            f"consumed={consumed:.1%} >= {MoveConsumptionConfig.BLOCK_THRESHOLD:.0%} | "
+                            f"Move ${move_so_far:.0f} / expected ${expected_move:.0f} | "
+                            f"El movimiento ya se agotó = NO HAY RECORRIDO"
+                        )
+                        # Return with structure_blocks=True to prevent entry
+                        return 0, self._breakdown.to_dict(), True
+                    
+                    # Check for PENALTY (move mostly consumed)
+                    elif consumed >= MoveConsumptionConfig.PENALIZE_THRESHOLD:
+                        self._breakdown.move_consumption_penalty = MoveConsumptionConfig.CONSUMPTION_PENALTY
+                        logger.warning(
+                            f"⚠️ FIX #230 MOVE_CONSUMPTION_PENALTY: {bias} penalty={MoveConsumptionConfig.CONSUMPTION_PENALTY:+.1f} | "
+                            f"consumed={consumed:.1%} >= {MoveConsumptionConfig.PENALIZE_THRESHOLD:.0%} | "
+                            f"Move ${move_so_far:.0f} / expected ${expected_move:.0f}"
+                        )
+        elif displacement_edge_active and impulse_start_price is not None:
+            logger.debug(
+                f"🔥 FIX #237: DISPLACEMENT BYPASS move consumption | "
+                f"origin=${impulse_start_price:.0f} price=${current_price:.0f}"
+            )
         
         # =====================================================================
         # 🔥 FIX #131 (Feb 09, 2026): EDGE FLOOR PROTECTION

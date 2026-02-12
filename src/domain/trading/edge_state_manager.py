@@ -378,9 +378,10 @@ class RangeEdgeCriteria:
     RANGE_SIZE_MAX = 0.30     # 30% size en rango (subido de 25%)
     
     # Timeouts
-    # 🔥 REFACTOR (Feb 05, 2026): Extended from 10 min to 20 min
-    # Range edges at extremes can take time to develop rejection
-    RANGE_EDGE_TIMEOUT_MIN = 20  # Was 10 min → extended
+    # 🔥 FIX #230 (Feb 12, 2026): EDGE TTL RADICAL
+    # BTC intradía = edges mueren rápido. 20 min = eternidad.
+    # Si no confirma en 10 min, el edge murió.
+    RANGE_EDGE_TIMEOUT_MIN = 10  # 🔥 Was 20 → 10 min (TTL radical)
 
 
 @dataclass
@@ -398,9 +399,9 @@ class BreakoutEdgeCriteria:
     BB_WIDTH_PERCENTILE_MAX = 25  # 🔥 Subido de 10 a 25 - percentil 25 ya indica compresión relativa
     VOLUME_DECLINE_RATIO = 0.70   # 🔥 Subido de 0.50 a 0.70 - volumen ≤70% es suficiente
     BREAKOUT_CONFIRMATION_CANDLES = 2  # 2 velas para confirmar ruptura
-    # 🔥 REFACTOR (Feb 05, 2026): Extended from 15 min to 30 min
-    # Breakouts often require consolidation after initial impulse
-    BREAKOUT_TIMEOUT_MIN = 30  # Was 15 min → extended
+    # 🔥 FIX #230 (Feb 12, 2026): EDGE TTL RADICAL
+    # Breakout que no rompe en 10 min = squeeze fallido = NO TRADE
+    BREAKOUT_TIMEOUT_MIN = 10  # 🔥 Was 30 → 10 min (TTL radical)
     
     # 🔥 NEW (Jan 28, 2026): Criterios R mínimo y invalidación
     MIN_TARGET_R = 2.0   # BREAKOUT debe apuntar a mínimo 2.0R
@@ -495,17 +496,18 @@ class DisplacementEdgeCriteria:
     CHASE_BLOCK_EXTENSION_MULT = 2.0  # Was 1.5 → allow more extension before chase block
     
     # Timeouts
-    # 🔥 REFACTOR (Feb 05, 2026): Extended all timeouts
-    # BTC moves in 30-60 minute waves, not 10 minute bursts.
-    EDGE_TIMEOUT_MIN = 90             # Was 60 → extended to 90 min
-    CONFIRMATION_TIMEOUT_MIN = 30     # Was 20 → extended to 30 min
+    # 🔥 FIX #230 (Feb 12, 2026): EDGE TTL RADICAL
+    # CRÍTICO: El análisis brutal demostró que 90 min = LOCURA para BTC intradía.
+    # Si no capturas displacement en 20 min, el movimiento ya se consumió.
+    # "Confirmation-based" = LATE. Reducir TTL fuerza timing temprano.
+    EDGE_TIMEOUT_MIN = 20             # 🔥 Was 90 → 20 min (TTL radical)
+    CONFIRMATION_TIMEOUT_MIN = 10     # 🔥 Was 30 → 10 min (TTL radical)
     
-    # 🔥 KILL LATE EDGE (Jan 30, 2026)
-    # Si pasa la ventana de entrada, NO perseguir
-    # 🔥 REFACTOR (Feb 05, 2026): Extended significantly
-    # The original 5 bars / 10 min was killing trends before they developed.
-    KILL_EDGE_AFTER_BARS = 20         # Was 5 → extended to 20 bars
-    KILL_EDGE_AFTER_MIN = 30          # Was 10 → extended to 30 min
+    # 🔥 KILL LATE EDGE - FIX #230 (Feb 12, 2026)
+    # Displacement que no entró en 10 min = CHASE = NO TRADE.
+    # El impulso ya se consumió, entrar ahora = vender al perdedor.
+    KILL_EDGE_AFTER_BARS = 10         # 🔥 Was 20 → 10 bars
+    KILL_EDGE_AFTER_MIN = 10          # 🔥 Was 30 → 10 min
     
     # Size multiplier (agresivo en momentum)
     SIZE_MULTIPLIER_BASE = 0.8        # 80% size base (conservador inicio)
@@ -1507,6 +1509,23 @@ class EdgeStateManager:
         # - RECHACE entradas cuando el edge lleva demasiado tiempo sin ejecutarse
         # =========================================================================
         self._edge_activated_at: Optional[datetime] = None  # Timestamp de activación
+        self._edge_origin_price: Optional[float] = None  # 🔥 FIX #210: Price at edge activation
+        
+        # =========================================================================
+        # 🔥 FIX #184 (Feb 11, 2026): CHASE DETECTION FOR DISPLACEMENT
+        # 
+        # PROBLEMA: Un edge se arma a precio X, queda bloqueado por CONSENSUS,
+        # el precio se mueve 2% en la dirección del edge, luego DISPLACEMENT
+        # detecta el movimiento y BYPASSES el bloqueo → entrada CRIMINAL al tope.
+        # 
+        # SOLUCIÓN: Trackear el precio al que se armó el edge.
+        # Cuando DISPLACEMENT intenta armar un nuevo edge:
+        # - Si había edge previo en la misma dirección
+        # - Y el precio se movió >1.5 ATR en esa dirección desde que se armó
+        # - → RECHAZAR el DISPLACEMENT (el movimiento ya pasó)
+        # =========================================================================
+        self._edge_armed_at_price: Optional[float] = None  # Precio cuando se armó el edge
+        self._edge_armed_direction: Optional[str] = None   # Dirección del edge armado
         
         _edge_log("NO_EDGE", "TREND", "-", "EdgeStateManager initialized | BE WATER MY FRIEND")
     
@@ -1568,6 +1587,11 @@ class EdgeStateManager:
                 self._last_valid_direction = direction
             # 🔥 FIX #171: Clear activation timestamp on expiry
             self._edge_activated_at = None
+            # 🔥 FIX #210: Clear origin price on expiry
+            self._edge_origin_price = None
+            # 🔥 FIX #184: Clear armed price tracking on expiry
+            self._edge_armed_at_price = None
+            self._edge_armed_direction = None
         elif new_state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
             # Nueva edge activa - dirección ya no es stale
             self._direction_stale_since = None
@@ -1579,6 +1603,13 @@ class EdgeStateManager:
                     ts = ts.replace(tzinfo=None)
                 self._edge_activated_at = ts
                 logger.info(f"🎯 FIX #171: Edge activated at {self._edge_activated_at.strftime('%H:%M:%S')}")
+            # 🔥 FIX #184: Track price at edge activation for chase detection
+            if self._current_bos and self._edge_armed_at_price is None:
+                self._edge_armed_at_price = self._current_bos.price
+                self._edge_armed_direction = self._current_bos.direction
+                # 🔥 FIX #210: Also store origin price for distance-based staleness
+                self._edge_origin_price = self._current_bos.price
+                logger.debug(f"🔥 FIX #184: Edge armed at price ${self._edge_armed_at_price:.0f} dir={self._edge_armed_direction}")
         
         # Keep history bounded
         if len(self._transition_history) > 100:
@@ -1628,6 +1659,18 @@ class EdgeStateManager:
         """Modo actual: INSTITUTIONAL o INTRADAY"""
         return self._current_edge_mode
     
+    @property
+    def direction(self) -> Optional[str]:
+        """
+        🔥 FIX #194 (Feb 11, 2026): Propiedad direction para compatibilidad.
+        
+        Devuelve la dirección del edge actual (LONG/SHORT) o None si no hay edge.
+        Esto evita el AttributeError cuando código externo accede a _edge_manager.direction
+        """
+        if self._current_bos:
+            return self._current_bos.direction
+        return None
+    
     # =========================================================================
     # 🔥 FIX #59 (Feb 06, 2026): Direction staleness API
     # =========================================================================
@@ -1649,7 +1692,13 @@ class EdgeStateManager:
         if self._state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
             return False  # Hay edge activo, no es stale
         
-        stale_duration = datetime.utcnow() - self._direction_stale_since
+        from datetime import timezone
+        now_aware = datetime.now(timezone.utc)
+        stale_since = self._direction_stale_since
+        # Ensure both are timezone-aware to avoid naive vs aware error
+        if stale_since.tzinfo is None:
+            stale_since = stale_since.replace(tzinfo=timezone.utc)
+        stale_duration = now_aware - stale_since
         return stale_duration > timedelta(minutes=stale_threshold_minutes)
     
     def get_stale_direction_info(self) -> Dict[str, Any]:
@@ -1721,39 +1770,178 @@ class EdgeStateManager:
             # Log silently and return safe default
             return 0.0
     
-    def get_signal_freshness_penalty(self, now: Optional[datetime] = None) -> float:
+    def get_edge_origin_price(self) -> Optional[float]:
         """
-        Calcula penalty por señal stale (vieja).
+        🔥 FIX #210 (Feb 12, 2026): Get the price where edge was activated.
+        Used for distance-based staleness calculation.
+        """
+        return self._edge_origin_price
+    
+    def refresh_edge_origin(self, new_origin_price: float, market_time: Optional[datetime] = None) -> None:
+        """
+        🔥 FIX #241 (Feb 15, 2026): Refresh edge origin to a closer BOS level.
         
-        LÓGICA:
-        - Edge < 3 min: FRESH → 0.0 penalty (listo para entrar)
-        - Edge 3-5 min: WARNING → -0.5 penalty (advertencia)
-        - Edge > 5 min: STALE → -1.5 penalty (señal vieja, rechazar)
+        When a continuation BOS occurs closer to price while edge is ACTIVE,
+        update the origin to reduce distance-based penalties. This prevents
+        the edge from being penalized for "distance" when the market has 
+        given a fresh signal at a closer level.
         
-        RATIONALE:
-        Si el edge lleva más de 5 minutos activo y aún no entró,
-        probablemente significa que el precio se alejó (chase) o
-        que las condiciones no eran óptimas. Entrar ahora sería
-        "entrar al final del movimiento" → PÉRDIDA probable.
+        Only refreshes if the new origin is CLOSER to current price than the old one.
+        """
+        if self._state not in (EdgeState.EDGE_ACTIVE, EdgeState.EDGE_PROVISIONAL):
+            return
+        
+        old_origin = self._edge_origin_price
+        self._edge_origin_price = new_origin_price
+        
+        # Also refresh the activation timestamp to reset time-based stale
+        ts = market_time or datetime.utcnow()
+        if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
+        self._edge_activated_at = ts
+        
+        logger.info(
+            f"🔄 FIX #241 EDGE REFRESH: origin ${old_origin:.0f} → ${new_origin_price:.0f} | "
+            f"Edge timer reset at {ts.strftime('%H:%M:%S')}"
+        )
+    
+    def get_distance_from_origin(self, current_price: float) -> float:
+        """
+        🔥 FIX #210 (Feb 12, 2026): Calculate distance from edge origin in absolute terms.
         
         Returns:
-            float: Penalty (negativo) o 0.0 si está fresh
+            float: Absolute distance in price units, or 0.0 if no origin
         """
+        if self._edge_origin_price is None:
+            return 0.0
+        return abs(current_price - self._edge_origin_price)
+    
+    def get_distance_from_origin_atr(self, current_price: float, atr: float) -> float:
+        """
+        🔥 FIX #210 (Feb 12, 2026): Calculate distance from edge origin in ATR units.
+        
+        This is the CORE metric for distance-based staleness.
+        
+        Args:
+            current_price: Current market price
+            atr: Current ATR (1m or whatever timeframe is relevant)
+            
+        Returns:
+            float: Distance in ATR units (e.g., 0.5 = half an ATR)
+        """
+        if self._edge_origin_price is None or atr <= 0:
+            return 0.0
+        distance = abs(current_price - self._edge_origin_price)
+        return distance / atr
+    
+    def get_signal_freshness_penalty(
+        self, 
+        now: Optional[datetime] = None,
+        current_price: Optional[float] = None,
+        atr: Optional[float] = None
+    ) -> float:
+        """
+        🔥 FIX #210 (Feb 12, 2026): DISTANCE-BASED STALENESS (COMPLETE REWRITE)
+        
+        PROBLEMA ANTERIOR: Penalty basado en TIEMPO.
+        - Un edge que viajó 0.3 ATR en 10 min seguía válido pero recibía -3.0 penalty
+        - Un edge que viajó 1.5 ATR en 2 min estaba "gastado" pero no recibía penalty
+        
+        NUEVA LÓGICA: Penalty basado en DISTANCIA recorrida (ATR units).
+        - Si el precio se movió mucho desde el origen → el movimiento ya pasó → STALE
+        - Si el precio NO se movió → el setup sigue intacto → FRESH
+        
+        CURVA DE PENALTY (distance-based, primary):
+        - Distancia < 0.3 ATR: FRESH → 0.0 penalty
+        - Distancia 0.3-0.7 ATR: WARNING → -0.5 penalty  
+        - Distancia 0.7-1.2 ATR: STALE → -1.0 to -2.0 progressive
+        - Distancia > 1.2 ATR: EXHAUSTED → -4.0 (move already happened)
+        
+        FALLBACK TEMPORAL (secondary, si no hay current_price/atr):
+        - Usa el viejo sistema basado en minutos
+        
+        TIME SAFETY NET (applies on top of distance):
+        - > 15 min: Add extra -2.0 (even if distance is small, something's wrong)
+        
+        Args:
+            now: Current time (optional)
+            current_price: Current market price (optional, enables distance mode)
+            atr: Current ATR (optional, enables distance mode)
+            
+        Returns:
+            float: Penalty (negative) or 0.0 if fresh
+        """
+        # =========================================================================
+        # DISTANCE-BASED PENALTY (primary mode when price/atr available)
+        # =========================================================================
+        if current_price is not None and atr is not None and atr > 0 and self._edge_origin_price is not None:
+            distance_atr = abs(current_price - self._edge_origin_price) / atr
+            
+            # Calculate distance-based penalty
+            if distance_atr < 0.3:
+                distance_penalty = 0.0  # FRESH: Price hasn't moved much
+            elif distance_atr < 0.7:
+                distance_penalty = -0.5  # WARNING: Minor movement
+            elif distance_atr < 1.2:
+                # STALE: Progressive penalty -1.0 to -2.0
+                distance_penalty = -1.0 - (distance_atr - 0.7) * 2.0
+            else:
+                # EXHAUSTED: Move already happened
+                distance_penalty = -4.0
+            
+            # TIME SAFETY NET: If edge is REALLY old, add extra penalty
+            age_min = self.get_edge_age_minutes(now)
+            time_safety_penalty = 0.0
+            if age_min > 15.0:
+                time_safety_penalty = -2.0  # Something's wrong if 15+ min without trade
+            elif age_min > 12.0:
+                time_safety_penalty = -1.0  # Approaching dead zone
+            
+            total_penalty = distance_penalty + time_safety_penalty
+            
+            # Log for transparency (rate-limited in caller)
+            if total_penalty < -0.5:
+                logger.debug(
+                    f"🔥 FIX #210: Distance-based penalty | dist={distance_atr:.2f} ATR → {distance_penalty:.1f} | "
+                    f"age={age_min:.1f}min → time_safety={time_safety_penalty:.1f} | total={total_penalty:.1f}"
+                )
+            
+            return total_penalty
+        
+        # =========================================================================
+        # FALLBACK: TIME-BASED PENALTY (when no price/atr available)
+        # =========================================================================
         age_min = self.get_edge_age_minutes(now)
         
         if age_min < 3.0:
-            # FRESH: No penalty
-            return 0.0
+            return 0.0  # FRESH
         elif age_min < 5.0:
-            # WARNING: Light penalty
-            return -0.5
+            return -0.5  # WARNING
+        elif age_min < 8.0:
+            # STALE: Progressive penalty -1.0 to -1.75
+            return -1.0 - (age_min - 5.0) * 0.25
+        elif age_min < 12.0:
+            # VERY STALE: Progressive penalty -1.75 to -2.5
+            return -1.75 - (age_min - 8.0) * 0.1875
         else:
-            # STALE: Heavy penalty - reject late entries
-            return -1.5
+            # 🔥 FIX #236 (Feb 15, 2026): Capped from -8.0 to -2.5
+            # PROBLEM: -8.0 was overkill. With a base score of 8.0, the penalty
+            # would result in score 0.0 → guaranteed block. The distance-based
+            # penalty (primary path) already caps at -4.0. This fallback should
+            # not be more aggressive.
+            return -2.5
     
     def is_signal_stale(self, now: Optional[datetime] = None) -> bool:
-        """Returns True if the edge has been active for > 5 minutes"""
+        """Returns True if the edge has been active for > 5 minutes (penalty zone)"""
         return self.get_edge_age_minutes(now) > 5.0
+    
+    def is_signal_dead(self, now: Optional[datetime] = None) -> bool:
+        """
+        🔥 FIX #186b: Returns True if edge is DEAD (> 12 min).
+        🔥 FIX #200 (Feb 12): Reduced from 15→12min to match MAX_EDGE_AGE_DEAD.
+        A DEAD edge should NEVER be traded, regardless of score.
+        """
+        return self.get_edge_age_minutes(now) > 12.0
     
     def can_trade(self) -> bool:
         """
@@ -2131,11 +2319,44 @@ class EdgeStateManager:
         cooldown_until = self._direction_cooldown.get(key)
         
         if cooldown_until is None:
+            # 🔥 FIX #194c: También verificar cooldown simple por dirección
+            # (usado cuando DEAD_EDGE expira)
+            cooldown_until = self._direction_cooldown.get(direction)
+        
+        if cooldown_until is None:
             return False, None
         
         if market_time >= cooldown_until:
             # Cooldown expirado, limpiar
-            del self._direction_cooldown[key]
+            if key in self._direction_cooldown:
+                del self._direction_cooldown[key]
+            if direction in self._direction_cooldown:
+                del self._direction_cooldown[direction]
+            return False, None
+        
+        remaining = int((cooldown_until - market_time).seconds / 60)
+        return True, remaining
+    
+    def is_simple_direction_cooldown_active(
+        self,
+        direction: str,
+        market_time: datetime
+    ) -> Tuple[bool, Optional[int]]:
+        """
+        🔥 FIX #194c (Feb 11): Verifica cooldown simple por dirección.
+        
+        Este cooldown se activa cuando un edge expira por DEAD_EDGE (>15 min).
+        Bloquea TODOS los edge types en esa dirección temporalmente.
+        
+        Returns: (is_active, minutes_remaining)
+        """
+        cooldown_until = self._direction_cooldown.get(direction)
+        
+        if cooldown_until is None:
+            return False, None
+        
+        if market_time >= cooldown_until:
+            del self._direction_cooldown[direction]
             return False, None
         
         remaining = int((cooldown_until - market_time).seconds / 60)
@@ -3002,6 +3223,60 @@ class EdgeStateManager:
             )
             return False
         
+        # =====================================================================
+        # 🔥 FIX #184 (Feb 11, 2026): CHASE-AFTER-BLOCK DETECTION
+        # 
+        # PROBLEMA: Un edge se arma a precio X, queda bloqueado por CONSENSUS
+        # durante 30+ minutos mientras el precio sube 2%. Luego DISPLACEMENT
+        # detecta el movimiento y BYPASSES el bloqueo → entrada CRIMINAL al tope.
+        # 
+        # SOLUCIÓN: Si había un edge previo en la misma dirección y el precio
+        # se ha movido >1.5 ATR en esa dirección desde que se armó el edge,
+        # RECHAZAR el DISPLACEMENT porque el movimiento ya pasó.
+        # 
+        # Ejemplo del log:
+        # - 14:32:05: Edge LONG armado a $67,218
+        # - 15:11:03: Precio en $68,507, DISPLACEMENT intenta armar
+        # - Movimiento: $68,507 - $67,218 = $1,289 > 1.5 ATR (~$200)
+        # - → RECHAZAR: El movimiento de 2% ya terminó
+        # =====================================================================
+        CHASE_THRESHOLD_ATR_MULT = 1.5  # Movimiento > 1.5 ATR = chase peligroso
+        
+        # 🔥 FIX #185b: Diagnostic log for FIX #184
+        logger.info(
+            f"🔍 FIX #184 CHECK: armed_price={self._edge_armed_at_price}, armed_dir={self._edge_armed_direction}, "
+            f"current={current_price:.0f}, dir={direction}, atr={atr:.0f}"
+        )
+        
+        if self._edge_armed_at_price is not None and atr > 0:
+            chase_threshold = atr * CHASE_THRESHOLD_ATR_MULT
+            
+            if direction == 'LONG' and self._edge_armed_direction == 'LONG':
+                # Para LONG: chase si el precio subió significativamente desde el armado
+                price_move_since_armed = current_price - self._edge_armed_at_price
+                if price_move_since_armed > chase_threshold:
+                    edge_age_min = self.get_edge_age_minutes(market_time)
+                    logger.warning(
+                        f"🚫 FIX #184 CHASE-AFTER-BLOCK: LONG displacement BLOCKED | "
+                        f"Price moved ${price_move_since_armed:.0f} since edge armed at ${self._edge_armed_at_price:.0f} "
+                        f"(> {chase_threshold:.0f} = 1.5 ATR) | Edge age: {edge_age_min:.1f}min | "
+                        f"Movement already happened while blocked → NOT arming"
+                    )
+                    return False
+                    
+            elif direction == 'SHORT' and self._edge_armed_direction == 'SHORT':
+                # Para SHORT: chase si el precio bajó significativamente desde el armado
+                price_move_since_armed = self._edge_armed_at_price - current_price
+                if price_move_since_armed > chase_threshold:
+                    edge_age_min = self.get_edge_age_minutes(market_time)
+                    logger.warning(
+                        f"🚫 FIX #184 CHASE-AFTER-BLOCK: SHORT displacement BLOCKED | "
+                        f"Price moved ${price_move_since_armed:.0f} since edge armed at ${self._edge_armed_at_price:.0f} "
+                        f"(> {chase_threshold:.0f} = 1.5 ATR) | Edge age: {edge_age_min:.1f}min | "
+                        f"Movement already happened while blocked → NOT arming"
+                    )
+                    return False
+        
         # Check context cooldown
         if self.is_context_in_cooldown(EdgeType.DISPLACEMENT, market_time):
             logger.debug(f"[DISPLACEMENT_EDGE] Cooldown activo - no armar")
@@ -3356,13 +3631,15 @@ class EdgeStateManager:
         market_time: datetime,
         reason: str = "CONSENSUS",
         macro_bias_strength: str | None = None,
-        has_momentum_override: bool = False
+        has_momentum_override: bool = False,
+        forbidden_direction: str | None = None  # 🔥 FIX #191
     ) -> bool:
         """
         Arma un CONSENSUS_EDGE cuando structural == active en TREND mode.
         
         🔥 FIX #31 (Feb 05): CONSENSUS tiene la MENOR prioridad (20).
         🔥 FIX #78 (Feb 07): MACRO BIAS COHERENCE CHECK
+        🔥 FIX #191 (Feb 11): FORBIDDEN DIRECTION CHECK
         
         Este edge NO requiere:
         - BOS (el consenso ES la señal)
@@ -3376,10 +3653,29 @@ class EdgeStateManager:
           * BEAR_STRONG + LONG = INCOHERENTE → BLOCKED (unless momentum_override)
           * BULL_STRONG + SHORT = INCOHERENTE → BLOCKED (unless momentum_override)
         
+        🔥 FIX #191: NO puede armar edge si direction == forbidden_direction
         Sizing: 0.40-0.60x (menor que BOS_PULLBACK por ser entrada directa)
         
         Returns: True si se armó el edge
         """
+        # =====================================================================
+        # 🔥 FIX #191 (Feb 11, 2026): FORBIDDEN DIRECTION CHECK
+        #
+        # PROBLEMA: El log mostró que cuando hay BIAS FLIP (ej: "FORBID SHORT,
+        # LONG detection ENABLED"), el sistema seguía creando edges SHORT porque
+        # arm_consensus_edge() no verificaba forbidden_direction.
+        #
+        # SOLUCIÓN: Si direction == forbidden_direction, BLOQUEAR el edge.
+        # Esto es PRIORITARIO sobre todo lo demás (incluso momentum override).
+        # =====================================================================
+        if forbidden_direction and direction == forbidden_direction:
+            logger.warning(
+                f"🚫 FIX #191: CONSENSUS BLOCKED by FORBIDDEN_DIRECTION | "
+                f"Cannot create {direction} edge while {direction} is forbidden | "
+                f"reason={reason}"
+            )
+            return False
+        
         # =====================================================================
         # 🔥 FIX #78: MACRO BIAS COHERENCE CHECK
         # 
@@ -3441,6 +3737,41 @@ class EdgeStateManager:
                 f"Wait for NEW structure after displacement expired"
             )
             return False
+        
+        # =====================================================================
+        # 🔥 FIX #194c (Feb 11): DEAD_EDGE cooldown check
+        # If an edge recently expired because it was DEAD (>15 min), don't immediately
+        # create a new edge in the same direction. The market needs NEW momentum.
+        #
+        # 🔥 FIX #223 (Feb 12): BYPASS COOLDOWN en TREND_BIRTH
+        # PROBLEMA: Cooldown impide entrar al inicio de NUEVA tendencia
+        # El momentum es NUEVO - no es el mismo edge stale
+        # SOLUCIÓN: Si TrendPhase = TREND_BIRTH, ignorar cooldown
+        # =====================================================================
+        is_simple_cooldown, simple_remaining = self.is_simple_direction_cooldown_active(direction, market_time)
+        
+        # 🔥 FIX #223: Check for TREND_BIRTH bypass
+        from src.domain.market.regime import TrendPhase
+        trend_phase = getattr(self, '_trend_phase_from_engine', None)
+        is_trend_birth = trend_phase == TrendPhase.TREND_BIRTH if trend_phase else False
+        
+        if is_simple_cooldown:
+            if is_trend_birth:
+                logger.warning(
+                    f"🚀 FIX #223: BYPASSING DEAD_EDGE COOLDOWN for TREND_BIRTH | "
+                    f"{direction} | TrendPhase={trend_phase.value if trend_phase else 'N/A'} | "
+                    f"New trend momentum detected - cooldown not applicable"
+                )
+                # Clear the cooldown since new trend started
+                if direction in self._direction_cooldown:
+                    del self._direction_cooldown[direction]
+            else:
+                logger.warning(
+                    f"🔥 FIX #194c: CONSENSUS BLOCKED by DEAD_EDGE COOLDOWN | "
+                    f"{direction} | ~{simple_remaining}min remaining | "
+                    f"Wait for fresh momentum after stale edge expired"
+                )
+                return False
         
         # 🔥 FIX #36 (Feb 05): Reset from EXPIRED state to allow re-arming
         # Without this, once an edge expires, CONSENSUS can never arm again
@@ -3704,6 +4035,46 @@ class EdgeStateManager:
         if self._current_bos is None:
             return False
         
+        # 🔥 FIX #189 (Feb 11, 2026): EXPIRE DEAD EDGES AUTOMATICALLY
+        # PROBLEMA: Edges con >35 min no expiraban, solo se bloqueaban con penalty -99.
+        # El edge quedaba en EDGE_ACTIVE eternamente, nunca detectando un nuevo edge.
+        # SOLUCIÓN: Expirar automáticamente edges DEAD (>15 min) antes de otros timeouts.
+        # 
+        # 🔥 FIX #194c (Feb 11, 2026): COOLDOWN TRAS DEAD_EDGE
+        # PROBLEMA: Cuando edge expira por DEAD_EDGE, el sistema inmediatamente
+        # crea un nuevo edge igual y el ciclo continúa (cycling):
+        #   EDGE_ACTIVE → DEAD_EDGE expired → EDGE_ACTIVE → DEAD_EDGE expired → ...
+        # SOLUCIÓN: Activar cooldown de 5 min tras expiración por DEAD_EDGE.
+        # El mercado debe mostrar NUEVO momentum, no detectar el mismo edge muerto.
+        #
+        # 🔥 FIX #200 (Feb 12, 2026): REDUCE EDGE DEATH SPIRAL
+        # PROBLEMA: Edge cycling paralizaba sistema por horas:
+        #   - Edge vive 15min con STALE penalty creciente
+        #   - Muere, cooldown 5min
+        #   - Nuevo edge igual → ciclo infinito = 0 trades
+        # SOLUCIÓN: 
+        #   - Reducir MAX_AGE de 15→12min (menos penalty acumulado)
+        #   - Reducir cooldown de 5→2min (reintento más rápido)
+        MAX_EDGE_AGE_DEAD = 12.0  # 🔥 FIX #200: Reduced from 15.0 to allow less penalty buildup
+        edge_age_min = self.get_edge_age_minutes(market_time)
+        if edge_age_min > MAX_EDGE_AGE_DEAD:
+            direction = self._current_bos.direction if self._current_bos else None
+            self._expire_edge(f"🔥 FIX #189 DEAD_EDGE: age {edge_age_min:.1f}min > {MAX_EDGE_AGE_DEAD}min")
+            # 🔥 FIX #194c + #200: Activar cooldown reducido para evitar cycling
+            cooldown_minutes = 2  # 🔥 FIX #200: Reduced from 5→2min for faster retry
+            if direction:
+                cooldown_until = market_time + timedelta(minutes=cooldown_minutes)
+                self._direction_cooldown[direction] = cooldown_until
+                logger.warning(
+                    f"🔥 FIX #194c: DEAD_EDGE cooldown {cooldown_minutes}min for {direction} | "
+                    f"Wait for fresh momentum before new edge"
+                )
+            logger.warning(
+                f"🔥 FIX #189: Expired DEAD edge after {edge_age_min:.1f}min. "
+                f"Cooldown active for {cooldown_minutes}min."
+            )
+            return True
+        
         bos = self._current_bos
         edge_type = bos.edge_type
         
@@ -3791,6 +4162,34 @@ class EdgeStateManager:
                     direction=direction,
                     market_time=datetime.utcnow(),
                     cooldown_minutes=10
+                )
+            
+            # =====================================================================
+            # 🔥 FIX #248 (Feb 16, 2026): CONSENSUS EXPIRY DIRECTION COOLDOWN
+            # 
+            # PROBLEMA: Cuando un CONSENSUS_DIRECT edge expira (por invalidación
+            # de precio, timeout, o cualquier razón), el sistema inmediatamente
+            # re-arma un nuevo edge en la MISMA dirección. Loop infinito:
+            #   EDGE_ACTIVE SHORT → invalidated → EDGE_ACTIVE SHORT → invalidated
+            # 
+            # LOG EVIDENCIA (Feb 12):
+            # - 16:16:46: Edge SHORT invalidated (price $67,595 > BOS $67,278)
+            # - 16:16:46: Immediately re-armed SHORT CONSENSUS at same pct=24%
+            # - Zero trades in 20+ minutes of this cycling
+            #
+            # SOLUCIÓN: Activar direction cooldown de 5 min tras expiración de
+            # CONSENSUS edges. Fuerza al sistema a esperar momentum NUEVO.
+            # NOTA: El dead-edge cooldown en check_expiration() sobreescribe
+            # a 2min para ese caso específico (comportamiento intencional).
+            # =====================================================================
+            if (hasattr(self._current_bos, 'trend_path') and 
+                self._current_bos.trend_path == TrendEdgePath.CONSENSUS_DIRECT):
+                cooldown_minutes = 5
+                cooldown_until = datetime.utcnow() + timedelta(minutes=cooldown_minutes)
+                self._direction_cooldown[direction] = cooldown_until
+                logger.warning(
+                    f"🔥 FIX #248: CONSENSUS {direction} cooldown {cooldown_minutes}min | "
+                    f"Reason: {reason} | Wait for fresh momentum before re-arm"
                 )
             
             # COOLDOWN POR CONTEXTO: bloquear edges relacionados
@@ -3896,9 +4295,27 @@ class EdgeStateManager:
         # - ATR = $500, swing = $1200 → max(300, 360) = $360 buffer
         # - ATR = $500, swing = $600 → max(300, 180) = $300 buffer
         # - ATR = $500, swing = $2000 → max(300, 600) = $600 buffer
+        #
+        # 🔥 FIX #187 (Feb 11, 2026): CAP swing_buffer to prevent absurd SL
+        # PROBLEMA: swing_range de $5,000+ → swing_buffer de $1,500+
+        # Esto hace que 1R = $1,500, y cualquier movimiento pequeño sea -0.3R
+        # Trade real: SL a $1,197 → movimiento de $500 = -0.40R → TIME_INVALIDATION
+        # SOLUCIÓN: Cap swing_buffer a max 2× ATR o $600, lo que sea menor
         # =====================================================================
         atr_buffer = atr * 0.6
-        swing_buffer = swing_range * 0.3 if swing_range > 0 else 0.0
+        swing_buffer_raw = swing_range * 0.3 if swing_range > 0 else 0.0
+        # 🔥 FIX #187: Cap swing_buffer to prevent absurd SL distances
+        MAX_SWING_BUFFER_ATR_MULT = 2.0  # Max 2× ATR
+        MAX_SWING_BUFFER_ABS = 600.0     # Max $600 absolute
+        swing_buffer_cap = min(atr * MAX_SWING_BUFFER_ATR_MULT, MAX_SWING_BUFFER_ABS)
+        swing_buffer = min(swing_buffer_raw, swing_buffer_cap)
+        
+        if swing_buffer_raw > swing_buffer_cap:
+            logger.debug(
+                f"🔥 FIX #187: Capped swing_buffer ${swing_buffer_raw:.0f} → ${swing_buffer:.0f} "
+                f"(max: {MAX_SWING_BUFFER_ATR_MULT}× ATR or ${MAX_SWING_BUFFER_ABS})"
+            )
+        
         invalidation_buffer = max(atr_buffer, swing_buffer)
         
         # Log if using swing-based buffer (significant difference) - THROTTLED

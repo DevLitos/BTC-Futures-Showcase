@@ -45,6 +45,29 @@ _guard_log_interval = timedelta(minutes=2)  # Only log same guard every 2 minute
 
 # 🔧 FIX #129 (Feb 09, 2026): Throttle TRANSITION_MODE log
 _last_transition_mode_log: Optional[datetime] = None
+
+# =========================================================================
+# 🔥 FIX #180 (Feb 11, 2026): LOG RATE LIMITING
+# 
+# PROBLEMA: Logs repetitivos ensucian los archivos:
+#   - "FIX #171 STALE SIGNAL" cada tick (50+ veces)
+#   - "FIX #147 Delta SEVERE" cada tick cuando delta es alto
+#   - "FIX #176 Cross-block expired" cada tick después de timeout
+#   - "PENALTY SUMMARY" cada tick con cualquier penalty
+# 
+# SOLUCIÓN: Rate limiter que sólo logea una vez por minuto para cada tipo.
+# =========================================================================
+_rate_limiter: dict[str, datetime] = {}  # log_key -> last_log_time
+_RATE_LIMIT_SECONDS = 60  # Solo logear cada 60 segundos
+
+def _should_log_rate_limited(key: str, interval_seconds: int = _RATE_LIMIT_SECONDS) -> bool:
+    """Check if we should log this message or skip due to rate limiting."""
+    now = datetime.utcnow()
+    last_log = _rate_limiter.get(key)
+    if last_log is None or (now - last_log).total_seconds() >= interval_seconds:
+        _rate_limiter[key] = now
+        return True
+    return False
 from src.infrastructure.exchanges.kraken.slippage_model import OrderType
 from src.application.live.entry_executor import ExecutionGuards, LocationGuards
 from src.application.live.entry_validators import ChaseResult
@@ -319,17 +342,25 @@ class GuardOrchestrator:
         trend_expansion_active = getattr(engine, '_trend_expansion_active', False)
         adx_value = getattr(engine, '_htf_cache_adx', 0.0) or 0.0
         
-        # Check transition mode (and check for expiration)
+        # Check transition mode (belt-and-suspenders: main loop in trading_app 
+        # also checks this, but guard check ensures state is consistent during eval)
         transition_mode_active = getattr(engine, '_transition_mode_active', False)
         transition_expires = getattr(engine, '_transition_mode_expires', None)
         if transition_mode_active and transition_expires:
             from datetime import datetime
             if datetime.now() > transition_expires:
-                # Transition mode expired
+                # Transition mode expired - main loop should have caught this,
+                # but clear here too for safety
                 engine._transition_mode_active = False
                 engine._transition_mode_direction = None
                 engine._transition_mode_expires = None
                 transition_mode_active = False
+                old_forbidden = getattr(engine, '_forbidden_direction', None)
+                if old_forbidden:
+                    engine._forbidden_direction = None
+                    logger.warning(
+                        f"🔥 FIX #250 (guard fallback): FORBIDDEN {old_forbidden} CLEARED on transition expiry"
+                    )
                 logger.info("🏁 TRANSITION_MODE EXPIRED: Returning to normal penalty floor")
         
         penalties.set_context(
@@ -415,6 +446,70 @@ class GuardOrchestrator:
             result.passed = False
             result.reason = f"Config error: TP1_RISK_MULTIPLE < RR_HARD_FLOOR"
             return result
+        
+        # =====================================================================
+        # 🔥 FIX #220 (Feb 12, 2026): TREND PHASE HARD BLOCK
+        # =====================================================================
+        # PROBLEMA: El sistema entraba al final de tendencias (EXHAUSTION, DISTRIBUTION)
+        # y en contratendencia. 15 de 19 trades fueron DE MIERDA según análisis manual.
+        # 
+        # El ajuste de threshold (+1.5, +2.0) NO ERA SUFICIENTE - un score alto
+        # aún pasaba. Necesitamos un HARD BLOCK REAL.
+        #
+        # SOLUCIÓN: 
+        # - TREND_EXHAUSTION en dirección de la tendencia → HARD BLOCK
+        # - DISTRIBUTION en dirección de la tendencia → HARD BLOCK  
+        # - TREND_DEATH en dirección de la tendencia → HARD BLOCK
+        # - Si es REVERSAL (contra-tendencia cuando trend muere) → permitir con penalty
+        # =====================================================================
+        from src.domain.market.regime.trend_intelligence import TrendPhase
+        
+        trend_phase = ctx.trend_phase
+        is_bad_phase = trend_phase in [TrendPhase.TREND_EXHAUSTION, TrendPhase.DISTRIBUTION, TrendPhase.TREND_DEATH]
+        
+        if is_bad_phase:
+            # Determinar si es entrada en la misma dirección de la tendencia (mala)
+            # o reversal (potencialmente buena)
+            trend_state = engine._trend_intelligence.state if hasattr(engine, '_trend_intelligence') else None
+            trend_dir = trend_state.direction.value if trend_state else None
+            
+            # Entry in same direction as dying trend = BAD
+            is_same_direction_as_trend = (
+                (trend_dir == 'BULLISH' and ctx.bias == 'LONG') or
+                (trend_dir == 'BEARISH' and ctx.bias == 'SHORT')
+            )
+            
+            # TREND_DEATH reversal is OK (entering against dying trend)
+            is_reversal = (
+                trend_phase == TrendPhase.TREND_DEATH and
+                not is_same_direction_as_trend
+            )
+            
+            if is_same_direction_as_trend and not is_reversal:
+                # HARD BLOCK: Entrando en la misma dirección de una tendencia que muere
+                result.passed = False
+                result.reason = (
+                    f"🚫 FIX #220 TREND_PHASE BLOCK: {trend_phase.value} {ctx.bias} | "
+                    f"Trend direction: {trend_dir} | Entering END of trend = LOSS"
+                )
+                logger.warning(
+                    f"🚫 FIX #220: BLOCKED {ctx.bias} entry | TrendPhase={trend_phase.value} | "
+                    f"TrendDir={trend_dir} | Entering at END of trend"
+                )
+                engine._set_rejection_cooldown("TrendPhase block", candles=5)
+                return result
+            elif is_reversal:
+                # Reversal is allowed but with penalty
+                penalties.add_penalty(
+                    source=PenaltySource.WEAK_EDGE,
+                    size_mult=0.60,
+                    score_adj=-1.0,
+                    reason=f"TREND_DEATH reversal: {ctx.bias} against {trend_dir}"
+                )
+                logger.info(
+                    f"🔄 FIX #220: TREND_DEATH REVERSAL allowed with penalty | "
+                    f"{ctx.bias} against dying {trend_dir} trend"
+                )
         
         # =====================================================================
         # PHASE 2: CATASTROPHIC EVENT CHECK
@@ -507,10 +602,12 @@ class GuardOrchestrator:
                 score_adj=-1.0,
                 reason=f"Delta SEVERE contradict: {delta_ratio:+.2f}x vs {ctx.bias}"
             )
-            logger.warning(
-                f"⚠️ FIX #147: Delta SEVERE {delta_ratio:+.2f}x vs {ctx.bias} | "
-                f"Size × 0.50, Score -1.0"
-            )
+            # 🔥 FIX #180: Rate limit - only log once per minute
+            if _should_log_rate_limited(f'delta_severe_{ctx.bias}'):
+                logger.warning(
+                    f"⚠️ FIX #147: Delta SEVERE {delta_ratio:+.2f}x vs {ctx.bias} | "
+                    f"Size × 0.50, Score -1.0"
+                )
         elif delta_moderate_contradict:
             # Moderate → penalizar moderado
             engine._current_trade_tags['delta_info_contradict'] = True
@@ -521,10 +618,12 @@ class GuardOrchestrator:
                 score_adj=-0.5,
                 reason=f"Delta MODERATE contradict: {delta_ratio:+.2f}x vs {ctx.bias}"
             )
-            logger.info(
-                f"📊 FIX #147: Delta MODERATE {delta_ratio:+.2f}x vs {ctx.bias} | "
-                f"Size × 0.70, Score -0.5"
-            )
+            # 🔥 FIX #180: Rate limit - only log once per minute
+            if _should_log_rate_limited(f'delta_moderate_{ctx.bias}'):
+                logger.info(
+                    f"📊 FIX #147: Delta MODERATE {delta_ratio:+.2f}x vs {ctx.bias} | "
+                    f"Size × 0.70, Score -0.5"
+                )
         else:
             engine._current_trade_tags['delta_info_contradict'] = False
         
@@ -799,21 +898,39 @@ class GuardOrchestrator:
                 if should_log:
                     _last_guard_log[log_key] = ctx.market_time
                     logger.warning(
-                        f"🛑 FIX #152: {block_type} BLOCK | {ctx.bias} blocked by "
+                        f"⚠️ FIX #234: {block_type} PENALTY | {ctx.bias} penalized by "
                         f"{'BULLISH' if ctx.bias == 'SHORT' else 'BEARISH'} absorption | "
                         f"conf={absorption_conf}% (threshold={effective_absorption_threshold}%) | "
                         f"delta={delta_ratio:+.2f}x | signals={absorption_result.signal_count} | "
                         f"reason={absorption_result.reason}"
                     )
                 
-                engine._current_trade_tags['absorption_blocked'] = True
+                engine._current_trade_tags['absorption_blocked'] = False
+                engine._current_trade_tags['absorption_penalized'] = True
                 engine._current_trade_tags['absorption_block_reason'] = absorption_result.reason
                 
-                # HARD BLOCK - no penalización, directamente no entrar
-                return result._replace(
-                    can_trade=False,
-                    block_reason=f"ABSORPTION_BLOCK: {absorption_result.reason}"
-                )
+                # =============================================================
+                # 🔥 FIX #234 (Feb 15, 2026): PENALTY instead of HARD BLOCK
+                # PROBLEM: Absorption hard-blocked ALL setups even with 50% 
+                # confidence and no delta. Good setups killed by weak signal.
+                # FIX: Only hard-block when DELTA_SEVERE + absorption (real 
+                # danger). Otherwise, apply penalty to let strong setups through.
+                # =============================================================
+                if delta_severe:
+                    # DELTA_SEVERE + absorption = genuine danger → HARD BLOCK
+                    result.passed = False
+                    result.reason = f"ABSORPTION_BLOCK: {block_type} | {absorption_result.reason}"
+                    return result
+                else:
+                    # MODERATE or NONE → penalty, not block
+                    score_adj = -1.5 if delta_moderate else -1.0
+                    size_mult = 0.50 if delta_moderate else 0.60
+                    penalties.add_penalty(
+                        source=PenaltySource.ABSORPTION_CONTRARY,
+                        size_mult=size_mult,
+                        score_adj=score_adj,
+                        reason=f"{block_type}: conf={absorption_conf}% delta={delta_ratio:+.2f}x"
+                    )
             
             # 🔥 BREAKOUT OVERRIDE: Still allow if clear structure break
             allow_short_breakout = (
@@ -1197,6 +1314,76 @@ class GuardOrchestrator:
             engine._obstinacy_block_count = 0
         
         # =====================================================================
+        # 🔥 FIX #212 (Feb 12, 2026): JERARQUÍA DE SEÑALES CONTRADICTORIAS
+        # =====================================================================
+        # PROBLEMA: El sistema seguía "insistiendo" en un lado cuando MÚLTIPLES
+        # señales contradictorias estaban presentes:
+        # - Absorption bullish + Delta bullish + Macro neutral + Bias short
+        # 
+        # SOLUCIÓN: Detectar contradicción FUERTE y actuar:
+        # - 3+ señales contrarias = REDUCE SIZE 50% (no block, pero mucho cuidado)
+        # - El sistema aprende a "cerrar libros" cuando no hay convicción
+        #
+        # Señales a considerar:
+        # 1. delta_severe_contradict o delta_info_contradict
+        # 2. absorption_contrary
+        # 3. micro_trend contrario (SHORT pero micro=BULLISH)
+        # 4. macro_regime contrario (SHORT pero macro=BULL)
+        # =====================================================================
+        contradiction_count = 0
+        contradiction_details = []
+        
+        # Delta contradict
+        if engine._current_trade_tags.get('delta_severe_contradict', False):
+            contradiction_count += 2  # Severe cuenta doble
+            contradiction_details.append(f"delta_severe({engine._current_trade_tags.get('delta_info_ratio', 0):+.1f}x)")
+        elif engine._current_trade_tags.get('delta_info_contradict', False):
+            contradiction_count += 1
+            contradiction_details.append(f"delta_moderate({engine._current_trade_tags.get('delta_info_ratio', 0):+.1f}x)")
+        
+        # Absorption contrary
+        if engine._current_trade_tags.get('absorption_contrary', False):
+            contradiction_count += 1
+            contradiction_details.append("absorption_contrary")
+        
+        # Micro trend contrario
+        micro_trend = engine._current_trade_tags.get('micro_trend', None)
+        if ctx.bias == 'SHORT' and micro_trend == 'BULLISH':
+            contradiction_count += 1
+            contradiction_details.append(f"micro_bullish_vs_short")
+        elif ctx.bias == 'LONG' and micro_trend == 'BEARISH':
+            contradiction_count += 1
+            contradiction_details.append(f"micro_bearish_vs_long")
+        
+        # Macro regime contrario
+        macro_regime = engine._current_trade_tags.get('regime_macro', None)
+        if ctx.bias == 'SHORT' and macro_regime == 'BULL':
+            contradiction_count += 1
+            contradiction_details.append(f"macro_bull_vs_short")
+        elif ctx.bias == 'LONG' and macro_regime == 'BEAR':
+            contradiction_count += 1
+            contradiction_details.append(f"macro_bear_vs_long")
+        
+        # Si hay contradicción fuerte (3+), aplicar reducción severa
+        if contradiction_count >= 3:
+            engine._current_trade_tags['signal_contradiction_count'] = contradiction_count
+            engine._current_trade_tags['signal_contradiction_details'] = contradiction_details
+            
+            # Añadir penalty de contradicción
+            penalties.add_penalty(
+                source=PenaltySource.DELTA_CONTRADICT,  # Reusamos el source
+                size_mult=0.50,  # Reducir size 50%
+                score_adj=-1.5,  # Penalizar score también
+                reason=f"CONTRADICTION: {contradiction_count} signals against {ctx.bias}: {', '.join(contradiction_details)}"
+            )
+            
+            if _should_log_rate_limited('signal_contradiction'):
+                logger.warning(
+                    f"⚠️ FIX #212 SIGNAL CONTRADICTION: {contradiction_count} signals against {ctx.bias} | "
+                    f"Details: {', '.join(contradiction_details)} | Size × 50%, Score -1.5"
+                )
+        
+        # =====================================================================
         # 🔥 FIX #94: FINAL PENALTY AGGREGATION (Simplificado)
         # =====================================================================
         # El sistema tenía DEMASIADOS penalties que se acumulaban y mataban
@@ -1228,12 +1415,15 @@ class GuardOrchestrator:
                 f"{p.source.value}(×{p.size_mult:.0%})" 
                 for p in penalty_result.penalties
             ])
-            logger.info(
-                f"📊 FIX #81 PENALTY SUMMARY: {ctx.bias} | "
-                f"Final size={penalty_result.final_size_mult:.0%}, "
-                f"Score adj={penalty_result.total_score_adj:+.1f} | "
-                f"Sources: {penalty_summary}"
-            )
+            # 🔥 FIX #180: Rate limit PENALTY SUMMARY - only log once per minute per source combo
+            penalty_key = f"penalty_summary_{penalty_summary}"
+            if _should_log_rate_limited(penalty_key):
+                logger.info(
+                    f"📊 FIX #81 PENALTY SUMMARY: {ctx.bias} | "
+                    f"Final size={penalty_result.final_size_mult:.0%}, "
+                    f"Score adj={penalty_result.total_score_adj:+.1f} | "
+                    f"Sources: {penalty_summary}"
+                )
             engine._current_trade_tags['penalty_final_size_mult'] = penalty_result.final_size_mult
             engine._current_trade_tags['penalty_total_score_adj'] = penalty_result.total_score_adj
             engine._current_trade_tags['penalty_sources'] = [p.source.value for p in penalty_result.penalties]
@@ -1314,6 +1504,17 @@ class ScoreOrchestrator:
         # e.g., "SHORT invalidated → FORBID SHORT, LONG detection ENABLED"
         bias_invalidated = engine._current_trade_tags.get('bias_invalidated', False)
         
+        # =========================================================================
+        # 🔥 FIX #230 (Feb 12, 2026): IMPULSE AGE + MOVE CONSUMPTION TRACKING
+        # =========================================================================
+        impulse_start_price: float | None = None
+        impulse_age_bars: int = 0
+        
+        if hasattr(engine, '_edge_manager') and engine._edge_manager is not None:
+            impulse_start_price = engine._edge_manager.get_edge_origin_price()
+            edge_age_min = engine._edge_manager.get_edge_age_minutes(ctx.market_time)
+            impulse_age_bars = int(edge_age_min / 5.0)  # 5m bars
+        
         # 1. Base score from scorer
         score, breakdown, structure_blocks = engine._entry_scorer.calculate_entry_score(
             df_1h=ctx.df_1h,
@@ -1329,6 +1530,8 @@ class ScoreOrchestrator:
             strong_trend_adx=effective_adx,                     # 🔥 FIX #56: Bypass for strong trend
             bias_inverted=bias_inverted,                        # 🔥 FIX #61: Bypass for bias inversion
             bias_invalidated=bias_invalidated,                  # 🔥 FIX #63: Bypass for bias flip
+            impulse_start_price=impulse_start_price,            # 🔥 FIX #230
+            impulse_age_bars=impulse_age_bars,                  # 🔥 FIX #230
         )
         
         result.score = float(score)
@@ -1411,34 +1614,229 @@ class ScoreOrchestrator:
             logger.info(f"⚠️ FIX #79 FAKEOUT SCORE: Applied penalty {fakeout_score_penalty}")
         
         # =========================================================================
-        # 🔥 FIX #171 (Feb 11, 2026): SIGNAL STALENESS PENALTY
+        # 🔥 FIX #210 (Feb 12, 2026): DISTANCE-BASED STALENESS + EARLY ENTRY BOOST
+        # 🔥 FIX #238 (Feb 15, 2026): DISPLACEMENT EXEMPT FROM DISTANCE-STALE
         # 
-        # PROBLEMA: El sistema ve el movimiento → espera → cuando todo está
-        # "perfecto" entra al FINAL del movimiento → PIERDE por rebote.
+        # The displacement IS the distance. Chase penalty already covers it.
+        # For DISPLACEMENT edges: only time-based stale, capped at -1.5.
+        # For other edges: distance-based stale as before.
         #
-        # SOLUCIÓN: Penalizar entradas cuando el edge lleva mucho tiempo activo.
-        # - Edge < 3 min: FRESH → sin penalty
-        # - Edge 3-5 min: WARNING → -0.5
-        # - Edge > 5 min: STALE → -1.5 (rechazar entrada tardía)
-        #
-        # Esto fuerza al sistema a entrar RÁPIDO o NO ENTRAR.
+        # PHASE 1: DISTANCE-BASED PENALTY (non-displacement only)
+        # PHASE 2: EARLY ENTRY BOOST
+        # PHASE 3: EVENT BYPASS (momentum triggers)
         # =========================================================================
         stale_score_penalty = 0.0
+        early_entry_boost = 0.0
+        event_bypass_active = False
+        
         if hasattr(engine, '_edge_manager'):
-            stale_score_penalty = engine._edge_manager.get_signal_freshness_penalty()
+            edge_mgr = engine._edge_manager
+            edge_age = edge_mgr.get_edge_age_minutes()
+            
+            # Get current price and ATR for distance-based calculation
+            current_price = ctx.current_price if hasattr(ctx, 'current_price') else None
+            # Use atr_1m which is the standard field in EntryContext
+            atr = getattr(ctx, 'atr_1m', None) or getattr(ctx, 'atr', None)
+            
+            # Calculate distance from origin in ATR units
+            distance_atr = 0.0
+            if current_price and atr and atr > 0:
+                distance_atr = edge_mgr.get_distance_from_origin_atr(current_price, atr)
+            
+            # =================================================================
+            # PHASE 3: EVENT BYPASS CHECK (do this FIRST)
+            # If momentum trigger active, reduce/eliminate stale penalty
+            # =================================================================
+            displacement_bypass = engine._current_trade_tags.get('displacement_bypass', False)
+            trend_displacement = engine._current_trade_tags.get('trend_displacement', False)
+            delta_score_bonus = engine._current_trade_tags.get('delta_score_bonus', 0)
+            
+            # Strong momentum = displacement + positive delta
+            has_momentum_trigger = (displacement_bypass or trend_displacement) and delta_score_bonus > 0
+            
+            # Alternative: Very strong delta alone (>1.0 bonus means delta is VERY supportive)
+            has_strong_delta_support = delta_score_bonus >= 1.0
+            
+            if has_momentum_trigger or has_strong_delta_support:
+                event_bypass_active = True
+                result.tags['event_bypass'] = 'momentum_trigger' if has_momentum_trigger else 'strong_delta'
+            
+            # =================================================================
+            # PHASE 1: STALENESS PENALTY
+            # 🔥 FIX #238: DISPLACEMENT edges use TIME-ONLY stale (no distance)
+            # =================================================================
+            from src.domain.trading.edge_state_manager import EdgeState, EdgeType
+            is_displacement_edge = (
+                edge_mgr.state == EdgeState.EDGE_ACTIVE and
+                edge_mgr.current_bos is not None and
+                edge_mgr.current_bos.edge_type == EdgeType.DISPLACEMENT
+            )
+            
+            if is_displacement_edge:
+                # 🔥 FIX #238: For displacement, use TIME-ONLY penalty (capped)
+                # The chase penalty from guard 11 already covers distance.
+                # Stacking distance-stale ON TOP of chase = double-counting.
+                if edge_age < 3.0:
+                    raw_stale_penalty = 0.0
+                elif edge_age < 8.0:
+                    raw_stale_penalty = -0.5  # Light time penalty only
+                elif edge_age < 12.0:
+                    raw_stale_penalty = -1.0
+                else:
+                    raw_stale_penalty = -1.5  # Max for displacement (was -8.0 via fallback)
+                
+                if _should_log_rate_limited('displacement_stale_bypass'):
+                    logger.info(
+                        f"🔥 FIX #238: DISPLACEMENT time-only stale | age={edge_age:.1f}min → "
+                        f"penalty={raw_stale_penalty:.1f} (distance-stale bypassed, chase covers it)"
+                    )
+            else:
+                raw_stale_penalty = edge_mgr.get_signal_freshness_penalty(
+                    current_price=current_price,
+                    atr=atr
+                )
+            
+            # =====================================================================
+            # 🔥 FIX #211 (Feb 12, 2026): ANTI-STALE EN EDGES FUERTES
+            # 
+            # REGLA PRO: Si el mercado te valida (score >= 5.5), no penalices
+            # Un trader profesional no penaliza setups que están funcionando
+            #
+            # JERARQUÍA:
+            # 1. Score >= 5.5 → DISABLE stale decay (mercado valida)
+            # 2. Event bypass → cap penalty at -0.5
+            # 3. Edge floor → gentler curve
+            # 4. Default → full penalty
+            # =====================================================================
+            score_before_stale = result.score
+            market_validates = score_before_stale >= 5.5
+            
+            if market_validates:
+                # 🔥 FIX #211: Si score alto, NO aplicar stale penalty
+                # El mercado está validando el setup, no lo mates
+                stale_score_penalty = 0.0
+                if _should_log_rate_limited('anti_stale_high_score'):
+                    logger.info(
+                        f"🛡️ FIX #211 ANTI-STALE: Score {score_before_stale:.1f} >= 5.5 → "
+                        f"stale penalty DISABLED (raw was {raw_stale_penalty:.1f})"
+                    )
+                result.tags['anti_stale_active'] = True
+            elif event_bypass_active:
+                # With event bypass, cap penalty at -0.5 (acknowledge staleness but don't kill)
+                if raw_stale_penalty < -0.5:
+                    stale_score_penalty = -0.5
+                    if _should_log_rate_limited('event_bypass'):
+                        logger.info(
+                            f"🔥 FIX #210 EVENT BYPASS: Stale penalty {raw_stale_penalty:.1f} "
+                            f"→ capped to {stale_score_penalty:.1f} | trigger={result.tags.get('event_bypass')}"
+                        )
+                else:
+                    stale_score_penalty = raw_stale_penalty
+            else:
+                # Check if EDGE FLOOR was applied (existing protection)
+                edge_floor_applied = getattr(engine, '_score_breakdown', {}).get('edge_floor_applied', False)
+                
+                if raw_stale_penalty < 0:
+                    if edge_floor_applied:
+                        # With EDGE FLOOR, use gentler penalty curve
+                        if edge_age <= 5.0:
+                            stale_score_penalty = 0.0  # Grace period
+                        elif edge_age <= 10.0:
+                            stale_score_penalty = max(-0.5, raw_stale_penalty)
+                        else:
+                            stale_score_penalty = max(-1.0, raw_stale_penalty)
+                    else:
+                        # 🔥 FIX #211: Cap máximo penalty a -2.0 (era ilimitado)
+                        stale_score_penalty = max(-2.0, raw_stale_penalty)
+            
+            # Apply the penalty
             if stale_score_penalty < 0:
-                edge_age = engine._edge_manager.get_edge_age_minutes()
                 result.score = max(0, result.score + stale_score_penalty)
                 result.tags['stale_signal_penalty'] = stale_score_penalty
                 result.tags['edge_age_minutes'] = round(edge_age, 1)
-                logger.warning(
-                    f"⚠️ FIX #171 STALE SIGNAL: Edge age {edge_age:.1f}min → "
-                    f"penalty {stale_score_penalty} → score {result.score:.1f}"
-                )
+                result.tags['distance_atr'] = round(distance_atr, 2)
+                
+                if _should_log_rate_limited('stale_signal'):
+                    logger.warning(
+                        f"⚠️ FIX #210 STALE: dist={distance_atr:.2f}ATR age={edge_age:.1f}min → "
+                        f"penalty {stale_score_penalty:.1f} → score {result.score:.1f}"
+                    )
+            
+            # =================================================================
+            # PHASE 2: EARLY ENTRY BOOST — DISABLED (FIX #251, Feb 12 2026)
+            # 
+            # PROBLEMA: +1.0 score a edges frescos inflaba artificialmente
+            # la calidad percibida de entradas malas. Evidencia Feb 12:
+            # - BOS_PULLBACK SHORT pct=20%: 7.5→8.5 (entró y perdió -$0.22)
+            # - TRANSITION LONG fusion=30%: 6.5→7.5 (entró y perdió -$0.20)
+            # Edge fresco ≠ edge bueno. El score base ya refleja calidad.
+            # =================================================================
         
         # 🔥 FIX #133 (Feb 09, 2026): Kill check disabled - was causing double-counting
         # The individual guards (delta, forbidden, etc.) already applied penalties
         # No additional kill_check_score_penalty needed
+        
+        # =====================================================================
+        # 🔥 FIX #239 (Feb 15, 2026): POST-PENALTY EDGE FLOOR
+        # =====================================================================
+        # PROBLEM: The edge floor (4.0) in entry_scorer.py applies BEFORE chase 
+        # and stale penalties are applied here. So a score of 4.0 (floor) gets 
+        # reduced to 1.0-2.0 by chase+stale, falling below SCORE_BLOCK_FLOOR.
+        # The floor was effectively dead code for downstream penalties.
+        #
+        # FIX: Apply a secondary floor AFTER all penalties. If the scorer gave
+        # an edge floor (has_valid_edge=True), we ensure the final score doesn't
+        # drop below 4.0 even after chase+stale penalties.
+        # This makes the edge floor actually functional.
+        # =====================================================================
+        edge_floor_was_applied = engine._score_breakdown.get('edge_floor_applied', False) if hasattr(engine, '_score_breakdown') else False
+        if not edge_floor_was_applied:
+            # Check if current setup would qualify for edge floor
+            edge_mgr = getattr(engine, '_edge_manager', None)
+            if edge_mgr:
+                from src.domain.trading.edge_state_manager import EdgeState
+                has_valid_edge = edge_mgr.state in (EdgeState.EDGE_ACTIVE, EdgeState.EDGE_PROVISIONAL)
+                if has_valid_edge:
+                    edge_floor_was_applied = True
+        
+        POST_PENALTY_EDGE_FLOOR = 4.0
+        # =====================================================================
+        # 🔥 FIX #249 (Feb 16, 2026): DISABLE EDGE FLOOR ON DELTA SEVERE
+        # 
+        # PROBLEMA: El floor de FIX #239 rescata scores de 0.0-2.0 a 4.0
+        # incluso cuando delta SEVERE contradict indica que el mercado va
+        # en dirección opuesta (+5x a +8x delta vs edge direction).
+        # El sistema SABE que el setup es terrible (score 0-2) pero el floor
+        # sobreescribe esa sabiduría.
+        #
+        # LOG EVIDENCIA (Feb 12):
+        # - Score 0.0 (delta SEVERE +5.55x vs SHORT) → floor 4.0
+        # - Score 1.0 (delta SEVERE +6.39x vs SHORT) → floor 4.0
+        # - Score 1.0 (delta SEVERE +8.60x vs SHORT) → floor 4.0
+        # - El sistema intentó entrar SHORT 10+ veces contra delta masivo
+        #
+        # SOLUCIÓN: Si delta SEVERE contradict está activo, NO aplicar el
+        # edge floor. Las penalizaciones por delta reflejan información
+        # real del mercado que el floor no debería anular.
+        # =====================================================================
+        delta_severe = engine._current_trade_tags.get('delta_severe_contradict', False) if hasattr(engine, '_current_trade_tags') else False
+        
+        if edge_floor_was_applied and result.score < POST_PENALTY_EDGE_FLOOR and not delta_severe:
+            old_score = result.score
+            result.score = POST_PENALTY_EDGE_FLOOR
+            result.tags['post_penalty_edge_floor'] = True
+            if _should_log_rate_limited('post_penalty_floor'):
+                logger.info(
+                    f"🛡️ FIX #239 POST-PENALTY EDGE FLOOR: Score {old_score:.1f} → {POST_PENALTY_EDGE_FLOOR:.0f} | "
+                    f"Valid edge active, floor protects against penalty stacking"
+                )
+        elif edge_floor_was_applied and result.score < POST_PENALTY_EDGE_FLOOR and delta_severe:
+            if _should_log_rate_limited('delta_blocks_floor'):
+                logger.warning(
+                    f"🚫 FIX #249: EDGE FLOOR BLOCKED by DELTA SEVERE | "
+                    f"Score {result.score:.1f} stays (no rescue to {POST_PENALTY_EDGE_FLOOR:.0f}) | "
+                    f"Delta contradict overrides floor protection"
+                )
         
         # =====================================================================
         
@@ -1505,52 +1903,89 @@ class ScoreOrchestrator:
             ctx.trend_phase == TrendPhase.RANGE_BOUND
         )
         
-        if is_regime_conflict:
-            REGIME_CONFLICT_PENALTY = 1.0  # Exigir 1 punto más de score
+        # =====================================================================
+        # 🔥 FIX #211 (Feb 12, 2026): MOMENTUM MANDA - THRESHOLD DINÁMICO REAL
+        # 
+        # PROBLEMA: regime_conflict subía threshold +1.0, matando trades válidos
+        # SOLUCIÓN: Momentum (displacement/expansion) BAJA threshold
+        #           regime_conflict solo sube +0.3 (no +1.0)
+        #
+        # JERARQUÍA:
+        # 1. Displacement activo → -0.7 threshold (momentum fuerte)
+        # 2. Trend expansion → -0.5 threshold (breakout en curso)
+        # 3. Regime conflict → +0.3 threshold (conflicto menor)
+        # =====================================================================
+        displacement_bypass = engine._current_trade_tags.get('displacement_bypass', False) if hasattr(engine, '_current_trade_tags') else False
+        trend_expansion = engine._current_trade_tags.get('trend_expansion', False) if hasattr(engine, '_current_trade_tags') else False
+        trend_displacement = engine._current_trade_tags.get('trend_displacement', False) if hasattr(engine, '_current_trade_tags') else False
+        
+        momentum_threshold_adj = 0.0
+        
+        # Momentum BAJA threshold (prioridad sobre regime_conflict)
+        if displacement_bypass or trend_displacement:
+            momentum_threshold_adj = -0.7  # Momentum fuerte → ser más agresivo
+            threshold = max(4.0, threshold + momentum_threshold_adj)
+            if _should_log_rate_limited('momentum_threshold'):
+                logger.info(f"🚀 FIX #211 MOMENTUM: Displacement active → threshold {momentum_threshold_adj:+.1f} → {threshold:.1f}")
+        elif trend_expansion:
+            momentum_threshold_adj = -0.5  # Expansion → ser más agresivo
+            threshold = max(4.0, threshold + momentum_threshold_adj)
+            if _should_log_rate_limited('momentum_threshold'):
+                logger.info(f"🚀 FIX #211 EXPANSION: Active → threshold {momentum_threshold_adj:+.1f} → {threshold:.1f}")
+        elif is_regime_conflict:
+            # 🔥 FIX #211: Reducido de +1.0 a +0.3 (era demasiado penalizador)
+            REGIME_CONFLICT_PENALTY = 0.3  # Solo +0.3, no +1.0
             threshold += REGIME_CONFLICT_PENALTY
-            logger.warning(
-                f"⚠️ FIX #102a REGIME CONFLICT: trading_mode=TREND but phase=RANGE_BOUND | "
-                f"Threshold +{REGIME_CONFLICT_PENALTY} → {threshold:.1f}"
-            )
-            # Store for sizing penalty later
-            if hasattr(engine, '_current_trade_tags'):
-                engine._current_trade_tags['regime_conflict'] = True
-                engine._current_trade_tags['regime_conflict_threshold_adj'] = REGIME_CONFLICT_PENALTY
+            if _should_log_rate_limited('regime_conflict'):
+                logger.debug(  # Cambiado de warning a debug
+                    f"📊 FIX #211 REGIME CONFLICT: trading_mode=TREND but phase=RANGE_BOUND | "
+                    f"Threshold +{REGIME_CONFLICT_PENALTY} → {threshold:.1f}"
+                )
+        
+        # Store adjustments for analysis
+        if hasattr(engine, '_current_trade_tags'):
+            engine._current_trade_tags['regime_conflict'] = is_regime_conflict
+            engine._current_trade_tags['momentum_threshold_adj'] = momentum_threshold_adj
+            if is_regime_conflict:
+                engine._current_trade_tags['regime_conflict_threshold_adj'] = 0.3
         
         # =====================================================================
         # 🔥 FIX #115 (Feb 09, 2026): TRANSITION_MODE REDUCES THRESHOLD
         #
-        # PROBLEMA (P6): El sistema sube el threshold en TRANSITION mode,
-        # pero TRANSITION_MODE (post-BIAS_FLIP) es cuando DEBERÍAMOS ser
-        # más agresivos porque hay edge de transición.
+        # DISABLED FIX #115 (FIX #251, Feb 12 2026): NO bajar threshold en TRANSITION
         #
-        # SOLUCIÓN: Cuando _transition_mode_active, BAJAR threshold
-        # - El mercado acaba de girar (BIAS_FLIP)
-        # - Tenemos ventana de 15min para capturar el edge
-        # - Score más bajo permite entrar antes del movimiento
-        # =====================================================================
-        transition_mode_active = getattr(engine, '_transition_mode_active', False)
-        transition_direction = getattr(engine, '_transition_mode_direction', None)
+        # PROBLEMA: Entrar en bias flips es PERSEGUIR. El mercado es volátil
+        # justo después del flip y las entradas suelen fallar. Evidencia Feb 12:
+        # - TRANSITION LONG: fusion=30%, macro=BEAR, threshold bajado a 4.0
+        # - Entró a $66,065, cerró a $65,780: -$0.20 pérdida
+        # No bajar el umbral = no entrar en momentos de incertidumbre máxima.
         
-        if transition_mode_active and transition_direction:
-            TRANSITION_MODE_THRESHOLD_BONUS = -1.0  # Bajar 1 punto
+        # =====================================================================
+        # 🔥 FIX #213 (Feb 12, 2026): EDGE FLOOR = THRESHOLD MATCH
+        # =====================================================================
+        # PROBLEMA CRÍTICO: EDGE_FLOOR pone score a 4.0, pero threshold es 4.5+
+        # → Score 4.0 vs Threshold 4.5 → NUNCA ENTRA
+        # 
+        # Esto es un diseño INVÁLIDO: El edge detector validó la oportunidad,
+        # pero los thresholds impiden operar. El edge "vive" pero nunca se
+        # explota (Create → Wait → Penalize → Die → Repeat sin trade).
+        #
+        # SOLUCIÓN: Si EDGE_FLOOR está activo (edge validado), threshold = 4.0
+        # Esto garantiza que un edge validado PUEDA ser operado.
+        #
+        # FILOSOFÍA PRO: Si detectaste el edge, OPERALO. No lo dejes morir.
+        # =====================================================================
+        edge_floor_applied = getattr(engine, '_score_breakdown', {}).get('edge_floor_applied', False)
+        if edge_floor_applied and threshold > 4.0:
             original_threshold = threshold
-            threshold = max(4.0, threshold + TRANSITION_MODE_THRESHOLD_BONUS)  # Floor en 4.0
-            
-            # Solo aplicar si la dirección coincide
-            if hasattr(ctx, 'bias') and ctx.bias == transition_direction:
-                # 🔧 FIX #129: Throttle log to once per 2 minutes
-                global _last_transition_mode_log
-                market_time = ctx.market_time if hasattr(ctx, 'market_time') else datetime.now()
-                if _last_transition_mode_log is None or \
-                   (market_time - _last_transition_mode_log).total_seconds() >= 120:
-                    logger.info(
-                        f"🚀 FIX #115 TRANSITION_MODE: Lowering threshold from {original_threshold:.1f} to {threshold:.1f} | "
-                        f"Direction={transition_direction}"
-                    )
-                    _last_transition_mode_log = market_time
-                if hasattr(engine, '_current_trade_tags'):
-                    engine._current_trade_tags['transition_mode_threshold_bonus'] = TRANSITION_MODE_THRESHOLD_BONUS
+            threshold = 4.0  # Match con EDGE_FLOOR_SCORE
+            if _should_log_rate_limited('edge_floor_threshold'):
+                logger.info(
+                    f"🛡️ FIX #213 EDGE FLOOR MATCH: Threshold {original_threshold:.1f} → {threshold:.1f} | "
+                    f"Valid edge detected, allowing trade"
+                )
+            if hasattr(engine, '_current_trade_tags'):
+                engine._current_trade_tags['edge_floor_threshold_match'] = True
         
         # 🔥 FIX (Jan 27, 2026): Anti-paralysis DISABLED
         # The system was accepting garbage trades due to incorrect activity tracking
@@ -1560,11 +1995,21 @@ class ScoreOrchestrator:
     
     @staticmethod
     def _get_trend_phase_adjustment(trend_phase: TrendPhase, bias: str, engine: 'SignalEngine') -> float:
-        """Get threshold adjustment based on trend phase."""
+        """
+        Get threshold adjustment based on trend phase.
+        
+        🔥 FIX #223 (Feb 12, 2026): Aumentado bonus para TREND_BIRTH
+        PROBLEMA: Score típico TREND_BIRTH = 5-6, threshold = 6.0 después de -1.0
+        SOLUCIÓN: Mayor reducción para asegurar que TREND_BIRTH entra
+        
+        New values:
+        - TREND_BIRTH: -2.0 (was -1.0) - Critical entry window!
+        - TREND_ACCELERATION: -1.0 (was -0.5) - Still good momentum
+        """
         if trend_phase == TrendPhase.TREND_BIRTH:
-            return -1.0
+            return -2.0  # 🔥 FIX #223: Increased from -1.0 - CATCH THE BIRTH!
         elif trend_phase == TrendPhase.TREND_ACCELERATION:
-            return -0.5
+            return -1.0  # 🔥 FIX #223: Increased from -0.5 - Momentum confirmed
         elif trend_phase == TrendPhase.TREND_EXHAUSTION:
             return 1.5
         elif trend_phase == TrendPhase.DISTRIBUTION:
@@ -1706,6 +2151,9 @@ class SizingOrchestrator:
         # 🔥 FIX #83 (Feb 7, 2026): Get RegimeFusion alignment multiplier
         regime_fusion_mult = engine._current_trade_tags.get('regime_size_mult', 1.0)
         
+        # 🔥 FIX #245 (Feb 16, 2026): Get entry score for score-to-sizing
+        entry_score = float(getattr(engine, '_entry_score', 5.0))
+        
         # Calculate using simplified system WITH edge mode
         sizing_result = SimplifiedSizer.calculate(
             capital=capital,
@@ -1726,6 +2174,7 @@ class SizingOrchestrator:
             last_trade_time=last_loss_time,  # 🔥 FIX: Use last LOSS time for cooldown
             momentum_score=momentum_score,  # 🔥 NEW (Feb 2): For momentum sizing predictor
             regime_fusion_mult=regime_fusion_mult,  # 🔥 FIX #83: Macro/Micro alignment
+            entry_score=entry_score,  # 🔥 FIX #245: Score-to-sizing
         )
         
         # Map to OrchestrationSizingResult
@@ -2112,6 +2561,60 @@ async def _displacement_fast_path(
         return None
     
     bars_since = current_bos.bars_since_displacement
+    
+    # =====================================================================
+    # 🔥 FIX #186 (Feb 11, 2026): STALE + CHASE BLOCK for DISPLACEMENT
+    # =====================================================================
+    # PROBLEMA CRÍTICO: DISPLACEMENT bypasea TODAS las protecciones incluyendo:
+    #   1. STALE SIGNAL (-1.5 penalty) → Un edge de 40 min igual que de 1 min
+    #   2. CHASE detection → Precio ya subió $1,300 antes de entrar
+    #   3. CONSENSUS BLOCKED → "LONG vs BEAR_STRONG" ignorado
+    #
+    # Caso real Feb 11: 
+    #   - 14:32:05: Edge LONG @ $67,218
+    #   - 14:35 → 15:10: BLOCKED por BEAR_STRONG (39 min)
+    #   - 15:11:03: DISPLACEMENT detected, bypasea TODO
+    #   - 15:11:04: Entry LONG @ $68,507 (top of 2% move)
+    #   - Resultado: -0.32R
+    #
+    # SOLUCIÓN:
+    #   - Edge age > 15 min → BLOCK (no solo penalty)
+    #   - Price moved > 1.5 ATR en dirección del edge → CHASE BLOCK
+    # =====================================================================
+    
+    # CHECK 1.5a: STALE BLOCK - No entrar con edge de más de 15 min
+    MAX_EDGE_AGE_MINUTES = 15.0
+    edge_age_min = edge_mgr.get_edge_age_minutes()
+    if edge_age_min > MAX_EDGE_AGE_MINUTES:
+        logger.warning(
+            f"🚫 FIX #186 STALE BLOCK: DISPLACEMENT edge age {edge_age_min:.1f}min > {MAX_EDGE_AGE_MINUTES}min | "
+            f"Edge too old - not chasing. FAST PATH BLOCKED."
+        )
+        # Expirar el edge para no seguir intentando
+        edge_mgr._expire_edge(reason=f"STALE_BLOCK:age={edge_age_min:.1f}min")
+        return None
+    
+    # CHECK 1.5b: CHASE BLOCK - No entrar si precio ya se movió > 1.5 ATR
+    CHASE_THRESHOLD_ATR = 1.5
+    disp_direction = current_bos.direction
+    origin_price = current_bos.displacement_origin if hasattr(current_bos, 'displacement_origin') else current_bos.price
+    
+    if origin_price and atr_1m > 0:
+        if disp_direction == 'LONG':
+            price_moved = current_price - origin_price
+        else:
+            price_moved = origin_price - current_price
+        
+        chase_threshold = CHASE_THRESHOLD_ATR * atr_1m
+        if price_moved > chase_threshold:
+            logger.warning(
+                f"🚫 FIX #186 CHASE BLOCK: Price moved ${price_moved:.0f} > ${chase_threshold:.0f} (1.5 ATR) | "
+                f"Origin ${origin_price:.0f} → Current ${current_price:.0f} | "
+                f"FAST PATH BLOCKED - would chase the move."
+            )
+            # NO expirar edge - solo bloquear fast path, dejar que pullback pipeline evalúe
+            current_bos.force_direct_entry = False
+            return None
     
     # =====================================================================
     # 🔥 FIX #160 (Feb 10): MODE_EXPANSION vs MODE_RANGE
@@ -2546,6 +3049,14 @@ async def _displacement_fast_path(
             expansion_mode_active = engine._current_trade_tags.get('expansion_mode_activated', False)
             effective_adx = engine._current_trade_tags.get('effective_adx', 0) or engine._current_trade_tags.get('htf_adx', 0)
             
+            # 🔥 FIX #230: Get impulse age and origin price
+            impulse_start_price: float | None = None
+            impulse_age_bars: int = 0
+            if hasattr(engine, '_edge_manager') and engine._edge_manager is not None:
+                impulse_start_price = engine._edge_manager.get_edge_origin_price()
+                edge_age_min = engine._edge_manager.get_edge_age_minutes(market_time)
+                impulse_age_bars = int(edge_age_min / 5.0)
+            
             # Calcular score con la firma correcta del método
             score, breakdown, structure_blocked = entry_scorer.calculate_entry_score(
                 df_1h=ctx.df_1h,
@@ -2559,6 +3070,8 @@ async def _displacement_fast_path(
                 displacement_edge_active=True,  # FAST_PATH = displacement activo
                 expansion_mode_active=expansion_mode_active,  # 🔥 FIX #56
                 strong_trend_adx=effective_adx,               # 🔥 FIX #56
+                impulse_start_price=impulse_start_price,      # 🔥 FIX #230
+                impulse_age_bars=impulse_age_bars,            # 🔥 FIX #230
             )
             fast_path_score = score
             fast_path_breakdown = breakdown
@@ -2640,12 +3153,39 @@ async def _displacement_fast_path(
     # Análisis de 49 trades FAST PATH: expectancy -0.012R, 35% TIME_INVALIDATION
     # Problema: Entraba con scores 5-6 en setups mediocres
     # Solución: Score >= 7 requiere buena estructura+timing+momentum
+    #
+    # 🔥 FIX #223 (Feb 12, 2026): TREND_BIRTH FAST TRACK
+    # PROBLEMA: Score típico de TREND_BIRTH es 5-6, pero threshold es 7
+    # Esto IMPIDE entrar al INICIO de tendencias (el mejor momento)
+    # SOLUCIÓN: Reducir threshold a 5.0 cuando TrendPhase = TREND_BIRTH
     from src.config.unified_constants import SCORES
-    FAST_PATH_MIN_SCORE = SCORES.FAST_PATH_MIN_SCORE
+    from src.domain.market.regime import TrendPhase
+    
+    FAST_PATH_MIN_SCORE = SCORES.FAST_PATH_MIN_SCORE  # Default 7.0
+    
+    # 🔥 FIX #223: Check if we're in TREND_BIRTH
+    trend_phase = getattr(engine, '_trend_phase', TrendPhase.RANGE_BOUND)
+    is_trend_birth = trend_phase == TrendPhase.TREND_BIRTH
+    is_trend_acceleration = trend_phase == TrendPhase.TREND_ACCELERATION
+    
+    if is_trend_birth:
+        FAST_PATH_MIN_SCORE = 5.0  # Reduced from 7.0 - CATCH THE BIRTH!
+        logger.info(
+            f"🚀 FIX #223 TREND_BIRTH FAST TRACK: Threshold reduced 7.0 → 5.0 | "
+            f"TrendPhase=TREND_BIRTH - OPTIMAL entry window!"
+        )
+    elif is_trend_acceleration:
+        FAST_PATH_MIN_SCORE = 6.0  # Slightly reduced - still good
+        logger.debug(
+            f"📈 FIX #223 TREND_ACCELERATION: Threshold reduced 7.0 → 6.0 | "
+            f"TrendPhase=TREND_ACCELERATION - momentum confirmed"
+        )
+    
     if fast_path_score < FAST_PATH_MIN_SCORE:
         logger.warning(
-            f"🛑 FAST PATH BLOCKED: Score {fast_path_score:.1f} < {FAST_PATH_MIN_SCORE} minimum (conservative) | "
-            f"direction={disp_direction} | breakdown={engine._score_breakdown}"
+            f"🛑 FAST PATH BLOCKED: Score {fast_path_score:.1f} < {FAST_PATH_MIN_SCORE} minimum | "
+            f"direction={disp_direction} | TrendPhase={trend_phase.value if hasattr(trend_phase, 'value') else trend_phase} | "
+            f"breakdown={engine._score_breakdown}"
         )
         return None
     
@@ -2911,6 +3451,7 @@ async def _displacement_fast_path(
         # =====================================================================
         engine.exhaustion_detector.start_tracking(market_time)
         engine._exhaustion_tightened = False
+        engine._exhaustion_partial_taken = False  # 🔥 FEB 11: Reset partial flag
         engine._gap_history = []
         engine._prev_tick_price = fill_price
         
@@ -3013,6 +3554,7 @@ async def _displacement_fast_path(
         if engine.output_manager:
             try:
                 from src.application.live.trading_app import _create_safe_task
+                logger.info(f"📲 Sending entry notification: {disp_direction} @ {fill_price:.2f}")
                 _create_safe_task(engine.output_manager.send_entry_notification({
                     'symbol': engine.symbol,
                     'direction': disp_direction,
@@ -3027,7 +3569,7 @@ async def _displacement_fast_path(
                     'entry_type': 'FAST_PATH_DISPLACEMENT'
                 }), "send_entry_notification")
             except Exception as e:
-                logger.debug(f"Entry notification error: {e}")
+                logger.warning(f"⚠️ Entry notification error: {e}")
         
     else:
         # =====================================================================
@@ -3343,6 +3885,44 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     # Session limit check (with override for high scores)
     # 🔥 FIX #10: Handle Hot Hand stopped (loss occurred)
     # 🔥 FIX #82: Improved message clarity
+    
+    # =========================================================================
+    # 🔥 FIX #251 (Feb 12, 2026): REGIME FUSION GATE
+    # =========================================================================
+    # PROBLEMA: regime_fusion_mult=0.30 significa que macro y micro están
+    # severamente desalineados (solo 30% de confianza). El sizing se reduce
+    # pero la entrada aún se permite. Evidencia Feb 12:
+    # - LONG con fusion=0.30, macro=BEAR → entró y perdió -$0.20
+    # - El sistema sabía que no estaba alineado pero entró igual
+    #
+    # SOLUCIÓN: Si regime_fusion < 0.40, bloquear SALVO score >= 8.0
+    # Un score de 8+ indica setup excepcional que puede justificar
+    # operar contra el macro. Score < 8 con fusion < 0.40 = no entrar.
+    # =========================================================================
+    FUSION_BLOCK_THRESHOLD = 0.40
+    FUSION_BLOCK_SCORE_OVERRIDE = 8.0
+    regime_fusion_mult = engine._current_trade_tags.get('regime_size_mult', 1.0)
+    
+    if regime_fusion_mult < FUSION_BLOCK_THRESHOLD and score_result.score < FUSION_BLOCK_SCORE_OVERRIDE:
+        result.reason = (
+            f"⛔ FIX #251 FUSION GATE: fusion={regime_fusion_mult:.0%} < {FUSION_BLOCK_THRESHOLD:.0%} | "
+            f"Score={score_result.score:.1f} < {FUSION_BLOCK_SCORE_OVERRIDE:.0f} required"
+        )
+        logger.warning(
+            f"🚫 {result.reason} | Macro/micro severely misaligned → blocking entry"
+        )
+        engine.missed_tracker.log_blocked_signal(
+            direction=bias,
+            price=current_price,
+            block_reason=result.reason,
+            block_category='regime_fusion',
+            score=score_result.score,
+            atr=engine._last_momentum_atr
+        )
+        engine._current_trade_tags['fusion_gate_blocked'] = True
+        engine._current_trade_tags['fusion_gate_mult'] = regime_fusion_mult
+        return result
+    
     if guard_result.tags.get('session_stopped', False):
         session_pnl = guard_result.tags.get('session_pnl_r', 0.0)
         result.reason = (
@@ -3518,19 +4098,24 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     
     # 🔥 SIMPLIFIED TP (Jan 27, 2026): Fixed TP based on regime only
     # 🔥 UPDATE (Jan 28, 2026): Added edge_type for BREAKOUT 2.0R minimum
+    # 🔥 UPDATE (Feb 11, 2026): Added atr_expansion_ratio for ADAPTIVE TP
     from src.config.simplified_sizing import SimplifiedFeatureFlags, SimplifiedExitConfig
     
     if SimplifiedFeatureFlags.USE_FIXED_TP:
         # Get edge type from current trade tags
         current_edge_type = engine._current_trade_tags.get('edge_type', None)
+        atr_expansion_ratio = engine._current_trade_tags.get('atr_expansion_ratio', None)
         
         # Simplified: 1.5R in trend, 1.0R in range, 2.0R in breakout
+        # 🔥 NEW: Adaptive TP based on volatility (atr_expansion_ratio)
         tp_mult = SimplifiedExitConfig.get_tp_r(
             regime_str=engine._current_regime.value if engine._current_regime else "NORMAL",
             adx=ctx.adx_1h if hasattr(ctx, 'adx_1h') else None,
-            edge_type=current_edge_type
+            edge_type=current_edge_type,
+            atr_expansion_ratio=atr_expansion_ratio
         )
-        logger.info(f"📊 SIMPLIFIED TP: {tp_mult}R (edge={current_edge_type})")
+        atr_ratio_str = f"{atr_expansion_ratio:.2f}" if atr_expansion_ratio else "N/A"
+        logger.debug(f"📊 SIMPLIFIED TP: {tp_mult:.2f}R (edge={current_edge_type}, atr_ratio={atr_ratio_str})")
     else:
         # Legacy: Dynamic TP from daily regime config
         daily_tp = engine._daily_regime_config.get('tp_r_target', AsymmetryConfig.BASE_TP_R) if hasattr(engine, '_daily_regime_config') and engine._daily_regime_config else RiskManagement.TP1_RISK_MULTIPLE
@@ -3835,22 +4420,25 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     capital = engine.risk_engine.capital if hasattr(engine, 'risk_engine') else 500.0
     
     # Umbrales de profit mínimo
-    # 🔥 FIX #118 (Feb 09, 2026): Escalar con capital para cuentas pequeñas
-    # - Cuentas pequeñas (<$500): 0.20% del capital (~$0.50 para $250)
-    # - Cuentas grandes (>$500): 0.10% del capital
-    # - Floor absoluto: $0.50 mínimo para que tenga sentido el trade
+    # 🔥 FIX #235 (Feb 15, 2026): Lowered MIN_PROFIT_FLOOR from $0.50 to $0.25
+    # PROBLEM: With $245 capital and probe sizing (0.25×), expected profit was
+    # ~$0.30 → blocked by $0.50 floor. Probe trades could NEVER pass.
+    # Combined with SCORE_BLOCK_FLOOR forcing probe sizing, this was a death trap.
+    # $0.25 still covers fees on Kraken Futures (maker 0.02%, taker 0.05%).
     if capital < 500:
-        MIN_PROFIT_PERCENT = 0.0020  # 0.20% for small accounts
+        MIN_PROFIT_PERCENT = 0.0015  # 0.15% for small accounts (~$0.37 for $245)
     else:
         MIN_PROFIT_PERCENT = 0.0010  # 0.10% for larger accounts
-    MIN_PROFIT_FLOOR = 0.50     # $0.50 minimum - si no puedes ganar esto, no vale la pena
+    MIN_PROFIT_FLOOR = 0.25     # 🔥 FIX #235: Lowered from $0.50 — allow probe trades on small accounts
     
     min_expected_profit = max(capital * MIN_PROFIT_PERCENT, MIN_PROFIT_FLOOR)
     
     # 🔥 FIX #102d: NO HAY BYPASS - profit mínimo es sagrado
     # Si no puedes ganar $0.50 neto, no deberías estar en el trade
     if cost_result.expected_profit_usd_net < min_expected_profit:
-        rr_ratio = cost_result.expected_profit_usd_net / max(sizing_result.risk_usd, 0.01) if hasattr(sizing_result, 'risk_usd') else 0.0
+        # 🔥 FIX: OrchestrationSizingResult doesn't have risk_usd, calculate from size
+        estimated_risk = sizing_result.size_usd * 0.01 if sizing_result.size_usd > 0 else 1.0  # ~1% of position
+        rr_ratio = cost_result.expected_profit_usd_net / max(estimated_risk, 0.01)
         logger.warning(
             f"🚫 FIX #102d BLOCK: profit_net=${cost_result.expected_profit_usd_net:.2f} < ${min_expected_profit:.2f} | "
             f"RR={rr_ratio:.2f} (no bypass allowed) | size={sizing_result.size:.6f}"
@@ -3873,7 +4461,9 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         )
         return result
     else:
-        rr_ratio = cost_result.expected_profit_usd_net / max(sizing_result.risk_usd, 0.01) if hasattr(sizing_result, 'risk_usd') else 1.0
+        # 🔥 FIX: OrchestrationSizingResult doesn't have risk_usd
+        estimated_risk = sizing_result.size_usd * 0.01 if sizing_result.size_usd > 0 else 1.0
+        rr_ratio = cost_result.expected_profit_usd_net / max(estimated_risk, 0.01)
         logger.info(
             f"✅ Profit check PASS: ${cost_result.expected_profit_usd_net:.2f} >= ${min_expected_profit:.2f} | "
             f"RR={rr_ratio:.2f}"
@@ -3979,8 +4569,10 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
             engine.state_machine.start_entry_timer()
             engine.state_machine.transition_to(BotState.WAIT_FILL, "Order placed")
         
-        # Update session trade count
-        engine._session_trade_counts[session_name] = engine._session_trade_counts.get(session_name, 0) + 1
+        # 🔥 FIX #196 (Feb 12, 2026): REMOVED DUPLICATE session_trade_counts increment
+        # The counter is already incremented in trading_app.py line ~6926 when fill is confirmed.
+        # Having it here too caused DOUBLE COUNTING: 2 real trades → 4 counted → session_limit blocked
+        # See: "Session STOPPED (4 trades done)" but Health said "trades_today=2"
         
         # 🔥 FIX (Jan 27, 2026): Use CENTRALIZED activity tracker
         from src.domain.trading.activity_tracker import record_trade_executed
@@ -4055,6 +4647,7 @@ async def _handle_instant_fill(
     # Start exhaustion tracking
     engine.exhaustion_detector.start_tracking(ctx.market_time)
     engine._exhaustion_tightened = False
+    engine._exhaustion_partial_taken = False  # 🔥 FEB 11: Reset partial flag
     
     # 🔥 FIX (Feb 01): Reset gap history for new trade
     engine._gap_history = []
@@ -4115,6 +4708,7 @@ async def _handle_instant_fill(
     if engine.output_manager:
         try:
             from src.application.live.trading_app import _create_safe_task
+            logger.info(f"📲 Sending entry notification: {ctx.bias} @ {ctx.current_price:.2f}")
             _create_safe_task(engine.output_manager.send_entry_notification({
                 'symbol': engine.symbol,
                 'direction': ctx.bias,
@@ -4128,7 +4722,7 @@ async def _handle_instant_fill(
                 'timestamp': ctx.market_time.isoformat() if hasattr(ctx.market_time, 'isoformat') else str(ctx.market_time)
             }), "send_entry_notification")
         except Exception as e:
-            logger.debug(f"Entry notification error: {e}")
+            logger.warning(f"⚠️ Entry notification error: {e}")
 
 
 # =========================================================================

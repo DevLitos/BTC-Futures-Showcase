@@ -120,6 +120,19 @@ class WaitFillHandler:
             return result
         
         # =====================================================================
+        # 🔥 FIX #181 (Feb 11, 2026): Fast-path if position already exists
+        # This means fill was processed but timeout interrupted before transition
+        # Just transition to MANAGE immediately
+        # =====================================================================
+        if ctx.risk_engine.position is not None:
+            logger.warning(f"🔄 FIX #181: WAIT_FILL with existing position - fast transition to MANAGE")
+            ctx.state_machine.transition_to(BotState.MANAGE, "FIX #181: Position exists")
+            result.handled = True
+            result.new_state = BotState.MANAGE
+            result.pending_order_id = None
+            return result
+        
+        # =====================================================================
         # BACKTEST-ONLY instant fill from fills list
         # =====================================================================
         if ctx.is_backtest and hasattr(ctx.execution, 'fills'):
@@ -222,6 +235,27 @@ class WaitFillHandler:
             return result
         
         elapsed = (market_time - ctx.entry_order_time).total_seconds()
+        
+        # ================================================================
+        # 🔥 FIX #172b (Feb 11, 2026): HARD ESCAPE after 10 minutes
+        # If stuck in WAIT_FILL for > 10 min, force exit unconditionally
+        # ================================================================
+        if elapsed > 600:  # 10 minutes = absolute max WAIT_FILL time
+            logger.critical(f"🚨 FIX #172b: HARD ESCAPE - stuck in WAIT_FILL for {elapsed:.0f}s (>10min)!")
+            
+            # Force cleanup
+            try:
+                await ctx.execution.cancel_order(ctx.pending_order_id, ctx.symbol)
+            except Exception:
+                pass  # Ignore - we're force escaping anyway
+            
+            ctx.reset_trade_state("FIX #172b: HARD ESCAPE from WAIT_FILL")
+            ctx.state_machine.transition_to(BotState.IDLE, "FIX #172b: Hard escape timeout")
+            
+            result.handled = True
+            result.new_state = BotState.IDLE
+            result.pending_order_id = None
+            return result
         
         if elapsed <= ENTRY_TIMEOUT_MINUTES * 60:
             return result  # Not timed out yet
@@ -491,6 +525,19 @@ class WaitFillHandler:
         """Process a confirmed fill."""
         result = FillHandlerResult()
         
+        # ================================================================
+        # 🔥 FIX #181 (Feb 11, 2026): Guard against duplicate fill processing
+        # If position already exists in risk_engine, we already processed this fill
+        # This prevents loop where timeout cancels mid-processing and we restart
+        # ================================================================
+        if ctx.risk_engine.position is not None:
+            logger.warning(f"🔄 FIX #181: Position already exists - fill already processed, skipping to MANAGE")
+            ctx.state_machine.transition_to(BotState.MANAGE, "FIX #181: Fill already processed")
+            result.handled = True
+            result.new_state = BotState.MANAGE
+            result.pending_order_id = None
+            return result
+        
         logger.info(f"✅ Entry order FILLED - verifying position on exchange...")
         
         # Capture order→fill latency
@@ -710,7 +757,9 @@ class WaitFillHandler:
                 
                 if not integrity_ok:
                     pos = ctx.risk_engine.position
-                    has_side_mismatch = any('SIDE MISMATCH' in e for e in pos.integrity_errors)
+                    has_side_mismatch = False
+                    if pos is not None:
+                        has_side_mismatch = any('SIDE MISMATCH' in e for e in pos.integrity_errors)
                     
                     if has_side_mismatch:
                         logger.critical("🚨 SIDE MISMATCH - SL/TP placement BLOCKED")
@@ -755,14 +804,16 @@ class WaitFillHandler:
             return result
         
         # Send entry notification
-        if ctx.output_manager and ctx.last_entry_data:
+        output_mgr = ctx.output_manager
+        if output_mgr and ctx.last_entry_data:
             try:
                 entry_data = ctx.last_entry_data
                 import asyncio
+                logger.info(f"📲 Sending entry notification: {entry_data.get('bias')} @ {entry_data.get('entry_price')}")
                 
                 async def safe_notify():
                     try:
-                        await ctx.output_manager.send_entry_notification({
+                        await output_mgr.send_entry_notification({
                             'symbol': ctx.symbol,
                             'direction': entry_data.get('bias', 'UNKNOWN'),
                             'entry_price': entry_data.get('entry_price'),
@@ -775,12 +826,11 @@ class WaitFillHandler:
                             'timestamp': market_time.isoformat() if hasattr(market_time, 'isoformat') else str(market_time)
                         })
                     except Exception as e:
-                        logger.debug(f"Entry notification error: {e}")
+                        logger.warning(f"⚠️ Entry notification error: {e}")
                 
                 asyncio.create_task(safe_notify(), name="send_entry_notification")
-                logger.info("📲 Entry notification sent to Telegram")
             except Exception as notif_err:
-                logger.debug(f"Entry notification error: {notif_err}")
+                logger.warning(f"⚠️ Entry notification task creation error: {notif_err}")
         
         # Final state transition
         result.pending_order_id = None

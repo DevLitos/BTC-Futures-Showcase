@@ -660,7 +660,16 @@ class RESTExecutionEngine:
             return 0
     
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
-        """Cancelar orden con timeout"""
+        """
+        Cancelar orden con timeout.
+        
+        🔥 FIX #172: Detecta ordenes que ya no existen (cancelled/filled externally)
+        y las trata como éxito para evitar loops infinitos de reintento.
+        
+        Returns:
+            True si orden cancelada o ya no existe (safe to proceed)
+            False solo si hay error real de red/exchange
+        """
         if not self.exchange:
             return False
         
@@ -679,6 +688,22 @@ class RESTExecutionEngine:
             return True
             
         except Exception as e:
+            error_str = str(e).lower()
+            
+            # 🔥 FIX #172: Order doesn't exist = already cancelled/filled/expired
+            # This is NOT an error - the order is gone, which is what we wanted
+            if 'notfound' in error_str or 'not found' in error_str or 'unknown order' in error_str:
+                logger.warning(f"⚠️ FIX #172: Order {order_id[:12]}... not found - already gone (cancelled/filled/expired)")
+                
+                # Clean up local tracking if exists
+                if order_id in self.open_orders:
+                    order = self.open_orders.pop(order_id)
+                    order['cancelled_at'] = datetime.now(UTC).isoformat()
+                    order['cancel_reason'] = 'NOT_FOUND_ON_EXCHANGE'
+                    self.order_history.append(order)
+                
+                return True  # 🔥 Return True - order is gone, mission accomplished
+            
             logger.error(f"Error cancelling order: {e}")
             return False
     

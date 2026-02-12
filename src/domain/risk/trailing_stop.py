@@ -114,19 +114,25 @@ class HybridATRTrailing:
     # - TREND: Pullbacks de 0.4-0.6R son normales, locks más holgados
     # - RANGE/SCALP: Necesita protección temprana, locks más ajustados
     #
-    # 🔥 FIX #139 (Feb 10, 2026): RANGE tiers mejorados
-    # - Nivel 1.0R ahora lock -0.1R (was +0.3R - más defensive)
-    # - 1.8R tier añadido para cerrar gaps
+    # 🔥 FIX #243 (Feb 16, 2026): RANGE tiers REFACTORED
+    # 
+    # PROBLEMA: Tiers (0.2, -0.25) y (0.3, -0.20) mataban winners.
+    # Un trade que toca +0.2R MFE y pullback normal de 0.45R (frecuente en BTC)
+    # activaba el trailing y cerraba a -0.25R. Datos: MFE 0.60R → exit 0.05R.
+    #
+    # SOLUCIÓN: Eliminar tiers < 0.5R MFE. BTC necesita room para pullbacks
+    # de 0.3-0.5R que son normales incluso en RANGE. Start trailing at 0.5R.
+    # 
+    # Antes: 9 tiers empezando en 0.2R
+    # Ahora: 7 tiers empezando en 0.5R (matching TREND philosophy)
     R_LOCK_TIERS_RANGE = [
-        (0.2, -0.25, 0),  # +0.2R MFE → max loss -0.25R 
-        (0.3, -0.20, 1),  # +0.3R → max loss -0.20R
-        (0.5, -0.10, 2),  # +0.5R → max loss -0.10R
-        (0.8, 0.0, 3),    # BE at 0.8R
-        (1.0, -0.10, 4),  # 🔥 FIX #139: Lock -0.1R at 1.0R (was +0.3R - más defensive)
-        (1.2, 0.0, 5),    # Lock BE at 1.2R MFE (RANGE conservative)
-        (1.5, 0.40, 6),   # Lock +0.4R at 1.5R MFE
-        (1.8, 0.70, 7),   # 🔥 FIX #139: NEW - Lock +0.7R at 1.8R MFE
-        (2.2, 1.10, 8),   # Lock +1.1R at 2.2R MFE
+        (0.5, -0.20, 0),  # +0.5R MFE → max loss -0.20R (was -0.10R at 0.5)
+        (0.8, -0.05, 1),  # +0.8R → near breakeven
+        (1.0, 0.10, 2),   # +1.0R → lock small profit
+        (1.2, 0.30, 3),   # +1.2R → lock 0.30R
+        (1.5, 0.60, 4),   # +1.5R → lock 0.60R
+        (1.8, 0.90, 5),   # +1.8R → lock 0.90R
+        (2.2, 1.30, 6),   # +2.2R → lock 1.30R
     ]
     
     # 🔥 FIX #139 (Feb 10, 2026): TREND tiers mejorados
@@ -172,8 +178,10 @@ class HybridATRTrailing:
     
     # CRITICAL: Only activate ATR trailing after this MFE threshold
     # This prevents killing winners too early
-    # 🔥 FIX (Feb 05, 2026): Reduced from 0.3 to 0.2 for SCALPING INTELIGENTE
-    ATR_TRAIL_ACTIVATION_MFE = 0.2  # Start ATR trailing at +0.2R (was 0.3)
+    # 🔥 FIX #243 (Feb 16, 2026): Increased from 0.2 to 0.4
+    # BTC pullbacks of 0.2-0.3R are normal. Starting ATR trail at +0.2R MFE
+    # caused trades to be stopped on normal noise. 0.4R gives room.
+    ATR_TRAIL_ACTIVATION_MFE = 0.4  # Start ATR trailing at +0.4R (was 0.2)
     
     # =========================================================================
     # 🔥 BOS QUALITY DYNAMIC TRAILING (Feb 3, 2026)
