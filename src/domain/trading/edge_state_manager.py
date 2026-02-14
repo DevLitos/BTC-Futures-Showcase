@@ -31,7 +31,7 @@ PHILOSOPHY:
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from enum import Enum
 from typing import Optional, Dict, Any, List, Tuple
 import logging
@@ -668,7 +668,7 @@ class EdgeTransition:
     from_state: EdgeState
     to_state: EdgeState
     reason: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     edge_type: Optional[EdgeType] = None
     direction: Optional[str] = None
     
@@ -903,7 +903,7 @@ class EdgeStateManager:
             from_state=old_state,
             to_state=new_state,
             reason=reason,
-            timestamp=market_time or datetime.utcnow(),
+            timestamp=market_time or datetime.now(UTC),
             edge_type=edge_type,
             direction=direction
         )
@@ -926,7 +926,7 @@ class EdgeStateManager:
         # =========================================================================
         if new_state in [EdgeState.EDGE_EXPIRED, EdgeState.NO_EDGE]:
             if direction:  # Solo si había dirección
-                self._direction_stale_since = market_time or datetime.utcnow()
+                self._direction_stale_since = market_time or datetime.now(UTC)
                 self._last_valid_direction = direction
             # 🔥 FIX #171: Clear activation timestamp on expiry
             self._edge_activated_at = None
@@ -940,7 +940,7 @@ class EdgeStateManager:
             self._direction_stale_since = None
             # 🔥 FIX #171: Track when edge was activated (always naive UTC)
             if new_state == EdgeState.EDGE_ACTIVE and self._edge_activated_at is None:
-                ts = market_time or datetime.utcnow()
+                ts = market_time or datetime.now(UTC)
                 # 🔥 FIX #171b: Force naive UTC to avoid timezone comparison issues
                 if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
                     ts = ts.replace(tzinfo=None)
@@ -1035,12 +1035,11 @@ class EdgeStateManager:
         if self._state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
             return False  # Hay edge activo, no es stale
         
-        from datetime import timezone
-        now_aware = datetime.now(timezone.utc)
+        now_aware = datetime.now(UTC)
         stale_since = self._direction_stale_since
-        # Ensure both are timezone-aware to avoid naive vs aware error
+        # Ensure both are timezone-aware
         if stale_since.tzinfo is None:
-            stale_since = stale_since.replace(tzinfo=timezone.utc)
+            stale_since = stale_since.replace(tzinfo=UTC)
         stale_duration = now_aware - stale_since
         return stale_duration > timedelta(minutes=stale_threshold_minutes)
     
@@ -1084,7 +1083,7 @@ class EdgeStateManager:
                 return 0.0
             
             # Get current time - always use naive UTC
-            current = now or datetime.utcnow()
+            current = now or datetime.now(UTC)
             
             # Normalize both to naive UTC for comparison (handle timezone mismatch)
             activated = self._edge_activated_at
@@ -1124,9 +1123,7 @@ class EdgeStateManager:
         self._edge_origin_price = new_origin_price
         
         # Also refresh the activation timestamp to reset time-based stale
-        ts = market_time or datetime.utcnow()
-        if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
-            ts = ts.replace(tzinfo=None)
+        ts = market_time or datetime.now(UTC)
         self._edge_activated_at = ts
         
         logger.info(
@@ -1353,7 +1350,14 @@ class EdgeStateManager:
             return False
         if self._post_displacement_cooldown_direction != direction:
             return False
-        if market_time >= self._post_displacement_cooldown_until:
+        # FIX #265: Ensure both datetimes are timezone-aware to prevent crash
+        cooldown_until = self._post_displacement_cooldown_until
+        mt = market_time
+        if mt.tzinfo is None and cooldown_until.tzinfo is not None:
+            mt = mt.replace(tzinfo=UTC)
+        elif mt.tzinfo is not None and cooldown_until.tzinfo is None:
+            cooldown_until = cooldown_until.replace(tzinfo=UTC)
+        if mt >= cooldown_until:
             # Cooldown expired - clear it
             self._post_displacement_cooldown_until = None
             self._post_displacement_cooldown_direction = None
@@ -2266,24 +2270,31 @@ class EdgeStateManager:
             return False
         
         # =====================================================================
-        # 🔥 FIX #78: MACRO BIAS COHERENCE CHECK
+        # MACRO BIAS COHERENCE CHECK (VETO absoluto)
         # 
-        # PROBLEMA: El log mostró TREND_CONSENSUS LONG con macro=BEAR_STRONG
-        # Eso es INCOHERENTE. No deberíamos armar un LONG consensus en BEAR_STRONG.
-        # 
-        # EXCEPCIÓN: Momentum override (DISPLACEMENT, EXPANSION) puede ignorar esto
-        # porque el price action ha demostrado que el macro se está rompiendo.
+        # LONG bloqueado si macro=BEAR_STRONG, SHORT si macro=BULL_STRONG.
+        # NO hay excepciones. momentum_override NO bypasa este check.
+        #
+        # RAZÓN: Los datos muestran que entrar contra el macro extremo resulta
+        # en trades perdedores consistentemente (MFE < 0.2R, TIME_INVALIDATION).
+        # El displacement/expansion en esos casos es ruido, no señal real.
         # =====================================================================
-        if macro_bias_strength and not has_momentum_override:
+        if macro_bias_strength:
             is_incoherent = (
                 (macro_bias_strength == 'BEAR_STRONG' and direction == 'LONG') or
                 (macro_bias_strength == 'BULL_STRONG' and direction == 'SHORT')
             )
             if is_incoherent:
-                logger.warning(
-                    f"🚫 CONSENSUS BLOCKED: {direction} incoherent with macro={macro_bias_strength} | "
-                    f"reason={reason} | momentum_override={has_momentum_override}"
-                )
+                # Throttle: solo logear 1 vez por minuto
+                _last_consensus_block = getattr(self, '_last_consensus_block_log', 0)
+                import time as _time_mod
+                _now_ts = _time_mod.time()
+                if _now_ts - _last_consensus_block >= 60:
+                    self._last_consensus_block_log = _now_ts
+                    logger.warning(
+                        f"🚫 CONSENSUS BLOCKED: {direction} incoherent with macro={macro_bias_strength} | "
+                        f"reason={reason} | momentum_override={has_momentum_override} | VETO absoluto"
+                    )
                 return False
         # =====================================================================
         # 🔥 FIX #31: CONSENSUS es el FALLBACK más bajo
@@ -2645,6 +2656,13 @@ class EdgeStateManager:
         #   - Reducir MAX_AGE de 15→12min (menos penalty acumulado)
         #   - Reducir cooldown de 5→2min (reintento más rápido)
         MAX_EDGE_AGE_DEAD = 12.0  # 🔥 FIX #200: Reduced from 15.0 to allow less penalty buildup
+        # 🔥 FIX #269: Extend timeout when transition_mode is active.
+        # After BIAS FLIP, the system needs ~3min stabilization + ~10min for 
+        # sweep/LTF filters to align. 12min total is insufficient.
+        # Extend to 18min to give post-BIAS-FLIP edges more time to execute.
+        transition_mode_active = getattr(self, '_transition_mode_from_engine', False)
+        if transition_mode_active:
+            MAX_EDGE_AGE_DEAD = 18.0
         edge_age_min = self.get_edge_age_minutes(market_time)
         if edge_age_min > MAX_EDGE_AGE_DEAD:
             direction = self._current_bos.direction if self._current_bos else None
@@ -2730,7 +2748,7 @@ class EdgeStateManager:
         direction = "-"
         
         if self._current_bos:
-            self._current_bos.expired_at = datetime.utcnow()
+            self._current_bos.expired_at = datetime.now(UTC)
             self._bos_history.append(self._current_bos)
             edge_type_str = self._current_bos.edge_type.value
             direction = self._current_bos.direction
@@ -2749,7 +2767,7 @@ class EdgeStateManager:
                 )
                 self.set_post_displacement_cooldown(
                     direction=direction,
-                    market_time=datetime.utcnow(),
+                    market_time=datetime.now(UTC),
                     cooldown_minutes=10
                 )
             
@@ -2774,10 +2792,7 @@ class EdgeStateManager:
             if (hasattr(self._current_bos, 'trend_path') and 
                 self._current_bos.trend_path == TrendEdgePath.CONSENSUS_DIRECT):
                 cooldown_minutes = 5
-                cooldown_until = datetime.utcnow() + timedelta(minutes=cooldown_minutes)
-                # Ensure naive UTC for consistent comparison
-                if hasattr(cooldown_until, 'tzinfo') and cooldown_until.tzinfo is not None:
-                    cooldown_until = cooldown_until.replace(tzinfo=None)
+                cooldown_until = datetime.now(UTC) + timedelta(minutes=cooldown_minutes)
                 self._direction_cooldown[direction] = cooldown_until
                 logger.warning(
                     f"🔥 FIX #248: CONSENSUS {direction} cooldown {cooldown_minutes}min | "
@@ -2787,7 +2802,7 @@ class EdgeStateManager:
             # COOLDOWN POR CONTEXTO: bloquear edges relacionados
             if set_context_cooldown and self._current_bos.trades_lost > 0:
                 edge_type = self._current_bos.edge_type
-                cooldown_until = datetime.utcnow() + timedelta(minutes=self.CONTEXT_COOLDOWN_MINUTES)
+                cooldown_until = datetime.now(UTC) + timedelta(minutes=self.CONTEXT_COOLDOWN_MINUTES)
                 
                 if edge_type == EdgeType.BREAKOUT:
                     self._context_cooldown['TREND'] = cooldown_until

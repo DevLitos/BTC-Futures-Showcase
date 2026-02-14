@@ -208,7 +208,38 @@ class GuardOrchestrator:
             return result
         
         # =====================================================================
-        # GUARD 4: Delta SEVERE contradict — HARD BLOCK
+        # GUARD 4: MACRO COHERENCE — HARD BLOCK (veto absoluto)
+        # Si macro=BEAR_STRONG y bias=LONG → no entrar. Igual al revés.
+        # Esto captura el caso donde el edge se armó antes de que macro
+        # se estabilizara (ej: durante warmup).
+        # =====================================================================
+        macro_strength = getattr(engine, '_current_bias_strength', None)
+        macro_str = macro_strength.value if macro_strength else None
+        if macro_str:
+            is_macro_incoherent = (
+                (macro_str == 'BEAR_STRONG' and ctx.bias == 'LONG') or
+                (macro_str == 'BULL_STRONG' and ctx.bias == 'SHORT')
+            )
+            if is_macro_incoherent:
+                result.passed = False
+                result.reason = f"MACRO VETO: {ctx.bias} blocked by macro={macro_str}"
+                # Also expire the stale edge that shouldn't exist
+                if hasattr(engine, '_edge_manager'):
+                    edge_mgr = engine._edge_manager
+                    if edge_mgr.state.name in ('EDGE_ACTIVE', 'EDGE_ARMED'):
+                        from src.domain.trading.edge_state_manager import EdgeState
+                        edge_mgr._transition_to(
+                            EdgeState.EDGE_EXPIRED,
+                            f"MACRO VETO: {ctx.bias} vs macro={macro_str}",
+                            ctx.market_time
+                        )
+                        logger.warning(
+                            f"🚫 MACRO VETO: Expired stale {ctx.bias} edge | macro={macro_str}"
+                        )
+                return result
+
+        # =====================================================================
+        # GUARD 5: Delta SEVERE contradict — HARD BLOCK
         # Only block on extreme delta (>5x) against direction
         # =====================================================================
         delta_ratio = engine._current_trade_tags.get('volume_delta_ratio', 0)
@@ -234,7 +265,7 @@ class GuardOrchestrator:
                 ctx.adx_1h = float(adx_1h[-1])
         
         # =====================================================================
-        # GUARD 5: Session limits with Hot Hand
+        # GUARD 6: Session limits with Hot Hand
         # =====================================================================
         session_trades = engine._session_trade_counts.get(ctx.session_name, 0)
         base_limit = SessionTradeLimits.MAX_TRADES_PER_SESSION.get(ctx.session_name, 3)

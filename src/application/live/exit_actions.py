@@ -60,7 +60,59 @@ async def handle_partial_close(
     # Verify position exists on exchange
     exchange_pos = await engine.execution.get_position(engine.symbol)
     if not exchange_pos:
+        # =============================================================
+        # 🔒 FIX #268: REGISTER PnL WHEN EXCHANGE CLOSED DURING PARTIAL
+        #
+        # ROOT CAUSE: Exchange closes position (TP/SL hit) between MFE
+        # detection and partial execution. Position gone → silent reset
+        # without recording PnL, trade logging, or daily PnL update.
+        # Log evidence: Trade 2 in run_20260214 - LONG @ 69427, +0.54R
+        # MFE, exchange closed, no PnL recorded.
+        # =============================================================
         logger.warning("⚠️ PARTIAL_CLOSE ABORTED: No position on exchange (was closed externally)")
+        
+        # Estimate PnL using last known price
+        try:
+            candles = engine.market_data.get_candles('1m')
+            exit_price = candles[-1]['close'] if candles and len(candles) > 0 else current_price
+            
+            pnl_estimate = 0.0
+            r_realized = 0.0
+            exit_type = "EXCHANGE_TP_SL"
+            
+            if position and position.entry_price > 0:
+                initial_risk = abs(position.entry_price - engine.risk_engine.initial_stop_loss)
+                if position.direction == 'LONG':
+                    pnl_estimate = (exit_price - position.entry_price) * position.size
+                    exit_type = 'EXCHANGE_TAKE_PROFIT' if exit_price > position.entry_price else 'EXCHANGE_STOP_LOSS'
+                else:
+                    pnl_estimate = (position.entry_price - exit_price) * position.size
+                    exit_type = 'EXCHANGE_TAKE_PROFIT' if exit_price < position.entry_price else 'EXCHANGE_STOP_LOSS'
+                if initial_risk > 0 and position.size > 0:
+                    r_realized = pnl_estimate / (initial_risk * position.size)
+            
+            # Record trade close (same as phantom_position_cleared)
+            engine.state_machine.record_trade_close(pnl_estimate, pnl_estimate > 0, exit_reason=exit_type)
+            engine.state_machine.update_daily_pnl(pnl_estimate)
+            
+            logger.warning(
+                f"🔒 FIX #268: Exchange closed during partial | "
+                f"{exit_type} | PnL: ${pnl_estimate:.2f} ({r_realized:.2f}R) | "
+                f"Entry: {position.entry_price:.2f} → Exit: {exit_price:.2f}"
+            )
+            
+            # Log trade
+            if hasattr(engine, 'trade_logger') and engine.trade_logger:
+                await engine.trade_logger.log_event('trade_closed', {
+                    'exit_reason': exit_type,
+                    'exit_price': exit_price,
+                    'pnl': pnl_estimate,
+                    'r_realized': r_realized,
+                    'note': 'FIX #268: Exchange closed during partial attempt'
+                })
+        except Exception as pnl_e:
+            logger.error(f"FIX #268: Could not estimate PnL: {pnl_e}")
+        
         engine.reconciler.notify_exit_completed()
         engine._reset_trade_state("Position closed externally before partial")
         engine.state_machine.to_idle("Position closed externally")
@@ -114,6 +166,44 @@ async def handle_partial_close(
                             'entryPrice': position.entry_price
                         })
                 
+                # =============================================================
+                # 🔒 FIX #266: POST-PARTIAL SL PROTECTION
+                #
+                # ROOT CAUSE: After 30% partial at +0.3R, the remaining 70%
+                # has NO protection (R-LOCK requires 0.5R MFE, TIME_LOCK too).
+                # Trades with MFE 0.30-0.49R devuelven TODA la ganancia.
+                # Log evidence: Trade 2 (+0.40R MFE → -0.40R), Trade 4 (+0.48R → -1.0R)
+                #
+                # FIX: After first partial, move SL to limit worst-case to -0.30R.
+                # Net trade outcome: +0.09R (partial) - 0.21R (70% * -0.30R) = -0.12R
+                # vs anterior: +0.09R - 0.70R (70% * -1.0R) = -0.61R
+                # =============================================================
+                post_partial_max_loss_r = -0.30
+                initial_risk = abs(position.entry_price - engine.risk_engine.initial_stop_loss)
+                if initial_risk > 0:
+                    if position.direction == 'LONG':
+                        new_sl = position.entry_price + (initial_risk * post_partial_max_loss_r)
+                        current_sl = engine.risk_engine.get_current_stop_loss()
+                        if current_sl and new_sl > current_sl:
+                            engine.risk_engine.trailing_stop = new_sl
+                            engine.risk_engine.stop_loss = new_sl
+                            logger.warning(
+                                f"🔒 FIX #266: POST-PARTIAL SL PROTECTION | "
+                                f"SL moved: {current_sl:.2f} → {new_sl:.2f} | "
+                                f"Max loss now {post_partial_max_loss_r}R (was -1.0R)"
+                            )
+                    else:  # SHORT
+                        new_sl = position.entry_price - (initial_risk * post_partial_max_loss_r)
+                        current_sl = engine.risk_engine.get_current_stop_loss()
+                        if current_sl and new_sl < current_sl:
+                            engine.risk_engine.trailing_stop = new_sl
+                            engine.risk_engine.stop_loss = new_sl
+                            logger.warning(
+                                f"🔒 FIX #266: POST-PARTIAL SL PROTECTION | "
+                                f"SL moved: {current_sl:.2f} → {new_sl:.2f} | "
+                                f"Max loss now {post_partial_max_loss_r}R (was -1.0R)"
+                            )
+
                 # Update SL order after partial close
                 await _update_sl_after_size_change(engine, position, exchange_size)
         else:

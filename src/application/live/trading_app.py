@@ -2184,6 +2184,9 @@ class SignalEngine:
                 # 🔥 FIX #223: Share trend_phase with edge_manager for TREND_BIRTH bypass
                 self._edge_manager._trend_phase_from_engine = self._trend_phase
                 
+                # 🔥 FIX #269: Share transition_mode with edge_manager for DEAD_EDGE timeout extension
+                self._edge_manager._transition_mode_from_engine = bool(self._transition_mode_active)
+                
                 if old_phase != self._trend_phase:
                     logger.info(
                         f"📈 TREND PHASE: {self._trend_intelligence.get_phase_description()}"
@@ -3525,6 +3528,13 @@ class SignalEngine:
             anticipation_pending=anticipation_pending,
             anticipation_direction=anticipation_direction_signal,
             anticipation_confidence=anticipation_confidence_val,
+            
+            # 🔥 FIX #269: TRANSITION_MODE direction (Priority 75)
+            # After BIAS FLIP, this keeps the system looking in the NEW direction
+            # even after the first SHORT edge expires, preventing reversion to
+            # stale structural_bias=LONG → infinite CONSENSUS BLOCKED spam
+            transition_mode_active=bool(self._transition_mode_active),
+            transition_mode_direction=self._transition_mode_direction,
             
             # Fast reversal signals (Priority 80)
             fast_reversal_detected=fast_reversal_detected,
@@ -5929,13 +5939,19 @@ class SignalEngine:
         is_trend_birth = self._trend_phase == TrendPhase.TREND_BIRTH
         is_trend_acceleration = self._trend_phase == TrendPhase.TREND_ACCELERATION
         
-        # 🔥 FIX #175 + #223: Reducir requisito en condiciones favorables
+        # 🔥 FIX #175 + #223 + #269: Reducir requisito en condiciones favorables
         if is_trend_birth:
             min_ltf_required = 1  # TREND_BIRTH: Entry is urgent!
             logger.debug(f"🚀 FIX #223: LTF requirement reduced to 1/3 (TREND_BIRTH - optimal entry window)")
         elif is_trend_acceleration:
             min_ltf_required = 1  # TREND_ACCELERATION: Still good
             logger.debug(f"📈 FIX #223: LTF requirement reduced to 1/3 (TREND_ACCELERATION)")
+        elif self._trend_phase == TrendPhase.TREND_EXHAUSTION and self._transition_mode_active:
+            # 🔥 FIX #269: TREND_EXHAUSTION + transition_mode = el viejo trend muere,
+            # el nuevo ya empezó (BIAS FLIP lo confirmó). LTF lagging no debe bloquear.
+            # Feb 14 log: 2 edges SHORT expirados sin entry porque LTF=1/3 < 2.
+            min_ltf_required = 1
+            logger.debug(f"🔄 FIX #269: LTF requirement reduced to 1/3 (TREND_EXHAUSTION + TRANSITION_MODE)")
         elif self._trend_expansion_active or self._expansion_mode:
             min_ltf_required = 1  # EXPANSION: 1/3 is enough
             logger.debug(f"📊 FIX #175: LTF requirement reduced to 1/3 (EXPANSION mode)")

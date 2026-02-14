@@ -201,7 +201,7 @@ class EntryFilterPipeline:
                     # No bloquear, pero aplicar penalty severo
                     aggregate.allow = True
                     aggregate.score_adjust -= 2.0  # Penalty por compresión
-                    aggregate.size_multiplier = min(aggregate.size_multiplier, 0.5)  # Max 50% size
+                    aggregate.size_factor = min(aggregate.size_factor, 0.5)  # 🔒 FIX #267: was size_multiplier (AttributeError crash)
                     aggregate.tags['bb_width_bypassed'] = True
                 else:
                     aggregate.tags['blocked_by'] = 'bb_width'

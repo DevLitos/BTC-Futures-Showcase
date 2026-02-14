@@ -61,6 +61,12 @@ class SignalPriority(Enum):
     DISPLACEMENT = 100        # Same level as EXPANSION (sovereign)
     ANTICIPATION = 100        # 🔥 RESTORED: 100% accuracy = CORE signal
     
+    # TRANSITION LEVEL (75) - BIAS FLIP direction overrides structural bias
+    # 🔥 FIX #269: When BIAS FLIP sets transition_mode_direction, it MUST
+    # override structural_bias. Otherwise the system reverts to LONG after
+    # SHORT edge expires, causing infinite CONSENSUS BLOCKED spam.
+    TRANSITION_MODE = 75
+    
     # CONFIRMER LEVEL (50) - These CONFIRM but don't override CORE
     STRUCTURAL_BIAS = 50      # HTF EMA-based bias
     
@@ -213,6 +219,12 @@ class DirectionOrchestrator:
                     anticipation_direction: Optional[str] = None,
                     anticipation_confidence: float = 0.0,
                     
+                    # 🔥 FIX #269: TRANSITION_MODE direction (Priority 75)
+                    # When BIAS FLIP sets transition_mode, this direction MUST
+                    # override structural_bias to prevent reverting to stale HTF bias
+                    transition_mode_active: bool = False,
+                    transition_mode_direction: Optional[str] = None,
+                    
                     # Fast reversal signals (Priority 80)
                     fast_reversal_detected: bool = False,
                     fast_reversal_direction: Optional[str] = None,
@@ -291,8 +303,23 @@ class DirectionOrchestrator:
                 metadata={'pending': True, 'high_confidence': is_high_confidence, 'can_bypass_forbidden': is_high_confidence}
             ))
         
-        # 5. FAST_REVERSAL - Single-candle reversal
-        # 🔥 REFACTOR (Feb 05, 2026): Now ADVISORY only - cannot determine direction
+        # 5. TRANSITION_MODE - BIAS FLIP direction (Priority 75)
+        # 🔥 FIX #269: When BIAS FLIP activates transition_mode, this direction
+        # MUST override structural_bias. Without this, after SHORT edge expires,
+        # structural_bias=LONG takes over → arm_consensus_edge(LONG) → CONSENSUS
+        # BLOCKED by macro=BEAR_STRONG → infinite spam, system paralyzed.
+        if transition_mode_active and transition_mode_direction:
+            signals.append(DirectionSignal(
+                source='TRANSITION_MODE',
+                direction=transition_mode_direction,
+                priority=SignalPriority.TRANSITION_MODE,
+                confidence=0.75,
+                reason=f"BIAS FLIP transition → {transition_mode_direction}",
+                metadata={'from_bias_flip': True}
+            ))
+        
+        # 6. FAST_REVERSAL - Single-candle reversal
+        # 🔥 REFACTOR (Feb 05, 2026): ADVISORY only - cannot determine direction
         # It can only be used to CONFIRM or add confidence to an existing CORE signal
         if fast_reversal_detected and fast_reversal_direction:
             signals.append(DirectionSignal(
@@ -304,7 +331,7 @@ class DirectionOrchestrator:
                 metadata={'override_momentum': False, 'is_advisory': True}  # 🔥 CHANGED
             ))
         
-        # 6. MICRO_MOMENTUM - HH/HL scoring
+        # 7. MICRO_MOMENTUM - HH/HL scoring
         # 🔥 REFACTOR (Feb 05, 2026): Now ADVISORY only - CANNOT determine direction
         # This is the KEY FIX. MicroMomentum is LAGGING. It should not set direction.
         # It can only modify size/confidence of an existing CORE direction.
@@ -319,8 +346,8 @@ class DirectionOrchestrator:
                 metadata={'strength': micro_momentum_strength, 'is_advisory': True}  # 🔥 CHANGED
             ))
         
-        # 7. STRUCTURAL_BIAS - HTF EMA
-        # 🔥 REFACTOR: Now CONFIRMER level - can confirm but not override CORE
+        # 8. STRUCTURAL_BIAS - HTF EMA
+        # 🔥 REFACTOR: CONFIRMER level - can confirm but not override CORE
         if structural_bias:
             signals.append(DirectionSignal(
                 source='STRUCTURAL_BIAS',
@@ -331,7 +358,7 @@ class DirectionOrchestrator:
                 metadata={'is_confirmer': True}
             ))
         
-        # 8. FORBIDDEN_FALLBACK - When nothing else works (10)
+        # 9. FORBIDDEN_FALLBACK - When nothing else works (10)
         if not signals and forbidden_direction:
             # If forbidden is LONG, fallback to SHORT
             fallback_dir = 'SHORT' if forbidden_direction == 'LONG' else 'LONG'

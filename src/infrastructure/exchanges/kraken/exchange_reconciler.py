@@ -564,6 +564,32 @@ class ExchangeReconciler:
             # Get positions
             position_data = await self.execution.get_position(self._symbol)
             
+            # =================================================================
+            # 🔒 FIX #264: API timeout/error must NOT be treated as "no position"
+            # 
+            # ROOT CAUSE: get_position() returns {'_timeout': True} or {'_error': ...}
+            # on failure. This dict is truthy but has contracts=0, so the reconciler
+            # interprets it as "position closed" → false POSITION_OPEN→IDLE transition
+            # → records phantom PnL → state corruption.
+            #
+            # FIX: If position_data contains error/timeout sentinels, skip this
+            # reconcile cycle entirely and return last known good snapshot.
+            # =================================================================
+            if isinstance(position_data, dict) and ('_error' in position_data or '_timeout' in position_data):
+                error_type = 'timeout' if position_data.get('_timeout') else position_data.get('_error', 'unknown')
+                logger.warning(
+                    f"🔒 FIX #264: API returned error/timeout ({error_type}) - "
+                    f"SKIPPING reconcile to prevent false position close. "
+                    f"Current state: {self._state.name}"
+                )
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                    if not self._degraded_mode:
+                        logger.critical(f"🚨 DEGRADED MODE: {self._consecutive_failures} consecutive exchange failures")
+                        self._degraded_mode = True
+                        self._exchange_available = False
+                return self._last_snapshot
+            
             # Get open orders (filter out SL/TP)
             open_orders = await self.execution.get_open_orders(self._symbol)
             pending_entry_orders = [

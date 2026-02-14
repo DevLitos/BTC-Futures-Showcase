@@ -1200,14 +1200,20 @@ class Position:
         # =====================================================================
         is_weekend_trade = getattr(self, 'is_weekend', False)
         
-        # 🔥 UNIVERSAL MAX LOSS = -0.25R (no exceptions anymore)
-        # The data shows ANY trade losing more than -0.25R is unlikely to recover.
+        # Throttle category determination logs: only log once per 30 candles
+        _cat_last_log = getattr(self, '_time_cat_last_log', 0)
+        _should_log_cat = (self.candle_count - _cat_last_log) >= 30
+        
         if is_weekend_trade:
-            max_loss_r = -0.15  # 🔥 WEEKEND: -0.15R (was -0.20R) - liquidity issues
-            logger.info(f"📊 TIME checkpoint: WEEKEND → max_loss={max_loss_r}R (strictest)")
+            max_loss_r = -0.15
+            if _should_log_cat:
+                self._time_cat_last_log = self.candle_count
+                logger.info(f"📊 TIME checkpoint: WEEKEND → max_loss={max_loss_r}R (strictest)")
         elif is_low_quality_entry:
-            max_loss_r = -0.20  # 🔥 FIX #121a: -0.15R → -0.20R - give a bit more room
-            logger.info(f"📊 TIME checkpoint: LOW_QUALITY (score={self.entry_score:.1f}) → max_loss={max_loss_r}R")
+            max_loss_r = -0.20
+            if _should_log_cat:
+                self._time_cat_last_log = self.candle_count
+                logger.info(f"📊 TIME checkpoint: LOW_QUALITY (score={self.entry_score:.1f}) → max_loss={max_loss_r}R")
         elif is_displacement_trade:
             # DISPLACEMENT: Still give a bit more room (stop is the invalidation)
             max_loss_r = -0.30  # 🔥 FIX #121a: -0.25R → -0.30R - displacement needs room
@@ -3240,10 +3246,12 @@ class RiskEngine:
                     return await self._close_position(current_price, exit_reason)
                 
                 # 0. Check mediocre trade exit (TIME_INVALIDATION INTELIGENTE)
-                # 🔥 FIX #242 (Feb 16, 2026): n_candles 6→12
-                # BTC needs 10-20 min for moves to develop. 6 min was too aggressive.
+                # WEEKEND: n_candles=6 (cortar pérdidas rápido con baja liquidez)
+                # Normal: n_candles=12 (BTC needs 10-20 min for moves to develop)
+                is_weekend_pos = getattr(pos, 'is_weekend', False)
+                ti_n_candles = 6 if is_weekend_pos else 12
                 time_check = pos.check_mediocre_trade_exit(
-                    n_candles=12, 
+                    n_candles=ti_n_candles, 
                     adx=adx, 
                     atr_ratio=atr_ratio,
                     current_price=current_price,
