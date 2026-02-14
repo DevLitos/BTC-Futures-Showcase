@@ -296,6 +296,10 @@ class Position:
         
         logger.info(f"Position opened: {direction} {size} {symbol} @ {entry_price:.2f} | SL: {stop_loss:.2f} | TP1: {self.tp1_price:.2f}")
     
+    def increment_candle_count(self):
+        """Increment candle counter for time-based exit logic (TIME_EXIT, RUNNER, mediocre detection)"""
+        self.candle_count += 1
+    
     def calculate_r_realized(self, exit_price: float) -> float:
         """
         Calculate realized R multiple for this trade.
@@ -345,63 +349,6 @@ class Position:
             mae = self.highest_price - self.initial_entry_price
         
         return mae / initial_risk
-    
-    def check_anti_roundtrip(self, current_price: float) -> dict | None:
-        """
-        🔥 FIX (Feb 4, 2026): ANTI-ROUNDTRIP PROTECTION
-        
-        If trade reached profit (MFE >= 0.5R) but then falls to <= -0.1R,
-        close immediately to prevent "gave it all back" scenarios.
-        
-        This addresses the Feb 3 trade:
-          - Entry SHORT @ $76,210
-          - Reached +0.65R MFE ($76,044)
-          - Fell back and hit trailing at $76,272 → -0.38R
-        
-        With this protection, we'd close at -0.1R after seeing +0.5R,
-        saving ~0.28R vs waiting for trailing stop.
-        
-        Returns: Close signal dict if triggered, None otherwise
-        """
-        if self.roundtrip_closed:
-            return None  # Already handled
-        
-        mfe_r = self.calculate_mfe_r()
-        
-        # Track once we've reached profit threshold
-        if mfe_r >= 0.5:
-            self.reached_profit_threshold = True
-        
-        if not self.reached_profit_threshold:
-            return None  # Haven't been profitable enough to trigger protection
-        
-        # Calculate current R using initial_entry_price for consistency
-        risk = abs(self.initial_entry_price - self.initial_stop_loss)
-        if risk <= 0:
-            return None
-        
-        if self.direction == 'LONG':
-            current_r = (current_price - self.initial_entry_price) / risk
-        else:
-            current_r = (self.initial_entry_price - current_price) / risk
-        
-        # If we were at 0.5R+ and now at -0.1R or worse, close immediately
-        ROUNDTRIP_CLOSE_THRESHOLD = -0.1
-        
-        if current_r <= ROUNDTRIP_CLOSE_THRESHOLD:
-            self.roundtrip_closed = True
-            logger.warning(
-                f"🛑 ANTI-ROUNDTRIP: Was at +{mfe_r:.2f}R, now at {current_r:.2f}R | "
-                f"Closing to prevent full roundtrip"
-            )
-            return {
-                'action': 'CLOSE',
-                'reason': f'Anti-roundtrip: MFE={mfe_r:.2f}R, now={current_r:.2f}R',
-                'mfe_r': mfe_r,
-                'current_r': current_r
-            }
-        
-        return None
     
     def check_displacement_reclaim(self, current_price: float) -> dict | None:
         """
@@ -955,10 +902,6 @@ class Position:
                             f"🛡️ EARLY PROFIT PROTECT: MFE {mfe_r:.2f}R >= 0.35R → "
                             f"Tighten SL to {new_stop:.2f} (-0.15R) (was {old_stop:.2f})"
                         )
-    
-    def increment_candle_count(self):
-        """Increment candle count for mediocre trade detection"""
-        self.candle_count += 1
     
     def check_regime_promotion(self) -> bool:
         """
@@ -1864,62 +1807,6 @@ class Position:
             'reason': f'Winner add at MFE {mfe_r:.2f}R ({continuation_reason})'
         }
     
-    def move_stop_to_breakeven(self, reason: str = "Structure break"):
-        """
-        Move stop to breakeven + fees
-        
-        SMART IMPLEMENTATION (Opción B):
-        Solo mueve SL a BE cuando:
-        1. TP1 ya alcanzado (estamos en profit)
-        2. Estructura rompe: EMA20 perdida o BOS en contra
-        
-        Esto reduce salidas prematuras y aumenta profit factor.
-        """
-        if self.be_moved:
-            return  # Ya movido, no hacer nada
-        
-        fee_buffer = self.entry_price * 0.001  # 0.1% buffer for fees
-        
-        if self.direction == 'LONG':
-            self.stop_loss = self.entry_price + fee_buffer
-            self.trailing_stop = self.stop_loss
-        else:
-            self.stop_loss = self.entry_price - fee_buffer
-            self.trailing_stop = self.stop_loss
-        
-        self.be_moved = True
-        logger.info(f"✅ SMART BE: Stop moved to BE + fees: {self.stop_loss:.2f} | Reason: {reason}")
-    
-    def tighten_stop_loss(self, tighten_pct: float = 0.5):
-        """
-        Tighten stop loss when thesis is invalidated (BOS before TP1)
-        
-        Args:
-            tighten_pct: Percentage to tighten (0.5 = move SL 50% closer to entry)
-        
-        Example:
-            Entry: 100, SL: 95, Current: 102
-            Distance: 5
-            New SL: 100 - (5 * 0.5) = 97.5
-        """
-        if self.sl_tightened:
-            return  # Ya ajustado, no hacer nada
-        
-        current_distance = abs(self.entry_price - self.stop_loss)
-        new_distance = current_distance * tighten_pct
-        
-        if self.direction == 'LONG':
-            new_sl = self.entry_price - new_distance
-            self.stop_loss = max(self.stop_loss, new_sl)  # Solo mover hacia arriba
-        else:
-            new_sl = self.entry_price + new_distance
-            self.stop_loss = min(self.stop_loss, new_sl)  # Solo mover hacia abajo
-        
-        self.trailing_stop = self.stop_loss
-        self.sl_tightened = True
-        
-        logger.warning(f"⚠️ BOS INVALIDATION: SL tightened to {self.stop_loss:.2f} ({tighten_pct*100:.0f}% closer)")
-    
     def check_stop_hit(self, current_price: float, current_low: float | None = None, 
                        atr_1m: float | None = None, market_time: datetime | None = None) -> bool:
         """
@@ -2049,39 +1936,6 @@ class Position:
         else:
             return current_price <= self.tp2_price
     
-    def check_structure_break(self, current_price: float, ema20_5m: float, 
-                             has_bos_against: bool = False) -> tuple[bool, str]:
-        """
-        Check if market structure breaks (señal para mover SL a BE)
-        
-        Returns: (should_move_be, reason)
-        
-        Condiciones para mover a BE:
-        1. TP1 ya alcanzado (estamos en profit)
-        2. Y ALGUNA de:
-           - Precio pierde EMA20 (5m)
-           - BOS en contra detectado
-        """
-        if not self.tp1_hit:
-            return False, "TP1 not hit yet"
-        
-        if self.be_moved:
-            return False, "BE already moved"
-        
-        # Check EMA20 break
-        if self.direction == 'LONG':
-            ema20_broken = current_price < ema20_5m
-        else:
-            ema20_broken = current_price > ema20_5m
-        
-        # Determinar razón
-        if has_bos_against:
-            return True, "BOS contra tendencia"
-        elif ema20_broken:
-            return True, f"Precio perdió EMA20 ({ema20_5m:.2f})"
-        
-        return False, "Estructura intacta"
-    
     def get_time_in_trade_minutes(self, market_time: datetime | None = None) -> float:
         """
         Get time in trade in minutes.
@@ -2091,99 +1945,6 @@ class Position:
         """
         current_time = market_time if market_time else self.open_time
         return (current_time - self.open_time).total_seconds() / 60
-    
-    # =========================================================================
-    # SHORT_PULLBACK SPECIFIC METHODS
-    # =========================================================================
-    
-    def pullback_increment_candle_count(self):
-        """Increment candle counter for pullback time stop."""
-        if self.is_pullback_short:
-            self.pullback_candle_count += 1
-    
-    def pullback_check_time_stop(self, time_stop_candles: int = 6, min_mfe_r: float = 0.3) -> Tuple[bool, str]:
-        """
-        Check if pullback short should be exited due to time stop.
-        
-        TIME STOP: If after N candles MFE < min_mfe_r, exit.
-        This prevents staying stuck in losing shorts against bull market.
-        
-        Args:
-            time_stop_candles: Number of candles before checking (default 6 = 30min)
-            min_mfe_r: Minimum MFE required after time_stop_candles
-            
-        Returns:
-            Tuple of (should_exit, reason)
-        """
-        if not self.is_pullback_short:
-            return False, "Not a pullback short"
-        
-        if self.pullback_candle_count < time_stop_candles:
-            return False, f"Only {self.pullback_candle_count}/{time_stop_candles} candles"
-        
-        mfe_r = self.calculate_mfe_r()
-        
-        if mfe_r < min_mfe_r:
-            return True, f"Time stop: MFE {mfe_r:.2f}R < {min_mfe_r}R after {self.pullback_candle_count} candles"
-        
-        return False, f"MFE {mfe_r:.2f}R >= {min_mfe_r}R"
-    
-    def pullback_check_be_after_tp1(self, atr_5m: float, be_offset_atr: float = 0.1) -> Optional[float]:
-        """
-        Check if BE (breakeven) should be moved after TP1 hit.
-        
-        BE = entry - offset (to cover fees)
-        
-        Args:
-            atr_5m: Current 5m ATR
-            be_offset_atr: Offset in ATR units (default 0.1 = covers fees)
-            
-        Returns:
-            New stop loss level if BE should be moved, None otherwise
-        """
-        if not self.is_pullback_short:
-            return None
-        
-        if not self.tp1_hit:
-            return None
-        
-        if self.pullback_be_moved:
-            return None  # Already moved
-        
-        # For SHORT: BE is above entry (we want to lock profit)
-        # BE = entry - offset (gives us some room for fees)
-        offset = be_offset_atr * atr_5m
-        be_level = self.entry_price - offset
-        
-        # Mark as moved
-        self.pullback_be_moved = True
-        
-        logger.info(f"[PULLBACK] Moving SL to BE: {self.stop_loss:.2f} → {be_level:.2f} (entry - {offset:.2f})")
-        
-        return be_level
-    
-    def pullback_get_tp1_partial_size(self, tp1_close_pct: int = 50) -> float:
-        """
-        Get the size to close at TP1 for partial exit.
-        
-        Args:
-            tp1_close_pct: Percentage to close at TP1 (default 50%)
-            
-        Returns:
-            Size to close
-        """
-        if not self.is_pullback_short:
-            return 0.0
-        
-        if self.pullback_tp1_partial_done:
-            return 0.0  # Already done
-        
-        pct = tp1_close_pct / 100.0
-        close_size = self.size * pct
-        
-        self.pullback_tp1_partial_done = True
-        
-        return close_size
     
     def should_force_exit_by_time(self, market_time: datetime | None = None, current_atr: float | None = None) -> tuple[bool, str]:
         """
@@ -2701,19 +2462,6 @@ class Position:
         
         return None
     
-    def get_volatility_regime(self, atr_ratio: float) -> str:
-        """
-        Get current volatility regime based on ATR ratio.
-        
-        Args:
-            atr_ratio: current_atr / sma(atr, 100)
-        
-        Returns:
-            Regime name: LOW_VOL, NORMAL, HIGH_VOL, or SPIKE
-        """
-        from src.config.trading_config import VolatilityRegime
-        return VolatilityRegime.classify(atr_ratio)
-    
     def get_tp1_percentage(self, regime: str) -> int:
         """
         Get TP1 close percentage based on market regime.
@@ -2837,135 +2585,8 @@ class RiskEngine:
         self.winning_trades = []
         self.losing_trades = []
         
-        # =====================================================================
-        # ANTI RE-ENTRY TRACKING (Jan 23, 2026)
-        # Track last entry to prevent reentry without new edge
-        # =====================================================================
-        self.last_entry_price: Optional[float] = None
-        self.last_entry_direction: Optional[str] = None
-        self.last_entry_atr: Optional[float] = None
-        self.last_entry_time: Optional[datetime] = None
-        self.last_exit_reason: Optional[str] = None
-        self.last_entry_conditions: dict = {}  # Store entry conditions
-        
         # Lock for thread safety
         self._lock = asyncio.Lock()
-    
-    def check_reentry_allowed(self, entry_price: float, direction: str, 
-                               atr: float, new_conditions: dict | None = None) -> dict:
-        """
-        ANTI RE-ENTRY: Check if reentry is allowed at this price.
-        
-        Prohibir reentrar en mismo rango de precio sin nueva información:
-        - Mismo precio = ±0.2 ATR del último entry
-        - Misma dirección
-        - Sin nuevo edge (LH, breakdown+retest, nuevo POC)
-        
-        Args:
-            entry_price: Proposed entry price
-            direction: Proposed direction
-            atr: Current ATR for range calculation
-            new_conditions: Dict of current market conditions
-        
-        Returns:
-            dict with 'allowed': bool and 'reason': str
-        """
-        from src.config.trading_config import ExitHierarchy
-        
-        if not ExitHierarchy.ANTI_REENTRY_ENABLED:
-            return {'allowed': True, 'reason': 'Anti-reentry disabled'}
-        
-        # No previous entry to compare
-        if self.last_entry_price is None:
-            return {'allowed': True, 'reason': 'No previous entry'}
-        
-        # Different direction is always allowed
-        if direction != self.last_entry_direction:
-            return {'allowed': True, 'reason': 'Different direction'}
-        
-        # Calculate price range (±0.2 ATR)
-        use_atr = self.last_entry_atr if self.last_entry_atr else atr
-        price_range = use_atr * ExitHierarchy.SAME_PRICE_RANGE_ATR
-        
-        price_diff = abs(entry_price - self.last_entry_price)
-        
-        # If price is outside the "same price" range, allowed
-        if price_diff > price_range:
-            return {
-                'allowed': True, 
-                'reason': f'Price moved {price_diff:.2f} > {price_range:.2f} (0.2 ATR)'
-            }
-        
-        # Same price range - check for new edge
-        if new_conditions and ExitHierarchy.REQUIRE_NEW_EDGE_FOR_REENTRY:
-            new_edge = self._check_new_edge(new_conditions)
-            if new_edge['has_new_edge']:
-                return {
-                    'allowed': True,
-                    'reason': f"New edge detected: {new_edge['edge_type']}"
-                }
-        
-        # No new edge, same price = blocked
-        return {
-            'allowed': False,
-            'reason': (
-                f"BLOCKED: Same price range ({entry_price:.2f} vs last {self.last_entry_price:.2f}), "
-                f"same direction ({direction}), no new edge detected"
-            )
-        }
-    
-    def _check_new_edge(self, conditions: dict) -> dict:
-        """
-        Check if there's new edge information vs last entry.
-        
-        New edge conditions:
-        - new_lh_confirmed: New Lower High for shorts
-        - breakdown_retest: Breakdown + retest of structure
-        - new_poc_displacement: New POC / value area shift
-        - volume_regime_change: Significant volume change
-        """
-        has_edge = False
-        edge_type = None
-        
-        # Check each condition against stored conditions
-        if conditions.get('new_lh_confirmed') and not self.last_entry_conditions.get('lh_price') == conditions.get('lh_price'):
-            has_edge = True
-            edge_type = 'NEW_LH_CONFIRMED'
-        
-        elif conditions.get('breakdown_retest'):
-            has_edge = True
-            edge_type = 'BREAKDOWN_RETEST'
-        
-        elif conditions.get('poc_price') and self.last_entry_conditions.get('poc_price'):
-            poc_diff = abs(conditions['poc_price'] - self.last_entry_conditions['poc_price'])
-            if poc_diff > conditions.get('atr', 0) * 0.5:  # POC moved > 0.5 ATR
-                has_edge = True
-                edge_type = 'NEW_POC_DISPLACEMENT'
-        
-        elif conditions.get('volume_regime_change'):
-            has_edge = True
-            edge_type = 'VOLUME_REGIME_CHANGE'
-        
-        return {
-            'has_new_edge': has_edge,
-            'edge_type': edge_type
-        }
-    
-    def record_entry(self, entry_price: float, direction: str, atr: float,
-                     entry_time: datetime | None = None, conditions: dict | None = None):
-        """
-        Record entry details for anti-reentry tracking.
-        Called after successful position open.
-        """
-        self.last_entry_price = entry_price
-        self.last_entry_direction = direction
-        self.last_entry_atr = atr
-        self.last_entry_time = entry_time or datetime.now(UTC)
-        self.last_entry_conditions = conditions or {}
-    
-    def record_exit(self, exit_reason: str):
-        """Record exit reason for cooldown/reentry logic."""
-        self.last_exit_reason = exit_reason
     
     def get_current_stop_loss(self) -> float | None:
         """
@@ -3033,16 +2654,6 @@ class RiskEngine:
             bos_quality=bos_quality,  # 🔥 NEW (Feb 03): Pass bos_quality for dynamic trailing
             displacement_origin=displacement_origin  # 🔥 NEW (Feb 04): Pass origin for reclaim exit
         )
-        
-        # Record entry for anti-reentry tracking
-        if direction is not None:
-            self.record_entry(
-                entry_price=entry_price,
-                direction=direction,
-                atr=atr_1m,
-                entry_time=market_time,
-                conditions=entry_conditions
-            )
         
         return self.position
     
@@ -3283,7 +2894,7 @@ class RiskEngine:
                 logger.warning(f"⚠️ FIX #188 SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple}× ATR)")
                 stop = max_stop
         
-        logger.info(f"Stop loss calculated: {stop:.2f} (Structure: {support_resistance:.2f}±{buffer:.2f}, ATR min: {min_sl_distance:.2f} [{atr_multiplier}x])")
+        logger.debug(f"Stop loss calculated: {stop:.2f} (Structure: {support_resistance:.2f}±{buffer:.2f}, ATR min: {min_sl_distance:.2f} [{atr_multiplier}x])")
         return stop
     
     async def open_position(self, symbol: str | None, direction: str | None, entry_price: float,
@@ -4073,51 +3684,6 @@ class RiskEngine:
     def get_initial_equity(self) -> float:
         """Return initial equity"""
         return self.initial_equity
-    
-    def _check_climactic_exit(self, current_volume: float, avg_volume: float, pos: Position) -> bool:
-        """Check for climactic volume exit"""
-        if avg_volume == 0:
-            return False
-        
-        volume_ratio = current_volume / avg_volume
-        
-        # Check if in extension (beyond TP1)
-        if pos.tp1_hit and volume_ratio >= RiskManagement.CLIMACTIC_VOLUME_MULTIPLIER:
-            logger.info(f"Climactic volume detected: {volume_ratio:.2f}x average")
-            return True
-        
-        return False
-    
-    def get_performance_metrics(self) -> dict:
-        """Calculate performance metrics"""
-        total_wins = len(self.winning_trades)
-        total_losses = len(self.losing_trades)
-        total_trades = total_wins + total_losses
-        
-        if total_trades == 0:
-            return {
-                'profit_factor': 0.0,
-                'expectancy': 0.0,
-                'win_rate': 0.0,
-                'total_trades': 0
-            }
-        
-        gross_profit = sum(self.winning_trades) if self.winning_trades else 0
-        gross_loss = abs(sum(self.losing_trades)) if self.losing_trades else 0
-        
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-        expectancy = self.total_pnl / total_trades
-        win_rate = (total_wins / total_trades) * 100
-        
-        return {
-            'profit_factor': round(profit_factor, 2),
-            'expectancy': round(expectancy, 2),
-            'win_rate': round(win_rate, 2),
-            'total_trades': total_trades,
-            'total_wins': total_wins,
-            'total_losses': total_losses,
-            'total_pnl': round(self.total_pnl, 2)
-        }
     
     async def update_from_exchange_position(self, position_data: dict, atr: float | None = None):
         """

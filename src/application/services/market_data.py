@@ -463,7 +463,11 @@ class SynchronizedMultiTimeframeBuffer:
             staleness = (real_now - self.current_time).total_seconds()
             # If market time is more than 2 minutes stale, use real time
             if staleness > 120:
-                logger.warning(f"⚠️ Market time stale by {staleness:.0f}s - using real time")
+                # Throttle: log once per 60s to avoid spam
+                now_ts = real_now.timestamp()
+                if not hasattr(self, '_last_stale_log') or (now_ts - self._last_stale_log) > 60:
+                    logger.warning(f"⚠️ Market time stale by {staleness:.0f}s - using real time")
+                    self._last_stale_log = now_ts
                 return real_now
         return self.current_time
     

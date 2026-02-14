@@ -642,6 +642,82 @@ class WaitFillHandler:
                         logger.info(f"🔄 Using actual fill size: {actual_size:.6f} → {exchange_qty:.6f}")
                     actual_size = exchange_qty
             
+            # ================================================================
+            # MICROFILL DETECTION: If fill < 30% of target → top up with IOC
+            # 
+            # Problem: POST-ONLY limit orders can partially fill with tiny
+            # amounts (e.g., 0.0001/0.0022 = 4.5%). Managing a micro position
+            # wastes capital and loses the real trade opportunity.
+            #
+            # Solution: Detect microfill, place aggressive IOC for remainder.
+            # If top-up fails, close micro position and return to IDLE.
+            # ================================================================
+            MICROFILL_THRESHOLD = 0.30  # 30% of target = microfill
+            target_size = entry_data['position_size']
+            
+            if target_size > 0 and actual_size / target_size < MICROFILL_THRESHOLD:
+                remaining = target_size - actual_size
+                logger.warning(
+                    f"⚠️ MICROFILL DETECTED: {actual_size:.6f} / {target_size:.6f} "
+                    f"= {actual_size/target_size:.0%} < {MICROFILL_THRESHOLD:.0%} threshold | "
+                    f"Attempting IOC top-up for {remaining:.6f}"
+                )
+                
+                topup_success = False
+                try:
+                    topup_result = await ctx.execution.place_aggressive_order(
+                        symbol=ctx.symbol,
+                        side='buy' if entry_data['bias'] == 'LONG' else 'sell',
+                        amount=remaining,
+                        price=actual_price,
+                        stop_loss=entry_data['stop_loss'],
+                        take_profit=entry_data['take_profit']
+                    )
+                    
+                    if topup_result and topup_result.get('id'):
+                        # Wait for fill and re-check exchange position
+                        import asyncio as _asyncio
+                        await _asyncio.sleep(1.0)
+                        refreshed_pos = await ctx.execution.get_position(ctx.symbol)
+                        if refreshed_pos:
+                            new_qty = abs(float(refreshed_pos.get('contracts', 0) or 0))
+                            new_price = float(refreshed_pos.get('entryPrice', 0) or 0)
+                            if new_qty > actual_size * 1.5:  # Got meaningfully more
+                                logger.info(
+                                    f"✅ MICROFILL TOP-UP SUCCESS: {actual_size:.6f} → {new_qty:.6f} "
+                                    f"@ {new_price:.2f} (target was {target_size:.6f})"
+                                )
+                                actual_size = new_qty
+                                actual_price = new_price if new_price > 0 else actual_price
+                                topup_success = True
+                            else:
+                                logger.warning(f"⚠️ Top-up didn't add enough: {actual_size:.6f} → {new_qty:.6f}")
+                except Exception as topup_err:
+                    logger.error(f"❌ Microfill top-up failed: {topup_err}")
+                
+                if not topup_success:
+                    # Close the micro position — not worth managing
+                    logger.warning(
+                        f"🗑️ Closing micro position {actual_size:.6f} BTC (not worth managing)"
+                    )
+                    try:
+                        close_side = 'sell' if entry_data['bias'] == 'LONG' else 'buy'
+                        await ctx.execution.close_position_market(
+                            symbol=ctx.symbol,
+                            side=close_side,
+                            amount=actual_size,
+                            reason="MICROFILL_CLOSE"
+                        )
+                    except Exception as close_err:
+                        logger.error(f"❌ Could not close micro position: {close_err}")
+                    
+                    ctx.reset_trade_state("Microfill - position too small")
+                    ctx.state_machine.transition_to(BotState.IDLE, "Microfill closed")
+                    result.handled = True
+                    result.new_state = BotState.IDLE
+                    result.pending_order_id = None
+                    return result
+            
             # Update position_store
             try:
                 fill_side = 'buy' if entry_data['bias'].upper() == 'LONG' else 'sell'

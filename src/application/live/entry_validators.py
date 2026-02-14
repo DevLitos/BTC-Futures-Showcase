@@ -8,6 +8,7 @@ Extracted from _execute_entry() as part of AUDIT REFACTOR Point 5.
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Optional, Tuple, Dict, Any, TYPE_CHECKING
 import logging
@@ -19,6 +20,18 @@ from src.config.trading_config import (
     TrendExpansionConfig,
     OperatingMode,
 )
+
+# Rate limiter for cost validator logs (avoid spam every tick)
+_cv_rate_limiter: dict[str, datetime] = {}
+_CV_RATE_LIMIT_SECONDS = 120
+
+def _cv_should_log(key: str) -> bool:
+    now = datetime.utcnow()
+    last = _cv_rate_limiter.get(key)
+    if last is None or (now - last).total_seconds() >= _CV_RATE_LIMIT_SECONDS:
+        _cv_rate_limiter[key] = now
+        return True
+    return False
 
 if TYPE_CHECKING:
     from src.application.live.trading_app import SignalEngine
@@ -772,17 +785,20 @@ class CostValidator:
                     f"of expected profit ${result.expected_profit_usd:.4f} "
                     f"(threshold: {result.threshold*100:.0f}%)"
                 )
-                logger.warning(f"💸 COST VALIDATOR BLOCK: {result.block_reason}")
+                if _cv_should_log("cost_block"):
+                    logger.warning(f"💸 COST VALIDATOR BLOCK: {result.block_reason}")
             else:
-                logger.info(
-                    f"✅ Cost validator PASS: ${result.cost_usd:.4f} = "
-                    f"{result.cost_ratio*100:.1f}% of profit (< {result.threshold*100:.0f}%)"
-                )
+                if _cv_should_log("cost_pass"):
+                    logger.info(
+                        f"✅ Cost validator PASS: ${result.cost_usd:.4f} = "
+                        f"{result.cost_ratio*100:.1f}% of profit (< {result.threshold*100:.0f}%)"
+                    )
 
-            logger.info(
-                f"📉 Net expectancy: gross={gross_r:.2f}R | fees≈{result.fee_r_estimate:.3f}R | net≈{result.expected_net_r:.2f}R | "
-                f"profit_net=${result.expected_profit_usd_net:.2f}"
-            )
+            if _cv_should_log("net_expectancy"):
+                logger.info(
+                    f"📉 Net expectancy: gross={gross_r:.2f}R | fees≈{result.fee_r_estimate:.3f}R | net≈{result.expected_net_r:.2f}R | "
+                    f"profit_net=${result.expected_profit_usd_net:.2f}"
+                )
         
         except Exception as e:
             logger.warning(f"⚠️ Cost validator error (proceeding with caution): {e}")

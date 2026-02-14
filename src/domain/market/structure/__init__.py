@@ -5,12 +5,6 @@ from src.domain.market.structure.important_levels import (
     AnchorLevel,
     get_important_levels_provider,
 )
-from src.domain.market.structure.htf_overextension import (
-    HTFOverextensionExtractor,
-    HTFContext,
-    LTFContext,
-    get_htf_overextension_extractor,
-)
 from src.domain.market.structure.quality_gate import (
     MarketQualityGate,
     MarketQualityStatus,
@@ -30,11 +24,6 @@ __all__ = [
     "LevelType", 
     "AnchorLevel",
     "get_important_levels_provider",
-    # HTF overextension
-    "HTFOverextensionExtractor",
-    "HTFContext",
-    "LTFContext",
-    "get_htf_overextension_extractor",
     # Quality gate
     "MarketQualityGate",
     "MarketQualityStatus",

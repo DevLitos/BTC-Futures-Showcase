@@ -60,10 +60,12 @@ run-live:
 	@echo "⚠️  LIVE MODE - REAL MONEY AT RISK!"
 	@echo "Press Ctrl+C within 5 seconds to cancel..."
 	@sleep 5
+	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	TRADING_MODE=LIVE uv run python main.py
 
 run-paper:
 	@echo "📊 PAPER MODE - Real orders will be placed!"
+	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	TRADING_MODE=PAPER uv run python main.py
 
 run-backtest:

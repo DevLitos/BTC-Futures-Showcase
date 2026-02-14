@@ -3,7 +3,7 @@
 ## Sistema BTC Perpetual Trading - Análisis Profundo
 
 **Fecha de Documentación:** Febrero 2026  
-**Versión:** Post-FIX #232-#241 (Feb 15, 2026)
+**Versión:** Post-Refactor Masivo (Feb 17, 2026) — ~5,700 líneas eliminadas
 
 ---
 
@@ -99,9 +99,9 @@ TICK RECIBIDO
 
 | Tipo | Prioridad | Descripción | Timeout |
 |------|-----------|-------------|---------|
-| `DISPLACEMENT` | 100 | Movimiento fuerte (≥1.5x ATR) | 90 min |
-| `BREAKOUT` | 80 | Ruptura de compresión BB | 30 min |
-| `RANGE` | 60 | Extremo de rango (≤15% o ≥85%) | 20 min |
+| `DISPLACEMENT` | 100 | Movimiento fuerte (≥1.5x ATR) | 20 min (FIX #230) |
+| `BREAKOUT` | 80 | Ruptura de compresión BB | 10 min (FIX #230) |
+| `RANGE` | 60 | Extremo de rango (≤15% o ≥85%) | 10 min (FIX #230) |
 | `TREND_BOS` | 40 | Break of Structure con pullback | 15 min |
 | `TREND_CONSENSUS` | 20 | Entrada directa en consenso | 15 min |
 
@@ -118,7 +118,7 @@ DisplacementEdgeCriteria:
     ZONA 2 (bars 2-10): PULLBACK - Entry en retroceso 15-45%, 40-60% size
     ZONA 3 (bars >15): CHASE BLOCK - NO PERSEGUIR
     
-    EDGE_TIMEOUT_MIN = 90             # 90 minutos
+    EDGE_TIMEOUT_MIN = 20             # 20 min (FIX #230 TTL radical)
     INVALIDATION_OPPOSITE_MULT = 0.6  # 60% en contra = invalida
 ```
 
@@ -133,7 +133,7 @@ RangeEdgeCriteria:
     PROBING_MIN_SCORE = 4
     
     RANGE_SIZE_MAX = 0.30     # Max 30% size en rango
-    RANGE_EDGE_TIMEOUT_MIN = 20
+    RANGE_EDGE_TIMEOUT_MIN = 10  # FIX #230
 ```
 
 #### BREAKOUT EDGE
@@ -145,7 +145,7 @@ BreakoutEdgeCriteria:
     
     MIN_TARGET_R = 2.0   # Mínimo 2R
     IDEAL_TARGET_R = 3.0
-    BREAKOUT_TIMEOUT_MIN = 30
+    BREAKOUT_TIMEOUT_MIN = 10  # FIX #230
 ```
 
 ---
@@ -720,33 +720,38 @@ class AsymmetryConfig:
 ```
 src/
 ├── application/live/
-│   ├── trading_app.py      # SignalEngine - orquestador principal (9589 líneas)
-│   ├── entry_orchestrator.py # Guards + Scoring + Sizing (4607 líneas)
+│   ├── trading_app.py      # SignalEngine - orquestador principal (9283 líneas)
+│   ├── entry_orchestrator.py # Guards + Scoring + Sizing (4015 líneas)
 │   └── direction_state_manager.py
 │
 ├── domain/trading/
-│   ├── edge_state_manager.py  # Edge lifecycle (4682 líneas)
+│   ├── edge_state_manager.py  # Edge lifecycle (3212 líneas)
 │   ├── scoring/
-│   │   └── entry_scorer.py    # 4-block scoring (1250 líneas)
+│   │   └── entry_scorer.py    # 4-block scoring (578 líneas)
 │   ├── state/
-│   │   └── state_machine.py   # BotState machine (563 líneas)
+│   │   └── state_machine.py   # BotState machine (562 líneas)
 │   └── strategy/
 │
 ├── domain/risk/
-│   ├── risk_engine.py      # Position + SL/TP + sizing (4227 líneas)
+│   ├── risk_engine.py      # Position + SL/TP + sizing (3794 líneas)
 │   └── trailing_stop.py    # Hybrid ATR trailing (508 líneas)
 │
 ├── domain/market/
 │   ├── regime/
-│   │   ├── trend_intelligence.py  # TrendPhase detection (907 líneas)
-│   │   └── regime_fusion.py       # 3-Layer fusion (442 líneas)
+│   │   ├── trend_intelligence.py  # TrendPhase detection
+│   │   └── regime_fusion.py       # 3-Layer fusion
 │   ├── filters/
-│   │   └── filter_pipeline.py     # 7 filtros (428 líneas)
+│   │   └── filter_pipeline.py     # 7 filtros
 │   └── absorption_detector.py
 │
 └── config/
     ├── trading_config.py    # TODAS las configuraciones (3419 líneas)
     └── unified_constants.py # Constantes centralizadas
+
+# ARCHIVOS ELIMINADOS (Feb 17, 2026):
+# - src/infrastructure/monitoring/advanced_analytics.py (1217 líneas - zero imports)
+# - src/domain/market/structure/htf_overextension.py (955 líneas - dead code)
+# - src/infrastructure/monitoring/opportunity_tracker.py (987 líneas - zero value)
 ```
 
 ---
@@ -763,10 +768,10 @@ SCORE_REDUCED_MAX = 6.0   # 5.5-6.0 = reduced (0.50×)
 # Profit Minimum (FIX #235)
 MIN_PROFIT_FLOOR = 0.25   # $0.25 min (was $0.50)
 
-# Edge Timeouts
-DISPLACEMENT_TIMEOUT = 90  # minutos
-BREAKOUT_TIMEOUT = 30
-RANGE_TIMEOUT = 20
+# Edge Timeouts (FIX #230 - TTL Radical)
+DISPLACEMENT_TIMEOUT = 20  # minutos (was 90)
+BREAKOUT_TIMEOUT = 10      # was 30
+RANGE_TIMEOUT = 10         # was 20
 TREND_TIMEOUT = 15
 
 # Risk Limits
@@ -807,4 +812,4 @@ Para que un trade se ejecute, debe pasar:
 
 ---
 
-*Documentación actualizada — Febrero 15, 2026 — Post FIX #232-#241*
+*Documentación actualizada — Febrero 17, 2026 — Post Refactor Masivo (~5,700 líneas eliminadas)*

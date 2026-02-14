@@ -513,7 +513,7 @@ class EdgeEnforcement:
     def log_weekly_report(self) -> None:
         """Logs comprehensive weekly report"""
         report = self.get_health_report()
-        state_transitions = self.state_machine.get_transition_history(limit=5)
+        state_transitions = []  # Transition history removed (dead code cleanup)
         
         self.logger.info("\n")
         self.logger.info("=" * 80)

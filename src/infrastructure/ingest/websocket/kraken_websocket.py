@@ -511,27 +511,30 @@ class KrakenFuturesWebSocket:
             
             if candle_key != last_key:
                 # CANDLE CLOSED
-                # 1. Emit the COMPLETED candle (from buffer)
+                # 1. Save completed candle data
+                closed_candle = None
                 if symbol in self.candle_builders[timeframe]['data']:
-                    closed_candle = self.candle_builders[timeframe]['data'][symbol]
+                    closed_candle = dict(self.candle_builders[timeframe]['data'][symbol])
                     closed_candle['timeframe'] = timeframe
-                    
-                    # Emit
-                    if timeframe == '1m' and self.on_candle_1m:
-                        await self.on_candle_1m(closed_candle)
-                    elif timeframe == '5m' and self.on_candle_5m:
-                        await self.on_candle_5m(closed_candle)
-                    elif timeframe == '1h' and self.on_candle_1h:
-                        await self.on_candle_1h(closed_candle)
-                        
-                # 2. Start NEW candle with current trade
+                
+                # 2. Update state FIRST (prevents cascading failure if callback crashes)
                 self.candle_builders[timeframe]['data'][symbol] = {
                     'open': price, 'high': price, 'low': price, 'close': price,
                     'volume': size, 'timestamp': ts
                 }
-                
-                # 3. Update key
                 self.candle_builders[timeframe]['last_close'][symbol] = candle_key
+                
+                # 3. Emit callback (safe - state already consistent)
+                if closed_candle:
+                    try:
+                        if timeframe == '1m' and self.on_candle_1m:
+                            await self.on_candle_1m(closed_candle)
+                        elif timeframe == '5m' and self.on_candle_5m:
+                            await self.on_candle_5m(closed_candle)
+                        elif timeframe == '1h' and self.on_candle_1h:
+                            await self.on_candle_1h(closed_candle)
+                    except Exception as e:
+                        logger.error(f"Error in {timeframe} candle callback: {e}")
                 
             else:
                 # UPDATE EXISTING CANDLE

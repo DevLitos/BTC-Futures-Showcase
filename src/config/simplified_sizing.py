@@ -43,7 +43,7 @@ REMOVED (set to 1.0):
 
 SIMPLIFIED EXITS (30-day test):
 - SL structural (no change)
-- TP fixed: 1.5R in trend, 1.0R in range
+- TP fixed: 1.2R in trend, 1.0R in range
 - Trailing: ONLY after 1R profit
 - WTP: DISABLED (this is the painful but correct decision)
 - TIME_INVALIDATION: Keep but simplify to 60 min flat
@@ -55,14 +55,22 @@ Date: January 27, 2026
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Tuple, Optional, Dict, Any, TYPE_CHECKING
+from typing import Tuple, Optional, Dict, Any
 import logging
 
-# Avoid circular imports - only for type hints
-if TYPE_CHECKING:
-    from src.domain.trading.edge_state_manager import LiquidityEvent
-
 logger = logging.getLogger(__name__)
+
+# Rate limiter for sizing logs
+_sizing_rate_limiter: dict[str, datetime] = {}
+_SIZING_RATE_LIMIT_SEC = 120
+
+def _sizing_should_log(key: str) -> bool:
+    now = datetime.utcnow()
+    last = _sizing_rate_limiter.get(key)
+    if last is None or (now - last).total_seconds() >= _SIZING_RATE_LIMIT_SEC:
+        _sizing_rate_limiter[key] = now
+        return True
+    return False
 
 
 class SimplifiedSizingMode(Enum):
@@ -584,49 +592,9 @@ class SimplifiedSizer:
                 result.tags['toxic_combo'] = f"{session_name}_{direction}"
                 result.tags['toxic_combo_mult'] = result.toxic_combo_mult
         
-        # =====================================================================
-        # 🔥 NEW (Feb 2, 2026): TOXIC HOUR MULTIPLIER
-        # Reduce size 50% during hours 0, 4, 21, 23 UTC
-        # =====================================================================
-        if market_time is not None:
-            result.toxic_hour_mult = ToxicHourMultiplier.from_datetime(market_time)
-            result.tags['toxic_hour_mult'] = result.toxic_hour_mult
-            result.tags['entry_hour_utc'] = market_time.hour
+        # Toxic hour, momentum, regime_fusion, score_mult REMOVED — Opción A (5 multipliers only)
         
-        # =====================================================================
-        # 🔥 NEW (Feb 2, 2026): MOMENTUM SIZING MULTIPLIER
-        # Boost high momentum (>=1.5) by 1.2x, reduce low (<0.5) by 0.5x
-        # =====================================================================
-        result.momentum_mult = MomentumSizingMultiplier.get_multiplier(momentum_score)
-        result.tags['momentum_score'] = momentum_score
-        result.tags['momentum_mult'] = result.momentum_mult
-        
-        # =====================================================================
-        # 🔥 FIX #245 (Feb 16, 2026): SCORE-TO-SIZING MULTIPLIER
-        # 
-        # PROBLEMA: Score era gate binario (block/pass). Score 5.0 y 9.0
-        # daban el mismo tamaño. Score decorrelado de outcomes porque no
-        # influía en sizing — solo bloqueaba trades < threshold.
-        #
-        # SOLUCIÓN: Score gradúa el tamaño de posición:
-        # - Score < 5.0 → 0.50x (probe size, low conviction)
-        # - Score 5.0-6.0 → 0.70x (reduced, moderate conviction)
-        # - Score 6.0-7.0 → 0.85x (near full)
-        # - Score >= 7.0 → 1.00x (full conviction)
-        #
-        # FILOSOFÍA: Un score bajo que pasa el gate NO debería tener el
-        # mismo sizing que un score alto. Score 5 = "maybe", Score 8 = "yes".
-        # =====================================================================
-        if entry_score < 5.0:
-            result.score_mult = 0.50
-        elif entry_score < 6.0:
-            result.score_mult = 0.70
-        elif entry_score < 7.0:
-            result.score_mult = 0.85
-        else:
-            result.score_mult = 1.00
-        result.tags['entry_score'] = entry_score
-        result.tags['score_mult'] = result.score_mult
+        # Score-to-sizing REMOVED — Opción A (score is gate only, not sizing)
         
         # =====================================================================
         # 🔥 INTRADAY vs INSTITUTIONAL: Filtros diferentes
@@ -796,22 +764,13 @@ class SimplifiedSizer:
         if result.is_provisional:
             result.tags['edge_mode_provisional'] = True
         
-        # 🔥 FIX #83: Apply RegimeFusion alignment multiplier
-        result.regime_fusion_mult = regime_fusion_mult
-        result.tags['regime_fusion_mult'] = regime_fusion_mult
-        
-        # 6. COMBINED MULTIPLIER (includes all adaptive filters)
+        # 6. COMBINED MULTIPLIER — Opción A: 5 multipliers only
         result.combined_multiplier = (
             result.rr_mult *
             result.regime_mult *
             result.loss_streak_mult *
             result.session_mult *
-            result.edge_mult *          # Edge mode multiplier
-            result.toxic_hour_mult *    # Toxic hour multiplier
-            result.toxic_combo_mult *   # Toxic combo multiplier (REDUCE mode)
-            result.momentum_mult *      # Momentum predictor multiplier
-            result.regime_fusion_mult * # 🔥 FIX #83: Macro/Micro alignment (0.3-1.0)
-            result.score_mult           # 🔥 FIX #245: Score-to-sizing (0.5-1.0)
+            result.edge_mult
         )
         
         # =====================================================================
@@ -856,23 +815,24 @@ class SimplifiedSizer:
             result.final_size = KRAKEN_MIN
             result.tags['min_size_applied'] = True
         
-        # Log the calculation
-        toxic_hour_log = f" × TOXIC_HR={result.toxic_hour_mult:.2f}" if result.toxic_hour_mult < 1.0 else ""
-        toxic_combo_log = f" × TOXIC_COMBO={result.toxic_combo_mult:.2f}" if result.toxic_combo_mult < 1.0 else ""
-        momentum_log = f" × MOM={result.momentum_mult:.2f}" if result.momentum_mult != 1.0 else ""
-        fusion_log = f" × FUSION={result.regime_fusion_mult:.2f}" if result.regime_fusion_mult < 1.0 else ""
-        score_log = f" × SCORE={result.score_mult:.2f}" if result.score_mult < 1.0 else ""
-        logger.info(
-            f"📊 SIMPLIFIED SIZING [{edge_mode}]: "
-            f"RR={result.rr_mult:.2f} × "
-            f"REG={result.regime_mult:.2f} × "
-            f"LOSS={result.loss_streak_mult:.2f} × "
-            f"SESS={result.session_mult:.2f} × "
-            f"EDGE={result.edge_mult:.2f}"
-            f"{toxic_hour_log}{toxic_combo_log}{momentum_log}{fusion_log}{score_log} = "
-            f"{result.combined_multiplier:.2f} → "
-            f"{result.final_size:.6f} BTC"
-        )
+        # Log the calculation (throttled to avoid spam every tick)
+        if _sizing_should_log("simplified_sizing"):
+            toxic_hour_log = f" × TOXIC_HR={result.toxic_hour_mult:.2f}" if result.toxic_hour_mult < 1.0 else ""
+            toxic_combo_log = f" × TOXIC_COMBO={result.toxic_combo_mult:.2f}" if result.toxic_combo_mult < 1.0 else ""
+            momentum_log = f" × MOM={result.momentum_mult:.2f}" if result.momentum_mult != 1.0 else ""
+            fusion_log = f" × FUSION={result.regime_fusion_mult:.2f}" if result.regime_fusion_mult < 1.0 else ""
+            score_log = f" × SCORE={result.score_mult:.2f}" if result.score_mult < 1.0 else ""
+            logger.info(
+                f"📊 SIMPLIFIED SIZING [{edge_mode}]: "
+                f"RR={result.rr_mult:.2f} × "
+                f"REG={result.regime_mult:.2f} × "
+                f"LOSS={result.loss_streak_mult:.2f} × "
+                f"SESS={result.session_mult:.2f} × "
+                f"EDGE={result.edge_mult:.2f}"
+                f"{toxic_hour_log}{toxic_combo_log}{momentum_log}{fusion_log}{score_log} = "
+                f"{result.combined_multiplier:.2f} → "
+                f"{result.final_size:.6f} BTC"
+            )
         
         return result
 
@@ -908,7 +868,7 @@ class SimplifiedExitConfig:
     
     # Take Profit - Moderados para calidad
     TP_R_TREND = 1.2    # 1.2R en tendencia (equilibrio calidad/frecuencia)
-    TP_R_RANGE = 0.8    # 0.8R en rango (scalp conservador)
+    TP_R_RANGE = 1.0    # 1.0R en rango (trailing gestiona salida real)
     
     # 🔥 NEW FEB 11: TP ADAPTATIVO basado en volatilidad
     # - Baja volatilidad (atr_ratio < 0.8): TP conservador
@@ -917,6 +877,12 @@ class SimplifiedExitConfig:
     TP_VOLATILITY_HIGH_THRESHOLD = 1.3
     TP_LOW_VOL_MULT = 0.8    # Reduce TP 20% en baja vol
     TP_HIGH_VOL_MULT = 1.25  # Aumenta TP 25% en alta vol
+    
+    # 🔥 FIX #261: TP floor to prevent HARD BLOCK deadlock
+    # When low-vol adjustment reduces TP to 0.80R, net_R = 0.80 - 0.225(fees) = 0.575 < 0.60
+    # This causes 16+ HARD BLOCK rejections until SL drifts enough to barely pass.
+    # Floor ensures TP after adjustment always passes MIN_EXPECTED_NET_R with margin.
+    TP_MIN_FLOOR = 0.88  # 0.88R - fees(0.225) = 0.655R > 0.60 HARD BLOCK threshold
     
     # 🔥 BREAKOUT edge - Alto TP porque baja frecuencia
     TP_R_BREAKOUT = 1.8       # BREAKOUT target (calidad > cantidad)
@@ -1005,8 +971,9 @@ class SimplifiedExitConfig:
     def _apply_volatility_adjustment(cls, base_tp: float, atr_expansion_ratio: Optional[float]) -> float:
         """
         🔥 NEW (Feb 11, 2026): Apply volatility-based TP adjustment.
+        🔥 FIX #261 (Feb 18, 2026): Added TP_MIN_FLOOR to prevent HARD BLOCK deadlock.
         
-        - Low volatility (atr_ratio < 0.8): Conservative targets (×0.8)
+        - Low volatility (atr_ratio < 0.8): Conservative targets (×0.8), floored at 0.88R
         - High volatility (atr_ratio > 1.3): Extended targets (×1.25)
         - Normal volatility: No adjustment
         """
@@ -1014,8 +981,15 @@ class SimplifiedExitConfig:
             return base_tp
         
         if atr_expansion_ratio < cls.TP_VOLATILITY_LOW_THRESHOLD:
-            # Baja volatilidad: reducir TP para capturar ganancias antes
-            return base_tp * cls.TP_LOW_VOL_MULT
+            # Baja volatilidad: reducir TP, pero nunca debajo del floor
+            adjusted = base_tp * cls.TP_LOW_VOL_MULT
+            floored = max(adjusted, cls.TP_MIN_FLOOR)
+            if floored > adjusted:
+                logger.info(
+                    f"🔥 FIX #261: TP floor applied {adjusted:.2f}R → {floored:.2f}R "
+                    f"(prevents HARD BLOCK deadlock)"
+                )
+            return floored
         elif atr_expansion_ratio > cls.TP_VOLATILITY_HIGH_THRESHOLD:
             # Alta volatilidad: extender TP, hay más espacio
             return base_tp * cls.TP_HIGH_VOL_MULT
@@ -1178,5 +1152,5 @@ logger.info(f"🔧 SIZING MODE: {SIZING_MODE.value.upper()}")
 if SIZING_MODE == SimplifiedSizingMode.SIMPLIFIED:
     logger.info("   → 5 multipliers: RR, REGIME, LOSS_STREAK, SESSION + base_risk")
     logger.info("   → WTP: DISABLED")
-    logger.info("   → TP: Fixed (1.5R trend / 1.0R range)")
+    logger.info("   → TP: Fixed (1.2R trend / 1.0R range)")
     logger.info("   → Trailing: Only after 1R")

@@ -23,8 +23,13 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 from datetime import datetime, UTC
 from pathlib import Path
+
+# 🔥 Prevent stale bytecode — always use source .py files directly.
+# Eliminates __pycache__ staleness when code is updated between runs.
+sys.dont_write_bytecode = True
 
 # =====================================================================
 # 🔒 PHASE 1: Load env file FIRST (before any imports that might use env vars)
