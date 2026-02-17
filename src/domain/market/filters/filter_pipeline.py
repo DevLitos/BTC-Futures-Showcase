@@ -103,6 +103,7 @@ class EntryFilterPipeline:
         # Track last decisions for debugging
         self._last_decisions: Dict[str, FilterDecision] = {}
         self._last_aggregate: Optional[FilterDecision] = None
+        self._last_bb_block_log_time: float = 0.0
     
     def evaluate(self,
                  # Data inputs
@@ -195,18 +196,27 @@ class EntryFilterPipeline:
             aggregate = aggregate.merge_dedup(decision)
             
             if not decision.allow and early_exit:
-                # 🔥 FIX #178: Si anticipation_bypass, convertir BLOCK → PENALTY
-                if anticipation_bypass:
-                    logger.info(f"📊 FIX #178: BB WIDTH BLOCK bypassed by ANTICIPATION (COMPRESSION_BREAKOUT) → converting to penalty")
-                    # No bloquear, pero aplicar penalty severo
+                # 🔥 FIX #178 + #270: BYPASS BB WIDTH para ANTICIPATION y DISPLACEMENT
+                # Run 20260214: BB WIDTH bloqueó 239 veces durante rally de +$1,400
+                # porque las BB se contraen en tendencias limpias (baja desviación).
+                # DISPLACEMENT = el mercado YA se movió → compresión es consecuencia, no causa.
+                # ANTICIPATION = detecta squeeze → la compresión ES el setup.
+                if anticipation_bypass or displacement_bypass:
+                    bypass_reason = "ANTICIPATION" if anticipation_bypass else "DISPLACEMENT"
+                    logger.info(f"📊 FIX #270: BB WIDTH BLOCK bypassed by {bypass_reason} → penalty only")
                     aggregate.allow = True
-                    aggregate.score_adjust -= 2.0  # Penalty por compresión
-                    aggregate.size_factor = min(aggregate.size_factor, 0.5)  # 🔒 FIX #267: was size_multiplier (AttributeError crash)
+                    aggregate.score_adjust -= 1.5  # Penalty por compresión (menos severo que antes)
+                    aggregate.size_factor = min(aggregate.size_factor, 0.6)
                     aggregate.tags['bb_width_bypassed'] = True
+                    aggregate.tags['bb_width_bypass_reason'] = bypass_reason
                 else:
                     aggregate.tags['blocked_by'] = 'bb_width'
                     self._last_aggregate = aggregate
-                    logger.warning(f"[BLOCK] FILTER [bb_width]: {decision.reasons[0] if decision.reasons else 'compression'}")
+                    import time as _time_mod
+                    _now = _time_mod.time()
+                    if _now - self._last_bb_block_log_time >= 60.0:
+                        self._last_bb_block_log_time = _now
+                        logger.warning(f"[BLOCK] FILTER [bb_width]: {decision.reasons[0] if decision.reasons else 'compression'}")
                     return aggregate
         
         # ===== 3. MACRO TREND (15m + 1h EMA200 + slope) =====

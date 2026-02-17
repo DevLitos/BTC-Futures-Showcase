@@ -372,12 +372,12 @@ class HybridATRTrailing:
             if r_stop > self._state.r_locked_level:
                 self._state.r_locked_level = r_stop
                 self._state.r_lock_tier = r_tier
-                logger.info(f"📈 R-LOCK upgraded: Tier {r_tier} → SL={r_stop:.2f} (MFE={mfe_r:.2f}R)")
+                logger.debug(f"📈 R-LOCK upgraded: Tier {r_tier} → SL={r_stop:.2f} (MFE={mfe_r:.2f}R)")
         else:
             if r_stop < self._state.r_locked_level:
                 self._state.r_locked_level = r_stop
                 self._state.r_lock_tier = r_tier
-                logger.info(f"📉 R-LOCK upgraded: Tier {r_tier} → SL={r_stop:.2f} (MFE={mfe_r:.2f}R)")
+                logger.debug(f"📉 R-LOCK upgraded: Tier {r_tier} → SL={r_stop:.2f} (MFE={mfe_r:.2f}R)")
         
         # 2. Get ATR trailing stop
         # CRITICAL: Only activate ATR trailing after MFE threshold
@@ -422,13 +422,13 @@ class HybridATRTrailing:
                 old_stop = self._state.final_stop
                 self._state.final_stop = final
                 self._state.stop_source = source
-                logger.info(f"🎯 FINAL STOP updated: {old_stop:.2f} → {final:.2f} ({source})")
+                logger.debug(f"🎯 FINAL STOP updated: {old_stop:.2f} → {final:.2f} ({source})")
         else:
             if final < self._state.final_stop:
                 old_stop = self._state.final_stop
                 self._state.final_stop = final
                 self._state.stop_source = source
-                logger.info(f"🎯 FINAL STOP updated: {old_stop:.2f} → {final:.2f} ({source})")
+                logger.debug(f"🎯 FINAL STOP updated: {old_stop:.2f} → {final:.2f} ({source})")
         
         self._state.regime = regime.value
         return self._state

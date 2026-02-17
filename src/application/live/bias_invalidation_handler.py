@@ -32,9 +32,9 @@ class BiasInvalidationConfig:
     Log showed 9 BIAS FLIPs in 3 hours - too noisy. Now requires 300 ticks 
     (~5 min) between consecutive flips to the SAME forbidden direction.
     """
-    base_atr_mult: float = 2.5  # Base threshold = ATR_1m * 2.5 (FIX #89: was 1.5)
-    min_threshold: float = 80.0  # Minimum $80 (FIX #89: was $50)
-    max_threshold: float = 350.0  # Maximum $350 (FIX #89: was $250)
+    base_atr_mult: float = 3.5  # Base threshold = ATR_1m * 3.5 (raised from 2.5 to resist noise)
+    min_threshold: float = 150.0  # Minimum $150 (raised from $80)
+    max_threshold: float = 500.0  # Maximum $500 (raised from $350)
     expansion_mult: float = 2.0  # Harder to invalidate during expansion
     direction_lock_mult: float = 1.5  # Harder during direction lock
     hysteresis_ticks: int = 180  # Min ticks before clearing forbidden (FIX #89: was 120)

@@ -146,7 +146,13 @@ class BTCCorrelationFilter(BaseFilter):
         
         # In cooldown after regime change?
         if self._in_regime_cooldown(market_time):
-            logger.info(f"⏳ BTC CORRELATION: In regime change cooldown, allowing cautiously")
+            # 🔥 FIX #283 (Feb 17, 2026): Throttle cooldown log — was 60+ messages per session
+            import time as _time_mod
+            _now = _time_mod.time()
+            _last_cooldown_log = getattr(self, '_last_cooldown_log_ts', 0)
+            if _now - _last_cooldown_log >= 60:
+                self._last_cooldown_log_ts = _now
+                logger.info(f"⏳ BTC CORRELATION: In regime change cooldown, allowing cautiously")
             return FilterDecision(
                 allow=True,
                 score_adjust=-1.0,  # Small penalty during uncertainty

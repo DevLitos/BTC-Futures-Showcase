@@ -787,6 +787,17 @@ class EdgeStateManager:
         # Key = "BREAKOUT_LONG" o "TREND_SHORT", Value = datetime hasta cuando está en cooldown
         self._direction_cooldown: Dict[str, datetime] = {}
         
+        # =====================================================================
+        # 🔥 FIX #285 (Feb 17, 2026): LOSS ZONE MEMORY
+        # LOG EVIDENCE: 3 identical LONG entries in $68,860-$68,950 zone, all lost.
+        # System didn't learn from first loss — entered twice more in same zone.
+        # Track recent loss zones and refuse identical setups for 30 minutes.
+        # Each entry: {'direction': str, 'price': float, 'atr': float, 'expires': datetime}
+        # =====================================================================
+        self._loss_zone_memory: List[Dict[str, Any]] = []
+        self.LOSS_ZONE_MEMORY_MINUTES = 30
+        self.LOSS_ZONE_RADIUS_ATR = 1.5  # Block within 1.5 ATR of loss price
+        
         # Edge Mode - INSTITUTIONAL vs INTRADAY
         self._current_edge_mode: EdgeMode = EdgeMode.INTRADAY
         self._intraday_trades_this_hour: int = 0
@@ -2270,32 +2281,44 @@ class EdgeStateManager:
             return False
         
         # =====================================================================
-        # MACRO BIAS COHERENCE CHECK (VETO absoluto)
-        # 
-        # LONG bloqueado si macro=BEAR_STRONG, SHORT si macro=BULL_STRONG.
-        # NO hay excepciones. momentum_override NO bypasa este check.
+        # MACRO BIAS COHERENCE CHECK
         #
-        # RAZÓN: Los datos muestran que entrar contra el macro extremo resulta
-        # en trades perdedores consistentemente (MFE < 0.2R, TIME_INVALIDATION).
-        # El displacement/expansion en esos casos es ruido, no señal real.
+        # Commit +$4 logic (proven profitable):
+        # - Only block on EXTREME macro (BEAR_STRONG / BULL_STRONG)
+        # - Momentum override (displacement/expansion) CAN bypass the veto
+        #   because price action has proven the macro is breaking
+        # - BEAR or BULL alone is NOT strong enough to veto
+        #
+        # Added safeguard: macro=None → BLOCK (prevents first-tick bypass)
         # =====================================================================
-        if macro_bias_strength:
-            is_incoherent = (
-                (macro_bias_strength == 'BEAR_STRONG' and direction == 'LONG') or
-                (macro_bias_strength == 'BULL_STRONG' and direction == 'SHORT')
-            )
-            if is_incoherent:
-                # Throttle: solo logear 1 vez por minuto
-                _last_consensus_block = getattr(self, '_last_consensus_block_log', 0)
-                import time as _time_mod
-                _now_ts = _time_mod.time()
-                if _now_ts - _last_consensus_block >= 60:
-                    self._last_consensus_block_log = _now_ts
-                    logger.warning(
-                        f"🚫 CONSENSUS BLOCKED: {direction} incoherent with macro={macro_bias_strength} | "
-                        f"reason={reason} | momentum_override={has_momentum_override} | VETO absoluto"
-                    )
-                return False
+        if not macro_bias_strength:
+            # Macro not yet calculated — BLOCK edge arming.
+            _last_none_log = getattr(self, '_last_macro_none_log', 0)
+            import time as _time_mod
+            _now_ts = _time_mod.time()
+            if _now_ts - _last_none_log >= 30:
+                self._last_macro_none_log = _now_ts
+                logger.warning(
+                    f"🚫 CONSENSUS BLOCKED: macro not yet calculated (None) | "
+                    f"direction={direction} | reason={reason} | Waiting for macro"
+                )
+            return False
+        
+        is_incoherent = (
+            (macro_bias_strength == 'BEAR_STRONG' and direction == 'LONG') or
+            (macro_bias_strength == 'BULL_STRONG' and direction == 'SHORT')
+        )
+        if is_incoherent and not has_momentum_override:
+            import time as _time_mod
+            _now_ts = _time_mod.time()
+            _last_consensus_block = getattr(self, '_last_consensus_block_log', 0)
+            if _now_ts - _last_consensus_block >= 60:
+                self._last_consensus_block_log = _now_ts
+                logger.warning(
+                    f"🚫 CONSENSUS BLOCKED: {direction} incoherent with macro={macro_bias_strength} | "
+                    f"reason={reason} | momentum_override={has_momentum_override}"
+                )
+            return False
         # =====================================================================
         # 🔥 FIX #31: CONSENSUS es el FALLBACK más bajo
         # Si ya hay edge de cualquier tipo, NO reemplazar
@@ -2366,17 +2389,63 @@ class EdgeStateManager:
                 if direction in self._direction_cooldown:
                     del self._direction_cooldown[direction]
             else:
-                logger.warning(
-                    f"🔥 FIX #194c: CONSENSUS BLOCKED by DEAD_EDGE COOLDOWN | "
-                    f"{direction} | ~{simple_remaining}min remaining | "
-                    f"Wait for fresh momentum after stale edge expired"
-                )
+                # Throttle: solo logear 1 vez por minuto
+                _last_dead_edge_log = getattr(self, '_last_dead_edge_cooldown_log', 0)
+                import time as _time_mod2
+                _now_ts2 = _time_mod2.time()
+                if _now_ts2 - _last_dead_edge_log >= 60:
+                    self._last_dead_edge_cooldown_log = _now_ts2
+                    logger.warning(
+                        f"🔥 FIX #194c: CONSENSUS BLOCKED by DEAD_EDGE COOLDOWN | "
+                        f"{direction} | ~{simple_remaining}min remaining | "
+                        f"Wait for fresh momentum after stale edge expired"
+                    )
                 return False
         
         # 🔥 FIX #36 (Feb 05): Reset from EXPIRED state to allow re-arming
         # Without this, once an edge expires, CONSENSUS can never arm again
         if self._state == EdgeState.EDGE_EXPIRED:
             self._transition_to(EdgeState.NO_EDGE, "reset from expired for consensus", market_time)
+        
+        # =====================================================================
+        # 🔥 FIX #285: LOSS ZONE MEMORY CHECK
+        # Don't re-enter the same direction in the same price zone after a loss.
+        # This prevents the "3 identical losing entries" pattern from the log.
+        # =====================================================================
+        now_utc = datetime.now(UTC)
+        self._loss_zone_memory = [z for z in self._loss_zone_memory if z['expires'] > now_utc]
+        for zone in self._loss_zone_memory:
+            if zone['direction'] == direction:
+                zone_radius = zone['atr'] * self.LOSS_ZONE_RADIUS_ATR
+                if abs(current_price - zone['price']) < zone_radius:
+                    remaining_min = (zone['expires'] - now_utc).total_seconds() / 60
+                    _last_zone_log = getattr(self, '_last_zone_memory_log', 0)
+                    import time as _time_mod3
+                    _now_ts3 = _time_mod3.time()
+                    if _now_ts3 - _last_zone_log >= 60:
+                        self._last_zone_memory_log = _now_ts3
+                        logger.warning(
+                            f"🚫 FIX #285 LOSS ZONE BLOCK: {direction} @ ${current_price:.0f} | "
+                            f"Previous loss @ ${zone['price']:.0f} ± ${zone_radius:.0f} | "
+                            f"~{remaining_min:.0f}min remaining | "
+                            f"Won't repeat same losing setup"
+                        )
+                    return False
+        
+        # =====================================================================
+        # 🔥 FIX #280 (Feb 17, 2026): CORRECT EDGE TYPE FOR RANGE CONSENSUS
+        #
+        # LOG EVIDENCE: Edge source = RANGE_CONSENSUS but edge_type = TREND.
+        # This caused TP to be set at 1.20R (trend) instead of 1.0R (range),
+        # and trailing stop to use trend-style behavior (loose) instead of 
+        # range-style (tight). In a RANGE_BOUND market with ADX 18.4, this
+        # mismatch causes systematic give-back of MFE.
+        #
+        # FIX: If reason contains "RANGE", set edge_type to RANGE.
+        # This flows through to TP calculation, trailing stop, and sizing.
+        # =====================================================================
+        is_range_consensus = 'RANGE' in reason.upper()
+        consensus_edge_type = EdgeType.RANGE if is_range_consensus else EdgeType.TREND
         
         # Crear BOSEvent para consensus con trend_path=CONSENSUS_DIRECT
         self._current_bos = BOSEvent(
@@ -2386,7 +2455,7 @@ class EdgeStateManager:
             htf_bias=direction,  # En consensus, htf ya está alineado
             bos_level=current_price,  # Nivel de entrada
             atr_at_bos=atr,
-            edge_type=EdgeType.TREND,
+            edge_type=consensus_edge_type,
             trend_path=TrendEdgePath.CONSENSUS_DIRECT,  # 🔥 Path específico
             # Consensus-specific: entrada directa permitida
             force_direct_entry=True,
@@ -2400,6 +2469,8 @@ class EdgeStateManager:
         else:
             self._stats.short_bos_events += 1
         
+        edge_type_str = consensus_edge_type.value
+        
         # Transición directa a ACTIVE (como displacement)
         self._transition_to(
             EdgeState.EDGE_ACTIVE,
@@ -2408,7 +2479,7 @@ class EdgeStateManager:
         )
         
         _edge_log(
-            "EDGE_ACTIVE", "TREND", direction,
+            "EDGE_ACTIVE", edge_type_str, direction,
             f"Consensus edge (path=DIRECT) | {reason} | Size reduced to 0.40-0.60x"
         )
         
@@ -2623,9 +2694,13 @@ class EdgeStateManager:
     # EXPIRACIÓN DEL EDGE
     # =========================================================================
     
-    def check_expiration(self, market_time: datetime) -> bool:
+    def check_expiration(self, market_time: datetime, current_price: float = 0.0) -> bool:
         """
         Verifica si el edge debe expirar.
+        
+        Args:
+            market_time: Timestamp actual del mercado
+            current_price: Precio actual (usado por FIX #271 para smart cooldown)
         
         Returns: True si expiró
         """
@@ -2665,20 +2740,20 @@ class EdgeStateManager:
             MAX_EDGE_AGE_DEAD = 18.0
         edge_age_min = self.get_edge_age_minutes(market_time)
         if edge_age_min > MAX_EDGE_AGE_DEAD:
-            direction = self._current_bos.direction if self._current_bos else None
-            self._expire_edge(f"🔥 FIX #189 DEAD_EDGE: age {edge_age_min:.1f}min > {MAX_EDGE_AGE_DEAD}min")
-            # 🔥 FIX #194c + #200: Activar cooldown reducido para evitar cycling
-            cooldown_minutes = 2  # 🔥 FIX #200: Reduced from 5→2min for faster retry
-            if direction:
-                cooldown_until = market_time + timedelta(minutes=cooldown_minutes)
-                self._direction_cooldown[direction] = cooldown_until
-                logger.warning(
-                    f"🔥 FIX #194c: DEAD_EDGE cooldown {cooldown_minutes}min for {direction} | "
-                    f"Wait for fresh momentum before new edge"
-                )
-            logger.warning(
-                f"🔥 FIX #189: Expired DEAD edge after {edge_age_min:.1f}min. "
-                f"Cooldown active for {cooldown_minutes}min."
+            # =====================================================================
+            # 🔥 FIX #273 (Feb 16, 2026): Unificación FIX #271 + FIX #248
+            #
+            # ANTES: FIX #248 (dentro de _expire_edge) aplicaba cooldown 5min para
+            # CONSENSUS edges SIEMPRE. FIX #271 (aquí fuera) intentaba saltar cooldown
+            # si la tendencia estaba confirmada, pero llegaba DESPUÉS → cooldown de
+            # FIX #248 ya estaba escrito → FIX #271 nunca funcionaba.
+            #
+            # AHORA: Pasar current_price a _expire_edge() para que la evaluación
+            # de tendencia confirmada se haga ANTES de escribir cooldowns.
+            # =====================================================================
+            self._expire_edge(
+                f"🔥 FIX #189 DEAD_EDGE: age {edge_age_min:.1f}min > {MAX_EDGE_AGE_DEAD}min",
+                current_price=current_price
             )
             return True
         
@@ -2732,7 +2807,7 @@ class EdgeStateManager:
         
         return False
     
-    def _expire_edge(self, reason: str, set_context_cooldown: bool = True):
+    def _expire_edge(self, reason: str, set_context_cooldown: bool = True, current_price: float = 0.0):
         """
         Expirar el edge actual.
         
@@ -2742,7 +2817,7 @@ class EdgeStateManager:
         - RANGE no afecta otros (contexto independiente)
         
         🔥 FIX #159b (Feb 10): Si es DISPLACEMENT, SIEMPRE activar post-displacement cooldown
-        para evitar que CONSENSUS entre después de momentum muerto.
+        🔥 FIX #273 (Feb 16): Unifica FIX #248 + FIX #271 — cooldown condicional
         """
         edge_type_str = "UNKNOWN"
         direction = "-"
@@ -2754,11 +2829,34 @@ class EdgeStateManager:
             direction = self._current_bos.direction
             
             # =====================================================================
+            # 🔥 FIX #271/273: SMART COOLDOWN — evaluar tendencia confirmada ANTES
+            # de aplicar cualquier cooldown de dirección.
+            #
+            # Si el precio confirma la dirección del edge muerto (>0.5 ATR),
+            # NO aplicar cooldown ni de FIX #248 (CONSENSUS) ni de DEAD_EDGE.
+            # =====================================================================
+            trend_confirmed = False
+            is_dead_edge = "DEAD_EDGE" in reason
+            edge_origin = self._current_bos.price
+            
+            if is_dead_edge and direction != "-" and edge_origin > 0 and current_price > 0:
+                price_moved = current_price - edge_origin
+                atr_ref = self._current_bos.atr_at_bos if self._current_bos.atr_at_bos else 100
+                if direction == 'LONG' and price_moved > atr_ref * 0.5:
+                    trend_confirmed = True
+                    logger.info(
+                        f"🔥 FIX #273: DEAD_EDGE sin cooldown | {direction} confirmado | "
+                        f"Precio subió ${price_moved:.0f} (>{atr_ref*0.5:.0f}) desde edge origin"
+                    )
+                elif direction == 'SHORT' and price_moved < -atr_ref * 0.5:
+                    trend_confirmed = True
+                    logger.info(
+                        f"🔥 FIX #273: DEAD_EDGE sin cooldown | {direction} confirmado | "
+                        f"Precio bajó ${abs(price_moved):.0f} (>{atr_ref*0.5:.0f}) desde edge origin"
+                    )
+            
+            # =====================================================================
             # 🔥 FIX #159b (Feb 10): POST-DISPLACEMENT COOLDOWN AUTOMÁTICO
-            # 
-            # Si expira un DISPLACEMENT por CUALQUIER razón (timeout, flip, chase, etc),
-            # SIEMPRE activar cooldown para evitar que CONSENSUS entre después.
-            # Esto centraliza la protección y cierra TODOS los paths de expiración.
             # =====================================================================
             if self._current_bos.edge_type == EdgeType.DISPLACEMENT:
                 logger.warning(
@@ -2772,31 +2870,34 @@ class EdgeStateManager:
                 )
             
             # =====================================================================
-            # 🔥 FIX #248 (Feb 16, 2026): CONSENSUS EXPIRY DIRECTION COOLDOWN
+            # 🔥 FIX #248/273: CONSENSUS EXPIRY DIRECTION COOLDOWN
             # 
-            # PROBLEMA: Cuando un CONSENSUS_DIRECT edge expira (por invalidación
-            # de precio, timeout, o cualquier razón), el sistema inmediatamente
-            # re-arma un nuevo edge en la MISMA dirección. Loop infinito:
-            #   EDGE_ACTIVE SHORT → invalidated → EDGE_ACTIVE SHORT → invalidated
-            # 
-            # LOG EVIDENCIA (Feb 12):
-            # - 16:16:46: Edge SHORT invalidated (price $67,595 > BOS $67,278)
-            # - 16:16:46: Immediately re-armed SHORT CONSENSUS at same pct=24%
-            # - Zero trades in 20+ minutes of this cycling
-            #
-            # SOLUCIÓN: Activar direction cooldown de 5 min tras expiración de
-            # CONSENSUS edges. Fuerza al sistema a esperar momentum NUEVO.
-            # NOTA: El dead-edge cooldown en check_expiration() sobreescribe
-            # a 2min para ese caso específico (comportamiento intencional).
+            # Solo aplicar cooldown si la tendencia NO está confirmada.
+            # Si trend_confirmed=True, saltar TODOS los cooldowns de dirección
+            # para permitir re-armar inmediatamente en la misma dirección.
             # =====================================================================
-            if (hasattr(self._current_bos, 'trend_path') and 
-                self._current_bos.trend_path == TrendEdgePath.CONSENSUS_DIRECT):
-                cooldown_minutes = 5
-                cooldown_until = datetime.now(UTC) + timedelta(minutes=cooldown_minutes)
-                self._direction_cooldown[direction] = cooldown_until
-                logger.warning(
-                    f"🔥 FIX #248: CONSENSUS {direction} cooldown {cooldown_minutes}min | "
-                    f"Reason: {reason} | Wait for fresh momentum before re-arm"
+            if not trend_confirmed:
+                if (hasattr(self._current_bos, 'trend_path') and 
+                    self._current_bos.trend_path == TrendEdgePath.CONSENSUS_DIRECT):
+                    cooldown_minutes = 5
+                    cooldown_until = datetime.now(UTC) + timedelta(minutes=cooldown_minutes)
+                    self._direction_cooldown[direction] = cooldown_until
+                    logger.warning(
+                        f"🔥 FIX #248: CONSENSUS {direction} cooldown {cooldown_minutes}min | "
+                        f"Reason: {reason} | Wait for fresh momentum before re-arm"
+                    )
+                elif is_dead_edge and direction != "-":
+                    # DEAD_EDGE no-CONSENSUS: cooldown corto de 2min
+                    cooldown_minutes = 2
+                    cooldown_until = datetime.now(UTC) + timedelta(minutes=cooldown_minutes)
+                    self._direction_cooldown[direction] = cooldown_until
+                    logger.warning(
+                        f"🔥 FIX #194c: DEAD_EDGE cooldown {cooldown_minutes}min for {direction} | "
+                        f"Wait for fresh momentum before new edge"
+                    )
+            else:
+                logger.info(
+                    f"🔥 FIX #273: Skipping ALL direction cooldowns | {direction} trend confirmed"
                 )
             
             # COOLDOWN POR CONTEXTO: bloquear edges relacionados
@@ -3057,6 +3158,30 @@ class EdgeStateManager:
         
         bos = self._current_bos
         bos.record_trade(won, r_captured)
+        
+        # =====================================================================
+        # 🔥 FIX #285: RECORD LOSS ZONE MEMORY
+        # After a loss, remember this price zone + direction so we don't
+        # re-enter the same losing setup within 30 minutes.
+        # =====================================================================
+        if not won and bos.price > 0 and bos.atr_at_bos > 0:
+            # Clean expired entries first
+            now = datetime.now(UTC)
+            self._loss_zone_memory = [
+                z for z in self._loss_zone_memory if z['expires'] > now
+            ]
+            self._loss_zone_memory.append({
+                'direction': bos.direction,
+                'price': bos.price,
+                'atr': bos.atr_at_bos,
+                'expires': now + timedelta(minutes=self.LOSS_ZONE_MEMORY_MINUTES)
+            })
+            logger.warning(
+                f"🔥 FIX #285: LOSS ZONE RECORDED | {bos.direction} @ ${bos.price:.0f} ± "
+                f"${bos.atr_at_bos * self.LOSS_ZONE_RADIUS_ATR:.0f} | "
+                f"Blocked for {self.LOSS_ZONE_MEMORY_MINUTES}min | "
+                f"Active zones: {len(self._loss_zone_memory)}"
+            )
         
         # Stats globales
         self._stats.total_trades += 1

@@ -59,7 +59,7 @@ class RegimeScoreResult:
     
     def to_tags(self) -> Dict[str, Any]:
         """Convert to trade tags dict."""
-        return {
+        tags = {
             'regime_score': round(self.score, 3),
             'trading_mode': self.trading_mode,
             'regime_adx_component': round(self.adx_normalized, 3),
@@ -69,7 +69,8 @@ class RegimeScoreResult:
             'trend_phase': self.trend_phase_str,
         }
         if self.displacement_bonus > 0:
-            return {'regime_displacement_bonus': self.displacement_bonus}
+            tags['regime_displacement_bonus'] = self.displacement_bonus
+        return tags
 
 
 def calculate_regime_score(
@@ -115,18 +116,24 @@ def calculate_regime_score(
                     W_VOLATILITY * vol_normalized)
     
     # === DISPLACEMENT BONUS ===
+    # El bonus se registra para sizing/confidence pero NO afecta la determinación
+    # del modo (RANGE/TRANSITION/TREND). Antes, +0.25 podía empujar RANGE (0.30)
+    # a TRANSITION (0.55), anulando las guards de range floor/ceiling.
     displacement_bonus = 0.0
     if has_displacement:
         displacement_bonus = 0.25
-        regime_score = min(1.0, regime_score + displacement_bonus)
     
-    # === DETERMINE MODE FROM SCORE ===
+    # === DETERMINE MODE FROM SCORE (sin displacement bonus) ===
     if regime_score < REGIME.RANGE_MAX:
         trading_mode = 'RANGE'
     elif regime_score < REGIME.TRANSITION_MAX:
         trading_mode = 'TRANSITION'
     else:
         trading_mode = 'TREND'
+    
+    # Aplicar bonus DESPUÉS de determinar el modo, solo para scoring
+    if displacement_bonus > 0:
+        regime_score = min(1.0, regime_score + displacement_bonus)
     
     # === ADX SUGGESTED MODE (legacy comparison) ===
     if effective_adx < ADX.RANGE_MAX:

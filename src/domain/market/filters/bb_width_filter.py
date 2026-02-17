@@ -65,6 +65,9 @@ class BBWidthFilter(BaseFilter):
     # PHASE A: Informative mode penalty (softer than block)
     INFORMATIVE_MODE_PENALTY = -0.5  # Soft penalty when informative only
     
+    # Log throttle interval (seconds) — avoid 854-line spam per run
+    LOG_THROTTLE_INTERVAL = 60.0
+    
     def __init__(self, 
                  enabled: bool = True,
                  extreme_threshold: float | None = None,
@@ -80,6 +83,7 @@ class BBWidthFilter(BaseFilter):
         """
         super().__init__(enabled)
         self.range_informative_mode = range_informative_mode
+        self._last_bb_block_log_time: float = 0.0
         if extreme_threshold:
             self.BB_EXTREME_COMPRESSION = extreme_threshold
         if range_threshold:
@@ -226,7 +230,11 @@ class BBWidthFilter(BaseFilter):
             # NOW: < 0.5% BB width = HARD BLOCK (no exceptions)
             # This trade lost -0.44R because it entered in 0.45% compression
             if self.EXTREME_COMPRESSION_BLOCK:
-                logger.warning(f"⛔ BB WIDTH BLOCK: {bb_width*100:.2f}% (extreme compression < {self.BB_EXTREME_COMPRESSION*100}%)")
+                import time as _time_mod
+                _now = _time_mod.time()
+                if _now - self._last_bb_block_log_time >= self.LOG_THROTTLE_INTERVAL:
+                    self._last_bb_block_log_time = _now
+                    logger.warning(f"⛔ BB WIDTH BLOCK: {bb_width*100:.2f}% (extreme compression < {self.BB_EXTREME_COMPRESSION*100}%)")
                 return FilterDecision(
                     allow=False,
                     regime="NO_TRADE",

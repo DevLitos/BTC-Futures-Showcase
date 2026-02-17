@@ -81,7 +81,7 @@ async def handle_partial_close(
             exit_type = "EXCHANGE_TP_SL"
             
             if position and position.entry_price > 0:
-                initial_risk = abs(position.entry_price - engine.risk_engine.initial_stop_loss)
+                initial_risk = abs(position.entry_price - position.initial_stop_loss)
                 if position.direction == 'LONG':
                     pnl_estimate = (exit_price - position.entry_price) * position.size
                     exit_type = 'EXCHANGE_TAKE_PROFIT' if exit_price > position.entry_price else 'EXCHANGE_STOP_LOSS'
@@ -167,26 +167,31 @@ async def handle_partial_close(
                         })
                 
                 # =============================================================
-                # 🔒 FIX #266: POST-PARTIAL SL PROTECTION
+                # 🔒 FIX #266/282: POST-PARTIAL SL PROTECTION
                 #
                 # ROOT CAUSE: After 30% partial at +0.3R, the remaining 70%
                 # has NO protection (R-LOCK requires 0.5R MFE, TIME_LOCK too).
                 # Trades with MFE 0.30-0.49R devuelven TODA la ganancia.
-                # Log evidence: Trade 2 (+0.40R MFE → -0.40R), Trade 4 (+0.48R → -1.0R)
                 #
-                # FIX: After first partial, move SL to limit worst-case to -0.30R.
-                # Net trade outcome: +0.09R (partial) - 0.21R (70% * -0.30R) = -0.12R
-                # vs anterior: +0.09R - 0.70R (70% * -1.0R) = -0.61R
+                # 🔥 FIX #282 (Feb 17, 2026): Tighten from -0.30R to -0.10R
+                # LOG EVIDENCE: Trade 2 had MFE=0.49R, partial at 0.33R, but 
+                # post-partial SL at -0.30R let price retrace entire move.
+                # Net result: -$0.34 despite having been +$1.45 at peak.
+                # 
+                # With -0.10R post-partial SL:
+                # - Partial captures: +0.33R * 30% = +0.10R
+                # - Worst case remaining: -0.10R * 70% = -0.07R
+                # - Net worst: +0.03R (breakeven) instead of -0.31R
                 # =============================================================
-                post_partial_max_loss_r = -0.30
-                initial_risk = abs(position.entry_price - engine.risk_engine.initial_stop_loss)
+                post_partial_max_loss_r = -0.10
+                initial_risk = abs(position.entry_price - position.initial_stop_loss)
                 if initial_risk > 0:
                     if position.direction == 'LONG':
                         new_sl = position.entry_price + (initial_risk * post_partial_max_loss_r)
-                        current_sl = engine.risk_engine.get_current_stop_loss()
+                        current_sl = position.current_stop_loss
                         if current_sl and new_sl > current_sl:
-                            engine.risk_engine.trailing_stop = new_sl
-                            engine.risk_engine.stop_loss = new_sl
+                            position.trailing_stop = new_sl
+                            position.stop_loss = new_sl
                             logger.warning(
                                 f"🔒 FIX #266: POST-PARTIAL SL PROTECTION | "
                                 f"SL moved: {current_sl:.2f} → {new_sl:.2f} | "
@@ -194,10 +199,10 @@ async def handle_partial_close(
                             )
                     else:  # SHORT
                         new_sl = position.entry_price - (initial_risk * post_partial_max_loss_r)
-                        current_sl = engine.risk_engine.get_current_stop_loss()
+                        current_sl = position.current_stop_loss
                         if current_sl and new_sl < current_sl:
-                            engine.risk_engine.trailing_stop = new_sl
-                            engine.risk_engine.stop_loss = new_sl
+                            position.trailing_stop = new_sl
+                            position.stop_loss = new_sl
                             logger.warning(
                                 f"🔒 FIX #266: POST-PARTIAL SL PROTECTION | "
                                 f"SL moved: {current_sl:.2f} → {new_sl:.2f} | "

@@ -208,14 +208,15 @@ class GuardOrchestrator:
             return result
         
         # =====================================================================
-        # GUARD 4: MACRO COHERENCE — HARD BLOCK (veto absoluto)
-        # Si macro=BEAR_STRONG y bias=LONG → no entrar. Igual al revés.
-        # Esto captura el caso donde el edge se armó antes de que macro
-        # se estabilizara (ej: durante warmup).
+        # GUARD 4: MACRO COHERENCE — Only block EXTREME macro mismatch
+        # Only BEAR_STRONG / BULL_STRONG are vetoed (not BEAR / BULL).
+        # Momentum override (displacement/expansion) bypasses this guard
+        # because price action has proven the macro is breaking.
         # =====================================================================
         macro_strength = getattr(engine, '_current_bias_strength', None)
         macro_str = macro_strength.value if macro_strength else None
-        if macro_str:
+        has_momentum = getattr(engine, 'has_momentum_override', False)
+        if macro_str and not has_momentum:
             is_macro_incoherent = (
                 (macro_str == 'BEAR_STRONG' and ctx.bias == 'LONG') or
                 (macro_str == 'BULL_STRONG' and ctx.bias == 'SHORT')

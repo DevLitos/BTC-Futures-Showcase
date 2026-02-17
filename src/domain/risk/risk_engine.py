@@ -704,11 +704,15 @@ class Position:
             
             if self.direction == 'LONG':
                 if new_hybrid_stop > self.trailing_stop:
-                    logger.info(f"🎯 HYBRID TRAIL: {self.trailing_stop:.2f} → {new_hybrid_stop:.2f} ({state.stop_source}, tier={state.r_lock_tier})")
+                    move = new_hybrid_stop - self.trailing_stop
+                    if move > 10:  # Only log significant moves (>$10)
+                        logger.info(f"🎯 HYBRID TRAIL: {self.trailing_stop:.2f} → {new_hybrid_stop:.2f} ({state.stop_source}, tier={state.r_lock_tier})")
                     self.trailing_stop = new_hybrid_stop
             else:
                 if new_hybrid_stop < self.trailing_stop:
-                    logger.info(f"🎯 HYBRID TRAIL: {self.trailing_stop:.2f} → {new_hybrid_stop:.2f} ({state.stop_source}, tier={state.r_lock_tier})")
+                    move = self.trailing_stop - new_hybrid_stop
+                    if move > 10:  # Only log significant moves (>$10)
+                        logger.info(f"🎯 HYBRID TRAIL: {self.trailing_stop:.2f} → {new_hybrid_stop:.2f} ({state.stop_source}, tier={state.r_lock_tier})")
                     self.trailing_stop = new_hybrid_stop
             
             return  # Hybrid trailing handled everything
