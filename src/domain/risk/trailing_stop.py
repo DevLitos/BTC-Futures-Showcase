@@ -103,51 +103,31 @@ class HybridATRTrailing:
     - min(r_locked_stop, atr_trail_stop) for SHORT
     """
     
-    # R-Lock thresholds
-    # 🔥 FIX (Feb 6, 2026): R-LOCK TIERS POR RÉGIMEN
-    # 
-    # PROBLEMA: Trade llegó a +0.36R MFE pero trailing sacó en -0.20R
-    # porque tier 1 (MFE 0.3 → lock -0.20R) se activó y un pullback
-    # normal de 0.36R → 0.16R tocó el stop.
-    #
-    # SOLUCIÓN: TIERS DIFERENCIADOS POR RÉGIMEN
-    # - TREND: Pullbacks de 0.4-0.6R son normales, locks más holgados
-    # - RANGE/SCALP: Necesita protección temprana, locks más ajustados
-    #
-    # 🔥 FIX #243 (Feb 16, 2026): RANGE tiers REFACTORED
-    # 
-    # PROBLEMA: Tiers (0.2, -0.25) y (0.3, -0.20) mataban winners.
-    # Un trade que toca +0.2R MFE y pullback normal de 0.45R (frecuente en BTC)
-    # activaba el trailing y cerraba a -0.25R. Datos: MFE 0.60R → exit 0.05R.
-    #
-    # SOLUCIÓN: Eliminar tiers < 0.5R MFE. BTC necesita room para pullbacks
-    # de 0.3-0.5R que son normales incluso en RANGE. Start trailing at 0.5R.
-    # 
-    # Antes: 9 tiers empezando en 0.2R
-    # Ahora: 7 tiers empezando en 0.5R (matching TREND philosophy)
+    # R-Lock tiers by regime
+    # TREND: More lenient (pullbacks of 0.3-0.5R are normal in BTC)
+    # RANGE: Tighter protection (RANGE oscillation rarely exceeds 0.5R)
+    # Both start at 0.3R MFE to prevent trades from reversing all gains.
     R_LOCK_TIERS_RANGE = [
-        (0.5, -0.20, 0),  # +0.5R MFE → max loss -0.20R (was -0.10R at 0.5)
-        (0.8, -0.05, 1),  # +0.8R → near breakeven
-        (1.0, 0.10, 2),   # +1.0R → lock small profit
-        (1.2, 0.30, 3),   # +1.2R → lock 0.30R
-        (1.5, 0.60, 4),   # +1.5R → lock 0.60R
-        (1.8, 0.90, 5),   # +1.8R → lock 0.90R
-        (2.2, 1.30, 6),   # +2.2R → lock 1.30R
+        (0.3, -0.10, 0),  # +0.3R MFE → max loss -0.10R (protects sub-0.5R reversal)
+        (0.5, -0.05, 1),  # +0.5R MFE → near breakeven
+        (0.8,  0.05, 2),  # +0.8R → small profit locked
+        (1.0,  0.20, 3),  # +1.0R → lock 0.20R
+        (1.2,  0.40, 4),  # +1.2R → lock 0.40R
+        (1.5,  0.70, 5),  # +1.5R → lock 0.70R
+        (1.8,  1.00, 6),  # +1.8R → lock 1.00R
+        (2.2,  1.40, 7),  # +2.2R → lock 1.40R
     ]
     
-    # 🔥 FIX #139 (Feb 10, 2026): TREND tiers mejorados
-    # - Añadido nivel 1.8R → +1.2R (cierra gap 1.5-2.2)
-    # - 1.0R ahora lock +0.2R (no esperar hasta 1.2R)
-    # - Gaps reducidos a max 0.3R
     R_LOCK_TIERS_TREND = [
-        (0.5, -0.40, 0),  # Solo proteger de full loss en +0.5R MFE
-        (0.8, -0.20, 1),  # +0.8R → max loss -0.20R 
-        (1.0, 0.20, 2),   # 🔥 FIX #139: Lock +0.2R at 1.0R (was BE)
-        (1.2, 0.50, 3),   # 🔥 FIX #139: Lock +0.5R at 1.2R (was +0.4R at 1.3R)
-        (1.5, 0.90, 4),   # Lock +0.9R at 1.5R MFE
-        (1.8, 1.20, 5),   # 🔥 FIX #139: NEW - Lock +1.2R at 1.8R MFE
-        (2.2, 1.60, 6),   # Lock +1.6R at 2.2R MFE
-        (3.0, 2.20, 7),   # Lock +2.2R at 3.0R MFE (runners)
+        (0.3, -0.20, 0),  # +0.3R MFE → max loss -0.20R (protects sub-0.5R reversal)
+        (0.5, -0.10, 1),  # +0.5R → max loss -0.10R
+        (0.8,  0.05, 2),  # +0.8R → small profit locked
+        (1.0,  0.20, 3),  # +1.0R → lock 0.20R
+        (1.2,  0.50, 4),  # +1.2R → lock 0.50R
+        (1.5,  0.90, 5),  # +1.5R → lock 0.90R
+        (1.8,  1.20, 6),  # +1.8R → lock 1.20R
+        (2.2,  1.60, 7),  # +2.2R → lock 1.60R
+        (3.0,  2.20, 8),  # +3.0R → lock 2.20R (runners)
     ]
     
     # Fallback (usado si régimen no está definido)

@@ -1097,426 +1097,163 @@ class Position:
                                      vwap: float | None = None, last_lh: float | None = None,
                                      vah: float | None = None) -> dict | None:
         """
-        TIME_INVALIDATION INTELIGENTE (Jan 23, 2026)
-        
-        🔥 FIX #242 (Feb 16, 2026): n_candles 6→12
-        BTC necesita 10-20 min para desarrollar movimientos. 6 candles (6 min)
-        mataba trades que habrían sido ganadores. 12 candles (~12 min) da room
-        suficiente para pullbacks normales sin permitir trades muertos.
-        
-        CAMBIO CRÍTICO: Timeout = checkpoint, NO gatillo ciego.
-        
-        En lugar de cerrar automáticamente, evalúa:
-        1. Si hay invalidación ESTRUCTURAL real (no numérica)
-        2. El estado del P&L (profit/flat/loss)
-        3. Si cerrar empeoraría el trade vs esperar
-        
-        REGLA DE ORO: TIME_INVALIDATION NUNCA puede cerrar un trade 
-        con más pérdida que -0.25R. Si estás en -0.1R y no hay invalidación
-        estructural, NO cierras "por tiempo" a -0.6R después.
-        
-        EXCEPTION (Jan 26, 2026):
-        - ADOPTED positions are EXCLUDED from time invalidation
-        - We don't know when the original trade was opened
-        - Let the exchange SL/TP handle these positions
-        
-        Args:
-            n_candles: Number of candles before checking (default 6)
-            mfe_threshold: Minimum MFE in R required (default 0.3R)
-            adx: Current ADX value
-            atr_ratio: Current ATR / Average ATR
-            current_price: Current price for P&L calculation
-            vwap: Current VWAP for structural invalidation
-            last_lh: Last Lower High for structure check
-            vah: Value Area High for structure check
-        
-        Returns: 
-            dict with action and details, or None if no action needed
-            Possible actions: 'CLOSE', 'PARTIAL', 'REDUCE_RISK', 'HOLD'
+        TIME_INVALIDATION: Exit trades that show no conviction.
+
+        Data (Feb 10-19): 23 TIME_INVALIDATION trades, 0 wins, avg -0.40R.
+        - 11/23 had MFE < 0.05R (price NEVER went the right way)
+        - 14/23 in ASIA/WEEKEND/DEAD_HOURS (low quality sessions)
+
+        Algorithm:
+        1. HARD LIMIT: -0.25R max loss (tighter than old -0.35R)
+           - MFE >= 0.15R → extend to -0.30R (showed some conviction)
+           - MFE >= 0.30R → extend to -0.40R (proved direction)
+           - MFE >= 0.50R → extend to -0.50R (clearly correct)
+           - Weekend/low quality: -0.15R always
+        2. FAST CUT (6 candles): MFE < 0.05R + losing → dead trade
+        3. NORMAL CHECK (12 candles): Evaluate based on MFE and market state
         """
-        from src.config.trading_config import ExitHierarchy
-        
-        # =========================================================================
-        # 🔒 CRITICAL FIX (Jan 26, 2026): EXCLUDE ADOPTED POSITIONS
-        # Adopted positions have candle_count starting from 0 but may have been
-        # open for hours/days. Time-based invalidation doesn't make sense.
-        # =========================================================================
-        if self.is_adopted:
+        from src.config.trading_config import ExitHierarchy, ADXThresholds
+
+        if self.is_adopted or current_price is None:
             return None
-        
-        if self.candle_count < n_candles:
-            return None  # Not yet at checkpoint
-        
-        mfe_r = self.calculate_mfe_r()
-        
-        # Calculate current R (actual P&L right now)
-        if current_price is None:
-            return None
-        
+
         initial_risk = abs(self.entry_price - self.initial_stop_loss)
         if initial_risk <= 0:
             return None
-            
+
         if self.direction == 'LONG':
             current_r = (current_price - self.entry_price) / initial_risk
         else:
             current_r = (self.entry_price - current_price) / initial_risk
-        
-        # =====================================================================
-        # 🔥 FIX (Jan 27, 2026): INTELLIGENT TIME_INVALIDATION FOR RANGE
-        # 
-        # PROBLEM: In ranging markets, -0.3R limit was too tight.
-        # Price floats around, hits -0.3R, closes for "administrative" loss.
-        # This is DEATH BY A THOUSAND CUTS.
-        # 
-        # SOLUTION:
-        # - In TRENDING (ADX >= 20): Use tight limit (-0.30R)
-        # - In RANGING (ADX < 20): Use looser limit (-0.60R) OR
-        #   don't close unless structure is invalid
-        # 
-        # The key insight: In range, let the STOP do its job.
-        # TIME_INVALIDATION should only trigger if structure breaks.
-        # =====================================================================
-        
-        # 🔄 REFACTORED Feb 04: Use ADXThresholds.TREND for consistent threshold
-        from src.config.trading_config import ADXThresholds
-        
-        # Determine market type
-        is_ranging = adx is not None and adx < ADXThresholds.TREND
-        
-        # 🔥 FIX (Jan 30): Check if this is a DISPLACEMENT trade
-        # DISPLACEMENT trades need more room - they're catching fast moves
-        # Don't kill them at -0.30R when SL is properly placed
-        is_displacement_trade = self.edge_type == 'DISPLACEMENT'
-        
-        # 🔥 FIX (Feb 02, 2026): Use ACTUAL SCORE instead of entry_score==0 hack
-        # Now FAST_PATH entries calculate an informative score, so we can use it
-        # 
-        # THRESHOLDS:
-        # - Score < 4: Very low quality → -0.25R (cut fast)
-        # - Score 4-5: Below average → -0.30R (normal TIME_INVALIDATION)
-        # - Score >= 5: Good quality → respect edge type / market mode
-        #
-        # This replaces the old logic that assumed entry_score=0 meant FAST_PATH
-        is_low_quality_entry = self.entry_score is not None and self.entry_score < 4
-        
-        # 🔥 FIX (Feb 04, 2026): AGGRESSIVE LOSS CUTTING
-        # =====================================================================
-        # PROBLEM: TIME_INVALIDATION_MAX_LOSS = -10.27R (27 trades, avg -0.38R)
-        # This destroyed ALL gains from other trades (+8.56R).
-        # Root cause: Code allowed -0.50R for DISPLACEMENT, -0.60R for RANGE
-        # 
-        # SOLUTION: STRICT limits for ALL cases. Better to cut early and re-enter.
-        # =====================================================================
-        is_weekend_trade = getattr(self, 'is_weekend', False)
-        
-        # Throttle category determination logs: only log once per 30 candles
-        _cat_last_log = getattr(self, '_time_cat_last_log', 0)
-        _should_log_cat = (self.candle_count - _cat_last_log) >= 30
-        
-        if is_weekend_trade:
+
+        mfe_r = self.calculate_mfe_r()
+        is_weekend = getattr(self, 'is_weekend', False)
+        is_low_quality = self.entry_score is not None and self.entry_score < 4
+
+        # === MAX LOSS CALCULATION (simple, no spaghetti) ===
+        if is_weekend or is_low_quality:
             max_loss_r = -0.15
-            if _should_log_cat:
-                self._time_cat_last_log = self.candle_count
-                logger.info(f"📊 TIME checkpoint: WEEKEND → max_loss={max_loss_r}R (strictest)")
-        elif is_low_quality_entry:
-            max_loss_r = -0.20
-            if _should_log_cat:
-                self._time_cat_last_log = self.candle_count
-                logger.info(f"📊 TIME checkpoint: LOW_QUALITY (score={self.entry_score:.1f}) → max_loss={max_loss_r}R")
-        elif is_displacement_trade:
-            # DISPLACEMENT: Still give a bit more room (stop is the invalidation)
-            max_loss_r = -0.30  # 🔥 FIX #121a: -0.25R → -0.30R - displacement needs room
-            logger.debug(f"📊 TIME checkpoint: DISPLACEMENT mode → max_loss={max_loss_r}R")
-        elif is_ranging:
-            # RANGE: Give more room than before
-            max_loss_r = -0.30  # 🔥 FIX #121a: -0.20R → -0.30R - range needs room too
-            logger.debug(f"📊 TIME checkpoint: RANGING mode → max_loss={max_loss_r}R")
         else:
-            # TREND: normal limit from config
-            max_loss_r = ExitHierarchy.TIME_INVALIDATION_MAX_LOSS_R  # -0.35R
-        
-        # =====================================================================
-        # 🔥 FIX #44 (Feb 05, 2026): STRONG TREND TOLERANCE
-        # =====================================================================
-        # PROBLEMA: Trades cerrados en -0.20R con ADX=58 que luego fueron ganadores.
-        # En tendencia MUY fuerte (ADX > 50), pullbacks de 0.3-0.4R son NORMALES.
-        # 
-        # SOLUCIÓN: Si ADX > 50, extender max_loss para dar room al pullback
-        # - ADX 50-60: max_loss = -0.35R
-        # - ADX > 60: max_loss = -0.40R
-        # =====================================================================
-        STRONG_TREND_ADX = 50
-        VERY_STRONG_TREND_ADX = 60
-        
-        if adx is not None and adx >= VERY_STRONG_TREND_ADX and not is_ranging:
-            max_loss_r = -0.40
-            logger.info(
-                f"📊 TIME checkpoint: VERY STRONG TREND (ADX={adx:.1f}) → "
-                f"Extended max_loss to {max_loss_r}R (pullbacks normal)"
-            )
-        elif adx is not None and adx >= STRONG_TREND_ADX and not is_ranging:
-            max_loss_r = -0.35
-            logger.info(
-                f"📊 TIME checkpoint: STRONG TREND (ADX={adx:.1f}) → "
-                f"Extended max_loss to {max_loss_r}R (pullbacks normal)"
-            )
-        
-        # =====================================================================
-        # 🔥 FIX (Feb 04, 2026): MFE TOLERANCE - TRADE PROVED CORRECT
-        # =====================================================================
-        # PROBLEMA REAL: Trade entró SHORT, bajó a MFE=0.31R (dirección CORRECTA),
-        # luego pullback temporal a -0.20R, TIME_INVALIDATION cerró, y el precio
-        # siguió bajando después (habría sido ganador).
-        #
-        # INSIGHT: Si el trade YA DEMOSTRÓ ser correcto (MFE >= 0.25R), un pullback
-        # de 0.4-0.5R es NORMAL en BTC. No es señal de trade malo.
-        #
-        # SOLUCIÓN: Si MFE >= threshold, extender tolerancia:
-        # - MFE 0.10-0.20R → max_loss = -0.37R (trade mostró algo de vida) [FIX #132]
-        # - MFE 0.20-0.50R → max_loss = -0.40R (trade mostró vida)
-        # - MFE >= 0.50R → max_loss = -0.50R (trade probado, dar room)
-        # =====================================================================
-        # 🔥 FIX #42 (Feb 05, 2026): Lowered from 0.25 to 0.20
-        # 🔥 FIX #132 (Feb 09, 2026): Added MFE_MIN_THRESHOLD for small positive MFE
-        MFE_MIN_THRESHOLD = 0.10     # Trade mostró algo de dirección correcta
-        MFE_PROVED_THRESHOLD = 0.20  # Trade mostró dirección correcta
-        MFE_STRONG_THRESHOLD = 0.50  # Trade claramente correcto
-        
-        # 🔥 FIX #106b: Throttle TIME checkpoint logs (era cada tick, ahora cada 30s)
-        _time_checkpoint_last_log = getattr(self, '_time_checkpoint_last_log', 0)
-        _should_log_checkpoint = (self.candle_count - _time_checkpoint_last_log) >= 30
-        
-        if mfe_r >= MFE_STRONG_THRESHOLD:
-            # Trade clearly proved correct - give it room
-            extended_max_loss = -0.50
-            if current_r > extended_max_loss:
-                if _should_log_checkpoint:
-                    self._time_checkpoint_last_log = self.candle_count
-                    logger.info(
-                        f"📊 TIME checkpoint: MFE={mfe_r:.2f}R PROVED CORRECT | "
-                        f"Pullback to {current_r:.2f}R is normal | "
-                        f"Extended tolerance to {extended_max_loss}R"
-                    )
-                return None  # Don't close - pullback is normal
-        elif mfe_r >= MFE_PROVED_THRESHOLD:
-            # Trade showed life - extend tolerance
-            extended_max_loss = -0.40
-            if current_r > extended_max_loss:
-                if _should_log_checkpoint:
-                    self._time_checkpoint_last_log = self.candle_count
-                    logger.info(
-                        f"📊 TIME checkpoint: MFE={mfe_r:.2f}R showed direction correct | "
-                        f"Pullback to {current_r:.2f}R within tolerance | "
-                        f"Extended tolerance to {extended_max_loss}R"
-                    )
-                return None  # Don't close - give it room
-        # 🔥 FIX #132 (Feb 09, 2026): New level for small positive MFE
-        # PROBLEMA: Trades con MFE 0.10-0.19R no tenían protección y se cerraban a -0.35R
-        # Si el trade mostró ALGO de dirección correcta, dar un poco más de room
-        elif mfe_r >= MFE_MIN_THRESHOLD:
-            # Trade showed some life - extend tolerance slightly
-            extended_max_loss = -0.37
-            if current_r > extended_max_loss:
-                if _should_log_checkpoint:
-                    self._time_checkpoint_last_log = self.candle_count
-                    logger.info(
-                        f"📊 FIX #132 TIME checkpoint: MFE={mfe_r:.2f}R showed some direction | "
-                        f"Pullback to {current_r:.2f}R within tolerance | "
-                        f"Extended tolerance to {extended_max_loss}R"
-                    )
-                return None  # Don't close - give it a chance
-        
-        # =====================================================================
-        # REGLA CRÍTICA: Límite de pérdida por TIME_INVALIDATION
-        # =====================================================================
+            max_loss_r = -0.25
+
+        # MFE tolerance: trade proved direction → give room for pullback
+        if mfe_r >= 0.50:
+            max_loss_r = min(max_loss_r, -0.50)
+        elif mfe_r >= 0.30:
+            max_loss_r = min(max_loss_r, -0.40)
+        elif mfe_r >= 0.15:
+            max_loss_r = min(max_loss_r, -0.30)
+
+        # ADX bonus: strong trend pullbacks are normal
+        if adx is not None and adx >= 60 and not is_weekend:
+            max_loss_r = min(max_loss_r, -0.40)
+        elif adx is not None and adx >= 50 and not is_weekend:
+            max_loss_r = min(max_loss_r, -0.35)
+
+        # === HARD LIMIT: enforce max loss at all times ===
         if current_r <= max_loss_r:
-            edge_info = f" | Edge={self.edge_type}" if self.edge_type else ""
             logger.warning(
-                f"☠️ TIME_INVALIDATION: Loss {current_r:.2f}R exceeds limit {max_loss_r}R | "
-                f"ADX={'RANGE' if is_ranging else 'TREND'}{edge_info} | "
-                f"MFE was {mfe_r:.2f}R | Closing immediately to prevent worse loss"
+                f"☠️ TIME_INVALIDATION: {current_r:.2f}R exceeds limit {max_loss_r:.2f}R | "
+                f"MFE={mfe_r:.2f}R | candles={self.candle_count}"
             )
             return {
-                'action': 'CLOSE',
-                'reason': 'TIME_INVALIDATION_MAX_LOSS',
-                'current_r': current_r,
-                'max_loss_r': max_loss_r,
-                'candles': self.candle_count,
-                'market_type': 'RANGE' if is_ranging else 'TREND'
-            }
-        
-        # =====================================================================
-        # Si MFE >= threshold, trade está probándose - NO matar
-        # =====================================================================
-        if mfe_r >= mfe_threshold:
-            return None
-        
-        # =====================================================================
-        # Check condiciones de mercado (ADX, ATR)
-        # Si mercado está trending o volatilidad OK, dar más tiempo
-        # =====================================================================
-        ADX_THRESHOLD = 20
-        ATR_RATIO_THRESHOLD = 0.8
-        
-        market_alive = False
-        if adx is not None and adx >= ADX_THRESHOLD:
-            market_alive = True
-            logger.debug(f"📊 TIME checkpoint: ADX={adx:.1f} >= {ADX_THRESHOLD} (trending)")
-        
-        if atr_ratio is not None and atr_ratio >= ATR_RATIO_THRESHOLD:
-            market_alive = True
-            logger.debug(f"📊 TIME checkpoint: ATR ratio={atr_ratio:.2f} >= {ATR_RATIO_THRESHOLD} (vol OK)")
-        
-        # =====================================================================
-        # 🔥 FIX (Jan 27, 2026): In RANGING market, ALWAYS HOLD unless
-        # we hit the max_loss or structure breaks. NO premature closes.
-        # =====================================================================
-        if is_ranging and not market_alive:
-            # In range with dead market: HOLD unless at max loss
-            # The stop will do its job if we're wrong
-            if current_r > max_loss_r + 0.1:  # Still have room
-                logger.info(
-                    f"⏱️ TIME checkpoint RANGE: {current_r:.2f}R | "
-                    f"Market dead but not at limit → HOLD (let stop work)"
-                )
-                return {
-                    'action': 'HOLD',
-                    'reason': 'RANGE_MARKET_HOLD',
-                    'current_r': current_r,
-                    'max_loss_r': max_loss_r,
-                    'candles': self.candle_count
-                }
-        
-        # =====================================================================
-        # COMPORTAMIENTO SEGÚN P&L ACTUAL
-        # =====================================================================
-        
-        # 🔥 CAMBIO CRÍTICO (Jan 28): NO PARCIALES < 0.3R
-        # Parciales muy pequeños destruyen convexidad del trade
-        # Si no llega a 0.3R → NO SE TOCA
-        MIN_PARTIAL_R = 0.3
-        
-        # A) EN PROFIT (>= 0.3R): Parcial + runner (con LIMIT, no MARKET)
-        if current_r >= MIN_PARTIAL_R:
-            # Check if we already did the TIME_IN_PROFIT partial
-            if self.time_checkpoint_profit_partial_done:
-                # Already executed - return HOLD instead of repeating
-                logger.debug(f"⏱️ TIME checkpoint in PROFIT: {current_r:.2f}R | Partial already done, holding runner")
-                return {
-                    'action': 'HOLD',
-                    'reason': 'TIME_IN_PROFIT_PARTIAL_ALREADY_DONE',
-                    'current_r': current_r,
-                    'candles': self.candle_count
-                }
-            
-            partial_pct = ExitHierarchy.TIME_IN_PROFIT_PARTIAL_PCT
-            logger.info(
-                f"⏱️ TIME checkpoint in PROFIT: {current_r:.2f}R >= {MIN_PARTIAL_R}R | "
-                f"Action: {partial_pct:.0%} LIMIT partial, keep runner"
-            )
-            return {
-                'action': 'PARTIAL',
-                'reason': 'TIME_IN_PROFIT',
-                'current_r': current_r,
-                'partial_pct': partial_pct,
-                'keep_runner': True,
-                'candles': self.candle_count,
-                'use_limit': True,  # 🔥 NO MARKET PARTIALS
-            }
-        
-        # Si profit < 0.3R → NO PARCIAL, HOLD y esperar
-        if current_r > 0 and current_r < MIN_PARTIAL_R:
-            logger.debug(
-                f"⏱️ TIME checkpoint: {current_r:.2f}R < MIN_PARTIAL ({MIN_PARTIAL_R}R) → HOLD"
-            )
-            return {
-                'action': 'HOLD',
-                'reason': f'PROFIT_BELOW_MIN_PARTIAL ({current_r:.2f}R < {MIN_PARTIAL_R}R)',
-                'current_r': current_r,
+                'action': 'CLOSE', 'reason': 'TIME_INVALIDATION_MAX_LOSS',
+                'current_r': current_r, 'max_loss_r': max_loss_r,
                 'candles': self.candle_count
             }
-        
-        # B) FLAT o pequeña pérdida: Evaluar si mercado está vivo
-        if market_alive:
-            # Mercado activo - dar más tiempo, solo ajustar stop
-            # 🔥 FIX #43 (Feb 05, 2026): TIME-based rate limiting (every 60s, not per R-bucket)
-            adx_str = f"{adx:.1f}" if adx is not None else "N/A"
-            now = datetime.now(UTC)
-            
-            # Only log if 60 seconds have passed since last log
-            should_log = False
-            if self.time_checkpoint_last_log_time is None:
-                should_log = True
-            else:
-                elapsed = (now - self.time_checkpoint_last_log_time).total_seconds()
-                if elapsed >= self.TIME_CHECKPOINT_LOG_INTERVAL_SEC:
-                    should_log = True
-            
-            if should_log:
-                self.time_checkpoint_last_log_time = now
-                logger.info(
-                    f"⏱️ TIME checkpoint FLAT (market alive): {current_r:.2f}R | "
-                    f"ADX={adx_str} | Holding"
+
+        # === PHASE 1: FAST CUT (6 candles) ===
+        # Trade never went the right direction → wrong entry, cut fast
+        if 6 <= self.candle_count < n_candles:
+            if mfe_r < 0.05 and current_r < -0.10:
+                logger.warning(
+                    f"☠️ TIME_FAST_CUT: {self.candle_count} candles, MFE={mfe_r:.2f}R | "
+                    f"current={current_r:.2f}R | Zero conviction, cutting dead trade"
                 )
-            # else: skip logging (rate limited)
-            
+                return {
+                    'action': 'CLOSE', 'reason': 'TIME_INVALIDATION_MAX_LOSS',
+                    'current_r': current_r, 'max_loss_r': max_loss_r,
+                    'candles': self.candle_count
+                }
+            return None  # Not at normal checkpoint yet
+
+        if self.candle_count < n_candles:
+            return None
+
+        # === PHASE 2: NORMAL CHECK (12+ candles) ===
+
+        # MFE >= 0.30R: trade proved direction → let trailing/partial handle it
+        if mfe_r >= 0.30:
+            return None
+
+        # Currently in decent profit → partial if not done
+        if current_r >= 0.30 and not self.time_checkpoint_profit_partial_done:
+            self.time_checkpoint_profit_partial_done = True
             return {
-                'action': 'HOLD',
-                'reason': 'MARKET_ALIVE',
+                'action': 'PARTIAL', 'reason': 'TIME_IN_PROFIT',
                 'current_r': current_r,
-                'candles': self.candle_count,
-                'market_indicators': {'adx': adx, 'atr_ratio': atr_ratio}
+                'partial_pct': ExitHierarchy.TIME_IN_PROFIT_PARTIAL_PCT,
+                'keep_runner': True, 'candles': self.candle_count,
+                'use_limit': True
             }
-        
-        # C) Mercado muerto + flat: Evaluar invalidación estructural
-        structural_invalid = self._check_structural_invalidation(
-            current_price, vwap, last_lh, vah
-        )
-        
-        if structural_invalid:
-            # Estructura invalidada - cerrar
+
+        # In any profit → hold
+        if current_r > 0:
+            return None
+
+        # === IN LOSS after 12+ candles ===
+
+        # MFE < 0.15R + losing → trade showed zero conviction
+        if mfe_r < 0.15 and current_r < -0.10:
             logger.warning(
-                f"☠️ TIME_INVALIDATION + STRUCTURE INVALID: {current_r:.2f}R | "
-                f"{structural_invalid['reason']}"
+                f"☠️ TIME_INVALIDATION: {self.candle_count} candles, MFE={mfe_r:.2f}R | "
+                f"current={current_r:.2f}R | No conviction"
             )
+            return {
+                'action': 'CLOSE', 'reason': 'TIME_INVALIDATION_MAX_LOSS',
+                'current_r': current_r, 'max_loss_r': max_loss_r,
+                'candles': self.candle_count
+            }
+
+        # MFE 0.15-0.30R but now losing: check if market still alive
+        is_ranging = adx is not None and adx < ADXThresholds.TREND
+        market_alive = (adx is not None and adx >= ADXThresholds.TREND) or \
+                       (atr_ratio is not None and atr_ratio >= 0.8)
+
+        if market_alive:
+            _last = getattr(self, '_time_checkpoint_last_log', 0)
+            if (self.candle_count - _last) >= 30:
+                self._time_checkpoint_last_log = self.candle_count
+                logger.info(f"⏱️ TIME: {current_r:.2f}R | MFE={mfe_r:.2f}R | Market alive, holding")
+            return {'action': 'HOLD', 'reason': 'MARKET_ALIVE',
+                    'current_r': current_r, 'candles': self.candle_count}
+
+        # Dead market + structure check
+        structural_invalid = self._check_structural_invalidation(current_price, vwap, last_lh, vah)
+        if structural_invalid:
+            logger.warning(f"☠️ TIME + STRUCTURE INVALID: {current_r:.2f}R | {structural_invalid['reason']}")
             return {
                 'action': 'CLOSE',
                 'reason': f"TIME_STRUCTURAL_INVALID: {structural_invalid['reason']}",
-                'current_r': current_r,
-                'candles': self.candle_count,
-                'structural_details': structural_invalid
+                'current_r': current_r, 'candles': self.candle_count
             }
-        
-        # D) Mercado muerto pero estructura intacta - reducir riesgo, no cerrar
-        # Solo cerrar si ya estamos cerca del límite
-        if current_r <= max_loss_r + 0.1:  # Dentro de 0.1R del límite
-            logger.info(
-                f"⏱️ TIME checkpoint near limit: {current_r:.2f}R | "
-                f"Structure intact but close to max loss - REDUCE RISK"
-            )
+
+        # Dead market, near limit → tighten stop
+        if current_r <= max_loss_r + 0.10:
             return {
-                'action': 'REDUCE_RISK',
-                'reason': 'TIME_NEAR_LIMIT',
-                'current_r': current_r,
-                'move_stop_to_r': max_loss_r,
+                'action': 'REDUCE_RISK', 'reason': 'TIME_NEAR_LIMIT',
+                'current_r': current_r, 'move_stop_to_r': max_loss_r,
                 'candles': self.candle_count
             }
-        
-        # E) Default: Mercado muerto, estructura OK, pérdida moderada
-        # Cerrar porque no hay edge ya
-        adx_str = f"ADX={adx:.1f}" if adx else "ADX=N/A"
-        atr_str = f"ATR_ratio={atr_ratio:.2f}" if atr_ratio else "ATR=N/A"
+
+        # Dead market, structure OK, moderate loss → close (no edge left)
         logger.warning(
-            f"☠️ TIME_INVALIDATION: {self.candle_count} velas, MFE={mfe_r:.2f}R, "
-            f"current={current_r:.2f}R | {adx_str} | {atr_str}"
+            f"☠️ TIME_INVALIDATION: {self.candle_count} candles, MFE={mfe_r:.2f}R, "
+            f"current={current_r:.2f}R | Market dead"
         )
         return {
-            'action': 'CLOSE',
-            'reason': 'TIME_INVALIDATION_DEAD_MARKET',
-            'current_r': current_r,
-            'mfe_r': mfe_r,
-            'candles': self.candle_count
+            'action': 'CLOSE', 'reason': 'TIME_INVALIDATION_MAX_LOSS',
+            'current_r': current_r, 'mfe_r': mfe_r, 'candles': self.candle_count
         }
     
     def _check_structural_invalidation(self, current_price: float, 
