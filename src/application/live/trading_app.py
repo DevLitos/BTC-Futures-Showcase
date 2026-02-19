@@ -814,6 +814,7 @@ class SignalEngine:
         self._expansion_direction: str | None = None  # Dirección del expansion (LONG/SHORT)
         self._expansion_start_time: datetime | None = None  # Cuando empezó el expansion
         self._expansion_initial_displacement: float = 0.0  # Magnitud inicial del displacement
+        self._last_trade_exit_time: datetime | None = None  # FIX: Displacement consumed after exit
         # 🌊 BE WATER: Timeout ADAPTATIVO basado en volatilidad
         # 🔥 FIX #19 (Feb 02, 2026): Reducido de 45 a 20 min base
         # El sistema quedaba bloqueado demasiado tiempo cuando el mercado revertía
@@ -1328,6 +1329,10 @@ class SignalEngine:
         
         # 🔥 FEB 11: Reset exhaustion partial flag
         self._exhaustion_partial_taken = False
+        
+        # 🔥 FIX (Feb 19, 2026): Mark displacement as "consumed" for 3 minutes
+        # Prevents re-entry using the SAME displacement that made the previous trade
+        self._last_trade_exit_time = datetime.now()
         
         # 🔥 FIX (Jan 29, 2026 - AUDIT BUG 4): Reset EXPANSION_MODE and DIRECTION_LOCK
         # Prevents state leakage between trades
@@ -3123,6 +3128,19 @@ class SignalEngine:
                     self._expansion_direction = None
                     self._direction_lock = None
                     self._direction_lock_expires_at = None
+                # 🔥 FIX (Feb 19, 2026): DISPLACEMENT CONSUMED CHECK
+                # After a trade exits, the displacement that made it profitable is "consumed".
+                # Don't re-enter using the SAME displacement for 3 minutes.
+                _disp_consumed_short = (
+                    self._last_trade_exit_time and
+                    (datetime.now() - self._last_trade_exit_time).total_seconds() < 180
+                )
+                if _disp_consumed_short and not self._expansion_mode:
+                    if self._idle_eval_count % 60 == 1:
+                        logger.info(
+                            f"⏳ SHORT displacement ${drop_from_high:.0f} consumed by previous trade | "
+                            f"Wait {180 - (datetime.now() - self._last_trade_exit_time).total_seconds():.0f}s"
+                        )
                 elif (not self._expansion_mode or self._expansion_direction != 'SHORT') and not is_stale_displacement:
                     self._expansion_mode = True
                     self._expansion_direction = 'SHORT'
@@ -3334,6 +3352,17 @@ class SignalEngine:
                     self._expansion_direction = None
                     self._direction_lock = None
                     self._direction_lock_expires_at = None
+                # 🔥 FIX (Feb 19, 2026): DISPLACEMENT CONSUMED CHECK
+                _disp_consumed_long = (
+                    self._last_trade_exit_time and
+                    (datetime.now() - self._last_trade_exit_time).total_seconds() < 180
+                )
+                if _disp_consumed_long and not self._expansion_mode:
+                    if self._idle_eval_count % 60 == 1:
+                        logger.info(
+                            f"⏳ LONG displacement ${rise_from_low:.0f} consumed by previous trade | "
+                            f"Wait {180 - (datetime.now() - self._last_trade_exit_time).total_seconds():.0f}s"
+                        )
                 elif (not self._expansion_mode or self._expansion_direction != 'LONG') and not is_stale_displacement_long:
                     self._expansion_mode = True
                     self._expansion_direction = 'LONG'
