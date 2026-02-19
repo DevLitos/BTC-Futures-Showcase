@@ -1462,6 +1462,24 @@ async def _displacement_fast_path(
         return None
 
     # =====================================================================
+    # 🔥 FIX (Feb 19, 2026): DISPLACEMENT CONSUMED GUARD
+    # Block re-entry using the SAME displacement that made the previous trade.
+    # After a trade exits, the rolling extremes still show the old move.
+    # Wait 180s before allowing any new displacement-based entry.
+    # =====================================================================
+    last_exit = getattr(engine, '_last_trade_exit_time', None)
+    if last_exit is not None:
+        from datetime import datetime
+        elapsed = (datetime.now() - last_exit).total_seconds()
+        if elapsed < 180:
+            logger.warning(
+                f"🚫 DISPLACEMENT CONSUMED: Last trade exited {elapsed:.0f}s ago (<180s) | "
+                f"Blocking fast path to prevent recycled displacement entry"
+            )
+            engine._current_trade_tags['displacement_consumed_blocked'] = True
+            return None
+
+    # =====================================================================
     # FAST PATH ACTIVADO - ENTRAR AHORA
     # =====================================================================
     origin_log = current_bos.origin_price or 0
@@ -2061,6 +2079,22 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     # Simple RR floor check — Opción A
     if worst_case_rr < 0.5:
         result.reason = f"RR too low: {worst_case_rr:.2f} < 0.5"
+        return result
+    
+    # 🔥 FIX (Feb 19, 2026): ENFORCE REGIME RR MINIMUM FOR FADES
+    # ROOT CAUSE: RegimeFusion correctly sets rr_min=2.0 for counter-trend
+    # entries, but nobody checked it. Result: LONG entries at the top of
+    # bounces in BEAR macro with 1.2R TP → guaranteed SL hit.
+    # Now: if is_fade AND ideal_rr < rr_min → BLOCK.
+    regime_is_fade = engine._current_trade_tags.get('regime_is_fade', False)
+    regime_rr_min = engine._current_trade_tags.get('regime_rr_min', 1.0)
+    if regime_is_fade and ideal_rr < regime_rr_min:
+        logger.warning(
+            f"🚫 FADE RR BLOCK: ideal_rr={ideal_rr:.2f} < regime_rr_min={regime_rr_min:.1f} | "
+            f"Counter-trend entry needs {regime_rr_min:.1f}R but can only achieve {ideal_rr:.2f}R | "
+            f"macro={engine._current_trade_tags.get('regime_macro', '?')}, micro={bias}"
+        )
+        result.reason = f"FADE RR BLOCK: {ideal_rr:.2f}R < {regime_rr_min:.1f}R minimum for counter-trend"
         return result
     
     # ========== PHASE 7: SIZING ==========

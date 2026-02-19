@@ -3448,13 +3448,14 @@ class RiskEngine:
         Handle early partial close — REGIME-AWARE.
         
         🔥 FIX (Feb 19, 2026): RANGE PARTIAL
-        - RANGE: Close 50% at +0.15R, ALWAYS move SL to BE
+        - RANGE: Close 50% at +0.15R, move SL to +0.05R (slight profit lock)
         - Other: Close 30% at +0.7R/+1.0R, optionally move SL
         
         RATIONALE (RANGE): Range trades oscillate ±0.1-0.2R around
         entry. TP at 1R is structurally unreachable. By closing 50%
-        at +0.15R and moving SL to BE, we guarantee a small profit
-        and free optionality on the remaining 50%.
+        at +0.15R and moving SL to +0.05R, we guarantee profit on
+        both halves: 50% banked + remaining protected with margin
+        for spread/slippage.
         """
         if pos.early_partial_done:
             return None
@@ -3490,13 +3491,21 @@ class RiskEngine:
         pos.size = remaining_size
         pos.early_partial_done = True
         
-        # Move SL to break-even: ALWAYS for RANGE, optionally for others
+        # Move SL: RANGE → +0.05R (slight profit lock), others → exact BE
         old_sl = pos.stop_loss
         if is_range or RiskManagement.EARLY_PARTIAL_MOVE_SL:
-            pos.stop_loss = pos.entry_price
-            pos.trailing_stop = pos.entry_price
+            risk = abs(pos.initial_entry_price - pos.initial_stop_loss)
+            if is_range and risk > 0:
+                # RANGE: SL at +0.05R to survive spread/slippage bounce-back
+                offset = risk * 0.05
+                new_sl = pos.entry_price + offset if pos.direction == 'LONG' else pos.entry_price - offset
+            else:
+                new_sl = pos.entry_price
+            pos.stop_loss = new_sl
+            pos.trailing_stop = new_sl
             pos.be_moved = True
-            logger.info(f"🔒 SL moved to BE after {'RANGE' if is_range else 'early'} partial: {old_sl:.2f} → {pos.entry_price:.2f}")
+            sl_label = f"+0.05R ({new_sl:.2f})" if is_range else f"BE ({new_sl:.2f})"
+            logger.info(f"🔒 SL moved to {sl_label} after {'RANGE' if is_range else 'early'} partial: {old_sl:.2f} → {new_sl:.2f}")
         
         partial_r_label = '0.15R' if is_range else f'+{RiskManagement.EARLY_PARTIAL_R}R'
         logger.info(
