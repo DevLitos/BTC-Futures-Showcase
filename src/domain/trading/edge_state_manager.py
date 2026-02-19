@@ -2959,13 +2959,32 @@ class EdgeStateManager:
         
         bos = self._current_bos
         
-        # RANGE: INVALIDACIÓN BINARIA (sweep level) - no buffer
+        # =====================================================================
+        # 🔥 FIX #297 (Feb 18, 2026): RANGE INVALIDATION CON MICRO-BUFFER
+        #
+        # ANTES: Invalidación binaria SIN buffer — un wobble de $5 mataba el edge.
+        # Run 20260217 (08:38-09:18): "binary: price 67890 < sweep 67918" (diff=$28)
+        # → 5+ edges armados y expirados en 40 min, sistema nunca entró.
+        #
+        # AHORA: Buffer de 0.15×ATR (~$30 para ATR=$200). El precio debe romper
+        # el sweep level por más de $30 para invalidar. Wobbles no matan el edge.
+        #
+        # Justificación: si el sweep level es soporte (LONG) o resistencia (SHORT),
+        # una penetración de <0.15×ATR es ruido, no ruptura estructural.
+        # =====================================================================
         if bos.edge_type == EdgeType.RANGE:
-            if bos.direction == 'LONG' and current_price < bos.bos_level:
-                self._expire_edge(f"binary: price {current_price:.0f} < sweep {bos.bos_level:.0f}")
+            range_buffer = atr * 0.15
+            if bos.direction == 'LONG' and current_price < (bos.bos_level - range_buffer):
+                self._expire_edge(
+                    f"binary: price {current_price:.0f} < sweep {bos.bos_level:.0f} "
+                    f"(buffer ${range_buffer:.0f})"
+                )
                 return True
-            elif bos.direction == 'SHORT' and current_price > bos.bos_level:
-                self._expire_edge(f"binary: price {current_price:.0f} > sweep {bos.bos_level:.0f}")
+            elif bos.direction == 'SHORT' and current_price > (bos.bos_level + range_buffer):
+                self._expire_edge(
+                    f"binary: price {current_price:.0f} > sweep {bos.bos_level:.0f} "
+                    f"(buffer ${range_buffer:.0f})"
+                )
                 return True
             return False
         

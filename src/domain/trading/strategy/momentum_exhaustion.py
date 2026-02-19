@@ -83,8 +83,11 @@ class MomentumExhaustionDetector:
     ATR_CONTRACTION_PCT = 0.8     # ATR < 80% of peak
     VELOCITY_DECAY_PCT = 0.5      # Velocity < 50% of peak
     
-    # Rate-limiting for logging (Fix #8 - Feb 2, 2026)
-    LOG_INTERVAL_SECONDS = 30  # Only log every 30 seconds unless state changes
+    # Rate-limiting for logging (Fix #8 - Feb 2, 2026; Fix #289 - Feb 18, 2026)
+    # 🔥 FIX #289: Increased from 30s → 120s. In Trade 4, the same 3 signals
+    # (vol climax, shooting star, velocity decay) logged every 30s for 6+ minutes.
+    # State changes (level/action/count) still log immediately.
+    LOG_INTERVAL_SECONDS = 120
     
     def __init__(self):
         self._last_state = ExhaustionState()

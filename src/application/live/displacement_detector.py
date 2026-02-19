@@ -69,7 +69,7 @@ class DisplacementDetector:
     """
     
     # Base thresholds (scaled by volatility)
-    BASE_DISPLACEMENT_ATR_MULT: float = 2.8  # ~1.1% of price for typical ATR
+    BASE_DISPLACEMENT_ATR_MULT: float = 1.8  # ~0.7% of price for typical ATR (FIX #278 applied)
     STRONG_DISPLACEMENT_FACTOR: float = 1.5  # 1.5x for strong
     STALE_ATR_MULT: float = 0.5  # Within 0.5 ATR = stale
     RANGE_FLOOR_CEILING_ATR_MULT: float = 1.5  # 1.5 ATR from extreme = at floor/ceiling

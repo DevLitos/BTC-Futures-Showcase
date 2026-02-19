@@ -615,6 +615,44 @@ def check_anticipation_signal(
                 elif anticipation.direction == 'SHORT' and current_price > anticipation.structure_level:
                     structure_invalidated = True
             
+            # =================================================================
+            # 🔥 FIX #302 (Feb 19, 2026): STALE BREAKOUT CHECK
+            #
+            # PROBLEMA: COMPRESSION_BREAKOUT detecta squeeze desde $66,117
+            # pero precio ya está en $66,449 ($332 arriba). El breakout
+            # ya ocurrió, la señal es stale. El bot entra en el TOPE del
+            # bounce y se come el reversal completo (Trade 3: -0.32R).
+            #
+            # SOLUCIÓN: Si el precio ya se movió > 2.5×ATR_5m desde el
+            # structure_level en la dirección del entry, el breakout ya
+            # se agotó. Invalidar la señal.
+            # =================================================================
+            stale_breakout = False
+            if (not structure_invalidated and 
+                anticipation.structure_level > 0 and 
+                anticipation.direction and
+                anticipation.signal == AnticipationSignal.COMPRESSION_BREAKOUT):
+                
+                if anticipation.direction == 'LONG':
+                    distance_from_structure = current_price - anticipation.structure_level
+                else:
+                    distance_from_structure = anticipation.structure_level - current_price
+                
+                atr_5m_for_stale = getattr(engine, '_last_atr_5m', 100.0)
+                STALE_BREAKOUT_ATR_MULT = 2.5
+                
+                if distance_from_structure > STALE_BREAKOUT_ATR_MULT * atr_5m_for_stale:
+                    stale_breakout = True
+                    logger.warning(
+                        f"⛔ FIX #302 STALE BREAKOUT: {anticipation.direction} structure @ "
+                        f"${anticipation.structure_level:.0f} but price ${current_price:.0f} | "
+                        f"Distance ${distance_from_structure:.0f} > "
+                        f"{STALE_BREAKOUT_ATR_MULT:.1f}×ATR_5m (${atr_5m_for_stale * STALE_BREAKOUT_ATR_MULT:.0f}) | "
+                        f"Breakout already played out"
+                    )
+                    anticipation = AnticipationState()
+                    engine._last_anticipation_state = anticipation
+            
             if structure_invalidated:
                 # Structure broken - invalidate anticipation
                 logger.warning(
@@ -623,6 +661,8 @@ def check_anticipation_signal(
                 )
                 anticipation = AnticipationState()  # Reset to empty
                 engine._last_anticipation_state = anticipation
+            elif stale_breakout:
+                pass  # Already handled above
             else:
                 # =====================================================================
                 # 🔥 FIX #107 (Feb 09, 2026): THROTTLE ANTICIPATION LOGS
@@ -853,6 +893,14 @@ async def check_pre_trade_conditions(
             # Log clearly when blocked by kill switch or loss cooldown
             if "KILL SWITCH" in loss_reason:
                 logger.warning(f"[BLOCKED] {loss_reason}")
+            else:
+                # 🔥 FIX #291: Throttle LOSS COOLDOWN log (was spamming every tick)
+                # Only log once per 60s instead of every evaluation
+                _last_loss_cd_log = getattr(engine, '_last_loss_cooldown_log_time', None)
+                _now = datetime.now()
+                if _last_loss_cd_log is None or (_now - _last_loss_cd_log).total_seconds() > 60:
+                    engine._last_loss_cooldown_log_time = _now
+                    logger.info(f"⏸️ {loss_reason}")
             return False, loss_reason
     
     # Daily halt check

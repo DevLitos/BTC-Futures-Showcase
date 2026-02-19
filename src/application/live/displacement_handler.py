@@ -66,7 +66,7 @@ class DisplacementHandler:
     """
     
     # Base thresholds
-    BASE_DISPLACEMENT_ATR_MULT = 2.8  # ~1.1% of price
+    BASE_DISPLACEMENT_ATR_MULT = 1.8  # ~0.7% of price (FIX #278 applied)
     STRONG_DISPLACEMENT_FACTOR = 1.5
     STALE_ATR_MULT = 0.5  # Within 0.5 ATR = stale
     RANGE_FLOOR_CEILING_ATR_MULT = 1.5  # 1.5 ATR from extreme

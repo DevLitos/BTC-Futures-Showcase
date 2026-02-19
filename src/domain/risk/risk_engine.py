@@ -419,17 +419,23 @@ class Position:
     
     def _calculate_early_partial_price(self) -> float:
         """
-        Calculate price for early partial.
+        Calculate price for early partial — REGIME-AWARE.
         
-        🔥 FIX (Feb 4, 2026): MODE SWITCH
-        - EVENT_DRIVEN trades (DISPLACEMENT, FAST_PATH): Take partial at EARLY_PARTIAL_R (0.7R)
-        - STRUCTURED trades (TREND, BOS): Move partial later to 1.0R (TP1)
+        🔥 FIX (Feb 19, 2026): RANGE PARTIAL at 0.15R
+        RANGE trades oscillate ±0.1-0.2R. TP at 1R is structurally
+        unreachable in lateral markets. Data: Feb 19 trade reached
+        0.19R MFE over 70+ min, never came close to 0.7R.
+        
+        - RANGE/MEAN_REVERSION: partial at 0.15R (capture oscillation)
+        - EVENT_DRIVEN (DISPLACEMENT, FAST_PATH): partial at 0.7R
+        - STRUCTURED (TREND, BOS): partial at 1.0R (TP1 level)
         """
-        # 🔥 FIX (Feb 4): Use initial values for consistent R after ADD
         risk = abs(self.initial_entry_price - self.initial_stop_loss)
         
-        # 🔥 FIX (Feb 4, 2026): Use different threshold based on trade type
-        if self.is_event_driven:
+        if self.regime_mode in ('RANGE', 'MEAN_REVERSION', 'CHOPPY_DEAD'):
+            # RANGE: Capture range oscillation — TP at 1R is unrealistic
+            partial_r = 0.15
+        elif self.is_event_driven:
             # EVENT_DRIVEN: Secure profits earlier at 0.7R 
             partial_r = RiskManagement.EARLY_PARTIAL_R
         else:
@@ -3439,17 +3445,23 @@ class RiskEngine:
     
     async def _handle_early_partial(self, pos: Position, current_price: float) -> dict | None:
         """
-        Handle early partial at +0.5R.
+        Handle early partial close — REGIME-AWARE.
         
-        🔥 NEW (Feb 2, 2026): Close 50% at +0.5R to secure early profits.
-        Analysis showed 18 trades reach +0.5R MFE but end in loss.
-        By taking partial, we capture +0.25R per trade = +4.50R total.
+        🔥 FIX (Feb 19, 2026): RANGE PARTIAL
+        - RANGE: Close 50% at +0.15R, ALWAYS move SL to BE
+        - Other: Close 30% at +0.7R/+1.0R, optionally move SL
+        
+        RATIONALE (RANGE): Range trades oscillate ±0.1-0.2R around
+        entry. TP at 1R is structurally unreachable. By closing 50%
+        at +0.15R and moving SL to BE, we guarantee a small profit
+        and free optionality on the remaining 50%.
         """
         if pos.early_partial_done:
             return None
         
-        # Get early partial percentage from config
-        early_pct = RiskManagement.EARLY_PARTIAL_PCT
+        # RANGE: close 50% and always move SL to BE
+        is_range = pos.regime_mode in ('RANGE', 'MEAN_REVERSION', 'CHOPPY_DEAD')
+        early_pct = 50 if is_range else RiskManagement.EARLY_PARTIAL_PCT
         
         # Calculate partial close
         close_size = pos.size * (early_pct / 100.0)
@@ -3478,22 +3490,24 @@ class RiskEngine:
         pos.size = remaining_size
         pos.early_partial_done = True
         
-        # Optionally move SL to break-even after early partial
+        # Move SL to break-even: ALWAYS for RANGE, optionally for others
         old_sl = pos.stop_loss
-        if RiskManagement.EARLY_PARTIAL_MOVE_SL:
+        if is_range or RiskManagement.EARLY_PARTIAL_MOVE_SL:
             pos.stop_loss = pos.entry_price
             pos.trailing_stop = pos.entry_price
             pos.be_moved = True
-            logger.info(f"🔒 SL moved to BE after early partial: {old_sl:.2f} → {pos.entry_price:.2f}")
+            logger.info(f"🔒 SL moved to BE after {'RANGE' if is_range else 'early'} partial: {old_sl:.2f} → {pos.entry_price:.2f}")
         
+        partial_r_label = '0.15R' if is_range else f'+{RiskManagement.EARLY_PARTIAL_R}R'
         logger.info(
-            f"💰 EARLY PARTIAL @ +0.5R - Closed {close_size:.4f} ({early_pct}%) @ {current_price:.2f} | "
+            f"💰 {'RANGE' if is_range else 'EARLY'} PARTIAL @ {partial_r_label} - "
+            f"Closed {close_size:.4f} ({early_pct}%) @ {current_price:.2f} | "
             f"PnL: ${pnl:.2f} | Remaining: {remaining_size:.4f}"
         )
         
         return {
             'action': 'PARTIAL_CLOSE',
-            'reason': 'EARLY_PARTIAL',
+            'reason': 'RANGE_PARTIAL' if is_range else 'EARLY_PARTIAL',
             'price': current_price,
             'size': close_size,
             'pnl': pnl,

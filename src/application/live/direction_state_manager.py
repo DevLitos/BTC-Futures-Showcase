@@ -109,7 +109,7 @@ class DirectionStateManager:
     BASE_ATR_MULT_INVALIDATION: float = 1.5
     MIN_INVALIDATION_THRESHOLD: float = 50.0
     MAX_INVALIDATION_THRESHOLD: float = 250.0
-    BASE_DISPLACEMENT_ATR_MULT: float = 2.8
+    BASE_DISPLACEMENT_ATR_MULT: float = 1.8
     STRONG_DISPLACEMENT_FACTOR: float = 1.5
     
     def __init__(self):

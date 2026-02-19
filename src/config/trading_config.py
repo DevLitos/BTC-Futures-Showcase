@@ -1174,7 +1174,7 @@ class OperatingMode:
     # 🔥 NEW (Jan 25, 2026): Dead Hours Loss-Based Block
     # If 2+ losses occur during DEAD_HOURS, block trading until next session
     DEAD_HOURS_MAX_LOSSES = 2       # Block after 2 losses in dead hours
-    DEAD_HOURS_UTC = (4, 7)         # 4am-7am UTC = dead zone
+    DEAD_HOURS_UTC = (0, 8)         # 🔥 FIX #293: Aligned with get_session_name()
     
     @classmethod
     def get_min_rr(cls) -> float:
@@ -1252,20 +1252,28 @@ class OperatingMode:
         """
         Calculate cooldown based on exit reason and loss size.
         
-        🔥 FIX #149 (Feb 10, 2026): NO COOLDOWN TRAS PROFIT
+        🔥 FIX #149 + FIX #298 (Feb 18, 2026):
         
-        PROBLEMA: Cooldown tras profit = miedo codificado
-        - Sales con +0.05R → 5min cooldown → el mercado continúa → pierdes.
+        FIX #149: NO COOLDOWN TRAS PROFIT (el edge sigue activo)
+        FIX #298: TRAILING_STOP con profit → 2min cooldown
         
-        SOLUCIÓN INSTITUCIONAL:
-        - Profit > 0 → 0 cooldown (el edge sigue activo)
-        - Scratch/BE → 1 min (reset mental mínimo)
-        - Pérdida pequeña → cooldown moderado
-        - Pérdida grande → cooldown largo
+        PROBLEMA FIX #298 (Run 20260217):
+        - Trade 4 LONG cerró por TRAILING_STOP con +0.35R a $67,853
+        - 0 cooldown → sistema inmediatamente disponible
+        - 10 min después, BIAS FLIP → Trade 5 LONG @ $68,111 ($258 más alto)
+        - TRAILING_STOP indica que el precio SE GIRÓ contra la posición
+        - Re-entry inmediato en la misma dirección = CHASE
         
-        El sistema debe estar LISTO para reentrar si el edge sigue.
+        SOLUCIÓN:
+        - TRAILING_STOP con profit → 2min cooldown (el precio se giró, esperar)
+        - Otros profits (TP, VPOC, etc.) → 0min (salida planificada, no giro)
         """
         exit_upper = exit_reason.upper()
+        
+        # 🔥 FIX #298: TRAILING_STOP con profit → 2min cooldown
+        # El trailing se activó porque el precio se giró. No re-entrar inmediatamente.
+        if pnl_r > 0.02 and 'TRAILING' in exit_upper:
+            return 2  # 2 minutos — el precio se giró, esperar estabilización
         
         # 🔥 FIX #149: SI HAY PROFIT → 0 COOLDOWN
         # El edge funcionó. Puede haber continuación.
@@ -2473,6 +2481,32 @@ class SessionQuality:
         'poor': 0.0,       # BLOCKED - Dead hours, extreme times
     }
     
+    # =========================================================================
+    # 🔥 FIX #293 (Feb 18, 2026): SESSION NAME → QUALITY TIER MAPPING
+    #
+    # ROOT CAUSE: session_quality tag stored SESSION NAMES ("ASIA") instead of
+    # quality tiers ("moderate"). QUALITY_SIZE_MULT.get("asia", 0.80) always
+    # returned the 0.80 default, making 'poor':0.0 DEAD CODE.
+    # The blocking path NEVER fired.
+    #
+    # This is the SINGLE SOURCE OF TRUTH for session→quality mapping.
+    # =========================================================================
+    SESSION_TO_QUALITY = {
+        'LONDON_NY_OVERLAP': 'good',
+        'LONDON': 'good',
+        'NY': 'good',
+        'NY_OPEN_VOLATILE': 'moderate',
+        'ASIA': 'moderate',
+        'DEAD_HOURS': 'poor',        # BLOCKED (0:00-7:59 UTC)
+        'WEEKEND': 'moderate',
+        'OTHER': 'moderate',
+    }
+    
+    @classmethod
+    def session_to_quality(cls, session_name: str) -> str:
+        """Convert session name to quality tier ('good', 'moderate', 'poor')."""
+        return cls.SESSION_TO_QUALITY.get(session_name.upper(), 'moderate')
+    
     @classmethod
     def get_session_size_mult(cls, session_name: str) -> float:
         """Get position size multiplier for current session."""
@@ -2645,13 +2679,16 @@ def get_session_name(hour: int, minute: int, day_of_week: int | None = None) -> 
     if (hour == 13 and minute >= 30) or (14 <= hour < 21):
         return "NY"
     
-    # Asia session: 23:00-8:00 UTC
-    if hour >= 23 or hour < 8:
-        return "ASIA"
-    
-    # Dead hours: 21:00-23:00 UTC (after NY close, before Asia)
-    if 21 <= hour < 23:
+    # 🔥 FIX #293 (Feb 18, 2026): Dead hours = 0:00-7:59 UTC (real dead zone)
+    # Root cause of overnight losses: "ASIA" covered 0-7 UTC with only 0.75x
+    # multiplier. System took 3 losses between 02:00-06:00 UTC.
+    # Split: 0-7 UTC = DEAD_HOURS (blocked), 21-23 UTC = ASIA (reduced)
+    if hour < 8:
         return "DEAD_HOURS"
+    
+    # Asia/Late session: 21:00-23:59 UTC (post-NY, reduced liquidity)
+    if hour >= 21:
+        return "ASIA"
     
     return "OTHER"
 

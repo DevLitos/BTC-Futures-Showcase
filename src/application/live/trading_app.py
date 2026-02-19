@@ -960,9 +960,12 @@ class SignalEngine:
         self._last_atr_ratio: float = 1.0
         
         # =====================================================================
-        # NEW: LAST SENT SL TRACKING for exchange updates (Jan 16, 2026)
+        # LAST SENT SL TRACKING for exchange updates (Jan 16, 2026)
+        # 🔥 FIX #294 (Feb 18, 2026): Added trailing sync failure tracking
         # =====================================================================
         self._last_sent_sl: float = 0.0
+        self._trailing_sync_failures: int = 0
+        self._last_sl_verify_time: float = 0.0
         
         # =====================================================================
         # NEW: BIAS STRENGTH & TREND EXPANSION SYSTEM (Jan 22, 2026)
@@ -1009,11 +1012,17 @@ class SignalEngine:
         
         # =========================================================================
         # 🔥 FIX #260: POST-BIAS-FLIP STABILIZATION COOLDOWN
-        # After BIAS FLIP, block edge creation for 3 minutes or until price
-        # pulls back 0.3 ATR. Prevents entering at extremes right after flip.
+        # After BIAS FLIP, block edge creation for 2.5 minutes or until price
+        # pulls back 2.0×ATR. Prevents entering at extremes right after flip.
         # =========================================================================
         self._post_bias_flip_cooldown_until: datetime | None = None
         self._post_bias_flip_price: float = 0.0
+        
+        # 🔥 FIX #299: BIAS_RECOVERY window after BIAS RESTORED
+        # HTF_BIAS_ALONE veto makes direction=None when only STRUCTURAL_BIAS exists.
+        # After BIAS RESTORED, the bias is FRESH (just confirmed by price), not stale.
+        # Keep recovery active for 10min to override the veto.
+        self._bias_recovery_until: datetime | None = None
         
         # 🔥 FIX #284: Track whether edge was cleared on OBSERVATION entry
         self._observation_edge_cleared: bool = False
@@ -2008,6 +2017,28 @@ class SignalEngine:
             logger.debug("In OBSERVATION state, skipping entry evaluation")
             return
         
+        # =================================================================
+        # 🔥 FIX #304 (Feb 19, 2026): DEAD_HOURS HARD BLOCK
+        #
+        # PROBLEMA: Trade 5 entró SHORT @ $66,631 a las 03:45 UTC
+        # (DEAD_HOURS). El sizing mostró SESS=0.90 (moderate) en vez de
+        # 'poor' (blocked). El bug está en que session_quality no se
+        # setea correctamente antes del sizing, defaulteando a 'moderate'.
+        #
+        # SOLUCIÓN: Hard block aquí, ANTES de cualquier evaluación.
+        # Si la hora UTC es DEAD_HOURS (0-7), no evaluar nada.
+        # Esto es infalible — no depende de tags ni sizing.
+        # =================================================================
+        _session = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
+        if _session == 'DEAD_HOURS':
+            self._idle_eval_count += 1
+            if self._idle_eval_count % 600 == 1:
+                logger.info(
+                    f"🌙 FIX #304: DEAD_HOURS HARD BLOCK | hour={market_time.hour} | "
+                    f"No trading during 0-8 UTC"
+                )
+            return
+        
         # =====================================================================
         # � REFACTORED (Jan 27, 2026): Using idle_state_handlers
         # =====================================================================
@@ -2600,6 +2631,8 @@ class SignalEngine:
             # =====================================================================
             new_direction_for_active = 'LONG' if invalidation_result.forbidden_direction == 'SHORT' else 'SHORT'
             old_active = self._active_direction
+            # 🔥 FIX #299: New BIAS FLIP invalidates any prior bias recovery
+            self._bias_recovery_until = None
             
             # =====================================================================
             # MACRO COHERENCE CHECK FOR BIAS FLIP
@@ -2655,10 +2688,19 @@ class SignalEngine:
             # creating an artificial LONG edge machine that ignores range context.
             # FIX: In RANGE_BOUND without expansion, skip TRANSITION_MODE entirely.
             # The system will wait for real CORE signals (displacement, breakout).
+            #
+            # 🔥 FIX #288 (Feb 18, 2026): ADX GUARD FOR TRANSITION_MODE
+            # LOG EVIDENCE: Trade 5 entered TRANSITION_MODE LONG with ADX=17.1,
+            # phase=ACCUMULATION (not yet RANGE_BOUND). MFE only 0.17R → -0.37R loss.
+            # FIX #279 only catches RANGE_BOUND, but ADX<20 already signals no trend.
+            # Adding ADX floor: if effective_adx < 20, TRANSITION_MODE is noise.
             # =====================================================================
             is_range_bound = getattr(self, '_trend_phase', None) == TrendPhase.RANGE_BOUND
             has_expansion = getattr(self, '_expansion_mode', False)
-            skip_transition_for_range = is_range_bound and not has_expansion
+            effective_adx = getattr(self, '_effective_adx', 25.0)
+            MIN_ADX_FOR_TRANSITION = 20.0
+            low_adx_no_trend = effective_adx < MIN_ADX_FOR_TRANSITION and not has_expansion
+            skip_transition_for_range = (is_range_bound and not has_expansion) or low_adx_no_trend
             
             if not flip_contradicts_macro and not skip_transition_for_range:
                 new_direction = 'LONG' if invalidation_result.forbidden_direction == 'SHORT' else 'SHORT'
@@ -2692,11 +2734,13 @@ class SignalEngine:
                             f"🔓 Cleared cooldowns for TRANSITION_MODE: {', '.join(cleared_cooldowns)}"
                         )
                 
-                # Post-BIAS-FLIP stabilization: block edge creation for 3 min
-                self._post_bias_flip_cooldown_until = datetime.now() + timedelta(minutes=3)
+                # 🔥 ROOT FIX: Post-BIAS-FLIP stabilization: 15s mandatory + 60s total timeout
+                # Reduced from 150s/45s → 60s/15s: BIAS FLIP already requires $80+ move,
+                # adding 2.5min of wait makes the entry structurally late.
+                self._post_bias_flip_cooldown_until = datetime.now() + timedelta(seconds=60)
                 self._post_bias_flip_price = current_price
                 logger.warning(
-                    f"⏳ Post-BIAS-FLIP 3min stabilization | "
+                    f"⏳ Post-BIAS-FLIP 1min stabilization | "
                     f"Price={current_price:.2f} | Need pullback before {new_direction} entry"
                 )
             else:
@@ -2710,9 +2754,14 @@ class SignalEngine:
                         f"🚫 TRANSITION_MODE CANCELLED: flip to {new_direction_for_active} contradicts macro={macro_str}"
                     )
                 elif skip_transition_for_range:
+                    skip_reason = (
+                        f"ADX={effective_adx:.1f} < {MIN_ADX_FOR_TRANSITION} (no trend)"
+                        if low_adx_no_trend
+                        else "RANGE_BOUND + no expansion"
+                    )
                     logger.warning(
-                        f"🚫 FIX #279 TRANSITION_MODE SKIPPED: RANGE_BOUND + no expansion | "
-                        f"BIAS FLIP to {new_direction_for_active} is noise in range | "
+                        f"🚫 FIX #279/#288 TRANSITION_MODE SKIPPED: {skip_reason} | "
+                        f"BIAS FLIP to {new_direction_for_active} is noise | "
                         f"Waiting for CORE signal (displacement/breakout)"
                     )
             
@@ -2870,6 +2919,8 @@ class SignalEngine:
                     )
                 
                 self._current_trade_tags['bias_fast_recovery'] = True
+                # 🔥 FIX #299: Keep bias recovery active 10min to override HTF_BIAS_ALONE
+                self._bias_recovery_until = datetime.now() + timedelta(minutes=10)
                 
                 # =====================================================================
                 # 🔥 FIX #260b: BIAS RESTORED → RE-INIT STABILIZATION COOLDOWN
@@ -2878,15 +2929,16 @@ class SignalEngine:
                 # entrar LONG instantáneamente en el tope de un bounce. 
                 # Run 20260214: 4 LONGs entraron así → 3 pérdidas, -$2.60.
                 #
-                # AHORA: BIAS RESTORED re-inicia un cooldown de 3min con pullback
+                # AHORA: BIAS RESTORED re-inicia un cooldown de 1min con pullback
                 # requerido para la NUEVA dirección restaurada. Esto fuerza que
                 # el precio retroceda antes de entrar, evitando comprar en máximos.
+                # ROOT FIX: Reduced from 150s to 60s — stop stacking delays.
                 # =====================================================================
                 from datetime import timedelta as _td  # Alias to avoid shadowing module-level timedelta
-                self._post_bias_flip_cooldown_until = datetime.now() + _td(minutes=3)
+                self._post_bias_flip_cooldown_until = datetime.now() + _td(seconds=60)
                 self._post_bias_flip_price = current_price
                 logger.warning(
-                    f"🔥 FIX #260b: Post-BIAS-RESTORED 3min stabilization | "
+                    f"🔥 FIX #260b: Post-BIAS-RESTORED 1min stabilization | "
                     f"Price={current_price:.2f} | Need pullback before {restored_bias} entry"
                 )
 
@@ -2907,17 +2959,15 @@ class SignalEngine:
         # =====================================================================
         
         # 🌊 BE WATER: ADAPTIVE DISPLACEMENT THRESHOLDS
-        # 🔥 FIX #278 (Feb 16, 2026): Bajar threshold de 2.8 a 1.8 ATR
-        # PROBLEMA ANTERIOR (2.8): Sistema entraba al FINAL del movimiento.
-        #   Con ATR_5m=$72, threshold=$202 → necesita caída de $200 en 10 velas.
-        #   BTC cayó 3% ($2100) y el sistema entró SHORT a $67,724 (el mínimo).
-        #   Es como adivinar el resultado del partido DESPUÉS de que termine.
-        # PROBLEMA ORIGINAL (1.2): Demasiados false positives en micromovimientos.
-        # SOLUCIÓN (1.8): Punto medio — detecta movimientos reales (~$130 con ATR $72)
-        #   sin esperar a que el movimiento entero se complete.
-        #   Con ATR_5m=$72: threshold=$130 (0.19% del precio) — detectable en 2-3 velas
-        #   Con ATR_5m=$200: threshold=$360 (0.52% del precio) — detectable en 3-5 velas
-        BASE_DISPLACEMENT_ATR_MULT = 2.8  # ~1.1% del precio con ATR típico (commit +$4 proven value)
+        # 🔥 ROOT FIX (Feb 19, 2026): APPLIED FIX #278 — threshold 2.8 → 1.8 ATR
+        # BEFORE (2.8): Needed $202 move to detect → entered at END of momentum
+        #   BTC dropped 3% ($2100) and system entered SHORT at the minimum.
+        # ORIGINAL (1.2): Too many false positives in micro-movements.
+        # NOW (1.8): Sweet spot — detects real moves (~$130 with ATR $72)
+        #   without waiting for the entire move to complete.
+        #   With ATR_5m=$72: threshold=$130 (0.19% of price) — detectable in 2-3 candles
+        #   With ATR_5m=$200: threshold=$360 (0.52% of price) — detectable in 3-5 candles
+        BASE_DISPLACEMENT_ATR_MULT = 1.8  # ~0.7% del precio con ATR típico (FIX #278 applied: detect 35% earlier)
         vol_displacement_adj = 1.0 + (self._current_volatility_ratio - 1.0) * 0.3  # +/- 30% por volatilidad
         vol_displacement_adj = max(0.7, min(1.5, vol_displacement_adj))  # Floor 0.7, cap 1.5
         
@@ -3456,6 +3506,30 @@ class SignalEngine:
                 f"Signals: {len(orch_result.all_signals)}"
             )
         
+        # =====================================================================
+        # 🔥 FIX #299: BIAS_RECOVERY overrides HTF_BIAS_ALONE veto
+        #
+        # After BIAS RESTORED, the structural bias is FRESHLY confirmed by
+        # price reclaiming the invalidation level. The HTF_BIAS_ALONE guard
+        # exists to prevent stale-bias trades, but a just-restored bias is
+        # NOT stale. Without this override, the system gets trapped in
+        # NO_CONSENSUS for 30-40+ minutes after every BIAS RESTORED event.
+        # LOG EVIDENCE (Feb 18, 2026): 44min deadlock (14:21-15:05) where
+        # direction=None due to HTF_BIAS_ALONE veto on STRUCTURAL_BIAS.
+        # =====================================================================
+        if (self._active_direction is None and 
+            orch_result.vetoed_by == 'HTF_BIAS_ALONE' and 
+            self._bias_recovery_until and datetime.now() < self._bias_recovery_until):
+            self._active_direction = self._structural_bias
+            self._active_direction_source = 'BIAS_RECOVERY'
+            self._active_direction_confidence = 0.65
+            if self._idle_eval_count % 60 == 1:
+                remaining = (self._bias_recovery_until - datetime.now()).total_seconds()
+                logger.info(
+                    f"🔥 FIX #299: BIAS_RECOVERY override HTF_BIAS_ALONE | "
+                    f"Direction={self._structural_bias} | {remaining:.0f}s remaining"
+                )
+        
         self._current_trade_tags['active_direction'] = self._active_direction
         self._current_trade_tags['displacement_bypass'] = self._displacement_bypass
         
@@ -3591,6 +3665,89 @@ class SignalEngine:
         # =====================================================================
         candles_1m = self.market_data.get_candles('1m')
         calculate_intraday_edge_data(candles_1m, self._current_trade_tags)
+        
+        # =========================================================================
+        # 🔥 FIX #292 (Feb 18, 2026): BIAS STRENGTH & REGIME FUSION - EARLY COMPUTATION
+        #
+        # ROOT CAUSE: _current_bias_strength was computed AFTER mode handlers
+        # and the can_evaluate_entry() guard. Mode handlers read macro_str=None →
+        # consensus BLOCKED → no edge armed → early return → bias NEVER computed.
+        # CIRCULAR DEADLOCK that blocked ALL trading for 3.5 hours on startup.
+        #
+        # FIX: Move bias computation BEFORE mode handlers so they get real data.
+        # All dependencies (df_1h, candles_5m, candles_1m, current_price) are
+        # already available at this point in the pipeline.
+        # =========================================================================
+        
+        # Reuse candles already fetched for fast_adx (candles_5m) and intraday_edge (candles_1m)
+        df_5m_bias = pd.DataFrame(candles_5m) if candles_5m and len(candles_5m) >= 30 else None
+        df_1m_bias = pd.DataFrame(candles_1m) if candles_1m and len(candles_1m) >= 20 else None
+        
+        # 1. Detect Bias Strength (uses extracted detector)
+        if df_5m_bias is not None and len(df_5m_bias) >= 20:
+            bias_result = self._bias_strength_detector.detect(df_1h, df_5m_bias, current_price)
+            self._current_bias_strength = bias_result.strength
+            self._is_bullish_structure = bias_result.is_bullish_structure
+        else:
+            self._current_bias_strength = BiasStrength.NEUTRAL
+            self._is_bullish_structure = None
+        
+        if self._current_bias_strength is None:
+            self._current_bias_strength = BiasStrength.NEUTRAL
+        self._current_trade_tags['bias_strength'] = self._current_bias_strength.value
+        
+        # Calculate WORKING BIAS from MACRO BIAS (FIX #76)
+        self._working_bias = BiasStrengthConfig.get_working_bias(self._current_bias_strength)
+        self._current_trade_tags['working_bias'] = self._working_bias.value
+        
+        logger.debug(
+            f"📊 BIAS: Macro={self._current_bias_strength.value} → Working={self._working_bias.value} | "
+            f"is_bullish_structure={self._is_bullish_structure}"
+        )
+        
+        # 3-LAYER REGIME FUSION (FIX #83): Compute MACRO layer
+        ema50_1h = float(df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1])
+        ema200_1h = float(df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1])
+        
+        try:
+            _, _, plus_di_arr, minus_di_arr = calculate_adx_with_di(
+                df_1h['high'].to_numpy(),
+                df_1h['low'].to_numpy(),
+                df_1h['close'].to_numpy(),
+                14
+            )
+            plus_di = float(plus_di_arr[-1]) if len(plus_di_arr) > 0 and not np.isnan(plus_di_arr[-1]) else 20.0
+            minus_di = float(minus_di_arr[-1]) if len(minus_di_arr) > 0 and not np.isnan(minus_di_arr[-1]) else 20.0
+        except Exception:
+            plus_di, minus_di = 20.0, 20.0
+        
+        ema50_series = df_1h['close'].ewm(span=50, adjust=False).mean()
+        if len(ema50_series) >= 2:
+            ema50_slope = (ema50_series.iloc[-1] - ema50_series.iloc[-2]) / ema50_series.iloc[-2]
+        else:
+            ema50_slope = 0.0
+        
+        self._regime_fusion.update_macro(
+            ema50=ema50_1h,
+            ema200=ema200_1h,
+            plus_di=plus_di,
+            minus_di=minus_di,
+            ema50_slope=ema50_slope
+        )
+        
+        macro_state = self._regime_fusion.regime_state
+        self._current_trade_tags['regime_macro_score'] = macro_state.macro_score
+        self._current_trade_tags['regime_macro_dir'] = macro_state.macro_dir
+        self._current_trade_tags['regime_macro_strength'] = macro_state.macro_strength
+        self._current_trade_tags['regime_macro'] = macro_state.regime.value
+        
+        if hasattr(self, '_last_logged_macro_regime') and self._last_logged_macro_regime != macro_state.regime:
+            logger.info(
+                f"🔄 MACRO REGIME CHANGE: {self._last_logged_macro_regime.value if self._last_logged_macro_regime else 'None'} → "
+                f"{macro_state.regime.value} | score={macro_state.macro_score:.2f} | "
+                f"+DI={plus_di:.1f} -DI={minus_di:.1f}"
+            )
+        self._last_logged_macro_regime = macro_state.regime
         
         # Store variables needed downstream
         trend_phase_str = regime_result.trend_phase_str
@@ -3773,10 +3930,12 @@ class SignalEngine:
             if volume_ratio < MIN_VOLUME_RATIO_RANGE:
                 # Check displacement bypass
                 if self._displacement_bypass or self._expansion_mode:
-                    logger.info(
-                        f"🔥 RANGE VOLUME BYPASS: vol_ratio={volume_ratio:.0%} < {MIN_VOLUME_RATIO_RANGE:.0%} | "
-                        f"But DISPLACEMENT active - proceeding"
-                    )
+                    # 🔥 FIX #290: Throttle RANGE VOLUME BYPASS log (was spamming every tick)
+                    if self._idle_eval_count % 180 == 1:
+                        logger.info(
+                            f"🔥 RANGE VOLUME BYPASS: vol_ratio={volume_ratio:.0%} < {MIN_VOLUME_RATIO_RANGE:.0%} | "
+                            f"But DISPLACEMENT active - proceeding"
+                        )
                 else:
                     # 🔥 FIX #83: NO HARD BLOCK → PENALIZE
                     # Low volume = riskier, so reduce size instead of blocking
@@ -3848,12 +4007,14 @@ class SignalEngine:
                 should_bypass, bypass_reason = self._should_bypass_regime_filter('RANGE_MID')
                 
                 if should_bypass:
-                    logger.info(
-                        f"🔥 RANGE BYPASS: {bypass_reason} | pct={pct_60d:.0f}% ignored | "
-                        f"ACTIVE_DIRECTION={self._active_direction} | "
-                        f"{'EXPANSION=' + str(self._expansion_direction) + ' | ' if self._expansion_mode else ''}"
-                        f"Range filter bypassed - continuing evaluation"
-                    )
+                    # 🔥 FIX #290: Throttle RANGE BYPASS log (was spamming every tick)
+                    if self._idle_eval_count % 180 == 1:
+                        logger.info(
+                            f"🔥 RANGE BYPASS: {bypass_reason} | pct={pct_60d:.0f}% ignored | "
+                            f"ACTIVE_DIRECTION={self._active_direction} | "
+                            f"{'EXPANSION=' + str(self._expansion_direction) + ' | ' if self._expansion_mode else ''}"
+                            f"Range filter bypassed - continuing evaluation"
+                        )
                     self._current_trade_tags['range_bypass_reason'] = bypass_reason
                     self._current_trade_tags['range_size_mult'] = 0.60  # Slightly reduced size for range-break
                     
@@ -3904,24 +4065,24 @@ class SignalEngine:
                     confidence = self._active_direction_confidence
                     
                     # =============================================================
-                    # RANGE MEAN-REVERSION DIRECTION OVERRIDE (commit +$4 style)
+                    # RANGE MEAN-REVERSION DIRECTION (refactored Feb 18, 2026)
                     #
-                    # In RANGE_MID, if pct_60d near support/resistance:
-                    # - pct < 20% → LONG (buy near support)
-                    # - pct > 80% → SHORT (sell near resistance)
-                    # - 20-80% → keep original direction (neutral zone)
+                    # In RANGE mode, price position in the range IS the signal:
+                    # - pct < 30% → LONG (buy near support)
+                    # - pct > 70% → SHORT (sell near resistance)
+                    # - 30-70% → need external direction signal
                     #
-                    # 🔥 FIX #278 (Feb 17, 2026): Thresholds tightened 35→20 / 65→80
-                    # LOG EVIDENCE: 3 consecutive losses in range with pct=29-37%.
-                    # At 29% of a $3,694 range, price was at $68,330-$68,860 — this
-                    # is NOT "near support" ($67,250). The 35% threshold created a
-                    # persistent LONG bias trap that overrode SHORT signals 30+ times.
-                    # Only override at TRUE extremes (bottom/top 20% of range).
+                    # CRITICAL FIX: Previously required direction!=None from
+                    # orchestrator, but HTF_BIAS_ALONE veto made direction=None
+                    # at pct=25-27%. Result: system NEVER went LONG at range
+                    # bottom, waited for BIAS FLIP ($200+ move), entered late.
                     #
-                    # The FIX #276 coherence guard below prevents wrong-side trades.
+                    # Now: if direction=None AND in MR zone, we GENERATE
+                    # direction from the range position itself. The range
+                    # position IS the edge in a ranging market.
                     # =============================================================
-                    RANGE_MR_LOW_PCT = 20.0
-                    RANGE_MR_HIGH_PCT = 80.0
+                    RANGE_MR_LOW_PCT = 30.0
+                    RANGE_MR_HIGH_PCT = 70.0
                     
                     # Guard 1: No override if active edge exists
                     _has_armed_edge = self._edge_manager.is_edge_active()
@@ -3936,33 +4097,37 @@ class SignalEngine:
                         self._current_trade_tags['range_mr_blocked'] = 'TREND_EXPANSION'
                         _has_armed_edge = True  # Prevents override below
                     
-                    if direction and pct_60d < RANGE_MR_LOW_PCT and direction == 'SHORT' and not _has_armed_edge:
+                    if not _has_armed_edge and pct_60d < RANGE_MR_LOW_PCT:
+                        # Near range bottom → LONG regardless of structural bias
                         original_dir = direction
                         direction = 'LONG'
                         source = 'RANGE_MR_LOW'
-                        confidence = max(confidence, 0.65)
+                        confidence = 0.65
                         self._active_direction = direction
                         self._active_direction_source = 'RANGE_MR_LOW'
                         self._active_direction_confidence = confidence
-                        logger.info(
-                            f"🔄 RANGE MR: pct={pct_60d:.0f}% < {RANGE_MR_LOW_PCT}% | "
-                            f"Override {original_dir} → LONG (buy near support)"
-                        )
+                        if self._idle_eval_count % 60 == 1:
+                            logger.info(
+                                f"🔄 RANGE MR LOW: pct={pct_60d:.0f}% < {RANGE_MR_LOW_PCT:.0f}% | "
+                                f"Direction={original_dir} → LONG (buy near range support)"
+                            )
                         self._current_trade_tags['range_mr_override'] = True
                         self._current_trade_tags['range_mr_from'] = original_dir
                         self._current_trade_tags['range_mr_pct'] = pct_60d
-                    elif direction and pct_60d > RANGE_MR_HIGH_PCT and direction == 'LONG' and not _has_armed_edge:
+                    elif not _has_armed_edge and pct_60d > RANGE_MR_HIGH_PCT:
+                        # Near range top → SHORT regardless of structural bias
                         original_dir = direction
                         direction = 'SHORT'
                         source = 'RANGE_MR_HIGH'
-                        confidence = max(confidence, 0.65)
+                        confidence = 0.65
                         self._active_direction = direction
                         self._active_direction_source = 'RANGE_MR_HIGH'
                         self._active_direction_confidence = confidence
-                        logger.info(
-                            f"🔄 RANGE MR: pct={pct_60d:.0f}% > {RANGE_MR_HIGH_PCT}% | "
-                            f"Override {original_dir} → SHORT (sell near resistance)"
-                        )
+                        if self._idle_eval_count % 60 == 1:
+                            logger.info(
+                                f"🔄 RANGE MR HIGH: pct={pct_60d:.0f}% > {RANGE_MR_HIGH_PCT:.0f}% | "
+                                f"Direction={original_dir} → SHORT (sell near range resistance)"
+                            )
                         self._current_trade_tags['range_mr_override'] = True
                         self._current_trade_tags['range_mr_from'] = original_dir
                         self._current_trade_tags['range_mr_pct'] = pct_60d
@@ -3979,18 +4144,18 @@ class SignalEngine:
                         # Regardless of how direction was determined, in RANGE mode:
                         # - SHORT at pct<20% = shorting the floor → ALWAYS wrong
                         # - LONG at pct>80% = longing the ceiling → ALWAYS wrong
-                        # This catches any path that FIX #274 missed
-                        if direction == 'SHORT' and pct_60d < RANGE_MR_LOW_PCT:
+                        # Coherence guard: don't trade AGAINST the range position
+                        if direction == 'SHORT' and pct_60d < 20.0:
                             if self._idle_eval_count % 120 == 1:
                                 logger.warning(
-                                    f"🚫 FIX #276 RANGE COHERENCE: SHORT at pct={pct_60d:.0f}% < {RANGE_MR_LOW_PCT}% | "
+                                    f"🚫 RANGE COHERENCE: SHORT at pct={pct_60d:.0f}% < 20% | "
                                     f"Cannot SHORT at range floor | source={source}"
                                 )
                             return
-                        if direction == 'LONG' and pct_60d > RANGE_MR_HIGH_PCT:
+                        if direction == 'LONG' and pct_60d > 80.0:
                             if self._idle_eval_count % 120 == 1:
                                 logger.warning(
-                                    f"🚫 FIX #276 RANGE COHERENCE: LONG at pct={pct_60d:.0f}% > {RANGE_MR_HIGH_PCT}% | "
+                                    f"🚫 RANGE COHERENCE: LONG at pct={pct_60d:.0f}% > 80% | "
                                     f"Cannot LONG at range ceiling | source={source}"
                                 )
                             return
@@ -4023,7 +4188,7 @@ class SignalEngine:
                         # RANGE_CONSENSUS. If volatility is dead, wait for expansion.
                         atr_1m_avg = self._current_trade_tags.get('atr_1m_avg', atr_1m)
                         atr_ratio_check = atr_1m / atr_1m_avg if atr_1m_avg > 0 else 1.0
-                        MIN_ATR_RATIO_FOR_RANGE = 0.70
+                        MIN_ATR_RATIO_FOR_RANGE = 0.50
                         if atr_ratio_check < MIN_ATR_RATIO_FOR_RANGE:
                             if self._idle_eval_count % 300 == 1:
                                 logger.warning(
@@ -5221,108 +5386,6 @@ class SignalEngine:
                     logger.debug(f"📍 Location penalty (allowed): {location_penalty:.1f}")
         
         # =========================================================================
-        # NEW: BIAS STRENGTH & TREND EXPANSION DETECTION (Jan 22, 2026)
-        # Detect market state for asymmetric direction rules
-        # =========================================================================
-        
-        # Get 5m data for expansion detection
-        candles_5m_pre = self.market_data.get_candles('5m')
-        df_5m_pre = pd.DataFrame(candles_5m_pre) if candles_5m_pre and len(candles_5m_pre) >= 30 else None
-        candles_1m_pre = self.market_data.get_candles('1m')
-        df_1m_pre = pd.DataFrame(candles_1m_pre) if candles_1m_pre and len(candles_1m_pre) >= 20 else None
-        
-        # 1. Detect Bias Strength (uses extracted detector)
-        if df_5m_pre is not None and len(df_5m_pre) >= 20:
-            bias_result = self._bias_strength_detector.detect(df_1h, df_5m_pre, current_price)
-            self._current_bias_strength = bias_result.strength
-            # 🔥 FIX #70d: Store is_bullish_structure for CT block bypass
-            self._is_bullish_structure = bias_result.is_bullish_structure
-        else:
-            self._current_bias_strength = BiasStrength.NEUTRAL
-            self._is_bullish_structure = None
-        
-        # 🔥 FIX: Ensure _current_bias_strength is not None before accessing .value
-        if self._current_bias_strength is None:
-            self._current_bias_strength = BiasStrength.NEUTRAL
-        self._current_trade_tags['bias_strength'] = self._current_bias_strength.value
-        
-        # =========================================================================
-        # 🔥 FIX #76 (Feb 07, 2026): Calculate WORKING BIAS from MACRO BIAS
-        # 
-        # WorkingBias tells us what direction to PREFER, NOT what to BLOCK.
-        # - BEAR_STRONG macro → SHORT_PREF (prefer shorts, allow longs with edge)
-        # - BULL_STRONG macro → LONG_PREF (prefer longs, allow shorts with edge)
-        # - NEUTRAL macro → BOTH (trade whatever triggers)
-        # =========================================================================
-        self._working_bias = BiasStrengthConfig.get_working_bias(self._current_bias_strength)
-        self._current_trade_tags['working_bias'] = self._working_bias.value
-        
-        logger.debug(
-            f"📊 BIAS: Macro={self._current_bias_strength.value} → Working={self._working_bias.value} | "
-            f"is_bullish_structure={self._is_bullish_structure}"
-        )
-        
-        # =========================================================================
-        # 🔥 FIX #83 (Feb 07, 2026): 3-LAYER REGIME FUSION
-        # 
-        # CAPA 1 - MACRO: EMA50/200, +DI/-DI, EMA50 slope → macro_score [-2.5, +2.5]
-        # CAPA 2 - MICRO: direction, confidence, displacement, structure
-        # CAPA 3 - FUSIÓN: alignment × peso → size_mult, rr_min, allowed
-        # 
-        # PRINCIPIO: No bloquear → hacer caro equivocarte.
-        # ÚNICO BLOQUEO: macro_strength > 2.0 AND contra AND sin displacement
-        # =========================================================================
-        
-        # Calcular indicadores para MACRO
-        ema50_1h = float(df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1])
-        ema200_1h = float(df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1])
-        
-        # Obtener +DI/-DI del 1h
-        try:
-            _, _, plus_di_arr, minus_di_arr = calculate_adx_with_di(
-                df_1h['high'].to_numpy(),
-                df_1h['low'].to_numpy(),
-                df_1h['close'].to_numpy(),
-                14
-            )
-            plus_di = float(plus_di_arr[-1]) if len(plus_di_arr) > 0 and not np.isnan(plus_di_arr[-1]) else 20.0
-            minus_di = float(minus_di_arr[-1]) if len(minus_di_arr) > 0 and not np.isnan(minus_di_arr[-1]) else 20.0
-        except Exception:
-            plus_di, minus_di = 20.0, 20.0
-        
-        # Calcular slope de EMA50 (primera derivada normalizada)
-        ema50_series = df_1h['close'].ewm(span=50, adjust=False).mean()
-        if len(ema50_series) >= 2:
-            ema50_slope = (ema50_series.iloc[-1] - ema50_series.iloc[-2]) / ema50_series.iloc[-2]
-        else:
-            ema50_slope = 0.0
-        
-        # Actualizar MACRO state en RegimeFusion
-        self._regime_fusion.update_macro(
-            ema50=ema50_1h,
-            ema200=ema200_1h,
-            plus_di=plus_di,
-            minus_di=minus_di,
-            ema50_slope=ema50_slope
-        )
-        
-        # Guardar estado macro para tags y logs
-        macro_state = self._regime_fusion.regime_state
-        self._current_trade_tags['regime_macro_score'] = macro_state.macro_score
-        self._current_trade_tags['regime_macro_dir'] = macro_state.macro_dir
-        self._current_trade_tags['regime_macro_strength'] = macro_state.macro_strength
-        self._current_trade_tags['regime_macro'] = macro_state.regime.value
-        
-        # Log cambios significativos en macro
-        if hasattr(self, '_last_logged_macro_regime') and self._last_logged_macro_regime != macro_state.regime:
-            logger.info(
-                f"🔄 MACRO REGIME CHANGE: {self._last_logged_macro_regime.value if self._last_logged_macro_regime else 'None'} → "
-                f"{macro_state.regime.value} | score={macro_state.macro_score:.2f} | "
-                f"+DI={plus_di:.1f} -DI={minus_di:.1f}"
-            )
-        self._last_logged_macro_regime = macro_state.regime
-        
-        # =========================================================================
         # 🧠 DECISION CENTER - INTELLIGENT TRADE GATING (Feb 06, 2026)
         # =========================================================================
         # Uses TrendIntelligence to make SMART decisions based on:
@@ -5556,6 +5619,10 @@ class SignalEngine:
         self._current_trade_tags['ct_max_rr'] = ct_rules['max_rr']
         
         # 3. Detect Trend Expansion (uses extracted detector)
+        # 🔥 FIX #292b: Create DataFrames from candles already fetched earlier in pipeline
+        # (candles_5m at fast_adx, candles_1m at intraday_edge_data)
+        df_5m_pre = pd.DataFrame(candles_5m) if candles_5m and len(candles_5m) >= 30 else None
+        df_1m_pre = pd.DataFrame(candles_1m) if candles_1m and len(candles_1m) >= 20 else None
         if df_5m_pre is not None and df_1m_pre is not None:
             atr_5m_pre = calculate_atr(df_5m_pre['high'].to_numpy(), df_5m_pre['low'].to_numpy(), df_5m_pre['close'].to_numpy(), 14)
             atr_5m_val = atr_5m_pre[-1] if len(atr_5m_pre) > 0 else current_price * 0.005
@@ -6111,6 +6178,9 @@ class SignalEngine:
                 logger.info(f"🎯 SETUP COMPLETE - {bias} | HTF✓ MTF✓ LTF({ltf_confs}/3){edge_info}")
                 self._last_setup_complete_log = now
         self._current_trade_type = TradeType.LONG_MAIN if bias == 'LONG' else TradeType.SHORT_STRUCTURAL
+        # FIX #303 REMOVED: Momentum drift check created a catch-22.
+        # Displacement needs $130+ to detect but drift blocked at $62 from BOS.
+        # The stale displacement check + edge invalidation already handle exhausted moves.
         try:
             await self._execute_entry(current_price, atr_1m, market_time)
         except Exception as e:
@@ -7805,6 +7875,7 @@ class SignalEngine:
         #
         # SOLUCIÓN: Después de cada manage_position, sincronizar el trailing
         # con el exchange si cambió significativamente.
+        # 🔥 FIX #294 (Feb 18, 2026): Track sync failures + periodic SL verification
         # =====================================================================
         if position and not self._is_backtest:
             current_trailing = position.trailing_stop
@@ -7833,9 +7904,72 @@ class SignalEngine:
                     )
                     if success:
                         self._last_sent_sl = new_sent
+                        self._trailing_sync_failures = 0
                         logger.info(f"🔄 TRAILING SYNCED TO EXCHANGE: {new_sent:.2f}")
+                    else:
+                        self._trailing_sync_failures += 1
+                        logger.warning(
+                            f"⚠️ Trailing sync failed ({self._trailing_sync_failures} consecutive) | "
+                            f"Local={current_trailing:.2f} Exchange={self._last_sent_sl:.2f}"
+                        )
                 except Exception as e:
-                    logger.warning(f"⚠️ Failed to sync trailing to exchange: {e}")
+                    self._trailing_sync_failures += 1
+                    logger.warning(
+                        f"⚠️ Failed to sync trailing to exchange ({self._trailing_sync_failures}x): {e}"
+                    )
+            
+            # =================================================================
+            # 🔥 FIX #294: PERIODIC SL HEALTH CHECK
+            #
+            # If trailing sync fails 5+ times OR every 120 seconds,
+            # verify the exchange SL actually exists. If it disappeared
+            # (cancelled externally, exchange error, etc.), either
+            # re-place it or mark inactive for local fallback.
+            # =================================================================
+            import time as _time
+            now_mono = _time.monotonic()
+            needs_verify = (
+                self._trailing_sync_failures >= 5 or
+                (now_mono - self._last_sl_verify_time > 120 and self._stops_set)
+            )
+            
+            if needs_verify and position.exchange_sl_active:
+                try:
+                    verification = await self.execution.verify_stops_on_exchange(self.symbol)
+                    self._last_sl_verify_time = now_mono
+                    
+                    if verification and verification.get('has_sl'):
+                        # SL exists on exchange — reset failure counter
+                        if self._trailing_sync_failures >= 5:
+                            logger.info(
+                                f"✅ FIX #294: SL verified on exchange despite {self._trailing_sync_failures} sync failures | "
+                                f"Exchange SL still protecting position"
+                            )
+                            self._trailing_sync_failures = 0
+                    else:
+                        # SL NOT found on exchange but exchange_sl_active=True — CRITICAL
+                        logger.critical(
+                            f"🚨 FIX #294: EXCHANGE SL MISSING! exchange_sl_active=True but no SL found | "
+                            f"Attempting emergency SL placement at {current_trailing:.2f}"
+                        )
+                        # Attempt emergency SL placement
+                        emergency_sl = await self.execution.set_position_stops(
+                            symbol=self.symbol,
+                            stop_loss=current_trailing,
+                            take_profit=None
+                        )
+                        if emergency_sl:
+                            self._last_sent_sl = current_trailing
+                            self._trailing_sync_failures = 0
+                            logger.info(f"✅ FIX #294: Emergency SL placed at {current_trailing:.2f}")
+                        else:
+                            position.mark_exchange_sl_inactive("FIX #294: SL missing + placement failed")
+                            logger.critical(
+                                f"🚨 FIX #294: Emergency SL FAILED — local SL fallback active | "
+                                f"Position at risk if bot disconnects"
+                            )
+                except Exception as e:
+                    logger.warning(f"⚠️ FIX #294: SL verification error: {e}")
         
         if exit_action:
             action = exit_action.get('action')
@@ -8037,12 +8171,14 @@ class SignalEngine:
     
     def _is_post_bias_flip_blocked(self, current_price: float, atr: float) -> bool:
         """
-        🔥 FIX #260: Block edge creation during post-BIAS-FLIP stabilization.
+        Block edge creation during post-BIAS-FLIP stabilization.
         
-        After a BIAS FLIP, the price is at an extreme (day high/low).
-        Entering immediately means buying at the top or selling at the bottom.
+        After a BIAS FLIP, brief wait to avoid entering at the exact extreme.
+        ROOT FIX: Reduced delays to stop compounding latency:
+        - 15s mandatory wait (was 45s)
+        - 0.5×ATR pullback (was 1.0×ATR)
+        - 60s total timeout (was 150s)
         
-        Block for 3 minutes OR until price pulls back ≥0.3 ATR from the flip price.
         Returns True if entry should be blocked.
         """
         if self._post_bias_flip_cooldown_until is None:
@@ -8051,41 +8187,56 @@ class SignalEngine:
         now = datetime.now()
         if now >= self._post_bias_flip_cooldown_until:
             logger.info(
-                f"🔥 FIX #260: Post-BIAS-FLIP cooldown expired | Entry allowed after stabilization"
+                f"🔥 Post-BIAS-FLIP cooldown expired | Entry allowed after stabilization"
             )
             self._post_bias_flip_cooldown_until = None
             return False
         
-        # Check for pullback from the flip extreme
+        # ROOT FIX: Reduced from 45s to 15s — BIAS FLIP already requires $80+ move,
+        # adding long waits makes entries structurally late
+        MANDATORY_WAIT_S = 15
+        COOLDOWN_TOTAL_S = 60
         flip_price = self._post_bias_flip_price
-        pullback_threshold = 0.3 * atr
+        elapsed_since_flip = (now - (self._post_bias_flip_cooldown_until - timedelta(seconds=COOLDOWN_TOTAL_S))).total_seconds()
+        
+        if elapsed_since_flip < MANDATORY_WAIT_S:
+            if self._idle_eval_count % 60 == 1:
+                logger.info(
+                    f"⏳ Post-BIAS-FLIP wait | {MANDATORY_WAIT_S - elapsed_since_flip:.0f}s of {MANDATORY_WAIT_S}s | "
+                    f"Price={current_price:.2f} flip={flip_price:.2f} dir={self._active_direction}"
+                )
+            return True
+        
+        # ROOT FIX: Reduced from 1.0 to 0.5 ATR — still quality-gates but doesn't
+        # wait for a full ATR pullback that may never come in a strong move
+        pullback_threshold = 0.5 * atr
         
         if self._active_direction == 'LONG':
-            # After flip to LONG, price should pull back DOWN before entering
-            if current_price <= flip_price - pullback_threshold:
+            actual_pullback = flip_price - current_price
+            if actual_pullback >= pullback_threshold:
                 logger.info(
-                    f"🔥 FIX #260: Pullback detected {flip_price - current_price:.2f} >= "
-                    f"{pullback_threshold:.2f} | LONG entry allowed after retracement"
+                    f"🔥 Pullback confirmed {actual_pullback:.2f} >= "
+                    f"{pullback_threshold:.2f} (0.5×ATR) | LONG entry allowed"
                 )
                 self._post_bias_flip_cooldown_until = None
                 return False
         elif self._active_direction == 'SHORT':
-            # After flip to SHORT, price should pull back UP before entering
-            if current_price >= flip_price + pullback_threshold:
+            actual_pullback = current_price - flip_price
+            if actual_pullback >= pullback_threshold:
                 logger.info(
-                    f"🔥 FIX #260: Pullback detected {current_price - flip_price:.2f} >= "
-                    f"{pullback_threshold:.2f} | SHORT entry allowed after retracement"
+                    f"🔥 Pullback confirmed {actual_pullback:.2f} >= "
+                    f"{pullback_threshold:.2f} (0.5×ATR) | SHORT entry allowed"
                 )
                 self._post_bias_flip_cooldown_until = None
                 return False
         
-        # Still in cooldown, no pullback yet
+        # Still waiting
         remaining = (self._post_bias_flip_cooldown_until - now).total_seconds()
         if self._idle_eval_count % 60 == 1:
             logger.info(
-                f"⏳ FIX #260: Post-BIAS-FLIP cooldown | {remaining:.0f}s remaining | "
-                f"Price={current_price:.2f} flip={flip_price:.2f} dir={self._active_direction} | "
-                f"Need pullback {pullback_threshold:.2f} or timeout"
+                f"⏳ Post-BIAS-FLIP | {remaining:.0f}s remaining | "
+                f"Price={current_price:.2f} flip={flip_price:.2f} | "
+                f"Need pullback {pullback_threshold:.2f} (0.5×ATR) or timeout"
             )
         return True
 

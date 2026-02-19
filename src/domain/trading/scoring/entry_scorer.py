@@ -546,7 +546,7 @@ class EntryScorer:
         else:
             self._trade_tags.session = 'quiet'
 
-        self._trade_tags.session_quality = session_name
+        self._trade_tags.session_quality = session_name  # Store name for analysis; quality tier set in entry_validators
 
         # Volatility check
         if len(df_5m) >= 50:

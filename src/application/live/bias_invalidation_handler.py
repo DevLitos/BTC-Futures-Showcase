@@ -22,19 +22,23 @@ logger = logging.getLogger(__name__)
 class BiasInvalidationConfig:
     """Configuration for bias invalidation thresholds.
     
-    FIX #89 (Feb 2026): Increased base_atr_mult from 1.5 to 2.5
-    to reduce BIAS FLIP whipsaws. With ATR ~$60:
-    - Normal: $60 * 2.5 = $150 threshold (was $90)
-    - Direction Lock: $150 * 1.5 = $225 
-    - Expansion: $150 * 2.0 = $300
+    REFACTORED (Feb 18, 2026): Lowered base_atr_mult from 3.5 to 2.0.
     
-    FIX #168 (Feb 11, 2026): Added flip_cooldown_ticks to prevent spam
-    Log showed 9 BIAS FLIPs in 3 hours - too noisy. Now requires 300 ticks 
-    (~5 min) between consecutive flips to the SAME forbidden direction.
+    ROOT CAUSE: With 3.5×ATR (~$196 at ATR=$56), the system needed
+    price to move $196+ before detecting a direction change. This meant
+    entries were always 5+ ATR late — the move was already done.
+    
+    With 2.0×ATR (~$112), direction changes are detected ~40% earlier.
+    Combined with lower min_threshold ($80 vs $150), the system can
+    now detect shifts in low-vol RANGE conditions where ATR is small.
+    
+    Still requires structural confirmation (swing break) to prevent
+    noise-triggered flips. The flip_cooldown_ticks (300 = ~5min) also
+    prevents rapid same-direction spam.
     """
-    base_atr_mult: float = 3.5  # Base threshold = ATR_1m * 3.5 (raised from 2.5 to resist noise)
-    min_threshold: float = 150.0  # Minimum $150 (raised from $80)
-    max_threshold: float = 500.0  # Maximum $500 (raised from $350)
+    base_atr_mult: float = 2.0  # Base threshold = ATR_1m * 2.0 (lowered from 3.5 — detect direction changes EARLIER)
+    min_threshold: float = 80.0  # Minimum $80 (lowered from $150 — allow detection in low vol)
+    max_threshold: float = 350.0  # Maximum $350 (lowered from $500)
     expansion_mult: float = 2.0  # Harder to invalidate during expansion
     direction_lock_mult: float = 1.5  # Harder during direction lock
     hysteresis_ticks: int = 180  # Min ticks before clearing forbidden (FIX #89: was 120)

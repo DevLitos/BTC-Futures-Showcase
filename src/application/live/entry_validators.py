@@ -490,12 +490,14 @@ class GraduatedSizer:
         result.combined_defensive *= loss_streak_multiplier
         
         # SESSION QUALITY SIZING
-        from src.config.trading_config import get_session_name
+        from src.config.trading_config import get_session_name, SessionQuality
         session_name = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
         session_multiplier = OperatingMode.get_session_multiplier(session_name)
         if session_multiplier < 1.0:
             logger.info(f"📊 Session sizing: {session_name} → {session_multiplier:.0%}")
-        result.tags['session_quality'] = session_name
+        # 🔥 FIX #293: Store quality TIER, not session NAME
+        result.tags['session_quality'] = SessionQuality.session_to_quality(session_name)
+        result.tags['session_name'] = session_name
         result.tags['session_size_factor'] = session_multiplier
         result.combined_defensive *= session_multiplier
         
