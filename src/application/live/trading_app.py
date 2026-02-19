@@ -5679,21 +5679,40 @@ class SignalEngine:
             self._current_trade_tags['trend_expansion'] = self._trend_expansion_active
             self._current_trade_tags['expansion_criteria'] = expansion_criteria
         
-        # 4. Apply anti-fade rule (reduce size in expansion, don't block)
-        # 🔥 FIX #83: Use regime_decision.is_fade instead of is_counter_preference
+        # 4. HARD BLOCK: No entries opposite to active expansion direction
+        # Data Feb 19: LONG during SHORT expansion → -$1.485 (catastrophic).
+        # A bounce during expansion is NOT a reversal signal.
+        if self._expansion_mode and self._expansion_direction:
+            if bias != self._expansion_direction:
+                should_log = (
+                    self._last_antifade_log is None or
+                    (market_time - self._last_antifade_log) > self._log_rate_limit_interval
+                )
+                if should_log:
+                    self._last_antifade_log = market_time
+                    logger.warning(
+                        f"🚫 EXPANSION BLOCK: Cannot enter {bias} during "
+                        f"{self._expansion_direction} expansion | HARD BLOCK"
+                    )
+                self._current_trade_tags['skip_reason'] = 'expansion_opposite_block'
+                return
+        
+        # 4b. HARD BLOCK: No fades during trend expansion anti-fade period
         if self._anti_fade_until and market_time < self._anti_fade_until:
             if regime_decision.is_fade:
                 remaining = (self._anti_fade_until - market_time).total_seconds() / 60
-                # Rate limit anti-fade log
                 should_log_af = (
                     self._last_antifade_log is None or
                     (market_time - self._last_antifade_log) > self._log_rate_limit_interval
                 )
                 if should_log_af:
                     self._last_antifade_log = market_time
-                    logger.info(f"⚠️ ANTI-FADE: Fade during expansion ({remaining:.0f}min remaining) | Size reduced 50%")
-                # Reduce size instead of blocking
-                self._current_trade_tags['regime_size_mult'] *= 0.5
+                    logger.warning(
+                        f"🚫 ANTI-FADE BLOCK: Cannot fade during expansion "
+                        f"({remaining:.0f}min remaining) | HARD BLOCK"
+                    )
+                self._current_trade_tags['skip_reason'] = 'anti_fade_expansion_block'
+                return
         
         # =====================================================================
         # 5. Short Obstinacy Check - 🔥 FIX #135: ELIMINATED (Feb 10, 2026)
@@ -8162,13 +8181,16 @@ class SignalEngine:
             base_cooldown = OperatingMode.get_smart_cooldown(exit_reason, pnl_r)
             
             # Check if signal still aligned with HTF - reduce cooldown if so
+            # BUT: Never reduce cooldown after SL hit (SL means thesis was WRONG)
             final_cooldown = base_cooldown
+            is_sl_exit = 'SL' in exit_reason.upper() or 'STOP_LOSS' in exit_reason.upper()
             try:
-                if self.current_bias and position:
-                    # If we exited and HTF bias still agrees with trade direction → reduce cooldown
+                if self.current_bias and position and not is_sl_exit:
                     if self.current_bias == position.direction:
                         final_cooldown = int(base_cooldown * OperatingMode.COOLDOWN_ALIGNED_REDUCTION)
                         logger.info(f"📊 HTF still aligned ({self.current_bias}) - cooldown reduced: {base_cooldown}→{final_cooldown}min")
+                elif is_sl_exit:
+                    logger.info(f"📊 SL exit - full cooldown {base_cooldown}min (no aligned reduction)")
             except Exception as e:
                 logger.warning(f"Could not check alignment for cooldown: {e}")
             

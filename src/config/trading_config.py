@@ -1227,18 +1227,19 @@ class OperatingMode:
     # - Pequeña pérdida = normal (recalibrar)
     # - Grande pérdida = más largo (protección emocional)
     # =====================================================================
-    COOLDOWN_PROFIT = 0              # 🔥 FIX #149: Sin cooldown tras profit
-    COOLDOWN_SCRATCH = 1             # 🔥 FIX #149: BE/scratch = 1 min reset
-    COOLDOWN_TIME_INVALIDATION = 2   # 🔥 Reducido de 3: mercado muerto, no error
-    COOLDOWN_PLANNED_EXIT = 0        # 🔥 FIX #149: TP = 0 cooldown (captura continuación)
-    COOLDOWN_SL_SMALL_LOSS = 5       # 🔥 Reducido de 8: pequeña pérdida
-    COOLDOWN_SL_NORMAL = 10          # 🔥 Reducido de 12: pérdida normal
-    COOLDOWN_SL_LARGE_LOSS = 15      # 🔥 Reducido de 20: pérdida grande
+    COOLDOWN_PROFIT = 3              # Mínimo 3min tras profit (previene chase en exhaustion)
+    COOLDOWN_SCRATCH = 2             # BE/scratch = 2min reset (nada pasó, esperar)
+    COOLDOWN_TIME_INVALIDATION = 2   # Mercado muerto, no error
+    COOLDOWN_PLANNED_EXIT = 3        # TP/VPOC = 3min (previene re-entry inmediato)
+    COOLDOWN_SL_SMALL_LOSS = 5       # pequeña pérdida (<0.5R)
+    COOLDOWN_SL_NORMAL = 15          # pérdida normal (0.5-1.0R) — was 10
+    COOLDOWN_SL_LARGE_LOSS = 20      # pérdida grande (>1.0R) — was 15
     COOLDOWN_EMERGENCY = 30          # 30 min - emergency close
-    COOLDOWN_DEFAULT = 5             # 🔥 Reducido de 10: default más bajo
+    COOLDOWN_DEFAULT = 5             # default
     
     # If signal still aligned with HTF after loss, reduce cooldown
-    COOLDOWN_ALIGNED_REDUCTION = 0.5  # 50% reduction if still aligned
+    # Only for non-SL exits (SL means we were WRONG, alignment doesn't help)
+    COOLDOWN_ALIGNED_REDUCTION = 0.5  # 50% reduction if still aligned (non-SL only)
     
     # 🔥 NEW: Planned exit reasons that deserve short cooldown
     PLANNED_EXIT_REASONS = {
@@ -1252,42 +1253,28 @@ class OperatingMode:
         """
         Calculate cooldown based on exit reason and loss size.
         
-        🔥 FIX #149 + FIX #298 (Feb 18, 2026):
+        Post-mortem Feb 17-19: 13W/16L = -$4.34
+        - TP hit → immediate re-entry at exhaustion bottom → SL (-$0.12 per event)
+        - TRAILING with profit → chase same direction ($258 higher) → loss
         
-        FIX #149: NO COOLDOWN TRAS PROFIT (el edge sigue activo)
-        FIX #298: TRAILING_STOP con profit → 2min cooldown
-        
-        PROBLEMA FIX #298 (Run 20260217):
-        - Trade 4 LONG cerró por TRAILING_STOP con +0.35R a $67,853
-        - 0 cooldown → sistema inmediatamente disponible
-        - 10 min después, BIAS FLIP → Trade 5 LONG @ $68,111 ($258 más alto)
-        - TRAILING_STOP indica que el precio SE GIRÓ contra la posición
-        - Re-entry inmediato en la misma dirección = CHASE
-        
-        SOLUCIÓN:
-        - TRAILING_STOP con profit → 2min cooldown (el precio se giró, esperar)
-        - Otros profits (TP, VPOC, etc.) → 0min (salida planificada, no giro)
+        REGLA: Siempre esperar mínimo 3min tras ANY exit con profit.
+        El mercado necesita tiempo para establecer nuevo equilibrio.
         """
         exit_upper = exit_reason.upper()
         
-        # 🔥 FIX #298: TRAILING_STOP con profit → 2min cooldown
-        # El trailing se activó porque el precio se giró. No re-entrar inmediatamente.
+        # TRAILING_STOP con profit → 3min: precio se giró contra posición
         if pnl_r > 0.02 and 'TRAILING' in exit_upper:
-            return 2  # 2 minutos — el precio se giró, esperar estabilización
+            return 3
         
-        # 🔥 FIX #149: SI HAY PROFIT → 0 COOLDOWN
-        # El edge funcionó. Puede haber continuación.
-        if pnl_r > 0.02:  # >0.02R = profit real (no dust)
-            return cls.COOLDOWN_PROFIT  # 0 minutos
+        # Cualquier profit → 3min mínimo: previene chase en exhaustion
+        if pnl_r > 0.02:
+            return cls.COOLDOWN_PROFIT  # 3 minutos
         
-        # Scratch/BE (-0.02 a +0.02)
+        # Scratch/BE (-0.02 a +0.02): nada pasó, breve reset
         if -0.02 <= pnl_r <= 0.02:
-            return cls.COOLDOWN_SCRATCH  # 1 minuto
+            return cls.COOLDOWN_SCRATCH  # 2 minutos
         
-        # Planned exits (TP, VPOC, etc.)
-        if exit_upper in cls.PLANNED_EXIT_REASONS or any(r in exit_upper for r in ['VPOC', 'TP', 'PROFIT']):
-            return cls.COOLDOWN_PLANNED_EXIT
-        
+        # TIME_INVALIDATION: mercado muerto
         if exit_reason == 'TIME_INVALIDATION':
             return cls.COOLDOWN_TIME_INVALIDATION
         elif 'EMERGENCY' in exit_reason:

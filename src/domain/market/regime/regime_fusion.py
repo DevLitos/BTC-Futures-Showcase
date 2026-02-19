@@ -344,39 +344,43 @@ class RegimeFusion:
             decision.is_fade = True
             decision.tags['counter_weak'] = not micro.is_explosive
             
-            # ========== ÚNICO BLOQUEO ==========
-            # Solo bloquear si:
-            # 1. Macro MUY fuerte (score > 2.0)
-            # 2. Micro confianza BAJA (< 0.5) - más permisivo que antes
-            # 3. Sin displacement
-            is_stupid_fade = (
-                macro.macro_strength > self.BLOCK_THRESHOLD and 
-                micro.confidence < self.BLOCK_CONFIDENCE_THRESHOLD and
-                not micro.has_displacement
-            )
-            
-            if is_stupid_fade:
+            # ========== BLOQUEO POR FUERZA MACRO ==========
+            # Data Feb 19: LONG vs BEAR(score=-2.5) con displacement override
+            # → -$1.485 (1 trade borró 5+ wins). Un "displacement bounce"
+            # contra macro fuerte es dead cat bounce, NO señal válida.
+            if macro.macro_strength > self.BLOCK_THRESHOLD:
+                # Macro MUY fuerte (>2.0): ALL fades blocked, even with displacement
                 decision.allowed = False
                 decision.is_blocked = True
                 decision.reason = (
-                    f"BLOCKED: Stupid fade (macro_str={macro.macro_strength:.1f} > {self.BLOCK_THRESHOLD}, "
-                    f"micro_conf={micro.confidence:.2f} < {self.BLOCK_CONFIDENCE_THRESHOLD}, no displacement)"
+                    f"BLOCKED: Fade vs very strong macro "
+                    f"(str={macro.macro_strength:.1f}, displacement={micro.has_displacement})"
                 )
                 logger.warning(
-                    f"☠️ FADE ESTÚPIDO BLOQUEADO: macro={macro.regime.value} "
+                    f"☠️ FADE BLOQUEADO (macro fuerte): macro={macro.regime.value} "
                     f"(score={macro.macro_score:.1f}), micro={micro.direction}, "
-                    f"conf={micro.confidence:.2f}"
+                    f"displacement={micro.has_displacement}"
                 )
-            else:
-                # Fade permitido pero caro
+            elif macro.macro_strength > 1.5:
+                # Macro moderadamente fuerte (1.5-2.0): allow with displacement but tiny size
                 if micro.is_explosive:
                     decision.override_type = "DISPLACEMENT" if micro.has_displacement else "HIGH_CONFIDENCE"
-                    decision.size_mult = 0.5  # Un poco más de size con edge
+                    decision.size_mult = 0.2  # Muy reducido: macro moderado, alto riesgo
+                    decision.rr_min = 2.5  # Requiere RR muy alto
                     decision.tags['counter_weak'] = False
-                    logger.debug(  # Changed to debug - too noisy
-                        f"🌊 FADE PERMITIDO CON EDGE: {decision.override_type} | "
-                        f"size={decision.size_mult}, rr_min={decision.rr_min}"
+                elif micro.confidence < self.BLOCK_CONFIDENCE_THRESHOLD:
+                    decision.allowed = False
+                    decision.is_blocked = True
+                    decision.reason = (
+                        f"BLOCKED: Fade no edge vs moderate macro "
+                        f"(str={macro.macro_strength:.1f}, conf={micro.confidence:.2f})"
                     )
+            else:
+                # Macro débil (<= 1.5): fade permitido con penalización normal
+                if micro.is_explosive:
+                    decision.override_type = "DISPLACEMENT" if micro.has_displacement else "HIGH_CONFIDENCE"
+                    decision.size_mult = 0.5
+                    decision.tags['counter_weak'] = False
         else:
             # NEUTRAL: Macro o Micro es neutral
             decision.size_mult = self.NEUTRAL_SIZE_MULT

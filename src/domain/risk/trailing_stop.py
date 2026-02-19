@@ -145,7 +145,7 @@ class HybridATRTrailing:
     # - CONSERVATIVE: 1.2 ATR (was 1.8 - conservative = protect profit)
     K_FACTORS = {
         TrailingRegime.TREND: 1.5,
-        TrailingRegime.RANGE: 1.3,
+        TrailingRegime.RANGE: 1.0,       # Tighter: RANGE moves are limited (was 1.3)
         TrailingRegime.VOLATILITY: 2.0,
         TrailingRegime.CONSERVATIVE: 1.2,
     }
