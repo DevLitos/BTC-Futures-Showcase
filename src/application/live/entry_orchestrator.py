@@ -179,6 +179,18 @@ class GuardOrchestrator:
         result = GuardResult()
         
         # =====================================================================
+        # GUARD 0: HARD DAILY TRADE LIMIT — NO OVERRIDE POSSIBLE
+        # Data Feb 17-19: 29 trades in 3 days, 13W/16L = -$4.34
+        # Most losses come from overtrading. 2-3 quality trades > 10 mediocre.
+        # =====================================================================
+        HARD_DAILY_LIMIT = 3  # Maximum trades per day, NO exceptions
+        daily_trades = getattr(engine.state_machine, 'daily_trades', 0)
+        if daily_trades >= HARD_DAILY_LIMIT:
+            result.passed = False
+            result.reason = f"DAILY LIMIT: {daily_trades}/{HARD_DAILY_LIMIT} trades today (HARD CAP)"
+            return result
+        
+        # =====================================================================
         # GUARD 1: Concurrency (pending orders, open positions) — HARD BLOCK
         # =====================================================================
         guard_result = await ExecutionGuards.check_all_guards(engine, ctx.current_price)
@@ -639,7 +651,7 @@ class OrderExecutor:
                 # If POST-ONLY rejected and system wanted market anyway → IOC fallback
                 if order_result is None:
                     # 🔥 Re-validate costs with TAKER fees before IOC fallback
-                    MIN_NET_R_IOC = 0.60
+                    MIN_NET_R_IOC = 0.10
                     taker_cost = engine._cost_validator.validate_costs(
                         position_size=size, current_price=ctx.current_price,
                         stop_loss=stop_loss, take_profit=take_profit,
@@ -679,7 +691,7 @@ class OrderExecutor:
                 if order_result is None:
                     # 🔥 Re-validate costs with TAKER fees before IOC fallback
                     # TP floor (0.88R) gives net=0.655R with maker, but with taker: net=0.587R < 0.60
-                    MIN_NET_R_IOC = 0.60
+                    MIN_NET_R_IOC = 0.10
                     taker_cost = engine._cost_validator.validate_costs(
                         position_size=size, current_price=ctx.current_price,
                         stop_loss=stop_loss, take_profit=take_profit,
@@ -802,6 +814,65 @@ async def _displacement_fast_path(
     # Solo para DISPLACEMENT edge type
     if current_bos.edge_type != EdgeType.DISPLACEMENT:
         return None
+    
+    # =====================================================================
+    # 🚫 RANGE MODE BLOCK: No displacement fast path in range markets
+    # Range = mean reversion. Displacement in range = false breakout.
+    # Entering at top/bottom of displacement = guaranteed loss.
+    # =====================================================================
+    from src.domain.market.regime.trend_intelligence import TrendPhase
+    current_trend_phase = getattr(engine, '_trend_phase', None)
+    current_trading_mode = getattr(engine, '_current_trade_tags', {}).get('trading_mode', '')
+    if current_trend_phase == TrendPhase.RANGE_BOUND or current_trading_mode == 'RANGE':
+        logger.info(
+            f"🚫 FAST PATH BLOCKED: RANGE mode | "
+            f"TrendPhase={current_trend_phase} | trading_mode={current_trading_mode} | "
+            f"Displacement fast path disabled in range markets"
+        )
+        # Expire edge so system doesn't keep trying
+        edge_mgr._expire_edge(reason="RANGE_MODE_BLOCK: displacement invalid in range")
+        return None
+    
+    # =====================================================================
+    # 🔥 DIRECTION MEMORY: Block same-direction fast path for 30 minutes
+    # Feb 19 evidence: TP hit → 66s displacement re-entry at bottom → instant SL
+    # After ANY trade close, block same direction displacement for 30 min.
+    # Opposite direction allowed after 3 min (fresh opportunity).
+    # =====================================================================
+    disp_direction = current_bos.direction
+    _SAME_DIR_BLOCK_S = 1800  # 30 minutes
+    _ANY_DIR_BLOCK_S = 180    # 3 minutes
+    _last_dir = getattr(engine, '_last_trade_direction', None)
+    _last_exit = getattr(engine, '_last_trade_exit_time', None)
+    if _last_exit is not None:
+        from datetime import datetime as _dt
+        _elapsed = (_dt.now() - _last_exit).total_seconds()
+        _same_dir = (_last_dir == disp_direction and _elapsed < _SAME_DIR_BLOCK_S)
+        _any_block = (_elapsed < _ANY_DIR_BLOCK_S)
+        if _same_dir or _any_block:
+            _block_type = "SAME DIR 30min" if _same_dir else "CONSUMED 3min"
+            _remaining = (_SAME_DIR_BLOCK_S if _same_dir else _ANY_DIR_BLOCK_S) - _elapsed
+            logger.info(
+                f"🚫 FAST PATH BLOCKED: DIRECTION MEMORY ({_block_type}) | "
+                f"Last={_last_dir} {_elapsed:.0f}s ago | "
+                f"Displacement={disp_direction} | Wait {_remaining:.0f}s"
+            )
+            return None
+    
+    # =====================================================================
+    # 🔥 GUARD 0 CHECK: DAILY LIMIT — CANNOT BE BYPASSED (Feb 19, 2026)
+    # The fast path was BEFORE GuardOrchestrator.run_all_guards(), so
+    # HARD_DAILY_LIMIT was NEVER checked for displacement entries.
+    # With $231 capital, every unnecessary trade can kill the project.
+    # =====================================================================
+    HARD_DAILY_LIMIT = 3
+    daily_trades = getattr(engine.state_machine, 'daily_trades', 0)
+    if daily_trades >= HARD_DAILY_LIMIT:
+        logger.warning(
+            f"🚫 FAST PATH BLOCKED: DAILY LIMIT {daily_trades}/{HARD_DAILY_LIMIT} (HARD CAP) | "
+            f"No displacement entries allowed — daily limit reached"
+        )
+        return EntryResult(success=False, reason=f"DAILY LIMIT: {daily_trades}/{HARD_DAILY_LIMIT} (fast path)")
     
     bars_since = current_bos.bars_since_displacement
     
@@ -1028,39 +1099,57 @@ async def _displacement_fast_path(
         return None
     
     # =====================================================================
-    # 🔥 CHECK 2a.5: LOCATION EXTREME BLOCK (Feb 01, 2026)
+    # 🔥 CHECK 2a.5: LOCATION BLOCK — FAST PATH (Feb 20, 2026 REFACTORED)
     # =====================================================================
-    # BUG CRÍTICO: FAST_PATH bypasaba todas las protecciones de location
-    # Trade real: SHORT en percentil 3.8% (sobreventa extrema) → -0.51R
-    #
-    # REGLA: No shorteamos en sobreventa extrema, no longeamos en sobrecompra
+    # Uses SWING RANGE position (not just percentile_60d which was too loose)
+    # Even for DISPLACEMENT, don't short at the very bottom or buy at the top.
+    # Swing range gives real-time context vs 60-day percentile.
     # =====================================================================
+    fp_swing_high = getattr(engine, '_last_swing_high', 0)
+    fp_swing_low = getattr(engine, '_last_swing_low', 0)
+    
+    if fp_swing_high > 0 and fp_swing_low > 0 and fp_swing_high > fp_swing_low:
+        fp_range = fp_swing_high - fp_swing_low
+        fp_range_pos = (current_price - fp_swing_low) / fp_range
+        
+        # DISPLACEMENT gets looser limits (20%/80%) but NOT unlimited
+        if disp_direction == 'SHORT' and fp_range_pos < 0.20:
+            logger.warning(
+                f"🚫 FAST PATH BLOCKED: SHORT at {fp_range_pos:.0%} of range (bottom 20%) | "
+                f"price={current_price:.0f} SwH={fp_swing_high:.0f} SwL={fp_swing_low:.0f}"
+            )
+            engine._current_trade_tags['fast_path_blocked_extreme'] = True
+            engine._current_trade_tags['fast_path_range_position'] = fp_range_pos
+            return None
+        
+        if disp_direction == 'LONG' and fp_range_pos > 0.80:
+            logger.warning(
+                f"🚫 FAST PATH BLOCKED: LONG at {fp_range_pos:.0%} of range (top 20%) | "
+                f"price={current_price:.0f} SwH={fp_swing_high:.0f} SwL={fp_swing_low:.0f}"
+            )
+            engine._current_trade_tags['fast_path_blocked_extreme'] = True
+            engine._current_trade_tags['fast_path_range_position'] = fp_range_pos
+            return None
+    
+    # Also check percentile_60d as fallback
     location_ctx = getattr(engine, '_location_context', None)
     if location_ctx:
         pct_60d = location_ctx.percentile_60d
         in_extreme_low = location_ctx.in_extreme_low or pct_60d <= 10
         in_extreme_high = location_ctx.in_extreme_high or pct_60d >= 90
         
-        # Block SHORT in extreme oversold
         if disp_direction == 'SHORT' and in_extreme_low:
             logger.warning(
-                f"🚫 FAST PATH BLOCKED: EXTREME OVERSOLD | "
-                f"Attempting SHORT at percentile {pct_60d:.1f}% | "
-                f"Don't short the bottom"
+                f"🚫 FAST PATH BLOCKED: EXTREME OVERSOLD (pct_60d={pct_60d:.1f}%)"
             )
             engine._current_trade_tags['fast_path_blocked_extreme'] = True
-            engine._current_trade_tags['fast_path_extreme_pct'] = pct_60d
             return None
         
-        # Block LONG in extreme overbought
         if disp_direction == 'LONG' and in_extreme_high:
             logger.warning(
-                f"🚫 FAST PATH BLOCKED: EXTREME OVERBOUGHT | "
-                f"Attempting LONG at percentile {pct_60d:.1f}% | "
-                f"Don't buy the top"
+                f"🚫 FAST PATH BLOCKED: EXTREME OVERBOUGHT (pct_60d={pct_60d:.1f}%)"
             )
             engine._current_trade_tags['fast_path_blocked_extreme'] = True
-            engine._current_trade_tags['fast_path_extreme_pct'] = pct_60d
             return None
     
     # 2b. No en cooldown global
@@ -1369,39 +1458,17 @@ async def _displacement_fast_path(
     # =====================================================================
     # CHECK 2.5e: SCORE MÍNIMO PARA FAST PATH (Feb 03, 2026)
     # =====================================================================
-    # 🔥 FIX #129 (Feb 09, 2026): Use centralized constant from unified_constants
     # Análisis de 49 trades FAST PATH: expectancy -0.012R, 35% TIME_INVALIDATION
-    # Problema: Entraba con scores 5-6 en setups mediocres
-    # Solución: Score >= 7 requiere buena estructura+timing+momentum
-    #
-    # 🔥 FIX #223 (Feb 12, 2026): TREND_BIRTH FAST TRACK
-    # PROBLEMA: Score típico de TREND_BIRTH es 5-6, pero threshold es 7
-    # Esto IMPIDE entrar al INICIO de tendencias (el mejor momento)
-    # SOLUCIÓN: Reducir threshold a 5.0 cuando TrendPhase = TREND_BIRTH
+    # With only 3 trades/day and $231 capital, every entry must be quality.
+    # Score >= 7.0 for ALL fast path entries — no TREND_BIRTH/ACCELERATION bypass.
+    # =====================================================================
     from src.config.unified_constants import SCORES
     from src.domain.market.regime import TrendPhase
     
-    FAST_PATH_MIN_SCORE = SCORES.FAST_PATH_MIN_SCORE  # Default 7.0
-    
-    # 🔥 FIX #223: Check if we're in TREND_BIRTH
-    trend_phase = getattr(engine, '_trend_phase', TrendPhase.RANGE_BOUND)
-    is_trend_birth = trend_phase == TrendPhase.TREND_BIRTH
-    is_trend_acceleration = trend_phase == TrendPhase.TREND_ACCELERATION
-    
-    if is_trend_birth:
-        FAST_PATH_MIN_SCORE = 5.0  # Reduced from 7.0 - CATCH THE BIRTH!
-        logger.info(
-            f"🚀 FIX #223 TREND_BIRTH FAST TRACK: Threshold reduced 7.0 → 5.0 | "
-            f"TrendPhase=TREND_BIRTH - OPTIMAL entry window!"
-        )
-    elif is_trend_acceleration:
-        FAST_PATH_MIN_SCORE = 6.0  # Slightly reduced - still good
-        logger.debug(
-            f"📈 FIX #223 TREND_ACCELERATION: Threshold reduced 7.0 → 6.0 | "
-            f"TrendPhase=TREND_ACCELERATION - momentum confirmed"
-        )
+    FAST_PATH_MIN_SCORE = SCORES.FAST_PATH_MIN_SCORE  # 7.0 — NO EXCEPTIONS
     
     if fast_path_score < FAST_PATH_MIN_SCORE:
+        trend_phase = getattr(engine, '_trend_phase', TrendPhase.RANGE_BOUND)
         logger.warning(
             f"🛑 FAST PATH BLOCKED: Score {fast_path_score:.1f} < {FAST_PATH_MIN_SCORE} minimum | "
             f"direction={disp_direction} | TrendPhase={trend_phase.value if hasattr(trend_phase, 'value') else trend_phase} | "
@@ -1545,9 +1612,16 @@ async def _displacement_fast_path(
     risk = abs(current_price - stop_loss)
     
     # =====================================================================
-    # TAKE PROFIT: 2.0R mínimo para displacement (tendencias)
+    # TAKE PROFIT: Regime-aware TP
+    # RANGE: 0.30R (scalp), TREND: 2.0R (runners)
     # =====================================================================
-    tp_r = 2.0
+    current_regime = getattr(engine, '_current_trade_regime', 'RANGE')
+    from src.domain.risk.risk_engine import normalize_regime_mode
+    normalized_regime = normalize_regime_mode(current_regime)
+    if normalized_regime == 'RANGE':
+        tp_r = 0.30
+    else:
+        tp_r = 2.0
     if disp_direction == 'LONG':
         take_profit = current_price + (risk * tp_r)
     else:
@@ -1865,6 +1939,66 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         result.reason = "No bias set"
         return result
     
+    # =====================================================================
+    # 🔥 DIRECTION MEMORY: Block same-direction normal entry for 30 minutes
+    # Prevents chasing the same move after a trade already captured it.
+    # =====================================================================
+    _SAME_DIR_BLOCK_NORMAL = 1800  # 30 minutes
+    _last_dir_n = getattr(engine, '_last_trade_direction', None)
+    _last_exit_n = getattr(engine, '_last_trade_exit_time', None)
+    if _last_dir_n and _last_exit_n and _last_dir_n == bias:
+        from datetime import datetime as _dt_n
+        _elapsed_n = (_dt_n.now() - _last_exit_n).total_seconds()
+        if _elapsed_n < _SAME_DIR_BLOCK_NORMAL:
+            _remaining_n = _SAME_DIR_BLOCK_NORMAL - _elapsed_n
+            if _should_log_rate_limited("direction_memory_normal", 120):
+                logger.info(
+                    f"🚫 DIRECTION MEMORY: {bias} blocked — last trade was {_last_dir_n} "
+                    f"{_elapsed_n:.0f}s ago | Wait {_remaining_n:.0f}s"
+                )
+            result.reason = f"DIRECTION MEMORY: {bias} blocked for {_remaining_n:.0f}s after last {_last_dir_n}"
+            return result
+    
+    # =====================================================================
+    # 🔥 LOCATION GATE (Feb 20, 2026) — THE #1 FIX
+    # Data: System was buying at the TOP and selling at the BOTTOM.
+    # Example: LONG @ $68868 when SwingH=$68448 (116% of range!) = instant loss
+    # Example: SHORT @ $65962 when SwingL=$65826 (5% of range!) = instant loss
+    #
+    # RULE: In RANGE market, only trade at favorable locations:
+    #   - LONG only when price < 70% of swing range
+    #   - SHORT only when price > 30% of swing range
+    # DISPLACEMENT edge bypasses this (genuine momentum breakout).
+    # =====================================================================
+    swing_high = getattr(engine, '_last_swing_high', 0)
+    swing_low = getattr(engine, '_last_swing_low', 0)
+    current_edge_type_for_location = engine._current_trade_tags.get('edge_type', None)
+    
+    if swing_high > 0 and swing_low > 0 and swing_high > swing_low:
+        swing_range = swing_high - swing_low
+        range_position = (current_price - swing_low) / swing_range  # 0.0 = bottom, 1.0 = top
+        engine._current_trade_tags['range_position_pct'] = round(range_position * 100, 1)
+        
+        # Only apply location gate for NON-displacement entries
+        if current_edge_type_for_location != 'DISPLACEMENT':
+            if bias == 'LONG' and range_position > 0.70:
+                result.reason = (
+                    f"LOCATION GATE: LONG blocked at {range_position:.0%} of range "
+                    f"(>{70}%) | price={current_price:.0f} SwH={swing_high:.0f} SwL={swing_low:.0f}"
+                )
+                if _should_log_rate_limited("location_gate", 120):
+                    logger.warning(f"🚫 {result.reason}")
+                return result
+            
+            if bias == 'SHORT' and range_position < 0.30:
+                result.reason = (
+                    f"LOCATION GATE: SHORT blocked at {range_position:.0%} of range "
+                    f"(<{30}%) | price={current_price:.0f} SwH={swing_high:.0f} SwL={swing_low:.0f}"
+                )
+                if _should_log_rate_limited("location_gate", 120):
+                    logger.warning(f"🚫 {result.reason}")
+                return result
+    
     # Parallel DI eval removed — Opción A
     
     # =========================================================================
@@ -1963,13 +2097,51 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         engine._set_rejection_cooldown("Structure against entry", candles=2)
         return result
     
+    # =====================================================================
+    # 🔥 TIMING GATE: Only enter at BIRTH of moves (BOS confirmed)
+    # Data Feb 16-20: timing=0 trades had 14% WR (worst performer).
+    # timing≥1 (BOS confirmed) = 60%+ WR.
+    # Without confirmed BOS, entry is random noise, not a genuine move.
+    # User demand: "SOLO COJA OPORTUNIDADES BUENAS EN EL NACIMIENTO"
+    # =====================================================================
+    timing_score = score_result.breakdown.get('timing', 0)
+    if timing_score == 0:
+        result.reason = f"TIMING GATE: No BOS confirmed (timing=0) — not a birth of a move"
+        return result
+    
     # Score floor check
     score_mult = EntryGateConfig.get_score_size_multiplier(score_result.score)
     if score_mult == 0.0:
         result.reason = f"Score {score_result.score:.1f} below floor"
         return result
     
-    # FADE block removed — Opción A
+    # =====================================================================
+    # 🔥 TREND EDGE BLOCK (Feb 20, 2026)
+    # Data (Feb 11-20): TREND edge = 28/41 trades, 18% WR, -$10.60 (83% of ALL losses)
+    # 18/28 TREND trades die in TIME_INVALIDATION with avg MFE 0.11R (never moved)
+    # The edge detection for TREND finds BOS in ranging market = noise.
+    # ONLY allow DISPLACEMENT and RANGE edges which have actual signal.
+    # =====================================================================
+    current_edge_type = engine._current_trade_tags.get('edge_type', None)
+    if current_edge_type == 'TREND':
+        result.reason = f"TREND edge BLOCKED (Score={score_result.score:.1f}) — 83% of losses, 18% WR in data"
+        return result
+
+    # =====================================================================
+    # 🔥 DISPLACEMENT CONSUMED GUARD — NORMAL PIPELINE (Feb 20, 2026)
+    # Same guard as fast path: block all entries for 300s after any exit
+    # to prevent re-entering on recycled edge data.
+    # =====================================================================
+    # Direction memory already handles same-direction blocking (30min) earlier.
+    # This is a fallback: block ALL entries for 3 minutes after any exit
+    # regardless of direction (market needs time to establish new equilibrium).
+    last_exit_normal = getattr(engine, '_last_trade_exit_time', None)
+    if last_exit_normal is not None:
+        from datetime import datetime
+        elapsed_since_exit = (datetime.now() - last_exit_normal).total_seconds()
+        if elapsed_since_exit < 180:  # 3 minutes minimum after any exit
+            result.reason = f"POST-EXIT COOLDOWN: {elapsed_since_exit:.0f}s < 180s since last exit"
+            return result
 
     # Session limit check (with override for high scores)
     # 🔥 FIX #10: Handle Hot Hand stopped (loss occurred)
@@ -2047,16 +2219,19 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         current_edge_type = engine._current_trade_tags.get('edge_type', None)
         atr_expansion_ratio = engine._current_trade_tags.get('atr_expansion_ratio', None)
         
-        # Simplified: 1.5R in trend, 1.0R in range, 2.0R in breakout
-        # 🔥 NEW: Adaptive TP based on volatility (atr_expansion_ratio)
+        # 🔥 FIX (Feb 20, 2026): Use trading_mode ('RANGE'/'TREND') as canonical regime
+        # instead of engine._current_regime.value which returns raw classifier strings
+        # like "low_participation_chop" that don't match get_tp_r()'s 'RANGE' check.
+        # This ensures RANGE exchange TP = 0.30R (safety net if bot crashes).
+        trading_mode_for_tp = engine._current_trade_tags.get('trading_mode', 'TREND')
         tp_mult = SimplifiedExitConfig.get_tp_r(
-            regime_str=engine._current_regime.value if engine._current_regime else "NORMAL",
+            regime_str=trading_mode_for_tp,
             adx=ctx.adx_1h if hasattr(ctx, 'adx_1h') else None,
             edge_type=current_edge_type,
             atr_expansion_ratio=atr_expansion_ratio
         )
         atr_ratio_str = f"{atr_expansion_ratio:.2f}" if atr_expansion_ratio else "N/A"
-        logger.info(f"📊 SIMPLIFIED TP: {tp_mult:.2f}R (edge={current_edge_type}, atr_ratio={atr_ratio_str})")
+        logger.info(f"📊 SIMPLIFIED TP: {tp_mult:.2f}R (mode={trading_mode_for_tp}, edge={current_edge_type}, atr_ratio={atr_ratio_str})")
     else:
         # Legacy: Dynamic TP from daily regime config
         daily_tp = engine._daily_regime_config.get('tp_r_target', AsymmetryConfig.BASE_TP_R) if hasattr(engine, '_daily_regime_config') and engine._daily_regime_config else RiskManagement.TP1_RISK_MULTIPLE
@@ -2076,9 +2251,9 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     engine._current_trade_tags['rr_worst_case'] = worst_case_rr
     
     # ========== PHASE 6: RR VALIDATION ==========
-    # Simple RR floor check — Opción A
-    if worst_case_rr < 0.5:
-        result.reason = f"RR too low: {worst_case_rr:.2f} < 0.5"
+    # RR floor — lowered for RANGE 0.30R TP (effective RR = 0.30/0.15 = 2.0)
+    if worst_case_rr < 0.20:
+        result.reason = f"RR too low: {worst_case_rr:.2f} < 0.20"
         return result
     
     # 🔥 FIX (Feb 19, 2026): ENFORCE REGIME RR MINIMUM FOR FADES
@@ -2086,9 +2261,16 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     # entries, but nobody checked it. Result: LONG entries at the top of
     # bounces in BEAR macro with 1.2R TP → guaranteed SL hit.
     # Now: if is_fade AND ideal_rr < rr_min → BLOCK.
+    # 🔥 FIX (Feb 20, 2026): RANGE mean-reversion EXEMPT from fade RR check.
+    # RANGE buys at support / sells at resistance with 0.30R TP — this is NOT
+    # a directional fade. rr_min=2.0 was designed for TREND entries going
+    # against macro. RANGE trades profit from many small wins at extremes.
     regime_is_fade = engine._current_trade_tags.get('regime_is_fade', False)
     regime_rr_min = engine._current_trade_tags.get('regime_rr_min', 1.0)
-    if regime_is_fade and ideal_rr < regime_rr_min:
+    current_trading_mode = engine._current_trade_tags.get('trading_mode', '')
+    is_range_mode = current_trading_mode == 'RANGE'
+    
+    if regime_is_fade and ideal_rr < regime_rr_min and not is_range_mode:
         logger.warning(
             f"🚫 FADE RR BLOCK: ideal_rr={ideal_rr:.2f} < regime_rr_min={regime_rr_min:.1f} | "
             f"Counter-trend entry needs {regime_rr_min:.1f}R but can only achieve {ideal_rr:.2f}R | "
@@ -2096,6 +2278,11 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         )
         result.reason = f"FADE RR BLOCK: {ideal_rr:.2f}R < {regime_rr_min:.1f}R minimum for counter-trend"
         return result
+    elif regime_is_fade and is_range_mode:
+        logger.info(
+            f"↔️ RANGE FADE PASS: ideal_rr={ideal_rr:.2f} | rr_min={regime_rr_min:.1f} bypassed | "
+            f"RANGE mean-reversion exempt from fade RR check"
+        )
     
     # ========== PHASE 7: SIZING ==========
     sizing_result = SizingOrchestrator.calculate_size_simplified(
@@ -2131,10 +2318,10 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         return result
 
     # =====================================================================
-    # ✅ PASO 3 — BLOQUEA TRADES PEQUEÑOS
-    # expected_net_R < 0.6 → NO TRADE (hard block)
+    # ✅ PASO 3 — BLOQUEA TRADES CON NET NEGATIVO
+    # Lowered for RANGE 0.30R TP: net_R = 0.30 - fees(~0.10) = 0.20
     # =====================================================================
-    MIN_EXPECTED_NET_R = 0.6
+    MIN_EXPECTED_NET_R = 0.10
     if cost_result.expected_net_r < MIN_EXPECTED_NET_R:
         if _should_log_rate_limited("hard_block_net_r", 120):
             logger.warning(
@@ -2164,16 +2351,11 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     capital = engine.risk_engine.capital if hasattr(engine, 'risk_engine') else 500.0
     
     # Umbrales de profit mínimo
-    # 🔥 FIX #235 (Feb 15, 2026): Lowered MIN_PROFIT_FLOOR from $0.50 to $0.25
-    # PROBLEM: With $245 capital and probe sizing (0.25×), expected profit was
-    # ~$0.30 → blocked by $0.50 floor. Probe trades could NEVER pass.
-    # Combined with SCORE_BLOCK_FLOOR forcing probe sizing, this was a death trap.
-    # $0.25 still covers fees on Kraken Futures (maker 0.02%, taker 0.05%).
     if capital < 500:
-        MIN_PROFIT_PERCENT = 0.0015  # 0.15% for small accounts (~$0.37 for $245)
+        MIN_PROFIT_PERCENT = 0.0004  # 0.04% for small accounts — was 0.15% which blocked ALL range entries
     else:
         MIN_PROFIT_PERCENT = 0.0010  # 0.10% for larger accounts
-    MIN_PROFIT_FLOOR = 0.25     # 🔥 FIX #235: Lowered from $0.50 — allow probe trades on small accounts
+    MIN_PROFIT_FLOOR = 0.08     # Absolute floor — was $0.25, blocked $230 account completely
     
     min_expected_profit = max(capital * MIN_PROFIT_PERCENT, MIN_PROFIT_FLOOR)
     

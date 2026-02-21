@@ -222,11 +222,17 @@ class EntryScorer:
             if micro_adj != 0:
                 self._breakdown.micro_trend_adj = micro_adj
 
-        # 7️⃣ FILTER PIPELINE ADJUSTMENT (applied directly)
-        if filter_pipeline is not None:
-            last_decision = filter_pipeline.get_last_decision()
-            if last_decision and last_decision.score_adjust != 0:
-                self._breakdown.filter_pipeline_adj = last_decision.score_adjust
+        # 7️⃣ FILTER PIPELINE ADJUSTMENT — DISABLED
+        # Data analysis Feb 16-20 (25 trades): filter_pipeline_adj is BACKWARDS.
+        # Score 5 (heavy penalty, raw 7-8) = 58% WR (BEST).
+        # Score 6 (light penalty, raw 6) = 14% WR (WORST).
+        # The pipeline penalizes GOOD setups and rewards BAD ones.
+        # Removing this noise lets the raw score (structure+timing+momentum+context+synergy)
+        # drive decisions accurately.
+        # if filter_pipeline is not None:
+        #     last_decision = filter_pipeline.get_last_decision()
+        #     if last_decision and last_decision.score_adjust != 0:
+        #         self._breakdown.filter_pipeline_adj = last_decision.score_adjust
 
         # Final score (MAX_TOTAL_PENALTY cap applied inside ScoreBreakdown.total)
         self._trade_tags.score = self._breakdown.total

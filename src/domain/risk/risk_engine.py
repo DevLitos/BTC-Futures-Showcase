@@ -36,6 +36,31 @@ REGIME_RUNNER = "RUNNER"    # Dejar correr, solo time exit
 RUNNER_PROMOTION_MFE = 1.5  # MFE >= 1.5R promociona a RUNNER (muy selectivo)
 RUNNER_TIME_EXIT_CANDLES = 90  # N velas fijas para time exit (90min)
 
+# =====================================================================
+# REGIME NORMALIZATION: Convert any regime string to canonical form.
+# EdgeRegimeClassifier returns values like "low_participation_chop",
+# "expansion_trend_continuation", etc. These MUST be normalized to
+# one of ('RANGE', 'TREND', 'BREAKOUT') for consistent TP/SL/trailing.
+# =====================================================================
+_REGIME_TREND_ALIASES = frozenset({
+    'TREND', 'REGIME_A', 'EXPANSION_TREND_CONTINUATION',
+    'TREND_EXPANSION', 'TREND_EXHAUSTION',
+})
+_REGIME_BREAKOUT_ALIASES = frozenset({'BREAKOUT'})
+
+def normalize_regime_mode(raw: str) -> str:
+    """Normalize any regime string to one of: 'RANGE', 'TREND', 'BREAKOUT'.
+    
+    Covers EdgeRegimeClassifier enum values (lowercase), enum names (REGIME_A..D),
+    HTF regime modes, and legacy strings. Default: 'RANGE' (safest).
+    """
+    key = (raw or 'RANGE').upper()
+    if key in _REGIME_TREND_ALIASES:
+        return 'TREND'
+    if key in _REGIME_BREAKOUT_ALIASES:
+        return 'BREAKOUT'
+    return 'RANGE'
+
 
 class Position:
     """Represents an open position with execution integrity invariants"""
@@ -44,7 +69,7 @@ class Position:
                  size: float, stop_loss: float, atr_1m: float,
                  market_time: datetime | None = None,
                  trade_type: TradeType = TradeType.LONG_MAIN,
-                 regime_mode: str = 'TREND',  # 🔥 NEW: regime_mode for BE logic
+                 regime_mode: str = 'RANGE',  # Normalized to RANGE/TREND/BREAKOUT
                  edge_type: str | None = None,  # 🔥 FIX (Jan 30): Track edge type for TIME_INVALIDATION
                  entry_score: float | None = None,  # 🔥 FIX (Feb 01): Track entry score for TIME_INVALIDATION
                  is_weekend: bool = False,  # 🔥 FIX (Feb 01): Track weekend for stricter exits
@@ -71,7 +96,7 @@ class Position:
         self.symbol = symbol
         self.direction = direction  # 'LONG' or 'SHORT'
         self.trade_type = trade_type  # LONG_MAIN, SHORT_STRUCTURAL, or SHORT_PULLBACK
-        self.regime_mode = regime_mode  # 🔥 NEW: 'TREND', 'RANGE', 'BREAKOUT'
+        self.regime_mode = normalize_regime_mode(regime_mode)  # Always 'RANGE', 'TREND', or 'BREAKOUT'
         self.entry_price = entry_price
         self.initial_entry_price = entry_price  # 🔥 FIX (Feb 4): NEVER changes, used for R/MFE calculations
         self.size = size
@@ -410,36 +435,41 @@ class Position:
         return None
 
     def _calculate_tp1(self, entry: float, stop: float, direction: str) -> float:
-        """Calculate TP1 at +1R"""
+        """Calculate TP1 — regime-aware.
+        
+        RANGE: 0.30R (validated Feb 20 sim: 38% hit rate, captures $0.83/win avg)
+        Other: 1.0R (standard TP1)
+        """
         risk = abs(entry - stop)
-        if direction == 'LONG':
-            return entry + (risk * RiskManagement.TP1_RISK_MULTIPLE)
+        if self.regime_mode in ('RANGE', 'MEAN_REVERSION', 'CHOPPY_DEAD'):
+            tp_mult = 0.30  # RANGE scalp TP
         else:
-            return entry - (risk * RiskManagement.TP1_RISK_MULTIPLE)
+            tp_mult = RiskManagement.TP1_RISK_MULTIPLE  # 1.0R
+        if direction == 'LONG':
+            return entry + (risk * tp_mult)
+        else:
+            return entry - (risk * tp_mult)
     
     def _calculate_early_partial_price(self) -> float:
         """
         Calculate price for early partial — REGIME-AWARE.
         
-        🔥 FIX (Feb 19, 2026): RANGE PARTIAL at 0.15R
-        RANGE trades oscillate ±0.1-0.2R. TP at 1R is structurally
-        unreachable in lateral markets. Data: Feb 19 trade reached
-        0.19R MFE over 70+ min, never came close to 0.7R.
+        CRITICAL FEE ANALYSIS (Feb 19, 2026):
+        Avg round-trip fees ≈ 0.17R. Any partial below 0.35R LOSES money.
         
-        - RANGE/MEAN_REVERSION: partial at 0.15R (capture oscillation)
-        - EVENT_DRIVEN (DISPLACEMENT, FAST_PATH): partial at 0.7R
+        - RANGE/MEAN_REVERSION: partial at 0.40R (was 0.15R — LOST money after fees!)
+        - EVENT_DRIVEN (DISPLACEMENT): partial at 0.70R
         - STRUCTURED (TREND, BOS): partial at 1.0R (TP1 level)
         """
         risk = abs(self.initial_entry_price - self.initial_stop_loss)
         
         if self.regime_mode in ('RANGE', 'MEAN_REVERSION', 'CHOPPY_DEAD'):
-            # RANGE: Capture range oscillation — TP at 1R is unrealistic
-            partial_r = 0.15
+            # RANGE: TP at 0.30R — full close (no runner in range)
+            # Data: avg RANGE MFE=0.26R, 38% reach 0.30R
+            partial_r = 0.30
         elif self.is_event_driven:
-            # EVENT_DRIVEN: Secure profits earlier at 0.7R 
-            partial_r = RiskManagement.EARLY_PARTIAL_R
+            partial_r = RiskManagement.EARLY_PARTIAL_R  # 0.7R
         else:
-            # STRUCTURED: Let winners run, partial at 1.0R (TP1 level)
             partial_r = 1.0
         
         if self.direction == 'LONG':
@@ -685,9 +715,13 @@ class Position:
                 try:
                     regime = TrailingRegime(regime_hint.upper())
                 except ValueError:
-                    regime = TrailingRegime.TREND
+                    regime = TrailingRegime.RANGE
             else:
-                regime = TrailingRegime.TREND
+                # Use position's regime_mode, default RANGE (conservative)
+                try:
+                    regime = TrailingRegime(self.regime_mode.upper()) if self.regime_mode else TrailingRegime.RANGE
+                except ValueError:
+                    regime = TrailingRegime.RANGE
             
             # Convert highs/lows to numpy arrays if needed
             import numpy as np
@@ -1130,25 +1164,25 @@ class Position:
         is_weekend = getattr(self, 'is_weekend', False)
         is_low_quality = self.entry_score is not None and self.entry_score < 4
 
-        # === MAX LOSS CALCULATION (simple, no spaghetti) ===
+        # === MAX LOSS CALCULATION (tight limits for $230 account) ===
         if is_weekend or is_low_quality:
-            max_loss_r = -0.15
+            max_loss_r = -0.10  # Weekend/low quality: cut fast
         else:
-            max_loss_r = -0.25
+            max_loss_r = -0.15  # Base: -0.15R (was -0.20R — tightened to preserve capital)
 
-        # MFE tolerance: trade proved direction → give room for pullback
+        # MFE tolerance: trade proved direction → give proportional room
         if mfe_r >= 0.50:
-            max_loss_r = min(max_loss_r, -0.50)
+            max_loss_r = min(max_loss_r, -0.30)  # Strong conviction
         elif mfe_r >= 0.30:
-            max_loss_r = min(max_loss_r, -0.40)
+            max_loss_r = min(max_loss_r, -0.20)  # Good conviction
         elif mfe_r >= 0.15:
-            max_loss_r = min(max_loss_r, -0.30)
+            max_loss_r = min(max_loss_r, -0.15)  # Some conviction
 
         # ADX bonus: strong trend pullbacks are normal
         if adx is not None and adx >= 60 and not is_weekend:
-            max_loss_r = min(max_loss_r, -0.40)
+            max_loss_r = min(max_loss_r, -0.30)  # Was -0.40
         elif adx is not None and adx >= 50 and not is_weekend:
-            max_loss_r = min(max_loss_r, -0.35)
+            max_loss_r = min(max_loss_r, -0.25)  # Was -0.35
 
         # === HARD LIMIT: enforce max loss at all times ===
         if current_r <= max_loss_r:
@@ -1162,10 +1196,11 @@ class Position:
                 'candles': self.candle_count
             }
 
-        # === PHASE 1: FAST CUT (6 candles) ===
-        # Trade never went the right direction → wrong entry, cut fast
-        if 6 <= self.candle_count < n_candles:
-            if mfe_r < 0.05 and current_r < -0.10:
+        # === PHASE 1: FAST CUT (4 candles) ===
+        # Trade never went the right direction → wrong entry, cut FAST
+        # Tightened from 6 candles/0.05R/0.10R → 4 candles/0.03R/0.08R
+        if 4 <= self.candle_count < n_candles:
+            if mfe_r < 0.03 and current_r < -0.08:
                 logger.warning(
                     f"☠️ TIME_FAST_CUT: {self.candle_count} candles, MFE={mfe_r:.2f}R | "
                     f"current={current_r:.2f}R | Zero conviction, cutting dead trade"
@@ -2256,18 +2291,18 @@ class Position:
         
         Returns first triggered exit or None.
         
-        Args:
-            current_price: Current market price
-            rsi: Current RSI (1m)
-            vpoc: VPOC price level
-            bb_width: Current BB width
-            bb_avg: Average BB width
-            volume_ratio: Volume ratio (current/avg)
-            rsi_values: Array of recent RSI values for divergence detection
-        
-        Returns:
-            Dict with highest priority exit trigger, or None
+        RANGE BYPASS (Feb 20, 2026):
+        In RANGE mode, smart exits are SKIPPED entirely.
+        _handle_early_partial() closes 100% at 0.30R instead.
+        Data: Scaled partials (30% at 0.3R) destroyed +$3.59 over 5 days
+        by leaving 70% exposed to mean reversion.
         """
+        # 🔥 RANGE: Skip ALL smart exits — early_partial handles 100% close at 0.30R
+        # Data: 11/25 trades reached 0.3R MFE, but scaled partials only closed 30%,
+        # leaving 70% to reverse. Simulated improvement: +$3.59 over 5 days.
+        if self.regime_mode in ('RANGE', 'MEAN_REVERSION', 'CHOPPY_DEAD'):
+            return None
+        
         # Update indicators
         self.update_smart_exit_indicators(rsi, bb_width, bb_avg, volume_ratio)
         
@@ -2729,31 +2764,7 @@ class RiskEngine:
                 )
                 self._last_r_log_time = now
             
-            # ================================================================
-            # 🔥 PROBE MODE: TP O SL, NADA MÁS (Jan 28, 2026)
-            # 
-            # PROBE trades = sin parciales, sin trailing, sin time stop
-            # Solo: TP o SL (dejar que el edge se pruebe limpio)
-            # 
-            # Si no, no sabes qué estás midiendo.
-            # ================================================================
             trade_tags = getattr(pos, 'trade_tags', {}) or {}
-            is_probe = bool(trade_tags.get('probing_mode', False))
-            
-            if is_probe:
-                # PROBE: Solo verificar SL y TP
-                sl_check = pos.check_stop_hit(current_price, market_time=market_time)
-                if sl_check:
-                    logger.info(f"🔬 PROBE STOP: R={pos.current_r_multiple:.2f}")
-                    return await self._close_position(current_price, 'STOP_LOSS')
-                
-                tp_check = pos.check_tp1_hit(current_price)
-                if tp_check:
-                    logger.info(f"🔬 PROBE TP: R={pos.current_r_multiple:.2f}")
-                    return await self._close_position(current_price, 'TAKE_PROFIT')
-                
-                # PROBE: No ejecutar ningún otro check (parciales, trailing, time)
-                return None
             
             # ================================================================
             # 🔥 ANOMALY-BASED EMERGENCY EXIT (Jan 24, 2026)
@@ -2813,14 +2824,28 @@ class RiskEngine:
                 )
                 return await self._close_position(current_price, f'EMERGENCY_ANOMALY ({anomaly_reason})')
             
-            # HARD BACKSTOP: -1.0R absolute limit (catastrophic protection)
-            HARD_BACKSTOP_R = -1.0
+            # HARD BACKSTOP: -0.50R absolute limit (catastrophic protection)
+            # FIX (Feb 20): Tightened from -1.0R. With $230 capital, -1.0R = $1.50 loss = death.
+            HARD_BACKSTOP_R = -0.50
             if current_r < HARD_BACKSTOP_R:
                 logger.error(
                     f"🚨🚨 HARD BACKSTOP EXIT: current_r={current_r:.3f}R < limit={HARD_BACKSTOP_R}R | "
-                    f"CRITICAL: Trade exceeded -1R, closing IMMEDIATELY"
+                    f"CRITICAL: Trade exceeded {HARD_BACKSTOP_R}R, closing IMMEDIATELY"
                 )
                 return await self._close_position(current_price, f'HARD_BACKSTOP (R={current_r:.3f})')
+            
+            # ================================================================
+            # 🚨 FIX (Feb 20, 2026): EMERGENCY MAX LOSS — defense in depth
+            # Fires during management cooldown, for adopted positions, always.
+            # This is the SECOND layer (first is in trading_app.py).
+            # ================================================================
+            EMERGENCY_MAX_LOSS_R = -0.20
+            if current_r < EMERGENCY_MAX_LOSS_R:
+                logger.warning(
+                    f"🚨 EMERGENCY MAX LOSS (risk_engine): R={current_r:.3f} < {EMERGENCY_MAX_LOSS_R} | "
+                    f"Bypassing cooldown/adopted/regime checks"
+                )
+                return await self._close_position(current_price, 'TIME_INVALIDATION_MAX_LOSS')
             
             # ================================================================
             # 🔥 FIX (Jan 23, 2026): MANAGEMENT COOLDOWN - Prevent action spam
@@ -2845,7 +2870,8 @@ class RiskEngine:
             
             # Update trailing stop (solo aplica en régimen NORMAL)
             if market_time is not None:
-                pos.update_trailing_stop(current_price, atr_1m, market_time)
+                pos.update_trailing_stop(current_price, atr_1m, market_time,
+                                         regime_hint=pos.regime_mode)
             
             # Set TP2 if provided and not yet set
             if tp2_target and not pos.tp2_price:
@@ -3123,10 +3149,11 @@ class RiskEngine:
                 if sl_check:
                     return await self._close_position(current_price, 'STOP_LOSS')
                 
-                # 1.5 🔥 NEW (Feb 2): Check EARLY PARTIAL at +0.5R
-                # Takes 50% off the table early to secure profits
+                # 1.5 🔥 EARLY PARTIAL — RANGE closes 100% at 0.30R, others at configured level
                 if pos.check_early_partial_hit(current_price):
-                    logger.info(f"💰 EARLY PARTIAL HIT @ {current_price:.2f} (+0.5R)")
+                    is_range = pos.regime_mode in ('RANGE', 'MEAN_REVERSION', 'CHOPPY_DEAD')
+                    label = "RANGE FULL CLOSE 0.30R" if is_range else "EARLY PARTIAL"
+                    logger.info(f"💰 {label} @ {current_price:.2f}")
                     return await self._handle_early_partial(pos, current_price)
                 
                 # 2. Check TP1 (partial close, promotes toward RUNNER)
@@ -3184,22 +3211,17 @@ class RiskEngine:
         """
         Handle early partial close — REGIME-AWARE.
         
-        🔥 FIX (Feb 19, 2026): RANGE PARTIAL
-        - RANGE: Close 50% at +0.15R, move SL to +0.05R (slight profit lock)
-        - Other: Close 30% at +0.7R/+1.0R, optionally move SL
-        
-        RATIONALE (RANGE): Range trades oscillate ±0.1-0.2R around
-        entry. TP at 1R is structurally unreachable. By closing 50%
-        at +0.15R and moving SL to +0.05R, we guarantee profit on
-        both halves: 50% banked + remaining protected with margin
-        for spread/slippage.
+        🔥 FIX (Feb 20, 2026): RANGE FULL CLOSE
+        - RANGE: Close 100% at +0.30R (full position, no runner in range)
+          Data: scaled partial (30%) left 70% to reverse → destroyed +$3.59 in 5 days
+        - Other: Close 30% at configured level, move SL to +0.05R
         """
         if pos.early_partial_done:
             return None
         
-        # RANGE: close 50% and always move SL to BE
+        # RANGE: close 100% and always move SL to BE
         is_range = pos.regime_mode in ('RANGE', 'MEAN_REVERSION', 'CHOPPY_DEAD')
-        early_pct = 50 if is_range else RiskManagement.EARLY_PARTIAL_PCT
+        early_pct = 100 if is_range else RiskManagement.EARLY_PARTIAL_PCT
         
         # Calculate partial close
         close_size = pos.size * (early_pct / 100.0)
@@ -3228,23 +3250,22 @@ class RiskEngine:
         pos.size = remaining_size
         pos.early_partial_done = True
         
-        # Move SL: RANGE → +0.05R (slight profit lock), others → exact BE
+        # Move SL: ALWAYS move to +0.05R after partial (never let winner become loser)
+        # Data: Trades with 0.7R partial but no SL move → 70% remaining gives back all profit
         old_sl = pos.stop_loss
-        if is_range or RiskManagement.EARLY_PARTIAL_MOVE_SL:
-            risk = abs(pos.initial_entry_price - pos.initial_stop_loss)
-            if is_range and risk > 0:
-                # RANGE: SL at +0.05R to survive spread/slippage bounce-back
-                offset = risk * 0.05
-                new_sl = pos.entry_price + offset if pos.direction == 'LONG' else pos.entry_price - offset
-            else:
-                new_sl = pos.entry_price
-            pos.stop_loss = new_sl
-            pos.trailing_stop = new_sl
-            pos.be_moved = True
-            sl_label = f"+0.05R ({new_sl:.2f})" if is_range else f"BE ({new_sl:.2f})"
-            logger.info(f"🔒 SL moved to {sl_label} after {'RANGE' if is_range else 'early'} partial: {old_sl:.2f} → {new_sl:.2f}")
+        risk = abs(pos.initial_entry_price - pos.initial_stop_loss)
+        if risk > 0:
+            # +0.05R offset: covers spread + slippage, guarantees profit on remainder
+            offset = risk * 0.05
+            new_sl = pos.entry_price + offset if pos.direction == 'LONG' else pos.entry_price - offset
+        else:
+            new_sl = pos.entry_price
+        pos.stop_loss = new_sl
+        pos.trailing_stop = new_sl
+        pos.be_moved = True
+        logger.info(f"🔒 SL moved to +0.05R ({new_sl:.2f}) after {'RANGE' if is_range else 'early'} partial: {old_sl:.2f} → {new_sl:.2f}")
         
-        partial_r_label = '0.15R' if is_range else f'+{RiskManagement.EARLY_PARTIAL_R}R'
+        partial_r_label = '0.40R' if is_range else f'+{RiskManagement.EARLY_PARTIAL_R}R'
         logger.info(
             f"💰 {'RANGE' if is_range else 'EARLY'} PARTIAL @ {partial_r_label} - "
             f"Closed {close_size:.4f} ({early_pct}%) @ {current_price:.2f} | "

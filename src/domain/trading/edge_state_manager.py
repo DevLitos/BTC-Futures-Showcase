@@ -2970,10 +2970,12 @@ class EdgeStateManager:
         # el sweep level por más de $30 para invalidar. Wobbles no matan el edge.
         #
         # Justificación: si el sweep level es soporte (LONG) o resistencia (SHORT),
-        # una penetración de <0.15×ATR es ruido, no ruptura estructural.
+        # una penetración de <0.30×ATR es ruido, no ruptura estructural.
+        # 🔥 FIX (Feb 20, 2026): Was 0.15×ATR (~$12-$19). Edges died in <30 seconds
+        # because any $15 wobble exceeded the buffer. Increased to 0.30×ATR (~$30).
         # =====================================================================
         if bos.edge_type == EdgeType.RANGE:
-            range_buffer = atr * 0.15
+            range_buffer = atr * 0.30
             if bos.direction == 'LONG' and current_price < (bos.bos_level - range_buffer):
                 self._expire_edge(
                     f"binary: price {current_price:.0f} < sweep {bos.bos_level:.0f} "

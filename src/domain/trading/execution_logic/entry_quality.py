@@ -92,8 +92,7 @@ class EntryQualityGate:
     WEAK_SESSION_ADX_THRESHOLD = 15  # ADX < 15 + poor session = reduce
     WEAK_SESSION_SIZE_FACTOR = 0.5   # Reduce to 50% size
     
-    # PROBE requirements in RANGE
-    RANGE_PROBE_MAX_SL_ATR = 1.6     # PROBE in RANGE: SL max 1.6x ATR
+    # SL limits in RANGE
     RANGE_FULL_MAX_SL_ATR = 2.0      # FULL in RANGE: SL max 2.0x ATR
     
     def __init__(self):
@@ -296,32 +295,6 @@ class EntryQualityGate:
             return True
         
         return False
-    
-    def get_sl_multiplier_for_regime(self, regime: str, is_probe: bool) -> float:
-        """
-        Get SL ATR multiplier based on regime and entry type.
-        
-        RANGE:
-        - FULL: max 2.0x ATR
-        - PROBE: max 1.6x ATR
-        
-        TREND:
-        - FULL: 3.0x-3.5x ATR (normal)
-        - PROBE: 2.5x ATR
-        """
-        is_range = regime.upper() in ['RANGE', 'CHOPPY_DEAD', 'MEAN_REVERSION']
-        
-        if is_range:
-            if is_probe:
-                return self.RANGE_PROBE_MAX_SL_ATR
-            else:
-                return self.RANGE_FULL_MAX_SL_ATR
-        else:
-            # TREND regime - normal multipliers
-            if is_probe:
-                return 2.5
-            else:
-                return 3.0
 
 
 # Singleton pattern

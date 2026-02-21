@@ -77,7 +77,6 @@ class EntryDecision:
     size_multiplier: float
     primary_reason: str
     gate_results: List[GateResult]
-    is_probe: bool = False
     
     # Detailed breakdown
     hard_gates_passed: bool = True
@@ -129,28 +128,20 @@ class EntryGateEvaluator:
         
         if decision.can_trade:
             position_size = base_size * decision.size_multiplier
-            if decision.is_probe:
-                logger.info("Entering with probe size")
     """
     
     # =========================================================================
     # SCORING THRESHOLDS FOR SOFT GATES
-    # 🔥 FIX #156 (Feb 10, 2026): Raised thresholds
-    # Trade 14:17:43 entered with score 5.5, MFE=0.00R, lost -0.44R
-    # Score < 5.5 is lottery. Score 5.5-6.5 is probe territory.
+    # Two tiers: 50% (marginal) and 100% (full conviction).
+    # Minimum 50% to ensure fees don't eat profits.
     # =========================================================================
     
-    # Score-based sizing (replaces binary threshold)
-    # 🔥 FIX #232: Rebalanced — 5.5 was too high, system never traded
-    SCORE_BLOCK_FLOOR = 4.5           # 🔥 FIX #232: Lowered from 5.5
-    SCORE_PROBE_MAX = 5.5             # 4.5-5.5 = probe (0.25x)
-    SCORE_REDUCED_MAX = 6.0           # 5.5-6.0 = reduced (0.5x)
-    # Above 6.0 = full size
+    SCORE_BLOCK_FLOOR = 5.0           # Block below this
+    SCORE_FULL_MIN = 7.0              # Full size above this
     
     # RR-based sizing
-    RR_BLOCK_FLOOR = 0.5              # Below 0.5 = mathematical roulette (was 0.6)
-    RR_PROBE_MAX = 0.8                # 0.5-0.8 = probe size (was 1.0)
-    RR_FULL_MIN = 1.0                 # Above 1.0 = full size (was 1.2)
+    RR_BLOCK_FLOOR = 0.20             # Below 0.20 = block (lowered for RANGE 0.30R TP)
+    RR_FULL_MIN = 0.80                # Above 0.8 = full size
     
     # LTF confirmations
     LTF_MAX_REQUIRED = 2              # Never require 3/3 confirmations
@@ -322,12 +313,9 @@ class EntryGateEvaluator:
                 tags=tags
             )
         
-        # Determine if this is a probe trade
-        is_probe = size_multiplier <= 0.3
-        
-        # Ensure minimum probe size (0.25) if trading
-        if size_multiplier > 0 and size_multiplier < 0.25:
-            size_multiplier = 0.25
+        # Enforce minimum size floor (50% — fees floor)
+        if size_multiplier > 0 and size_multiplier < 0.50:
+            size_multiplier = 0.50
         
         # Calculate soft gates average score for analysis
         soft_multipliers = [r.size_multiplier for r in soft_gates if r.passed]
@@ -345,7 +333,6 @@ class EntryGateEvaluator:
             size_multiplier=round(size_multiplier, 2),
             primary_reason=primary_reason,
             gate_results=results,
-            is_probe=is_probe,
             hard_gates_passed=True,
             soft_gates_score=round(soft_gates_score, 2),
             tags=tags
@@ -537,36 +524,26 @@ class EntryGateEvaluator:
         
         🔥 FIX #232: Rebalanced tiers:
         - score < 4.5: Block (floor breach)
-        - 4.5 <= score < 5.5: Probe (0.25x)
-        - 5.5 <= score < 6.0: Reduced (0.5x)
-        - score >= 6.0: Full (1.0x)
+        - score < 5.0: Block
+        - 5.0 <= score < 7.0: Reduced (0.5x)
+        - score >= 7.0: Full (1.0x)
         """
         if score < self.SCORE_BLOCK_FLOOR:
             return GateResult(
                 name="Score",
                 gate_type=GateType.SOFT,
                 category=GateCategory.SIZING,
-                passed=False,  # Hard floor breach
+                passed=False,
                 reason=f"Score {score:.1f} < floor {self.SCORE_BLOCK_FLOOR}"
             )
-        elif score < self.SCORE_PROBE_MAX:
-            return GateResult(
-                name="Score",
-                gate_type=GateType.SOFT,
-                category=GateCategory.SIZING,
-                passed=True,
-                size_multiplier=0.25,
-                reason=f"Score {score:.1f} in probe zone (3.5-4.5)",
-                details={'score': score, 'zone': 'probe'}
-            )
-        elif score < self.SCORE_REDUCED_MAX:
+        elif score < self.SCORE_FULL_MIN:
             return GateResult(
                 name="Score",
                 gate_type=GateType.SOFT,
                 category=GateCategory.SIZING,
                 passed=True,
                 size_multiplier=0.5,
-                reason=f"Score {score:.1f} in reduced zone (4.5-5.5)",
+                reason=f"Score {score:.1f} in reduced zone ({self.SCORE_BLOCK_FLOOR}-{self.SCORE_FULL_MIN})",
                 details={'score': score, 'zone': 'reduced'}
             )
         else:
@@ -575,7 +552,7 @@ class EntryGateEvaluator:
                 gate_type=GateType.SOFT,
                 category=GateCategory.SIZING,
                 passed=True,
-                reason=f"Score {score:.1f} excellent (>= 5.5)",
+                reason=f"Score {score:.1f} excellent (>= {self.SCORE_FULL_MIN})",
                 details={'score': score, 'zone': 'full'}
             )
     
@@ -589,22 +566,20 @@ class EntryGateEvaluator:
         Evaluate RR gate with graduated sizing - SOFT.
         
         Sizing:
-        - rr_net < 0.6: Block (mathematical roulette)
-        - 0.6 <= rr_net < 1.0: Probe (0.25x) + require confirmation
-        - 1.0 <= rr_net < 1.2: Reduced (0.5x)
-        - rr_net >= 1.2: Full (1.0x)
+        - rr_net < 0.7: Block
+        - 0.7 <= rr_net < 0.8: Reduced (0.5x)
+        - rr_net >= 0.8: Full (1.0x)
         
         Note: In RANGE regime, lower RR thresholds are acceptable
         due to higher winrate mean-reversion.
         """
         # Adjust floors for RANGE regime
         block_floor = self.RR_BLOCK_FLOOR
-        probe_max = self.RR_PROBE_MAX
+        full_min = self.RR_FULL_MIN
         
         if regime == "RANGE":
-            # RANGE regime can accept lower RR due to high winrate
-            block_floor = 0.5
-            probe_max = 0.8
+            block_floor = 0.20
+            full_min = 0.30
         
         if rr_net < block_floor:
             return GateResult(
@@ -612,26 +587,16 @@ class EntryGateEvaluator:
                 gate_type=GateType.SOFT,
                 category=GateCategory.SIZING,
                 passed=False,
-                reason=f"RR {rr_net:.2f} < floor {block_floor} (mathematical roulette)"
+                reason=f"RR {rr_net:.2f} < floor {block_floor}"
             )
-        elif rr_net < probe_max:
-            return GateResult(
-                name="RiskReward",
-                gate_type=GateType.SOFT,
-                category=GateCategory.SIZING,
-                passed=True,
-                size_multiplier=0.25,
-                reason=f"RR {rr_net:.2f} in probe zone ({block_floor}-{probe_max})",
-                details={'rr_net': rr_net, 'zone': 'probe'}
-            )
-        elif rr_net < self.RR_FULL_MIN:
+        elif rr_net < full_min:
             return GateResult(
                 name="RiskReward",
                 gate_type=GateType.SOFT,
                 category=GateCategory.SIZING,
                 passed=True,
                 size_multiplier=0.5,
-                reason=f"RR {rr_net:.2f} in reduced zone ({probe_max}-{self.RR_FULL_MIN})",
+                reason=f"RR {rr_net:.2f} in reduced zone ({block_floor}-{full_min})",
                 details={'rr_net': rr_net, 'zone': 'reduced'}
             )
         else:
@@ -640,7 +605,7 @@ class EntryGateEvaluator:
                 gate_type=GateType.SOFT,
                 category=GateCategory.SIZING,
                 passed=True,
-                reason=f"RR {rr_net:.2f} good (>= {self.RR_FULL_MIN})",
+                reason=f"RR {rr_net:.2f} good (>= {full_min})",
                 details={'rr_net': rr_net, 'zone': 'full'}
             )
     

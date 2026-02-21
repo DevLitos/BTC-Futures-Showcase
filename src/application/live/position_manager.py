@@ -1,16 +1,12 @@
 """
-Position Manager - Extracted from SignalEngine (AUDIT REFACTOR Point 5)
+Position Manager - Manages open position lifecycle.
 
-Created: Jan 27, 2026
-Updated: Jan 27, 2026 - FULL REFACTOR (extracted complete logic from _handle_manage_state)
-
-Manages open position lifecycle:
+Manages:
 - Trailing stops (hybrid: tight fast + wider slow)
 - Partial exits (TP1 smart close)
 - BOS invalidation detection
 - Exhaustion detection & exit
 - Time-based/stagnation exits
-- Probing mode exits
 - Anticipation trade timeouts
 - Momentum decay checks
 - Funding/time-based forced exits
@@ -19,8 +15,7 @@ This module contains:
 1. Pure utility functions (no state) - calculate_current_r, check_bos_against_position, etc.
 2. PositionHealthChecker class - evaluates position health
 3. PositionExitChecker class - determines if position should exit
-4. ProbingModeChecker class - special exit rules for probing trades
-5. MomentumDecayChecker class - detects dying momentum
+4. MomentumDecayChecker class - detects dying momentum
 """
 
 import logging
@@ -392,139 +387,6 @@ class PositionHealthChecker:
 
 
 # =========================================================================
-# PROBING MODE CHECKER - Special exit rules for diagnostic trades
-# =========================================================================
-
-class ProbingModeChecker:
-    """
-    Handles special exit rules for PROBING trades.
-    
-    PROBING trades are "diagnostic probes" - testing edge viability, not exploiting.
-    
-    Rules:
-    1. If MAE > 0.5R AND time > 60s → ABORT (thesis failed, gave time to work)
-    2. If +0.2R reached in <90s → Validation passed (can continue)
-    3. If +0.2R NOT reached after 5min → Abort (no edge shown)
-    """
-    
-    # Configurable thresholds
-    MAE_THRESHOLD_R = 0.5
-    MIN_TIME_FOR_MAE_ABORT_SEC = 60
-    VALIDATION_TARGET_R = 0.2
-    VALIDATION_TIME_LIMIT_SEC = 90
-    TIMEOUT_SEC = 300  # 5 minutes
-    
-    @staticmethod
-    def check_probing_exit(
-        position,
-        trade_tags: Dict[str, Any],
-        market_time: datetime,
-        current_price: float
-    ) -> ExitCheckResult:
-        """
-        Check if probing trade should exit.
-        
-        Args:
-            position: Current position object
-            trade_tags: Dict with trade metadata (probing_mode, entry_timestamp_ms, etc.)
-            market_time: Current market time
-            current_price: Current price
-        
-        Returns:
-            ExitCheckResult with decision and reason
-        """
-        result = ExitCheckResult()
-        
-        # Only applies to probing trades
-        if not trade_tags.get('probing_mode', False):
-            return result
-        
-        if not position:
-            return result
-        
-        mae_r = position.calculate_mae_r() if hasattr(position, 'calculate_mae_r') else 0
-        mfe_r = position.calculate_mfe_r() if hasattr(position, 'calculate_mfe_r') else 0
-        
-        # Calculate time in trade
-        entry_ts = trade_tags.get('entry_timestamp_ms', 0)
-        time_in_trade_sec = (market_time.timestamp() * 1000 - entry_ts) / 1000 if entry_ts > 0 else 0
-        
-        # Rule 1: MAE > 0.5R AND time > 60s → ABORT (thesis failed)
-        if mae_r > ProbingModeChecker.MAE_THRESHOLD_R and time_in_trade_sec > ProbingModeChecker.MIN_TIME_FOR_MAE_ABORT_SEC:
-            result.decision = ExitDecision.CLOSE
-            result.reason = "PROBING_ABORT_MAE"
-            result.cooldown_minutes = 2
-            result.extra_data = {
-                'mae_r': mae_r,
-                'time_in_trade_sec': time_in_trade_sec
-            }
-            return result
-        
-        # Rule 2: +0.2R reached fast → Validation passed (just log, don't exit)
-        time_to_02r = trade_tags.get('time_to_02r_sec', -1)
-        if time_to_02r > 0 and time_to_02r < ProbingModeChecker.VALIDATION_TIME_LIMIT_SEC:
-            if not trade_tags.get('probing_validated', False):
-                result.extra_data['probing_validated'] = True
-                result.extra_data['probing_validated_at'] = market_time.isoformat()
-                logger.info(f"🟢 PROBING VALIDATED: +0.2R in {time_to_02r:.0f}s - edge confirmed")
-        
-        # Rule 3: No +0.2R after 5 minutes → Abort
-        if time_in_trade_sec > ProbingModeChecker.TIMEOUT_SEC and mfe_r < ProbingModeChecker.VALIDATION_TARGET_R:
-            result.decision = ExitDecision.CLOSE
-            result.reason = "PROBING_TIMEOUT"
-            result.cooldown_minutes = 3  # Longer cooldown - edge not shown
-            result.extra_data = {
-                'time_in_trade_sec': time_in_trade_sec,
-                'mfe_r': mfe_r
-            }
-            return result
-        
-        return result
-    
-    @staticmethod
-    def track_probe_max_sequence(
-        position,
-        trade_tags: Dict[str, Any],
-        market_time: datetime
-    ) -> Dict[str, Any]:
-        """
-        Track PROBE_MAX observability - sequence of +0.2R then MAE > 0.5R.
-        
-        This tells us:
-        - If edge is CLEAN MOMENTUM (rare to see MAE > 0.5R after +0.2R)
-        - Or HIGH NOISE MEAN-REVERT (common to see retrace after +0.2R)
-        
-        Returns updated trade_tags with observability data.
-        """
-        if not position:
-            return trade_tags
-        
-        probing_level = trade_tags.get('range_size_mult', 0.25)
-        is_probe_max = probing_level >= 0.65
-        was_validated = trade_tags.get('probing_validated', False)
-        mae_r = position.calculate_mae_r() if hasattr(position, 'calculate_mae_r') else 0
-        
-        if is_probe_max and was_validated and mae_r > 0.5:
-            if not trade_tags.get('probe_max_sequence_logged', False):
-                trade_tags['probe_max_sequence_logged'] = True
-                trade_tags['probe_max_validated_then_mae'] = True
-                trade_tags['probe_max_mae_after_validation'] = mae_r
-                logger.info(
-                    f"📊 PROBE_MAX SEQUENCE: Validated (+0.2R) → then MAE={mae_r:.2f}R | "
-                    f"This suggests HIGH NOISE / MEAN-REVERT behavior"
-                )
-        
-        # Track clean momentum
-        if is_probe_max and was_validated and not trade_tags.get('probe_max_clean_momentum_logged', False):
-            if mae_r < 0.3:
-                trade_tags['probe_max_clean_momentum_logged'] = True
-                trade_tags['probe_max_clean_momentum'] = True
-                logger.debug(f"📊 PROBE_MAX CLEAN: Validated (+0.2R) with MAE={mae_r:.2f}R (clean momentum)")
-        
-        return trade_tags
-
-
-# =========================================================================
 # ANTICIPATION TRADE CHECKER - Timeout for anticipation entries
 # =========================================================================
 
@@ -853,7 +715,6 @@ class PositionManager:
     """
     
     def __init__(self):
-        self.probing_checker = ProbingModeChecker()
         self.anticipation_checker = AnticipationChecker()
         self.momentum_decay_checker = MomentumDecayChecker()
         self.bos_checker = BOSInvalidationChecker()
@@ -874,11 +735,10 @@ class PositionManager:
         Run all exit checks and return first CLOSE or TIGHTEN result.
         
         Checks run in order of urgency:
-        1. Probing mode special exits
-        2. Anticipation trade timeout
-        3. BOS invalidation
-        4. Momentum decay
-        5. Position health (stagnation)
+        1. Anticipation trade timeout
+        2. BOS invalidation
+        3. Momentum decay
+        4. Position health (stagnation)
         
         Returns:
             ExitCheckResult - first non-HOLD result, or HOLD if all pass
@@ -886,38 +746,28 @@ class PositionManager:
         if not position:
             return ExitCheckResult()
         
-        # 1. Probing mode exits
-        probing_result = ProbingModeChecker.check_probing_exit(
-            position, trade_tags, market_time, current_price
-        )
-        if probing_result.decision != ExitDecision.HOLD:
-            return probing_result
-        
-        # Track probe_max sequence (observability, doesn't exit)
-        ProbingModeChecker.track_probe_max_sequence(position, trade_tags, market_time)
-        
-        # 2. Anticipation timeout
+        # 1. Anticipation timeout
         anticipation_result = AnticipationChecker.check_anticipation_timeout(
             position, trade_tags, market_time
         )
         if anticipation_result.decision != ExitDecision.HOLD:
             return anticipation_result
         
-        # 3. BOS invalidation
+        # 2. BOS invalidation
         bos_result = BOSInvalidationChecker.check_bos_invalidation(
             position, has_bos_against, current_price, market_time, df_5m
         )
         if bos_result.decision != ExitDecision.HOLD:
             return bos_result
         
-        # 4. Momentum decay
+        # 3. Momentum decay
         momentum_result = MomentumDecayChecker.check_momentum_decay(
             position, current_price, market_time, current_adx
         )
         if momentum_result.decision != ExitDecision.HOLD:
             return momentum_result
         
-        # 5. Position health (stagnation, comprehensive check)
+        # 4. Position health (stagnation, comprehensive check)
         if atr_5m and df_5m is not None:
             health_eval = PositionHealthChecker.evaluate_position(
                 position, current_price, market_time, df_5m, atr_5m

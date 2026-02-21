@@ -148,9 +148,6 @@ class TradeRecorder:
         else:
             result = self._handle_win(result, state, pnl, trade_tags)
         
-        # Log PROBE_MAX observability if applicable
-        self._log_probe_max_result(trade_tags, pnl, exit_reason)
-        
         return result
     
     def _handle_expansion_tracking(
@@ -293,33 +290,6 @@ class TradeRecorder:
         )
         
         return result
-    
-    def _log_probe_max_result(self, trade_tags: dict, pnl: float, exit_reason: str):
-        """Log detailed PROBE_MAX metrics."""
-        probing_mode = trade_tags.get('probing_mode', '')
-        if probing_mode != 'PROBE_MAX':
-            return
-        
-        validated_then_mae = trade_tags.get('probe_max_validated_then_mae', False)
-        mae_after_validation = trade_tags.get('probe_max_mae_after_validation', 0.0)
-        clean_momentum = trade_tags.get('probe_max_clean_momentum', False)
-        conviction_score = trade_tags.get('conviction_score', 0)
-        
-        pnl_r = pnl / trade_tags.get('sl_amount', pnl) if pnl != 0 else 0.0
-        mfe_r = trade_tags.get('mfe_r', 0.0)
-        mae_r = trade_tags.get('mae_r', 0.0)
-        
-        mode_str = (
-            'VALIDATED_THEN_MAE' if validated_then_mae 
-            else 'CLEAN_MOMENTUM' if clean_momentum 
-            else 'NORMAL'
-        )
-        
-        logger.info(
-            f"📊 PROBE_MAX RESULT: PnL={pnl_r:.2f}R | MFE={mfe_r:.2f}R | MAE={mae_r:.2f}R | "
-            f"conviction={conviction_score} | {mode_str} | "
-            f"MAE_post_val={mae_after_validation:.2f}R | exit={exit_reason}"
-        )
 
 
 # ============================================================================

@@ -39,7 +39,6 @@ from src.domain.trading.scoring.entry_scorer import (
 # Re-export edge
 from src.domain.trading.edge.edge_enforcement import EdgeEnforcement
 from src.domain.trading.edge.edge_validator import EdgeValidator, ContextValidity
-from src.domain.trading.edge.edge_recovery_protocol import EdgeRecoveryProtocol
 
 # Re-export state
 from src.domain.trading.state.state_machine import StateMachine, BotState
@@ -69,7 +68,7 @@ __all__ = [
     # Scoring
     'EntryScorer', 'get_entry_scorer',
     # Edge
-    'EdgeEnforcement', 'EdgeValidator', 'ContextValidity', 'EdgeRecoveryProtocol',
+    'EdgeEnforcement', 'EdgeValidator', 'ContextValidity',
     # Edge State Manager
     'EdgeStateManager', 'EdgeState', 'BOSEvent', 'EdgeStats',
     'get_edge_manager', 'reset_edge_manager',

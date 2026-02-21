@@ -104,26 +104,35 @@ class HybridATRTrailing:
     """
     
     # R-Lock tiers by regime
-    # TREND: More lenient (pullbacks of 0.3-0.5R are normal in BTC)
-    # RANGE: Tighter protection (RANGE oscillation rarely exceeds 0.5R)
-    # Both start at 0.3R MFE to prevent trades from reversing all gains.
+    # 🔥 FIX (Feb 20, 2026): AGGRESSIVE CAPTURE for RANGE
+    # Data (Feb 11-20): 20 trades had MFE>=0.20R but captured NEGATIVE total (-1.25R)!
+    # Old tiers captured 0-30% of MFE. New tiers target 33-60% capture.
+    # In RANGE mode, moves REVERSE. Capture profit while it exists.
+    # REFACTORED (Feb 20, 2026): Start protecting at 0.10R MFE
+    # Data: 20 trades with MFE >= 0.20R captured -1.25R total! (negative!)
+    # The trailing was letting price reverse ALL gains before locking anything.
+    #
+    # 🔥 FIX (Feb 20, 2026): tier=0 was at 0.10R MFE → locked at +0.01R (=breakeven).
+    # With TP at 0.30R, the trade NEVER had room to reach TP — trailing killed it at
+    # 0.108R MFE with $0.00 PnL. Moved tier=0 to 0.20R MFE to give trades breathing room.
+    # The early partial at 0.30R handles the RANGE full-close anyway.
     R_LOCK_TIERS_RANGE = [
-        (0.3, -0.10, 0),  # +0.3R MFE → max loss -0.10R (protects sub-0.5R reversal)
-        (0.5, -0.05, 1),  # +0.5R MFE → near breakeven
-        (0.8,  0.05, 2),  # +0.8R → small profit locked
-        (1.0,  0.20, 3),  # +1.0R → lock 0.20R
-        (1.2,  0.40, 4),  # +1.2R → lock 0.40R
-        (1.5,  0.70, 5),  # +1.5R → lock 0.70R
-        (1.8,  1.00, 6),  # +1.8R → lock 1.00R
-        (2.2,  1.40, 7),  # +2.2R → lock 1.40R
+        (0.20, 0.05, 0),  # +0.20R MFE → lock +0.05R (breakeven + small profit)
+        (0.25, 0.10, 1),  # +0.25R → lock +0.10R (close to TP, secure gains)
+        (0.30, 0.15, 2),  # +0.30R → lock +0.15R (at TP level, 50% capture)
+        (0.40, 0.22, 3),  # +0.40R → lock +0.22R (55% capture)
+        (0.50, 0.30, 4),  # +0.50R → lock +0.30R (60% capture)
+        (0.70, 0.45, 5),  # +0.70R → lock +0.45R (64% capture)
+        (1.00, 0.65, 6),  # +1.00R → lock +0.65R (65% capture)
+        (1.50, 1.00, 7),  # +1.50R → lock +1.00R (67% capture)
     ]
     
     R_LOCK_TIERS_TREND = [
-        (0.3, -0.20, 0),  # +0.3R MFE → max loss -0.20R (protects sub-0.5R reversal)
-        (0.5, -0.10, 1),  # +0.5R → max loss -0.10R
-        (0.8,  0.05, 2),  # +0.8R → small profit locked
-        (1.0,  0.20, 3),  # +1.0R → lock 0.20R
-        (1.2,  0.50, 4),  # +1.2R → lock 0.50R
+        (0.3, -0.05, 0),  # +0.3R MFE → max loss -0.05R (was -0.20R)
+        (0.5,  0.00, 1),  # +0.5R → breakeven (was -0.10R)
+        (0.8,  0.15, 2),  # +0.8R → profit locked (was 0.05R)
+        (1.0,  0.30, 3),  # +1.0R → lock 0.30R (was 0.20R)
+        (1.2,  0.55, 4),  # +1.2R → lock 0.55R (was 0.50R)
         (1.5,  0.90, 5),  # +1.5R → lock 0.90R
         (1.8,  1.20, 6),  # +1.8R → lock 1.20R
         (2.2,  1.60, 7),  # +2.2R → lock 1.60R
@@ -145,9 +154,9 @@ class HybridATRTrailing:
     # - CONSERVATIVE: 1.2 ATR (was 1.8 - conservative = protect profit)
     K_FACTORS = {
         TrailingRegime.TREND: 1.5,
-        TrailingRegime.RANGE: 1.0,       # Tighter: RANGE moves are limited (was 1.3)
-        TrailingRegime.VOLATILITY: 2.0,
-        TrailingRegime.CONSERVATIVE: 1.2,
+        TrailingRegime.RANGE: 0.7,       # 🔥 FIX (Feb 20): AGGRESSIVE capture in RANGE (was 1.0)
+        TrailingRegime.VOLATILITY: 2.0,  # Data: captures only 7% of MFE at K=1.0, need tighter
+        TrailingRegime.CONSERVATIVE: 1.0, # Tightened from 1.2 for consistency
     }
     
     # Swing reference lookback (candles)
@@ -157,11 +166,11 @@ class HybridATRTrailing:
     MIN_STOP_MOVE_ATR_MULT = 0.1  # Only move if > 0.1 ATR improvement
     
     # CRITICAL: Only activate ATR trailing after this MFE threshold
-    # This prevents killing winners too early
-    # 🔥 FIX #243 (Feb 16, 2026): Increased from 0.2 to 0.4
-    # BTC pullbacks of 0.2-0.3R are normal. Starting ATR trail at +0.2R MFE
-    # caused trades to be stopped on normal noise. 0.4R gives room.
-    ATR_TRAIL_ACTIVATION_MFE = 0.4  # Start ATR trailing at +0.4R (was 0.2)
+    # With K_FACTOR_RANGE=0.7 and ATR/risk≈0.31, trail_distance≈0.22R
+    # At MFE 0.20R: trail at 0.20-0.22=-0.02R (R_LOCK handles it)
+    # At MFE 0.25R: trail at 0.25-0.22=+0.03R (barely positive)
+    # Lowered to 0.20 to start ATR tracking sooner — R_LOCK still dominant
+    ATR_TRAIL_ACTIVATION_MFE = 0.20  # Start ATR trailing at +0.20R (was 0.25)
     
     # =========================================================================
     # 🔥 BOS QUALITY DYNAMIC TRAILING (Feb 3, 2026)

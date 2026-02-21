@@ -34,7 +34,7 @@ REMOVED (set to 1.0):
 - day_mult          → noise
 - spread_mult       → noise (use hard block if spread > threshold)
 - countertrend_mult → use regime instead
-- anticipation_mult → probe entries are eliminated
+- anticipation_mult → eliminated
 - volatility_mult   → noise (covered by regime)
 - gate_cap          → eliminated
 - range_mult        → covered by regime_mult
@@ -95,7 +95,7 @@ class SimplifiedSizingResult:
     block_reason: Optional[str] = None
     
     # The 5 core multipliers (+ edge mode + adaptive filters)
-    base_risk_pct: float = 0.01  # 1% always
+    base_risk_pct: float = 0.015  # 1.5% base — from 1% survival mode, increased to dilute fee impact
     rr_mult: float = 1.0
     regime_mult: float = 1.0
     loss_streak_mult: float = 1.0
@@ -137,8 +137,8 @@ class RRBucket:
     - Preferimos MENOS trades de MAYOR calidad
     - Bloquear trades < 0.6R, reducir < 0.9R
     """
-    BLOCK_THRESHOLD = 0.60       # Below this = HARD BLOCK (quality filter)
-    REDUCED_THRESHOLD = 0.90     # Below this = 0.75x (moderate quality)
+    BLOCK_THRESHOLD = 0.20       # Below this = HARD BLOCK (lowered for RANGE 0.30R TP)
+    REDUCED_THRESHOLD = 0.40     # Below this = 0.75x (moderate quality)
     # Above 0.6R = 1.0x
     
     @classmethod
@@ -167,7 +167,7 @@ class RegimeMultiplier:
     🔄 REFACTORED Feb 04: Uses ADXThresholds from trading_config
     """
     TREND = 1.0
-    RANGE = 0.7  # ADX < ADXThresholds.RANGE (18)
+    RANGE = 1.0  # No penalty — RANGE uses tight TP=0.30R + MaxLoss=-0.15R
     
     @classmethod
     def get_multiplier(cls, adx: Optional[float], regime_str: str = "NORMAL") -> float:
@@ -866,9 +866,11 @@ class SimplifiedExitConfig:
     # - Filtros estrictos para solo trades de alta probabilidad
     # - WTP deshabilitado para ver edge real
     
-    # Take Profit - Moderados para calidad
+    # Take Profit - REALISTIC targets based on actual data
+    # Data (Feb 11-20): TP 1.0R = 2% hit rate, TP 0.5R = 20% hit rate
+    # In RANGE: moves rarely exceed 0.7R, set TP to minimum viable
     TP_R_TREND = 1.2    # 1.2R en tendencia (equilibrio calidad/frecuencia)
-    TP_R_RANGE = 1.0    # 1.0R en rango (trailing gestiona salida real)
+    TP_R_RANGE = 0.30   # 0.30R — data-validated: 38% hit rate, +$0.83 avg win
     
     # 🔥 NEW FEB 11: TP ADAPTATIVO basado en volatilidad
     # - Baja volatilidad (atr_ratio < 0.8): TP conservador
@@ -882,7 +884,7 @@ class SimplifiedExitConfig:
     # When low-vol adjustment reduces TP to 0.80R, net_R = 0.80 - 0.225(fees) = 0.575 < 0.60
     # This causes 16+ HARD BLOCK rejections until SL drifts enough to barely pass.
     # Floor ensures TP after adjustment always passes MIN_EXPECTED_NET_R with margin.
-    TP_MIN_FLOOR = 0.88  # 0.88R - fees(0.225) = 0.655R > 0.60 HARD BLOCK threshold
+    TP_MIN_FLOOR = 0.30  # 0.30R — matches RANGE TP target
     
     # 🔥 BREAKOUT edge - Alto TP porque baja frecuencia
     TP_R_BREAKOUT = 1.8       # BREAKOUT target (calidad > cantidad)

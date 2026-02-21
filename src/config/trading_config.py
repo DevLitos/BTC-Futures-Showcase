@@ -1227,15 +1227,15 @@ class OperatingMode:
     # - Pequeña pérdida = normal (recalibrar)
     # - Grande pérdida = más largo (protección emocional)
     # =====================================================================
-    COOLDOWN_PROFIT = 3              # Mínimo 3min tras profit (previene chase en exhaustion)
-    COOLDOWN_SCRATCH = 2             # BE/scratch = 2min reset (nada pasó, esperar)
-    COOLDOWN_TIME_INVALIDATION = 2   # Mercado muerto, no error
-    COOLDOWN_PLANNED_EXIT = 3        # TP/VPOC = 3min (previene re-entry inmediato)
+    COOLDOWN_PROFIT = 10             # 10min tras profit — Feb 19 data: 3min allowed displacement re-entry at bottom
+    COOLDOWN_SCRATCH = 5             # BE/scratch = 5min reset — was 2, too short for $230 account
+    COOLDOWN_TIME_INVALIDATION = 10  # Was 2min — if entry was bad, wait for new setup
+    COOLDOWN_PLANNED_EXIT = 10        # TP/VPOC = 10min — was 3min, too short (Feb 19: TP→66s re-entry→SL)
     COOLDOWN_SL_SMALL_LOSS = 5       # pequeña pérdida (<0.5R)
     COOLDOWN_SL_NORMAL = 15          # pérdida normal (0.5-1.0R) — was 10
     COOLDOWN_SL_LARGE_LOSS = 20      # pérdida grande (>1.0R) — was 15
     COOLDOWN_EMERGENCY = 30          # 30 min - emergency close
-    COOLDOWN_DEFAULT = 5             # default
+    COOLDOWN_DEFAULT = 10            # default — was 5, extended for survival mode
     
     # If signal still aligned with HTF after loss, reduce cooldown
     # Only for non-SL exits (SL means we were WRONG, alignment doesn't help)
@@ -1415,9 +1415,9 @@ class IndicatorPeriods:
 # KILL CONDITIONS & RISK LIMITS
 # ============================================================================
 class KillConditions:
-    # Drawdown limits
-    MAX_DAILY_DRAWDOWN_PCT = 3.0  # 3% daily drawdown stops the bot
-    MAX_CONSECUTIVE_LOSSES = 3     # 3 consecutive losses stops the bot
+    # Drawdown limits — TIGHT for $230 account ($1.60 from project death)
+    MAX_DAILY_DRAWDOWN_PCT = 1.5  # $230 × 1.5% = $3.45 max daily loss (was 3.0%)
+    MAX_CONSECUTIVE_LOSSES = 2     # 2 consecutive losses stops the bot (was 3)
     
     # Technical resilience
     WEBSOCKET_TIMEOUT_SECONDS = 75  # Max websocket silence before emergency exit (increased for Kraken - no constant messages)
@@ -1452,91 +1452,62 @@ class EntryGateConfig:
     PHILOSOPHY:
     - HARD GATES: Must pass or trade blocked (spread, chaos, HTF veto)
     - SOFT GATES: Adjust sizing, don't block (score, RR, LTF confirmations)
-    - PROBE TRADES: When edge detected but soft gates marginal (0.25x size)
     
-    This fixes the "missed winners" problem while maintaining proper risk control.
+    Two tiers only: 50% (marginal) and 100% (full conviction).
+    Minimum 50% sizing to ensure fees don't eat profits.
     """
     
-    # SCORE-BASED SIZING (replaces binary threshold)
-    # Graduated sizing based on score quality
-    # 
-    # 🔥 FIX (Feb 01, 2026): Data-driven score thresholds from 62 trade analysis
-    # Analysis results:
-    # 🔥 FIX #232 (Feb 15, 2026): Score thresholds REBALANCED
-    # PROBLEM: BLOCK=5.5 was too high. Edge floor gives 4.0 minimum,
-    # so scores 4.0-5.4 were ALWAYS blocked = system never trades.
-    # Combined with probe sizing + MIN_PROFIT check = death trap.
-    #
-    # NEW: BLOCK=4.5, PROBE=5.5, REDUCED=6.0, FULL>=6.0
-    # This lets edge-floor trades enter as probes and decent setups trade.
-    #
-    SCORE_BLOCK_FLOOR = 4.5          # 🔥 FIX #232: Lowered from 5.5 - allow marginal as probe
-    SCORE_PROBE_MAX = 5.5            # 4.5-5.5 = probe (0.25x)
-    SCORE_REDUCED_MAX = 6.0          # 5.5-6.0 = reduced (0.5x)
-    # Above 6.0 = full size (1.0x)
+    # SCORE-BASED SIZING
+    # Score < 5.0 = BLOCK, 5.0-7.0 = 50%, 7.0+ = 100%
+    SCORE_BLOCK_FLOOR = 5.0          # Block below this
+    SCORE_FULL_MIN = 7.0             # Full size above this
     
     # RR-BASED SIZING
-    # Graduated sizing based on risk:reward quality
-    # 
-    # NOTE (Jan 27, 2026): HARD BLOCKS in entry_validators.py block trades with 
-    # worst-case RR < 0.7R. These floors below 0.7R are for edge cases where
-    # HARD BLOCKS are not applied (e.g., adopted positions, manual overrides).
-    #
-    # HIERARCHY:
-    # 1. HARD BLOCK: worst_case_rr < 0.7R → NO ENTRY (entry_validators.py)
-    # 2. EntryGate: worst_case_rr 0.7-0.8R → PROBE size (0.25x)
-    # 3. EntryGate: worst_case_rr > 0.8R → FULL size (1.0x)
-    #
-    RR_BLOCK_FLOOR = 0.70            # Aligned with HARD BLOCK (was 0.30)
-    RR_PROBE_MAX = 0.80              # 0.70-0.80 = probe (0.25x)
+    # HARD BLOCK at <0.7R in entry_validators.py
+    RR_BLOCK_FLOOR = 0.70            # Aligned with HARD BLOCK
     RR_FULL_MIN = 0.80               # Above 0.8 = full size
     
-    # RANGE regime: HARD BLOCK requires RR >= 0.85 in ranging markets (ADX < 20)
-    RR_BLOCK_FLOOR_RANGE = 0.85      # Aligned with HARD BLOCK range check
-    RR_PROBE_MAX_RANGE = 0.95        # 0.85-0.95 = probe in RANGE
+    # RANGE regime: stricter RR floor
+    RR_BLOCK_FLOOR_RANGE = 0.85      # HARD BLOCK range check
+    RR_FULL_MIN_RANGE = 0.95         # Full size in RANGE
     
     # LTF CONFIRMATIONS
-    # Never require all confirmations (anti-paralysis)
     LTF_MAX_REQUIRED = 2             # Max confirmations required (out of 3)
     LTF_WEAK_SIZE = 0.5              # Size when 1/3 confirmations
     LTF_VERY_WEAK_SIZE = 0.25        # Size when 0/3 confirmations
     
-    # PROBE TRADE SETTINGS
-    PROBE_SIZE_DEFAULT = 0.25        # Default probe size
-    PROBE_SIZE_MIN = 0.20            # Never go below 20%
-    MIN_SIZE_MULTIPLIER = 0.25       # Minimum trade size (25% of normal)
+    # MINIMUM SIZE
+    MIN_SIZE_MULTIPLIER = 0.50       # Never trade below 50% (fees floor)
     
     # SESSION LIMIT OVERRIDE
-    # High score can override session limit
     SESSION_LIMIT_OVERRIDE_SCORE = 7.0  # Score required to override limit
     SESSION_LIMIT_OVERRIDE_SIZE = 0.5   # Size reduction when overriding
     
     @classmethod
     def get_score_size_multiplier(cls, score: float) -> float:
-        """Get position size multiplier based on score."""
+        """Get position size multiplier based on score.
+        
+        Two tiers: 50% (marginal) and 100% (full).
+        """
         if score < cls.SCORE_BLOCK_FLOOR:
-            return 0.0  # Block
-        elif score < cls.SCORE_PROBE_MAX:
-            return 0.25  # Probe
-        elif score < cls.SCORE_REDUCED_MAX:
-            return 0.5   # Reduced
+            return 0.0   # Block
+        elif score < cls.SCORE_FULL_MIN:
+            return 0.5    # Reduced
         else:
-            return 1.0   # Full
+            return 1.0    # Full
     
     @classmethod
     def get_rr_size_multiplier(cls, rr_net: float, regime: str = "NORMAL") -> float:
         """Get position size multiplier based on RR."""
         block_floor = cls.RR_BLOCK_FLOOR_RANGE if regime == "RANGE" else cls.RR_BLOCK_FLOOR
-        probe_max = cls.RR_PROBE_MAX_RANGE if regime == "RANGE" else cls.RR_PROBE_MAX
+        full_min = cls.RR_FULL_MIN_RANGE if regime == "RANGE" else cls.RR_FULL_MIN
         
         if rr_net < block_floor:
-            return 0.0  # Block
-        elif rr_net < probe_max:
-            return 0.25  # Probe
-        elif rr_net < cls.RR_FULL_MIN:
-            return 0.5   # Reduced
+            return 0.0   # Block
+        elif rr_net < full_min:
+            return 0.5    # Reduced
         else:
-            return 1.0   # Full
+            return 1.0    # Full
     
     @classmethod
     def get_ltf_size_multiplier(cls, confirmations: int, total: int = 3) -> float:
@@ -1924,7 +1895,7 @@ class RiskManagement:
     EARLY_PARTIAL_ENABLED = True
     EARLY_PARTIAL_R = 0.7           # Take partial at +0.7R (not too early)
     EARLY_PARTIAL_PCT = 30          # Close 30% (leave 70% for runners)
-    EARLY_PARTIAL_MOVE_SL = False   # Don't move to BE yet - let R_LOCK handle
+    EARLY_PARTIAL_MOVE_SL = True    # ALWAYS move SL to BE+buffer after partial (never let winner become loser)
     
     # =========================================================================
     # 🔥 NEW (Feb 2, 2026): ADAPTIVE SIZING FILTERS

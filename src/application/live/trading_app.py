@@ -75,11 +75,9 @@ from src.domain.market.regime.regime_fusion import RegimeFusion, TradeDecision
 # NEW: Anticipation & Exhaustion engines (Jan 22, 2026)
 from src.domain.trading.anticipation import (
     get_anticipation_engine, AnticipationState
-    # 🔥 REMOVED Feb 04: AnticipationEngine, AnticipationSignal - unused
 )
 from src.domain.trading.strategy.momentum_exhaustion import (
     get_exhaustion_detector, ExhaustionLevel, ExhaustionState
-    # 🔥 REMOVED Feb 04: MomentumExhaustionDetector - unused
 )
 
 from src.infrastructure.monitoring.metrics import (
@@ -175,12 +173,6 @@ from src.application.live.wait_fill_handler import (
     WaitFillHandler, get_wait_fill_handler, FillHandlerContext
 )
 
-# NEW (Jan 24, 2026): Adaptive Entry System - Market-aware thresholds
-from src.domain.trading.strategy.adaptive_entry import (
-    get_adaptive_entry_system
-    # 🔥 REMOVED Feb 04: AdaptiveEntrySystem, MarketCondition - unused
-)
-
 # NEW (Jan 24, 2026): ML Entry Score Refinement - Shadow mode logging
 from src.ml.inference import get_ml_inference_engine
 
@@ -197,7 +189,7 @@ from src.application.live.position_manager import (
     check_bos_against_position,
     calculate_smart_trailing_stop,
     get_position_manager,
-    ProbingModeChecker, AnticipationChecker, MomentumDecayChecker, BOSInvalidationChecker,
+    AnticipationChecker, MomentumDecayChecker, BOSInvalidationChecker,
     ExitDecision,
     ExhaustionTighteningChecker
     # 🔥 REMOVED Feb 04: calculate_current_r, get_position_health_checker, PositionManager, ExitCheckResult - unused
@@ -508,15 +500,6 @@ class SignalEngine:
         self._intelligent_filter = get_intelligent_filter()
         
         # =====================================================================
-        # 🔥 ADAPTIVE ENTRY SYSTEM (Jan 24, 2026)
-        # Market-aware thresholds that adjust based on:
-        # - Volatility (BB width, ADX)
-        # - Activity level (hours since last trade)
-        # - Market condition (dead, low, normal, high, extreme)
-        # =====================================================================
-        self._adaptive_entry = get_adaptive_entry_system()
-        
-        # =====================================================================
         # 🤖 ML INFERENCE ENGINE (Jan 24, 2026) - Entry Score Refinement
         # SHADOW MODE: Logs predictions without affecting decisions
         # Future: HYBRID mode will adjust score ±1 based on ML confidence
@@ -815,6 +798,7 @@ class SignalEngine:
         self._expansion_start_time: datetime | None = None  # Cuando empezó el expansion
         self._expansion_initial_displacement: float = 0.0  # Magnitud inicial del displacement
         self._last_trade_exit_time: datetime | None = None  # FIX: Displacement consumed after exit
+        self._last_trade_direction: str | None = None  # Track direction of last closed trade
         # 🌊 BE WATER: Timeout ADAPTATIVO basado en volatilidad
         # 🔥 FIX #19 (Feb 02, 2026): Reducido de 45 a 20 min base
         # El sistema quedaba bloqueado demasiado tiempo cuando el mercado revertía
@@ -1059,7 +1043,7 @@ class SignalEngine:
         
         # =====================================================================
         # 🔧 AUDIT REFACTOR (Jan 27, 2026): Position Manager
-        # Orchestrates all position exit checks (probing, anticipation, BOS, momentum decay)
+        # Orchestrates all position exit checks (anticipation, BOS, momentum decay)
         # =====================================================================
         self._position_manager = get_position_manager()
         
@@ -1238,6 +1222,9 @@ class SignalEngine:
                         logger.error(f"Failed to send Telegram notification for TP/SL: {e}")
             
             # Clear local state (sync - we're in a sync callback)
+            # Store direction BEFORE reset clears position data
+            if position is not None and hasattr(position, 'direction'):
+                self._last_trade_direction = position.direction
             self.risk_engine.clear_position_sync("Exchange TP/SL hit - reconciler detected")
             self._reset_trade_state("Exchange TP/SL hit - reconciler detected")
             
@@ -3113,6 +3100,23 @@ class SignalEngine:
                         )
                         self._last_stale_log_short = True
                 
+                # =========================================================
+                # 🚫 RANGE_BOUND BLOCK: No displacement in range mode
+                # Range markets bounce between extremes. A displacement in
+                # a range is noise (false breakout), not a trend signal.
+                # Entering on displacement at range extremes = buying tops,
+                # selling bottoms = guaranteed losses.
+                # =========================================================
+                if getattr(self, '_trend_phase', None) == TrendPhase.RANGE_BOUND:
+                    if not is_stale_displacement:
+                        if self._idle_eval_count % 60 == 1:
+                            logger.info(
+                                f"🚫 RANGE_BOUND BLOCK SHORT: Displacement ${drop_from_high:.0f} "
+                                f"detected but TrendPhase=RANGE_BOUND | NOT arming edge"
+                            )
+                        is_stale_displacement = True
+                        _short_disp_stale = True
+
                 # 🔥 EXPANSION_MODE ACTIVATION: Only activate if not already in expansion
                 # or if this is a stronger displacement in the same direction
                 # 🔥 FIX #9: Also check for stale displacement
@@ -3128,18 +3132,31 @@ class SignalEngine:
                     self._expansion_direction = None
                     self._direction_lock = None
                     self._direction_lock_expires_at = None
-                # 🔥 FIX (Feb 19, 2026): DISPLACEMENT CONSUMED CHECK
-                # After a trade exits, the displacement that made it profitable is "consumed".
-                # Don't re-enter using the SAME displacement for 3 minutes.
-                _disp_consumed_short = (
-                    self._last_trade_exit_time and
-                    (datetime.now() - self._last_trade_exit_time).total_seconds() < 180
+                # 🔥 DIRECTION MEMORY: Block same-direction displacement for 30 minutes
+                # After a SHORT trade exits, don't re-enter SHORT at exhaustion.
+                # Feb 19 evidence: TP hit → 66s re-entry at bottom → instant SL.
+                # For OPPOSITE direction: only 3 minutes (displacement consumed).
+                _SAME_DIR_BLOCK_SECONDS = 1800  # 30 minutes
+                _ANY_DIR_BLOCK_SECONDS = 180    # 3 minutes
+                
+                _elapsed_since_exit = (
+                    (datetime.now() - self._last_trade_exit_time).total_seconds()
+                    if self._last_trade_exit_time else 99999
                 )
-                if _disp_consumed_short and not self._expansion_mode:
+                _same_dir_block = (
+                    self._last_trade_direction == 'SHORT' and
+                    _elapsed_since_exit < _SAME_DIR_BLOCK_SECONDS
+                )
+                _any_dir_block = _elapsed_since_exit < _ANY_DIR_BLOCK_SECONDS
+                
+                if (_same_dir_block or _any_dir_block) and not self._expansion_mode:
                     if self._idle_eval_count % 60 == 1:
+                        block_type = "SAME DIR 30min" if _same_dir_block else "CONSUMED 3min"
+                        remaining = (_SAME_DIR_BLOCK_SECONDS if _same_dir_block else _ANY_DIR_BLOCK_SECONDS) - _elapsed_since_exit
                         logger.info(
-                            f"⏳ SHORT displacement ${drop_from_high:.0f} consumed by previous trade | "
-                            f"Wait {180 - (datetime.now() - self._last_trade_exit_time).total_seconds():.0f}s"
+                            f"⏳ SHORT displacement ${drop_from_high:.0f} BLOCKED ({block_type}) | "
+                            f"Last trade={self._last_trade_direction} {_elapsed_since_exit:.0f}s ago | "
+                            f"Wait {remaining:.0f}s"
                         )
                 elif (not self._expansion_mode or self._expansion_direction != 'SHORT') and not is_stale_displacement:
                     self._expansion_mode = True
@@ -3337,6 +3354,23 @@ class SignalEngine:
                         )
                         self._last_stale_log_long = True
                 
+                # =========================================================
+                # 🚫 RANGE_BOUND BLOCK: No displacement in range mode
+                # Range markets bounce between extremes. A displacement in
+                # a range is noise (false breakout), not a trend signal.
+                # Entering on displacement at range extremes = buying tops,
+                # selling bottoms = guaranteed losses.
+                # =========================================================
+                if getattr(self, '_trend_phase', None) == TrendPhase.RANGE_BOUND:
+                    if not is_stale_displacement_long:
+                        if self._idle_eval_count % 60 == 1:
+                            logger.info(
+                                f"🚫 RANGE_BOUND BLOCK LONG: Displacement ${rise_from_low:.0f} "
+                                f"detected but TrendPhase=RANGE_BOUND | NOT arming edge"
+                            )
+                        is_stale_displacement_long = True
+                        _long_disp_stale = True
+
                 # 🔥 EXPANSION_MODE ACTIVATION: Only activate if not already in expansion
                 # or if this is a stronger displacement in the same direction
                 # 🔥 FIX #9: Also check for stale displacement
@@ -3352,16 +3386,28 @@ class SignalEngine:
                     self._expansion_direction = None
                     self._direction_lock = None
                     self._direction_lock_expires_at = None
-                # 🔥 FIX (Feb 19, 2026): DISPLACEMENT CONSUMED CHECK
-                _disp_consumed_long = (
-                    self._last_trade_exit_time and
-                    (datetime.now() - self._last_trade_exit_time).total_seconds() < 180
+                # 🔥 DIRECTION MEMORY: Block same-direction displacement for 30 minutes
+                _SAME_DIR_BLOCK_SECONDS = 1800  # 30 minutes
+                _ANY_DIR_BLOCK_SECONDS = 180    # 3 minutes
+                
+                _elapsed_since_exit_long = (
+                    (datetime.now() - self._last_trade_exit_time).total_seconds()
+                    if self._last_trade_exit_time else 99999
                 )
-                if _disp_consumed_long and not self._expansion_mode:
+                _same_dir_block_long = (
+                    self._last_trade_direction == 'LONG' and
+                    _elapsed_since_exit_long < _SAME_DIR_BLOCK_SECONDS
+                )
+                _any_dir_block_long = _elapsed_since_exit_long < _ANY_DIR_BLOCK_SECONDS
+                
+                if (_same_dir_block_long or _any_dir_block_long) and not self._expansion_mode:
                     if self._idle_eval_count % 60 == 1:
+                        block_type = "SAME DIR 30min" if _same_dir_block_long else "CONSUMED 3min"
+                        remaining = (_SAME_DIR_BLOCK_SECONDS if _same_dir_block_long else _ANY_DIR_BLOCK_SECONDS) - _elapsed_since_exit_long
                         logger.info(
-                            f"⏳ LONG displacement ${rise_from_low:.0f} consumed by previous trade | "
-                            f"Wait {180 - (datetime.now() - self._last_trade_exit_time).total_seconds():.0f}s"
+                            f"⏳ LONG displacement ${rise_from_low:.0f} BLOCKED ({block_type}) | "
+                            f"Last trade={self._last_trade_direction} {_elapsed_since_exit_long:.0f}s ago | "
+                            f"Wait {remaining:.0f}s"
                         )
                 elif (not self._expansion_mode or self._expansion_direction != 'LONG') and not is_stale_displacement_long:
                     self._expansion_mode = True
@@ -4681,10 +4727,20 @@ class SignalEngine:
         # Si los swings siguen en 0 o inválidos (primer inicio), inicializar
         # desde datos recientes. Esto solo corre UNA VEZ al inicio.
         # =====================================================================
+        # 🔥 FIX (Feb 20, 2026): Was 48 bars (48h) → created $2697 range when ATR=$100.
+        # Location gate saw everything as "73% of range" and blocked LONGs with displacement.
+        # Now: 24 bars (24h) with sanity check — if range > 10×ATR, shrink to 12 bars.
         if self._last_swing_high == 0 or not is_swing_relevant(self._last_swing_high, current_price):
-            RECENT_BARS = 48
+            RECENT_BARS = 24
             if len(highs_1h) >= RECENT_BARS:
-                self._last_swing_high = float(np.max(highs_1h[-RECENT_BARS:]))
+                candidate_high = float(np.max(highs_1h[-RECENT_BARS:]))
+                candidate_low = float(np.min(lows_1h[-RECENT_BARS:])) if len(lows_1h) >= RECENT_BARS else current_price * 0.98
+                # Sanity: if range > 10×ATR, use even shorter window (atr_1h from line ~4668)
+                if atr_1h > 0 and (candidate_high - candidate_low) > 10 * atr_1h:
+                    RECENT_BARS = 12
+                    candidate_high = float(np.max(highs_1h[-RECENT_BARS:]))
+                    logger.info(f"📍 SWING SANITY: 24-bar range too wide, using {RECENT_BARS} bars")
+                self._last_swing_high = candidate_high
                 self._prev_swing_high = self._last_swing_high
                 logger.info(f"📍 INIT SWING HIGH: ${self._last_swing_high:.0f} (from last {RECENT_BARS} bars)")
             else:
@@ -4692,9 +4748,16 @@ class SignalEngine:
                 self._prev_swing_high = self._last_swing_high
         
         if self._last_swing_low == 0 or not is_swing_relevant(self._last_swing_low, current_price):
-            RECENT_BARS = 48
+            RECENT_BARS = 24
             if len(lows_1h) >= RECENT_BARS:
-                self._last_swing_low = float(np.min(lows_1h[-RECENT_BARS:]))
+                candidate_low = float(np.min(lows_1h[-RECENT_BARS:]))
+                candidate_high = float(np.max(highs_1h[-RECENT_BARS:])) if len(highs_1h) >= RECENT_BARS else current_price * 1.02
+                # Sanity: if range > 10×ATR, use even shorter window (atr_1h from line ~4668)
+                if atr_1h > 0 and (candidate_high - candidate_low) > 10 * atr_1h:
+                    RECENT_BARS = 12
+                    candidate_low = float(np.min(lows_1h[-RECENT_BARS:]))
+                    logger.info(f"📍 SWING SANITY: 24-bar range too wide, using {RECENT_BARS} bars")
+                self._last_swing_low = candidate_low
                 self._prev_swing_low = self._last_swing_low
                 logger.info(f"📍 INIT SWING LOW: ${self._last_swing_low:.0f} (from last {RECENT_BARS} bars)")
             else:
@@ -5171,12 +5234,7 @@ class SignalEngine:
             
             self._edge_manager._no_edge_reason = reason
         
-        # 5. Si NO hay edge activo → skip evaluación (el core del cambio)
-        # PERO: Permitir modo PROBING para diagnóstico (0.25x size)
-        # 🔥 FIX (Jan 28, 2026): PROBE mode puede operar sin edge activo
-        #    ProbeValidator valida rentabilidad mínima
-        # 🔥 FIX (Jan 28): PROBE mode eliminado en RANGE
-        # 🔥 FIX #160 (Feb 10): RANGE ahora arma edges con CONSENSUS/EXTREME/BYPASS
+        # 5. Si NO hay edge activo → skip evaluación
         #    Si llegamos aquí con NO_EDGE, significa que no hubo CONSENSUS ni condición válida
         
         if not self._edge_manager.can_evaluate_entry():
@@ -5252,16 +5310,16 @@ class SignalEngine:
         adx_1h_vals, _ = calculate_adx(highs_1h, lows_1h, closes_1h, 14)
         adx_1h = adx_1h_vals[-1] if len(adx_1h_vals) > 0 else 20.0
         
-        # Get current regime for location filter
-        regime_for_location = self.regime_classifier.current_regime.value if self.regime_classifier.current_regime else "RANGE"
+        # Get current regime for location filter — NORMALIZE to canonical form
+        from src.domain.risk.risk_engine import normalize_regime_mode
+        raw_regime = self.regime_classifier.current_regime.value if self.regime_classifier.current_regime else "RANGE"
+        regime_for_location = normalize_regime_mode(raw_regime)
         
-        # 🔥 FIX (Jan 23, 2026): HTF ADX classification can OVERRIDE regime to RANGE
-        # If HTF ADX says RANGE/WEAK_TREND but EdgeRegimeClassifier says TREND, trust ADX
-        # This fixes the bug where ADX 15.3 was treated as TREND (wrong stops, wrong logic)
+        # HTF ADX can further override TREND/BREAKOUT to RANGE
         htf_regime_mode = self._htf_cache_regime_mode
         if htf_regime_mode in ('RANGE', 'WEAK_TREND', 'LOW_ADX'):
-            if regime_for_location in ('REGIME_A', 'TREND', 'BREAKOUT'):
-                logger.info(f"⚠️ HTF ADX override: classifier={regime_for_location} but ADX={self._htf_cache_adx:.1f} → forcing RANGE logic")
+            if regime_for_location in ('TREND', 'BREAKOUT'):
+                logger.info(f"⚠️ HTF ADX override: classifier={raw_regime} → {regime_for_location} but ADX={self._htf_cache_adx:.1f} → forcing RANGE logic")
                 regime_for_location = 'RANGE'
         
         # 🔥 FIX (Jan 22, 2026): Store regime for trailing stop to use SAME regime
@@ -6070,17 +6128,30 @@ class SignalEngine:
 
         is_expansion = self._trend_expansion_active or self._expansion_mode
         is_displacement_edge = False
-        if self._edge_manager.state == EdgeState.EDGE_ACTIVE:
+        is_breakout_edge = False
+        if self._edge_manager.state in (EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE):
             bos = self._edge_manager.current_bos
-            if bos and bos.trend_path and 'DISPLACEMENT' in str(bos.trend_path):
-                is_displacement_edge = True
+            if bos:
+                if bos.trend_path and 'DISPLACEMENT' in str(bos.trend_path):
+                    is_displacement_edge = True
+                if hasattr(bos, 'edge_type') and bos.edge_type:
+                    et = bos.edge_type.value if hasattr(bos.edge_type, 'value') else str(bos.edge_type)
+                    if et == 'BREAKOUT':
+                        is_breakout_edge = True
 
+        # 🔥 FIX #154b (Feb 20, 2026): BREAKOUT bypass for LTF gate
+        # Data: 3/4 entries blocked by LTF 1/3 in log_20260220. BREAKOUT edges
+        # fire from ANTICIPATION (compression) where LTF EMA/BOS lag behind.
+        # BREAKOUT already has reduced sizing (0.50-0.71x), so 1/3 LTF is acceptable.
         if is_expansion:
             min_ltf_required = 1
             logger.debug(f"📊 LTF bypass: 1/3 suficiente (EXPANSION mode)")
         elif is_displacement_edge:
             min_ltf_required = 1
             logger.debug(f"📊 LTF bypass: 1/3 suficiente (DISPLACEMENT edge)")
+        elif is_breakout_edge:
+            min_ltf_required = 1
+            logger.debug(f"📊 LTF bypass: 1/3 suficiente (BREAKOUT edge)")
         
         if ltf_confs < min_ltf_required:
             if self._last_ltf_state != 'weak_ltf':
@@ -7333,7 +7404,54 @@ class SignalEngine:
         """MANAGE state: run open position"""
         
         # =====================================================================
-        # 🔒 HARD_LOCK CHECK - No subsystem can act during transition periods
+        # � FIX (Feb 20, 2026): EMERGENCY MAX LOSS CAP — UNBLOCABLE
+        # 
+        # DATA (Feb 16-20): 14 losers averaged -0.42R despite -0.15R cap.
+        # ROOT CAUSE: Multiple gates (can_subsystems_act, _syncing_position,
+        # is_exchange_available, is_adopted) prevented manage_position from
+        # running. Trades drifted to -0.44R, -0.75R, -1.0R without any cap.
+        #
+        # This check fires BEFORE any gate. Nothing can bypass it.
+        # At $230 capital, one -0.50R loss = project death.
+        # =====================================================================
+        EMERGENCY_MAX_LOSS_R = -0.20
+        position = self.risk_engine.position
+        if position and current_price > 0:
+            initial_risk = abs(position.entry_price - position.initial_stop_loss)
+            if initial_risk > 0:
+                if position.direction == 'LONG':
+                    emergency_r = (current_price - position.entry_price) / initial_risk
+                else:
+                    emergency_r = (position.entry_price - current_price) / initial_risk
+                if emergency_r < EMERGENCY_MAX_LOSS_R:
+                    logger.critical(
+                        f"🚨 EMERGENCY MAX LOSS: R={emergency_r:.3f} < {EMERGENCY_MAX_LOSS_R} | "
+                        f"Entry={position.entry_price:.2f} Price={current_price:.2f} | "
+                        f"CLOSING NOW — no gate can block this"
+                    )
+                    try:
+                        await self._close_position_with_full_flow(
+                            reason="TIME_INVALIDATION_MAX_LOSS",
+                            current_price=current_price,
+                            market_time=market_time,
+                            position=position,
+                            cooldown_minutes=10,
+                            extra_log_data={'emergency_r': emergency_r, 'cap': EMERGENCY_MAX_LOSS_R}
+                        )
+                    except Exception as e:
+                        logger.critical(f"🚨 EMERGENCY CLOSE FAILED: {e} — trying raw market close")
+                        try:
+                            close_side = 'sell' if position.direction == 'LONG' else 'buy'
+                            await self.execution.close_position_market(
+                                symbol=self.symbol, side=close_side,
+                                amount=position.size, reason="EMERGENCY_MAX_LOSS_FALLBACK"
+                            )
+                        except Exception as e2:
+                            logger.critical(f"🚨🚨 ALL CLOSE METHODS FAILED: {e2}")
+                    return
+        
+        # =====================================================================
+        # �🔒 HARD_LOCK CHECK - No subsystem can act during transition periods
         # The reconciler enforces this to prevent premature reactions
         # =====================================================================
         can_act, block_reason = self.reconciler.can_subsystems_act()
@@ -7459,14 +7577,44 @@ class SignalEngine:
                             logger.info(f"🔄 FIX #79: Creating local position from exchange: {side} {size} @ {entry_price}")
                             
                             direction = 'LONG' if side == 'long' else 'SHORT'
-                            # Use 1% of entry price as fallback ATR
-                            fallback_atr = entry_price * 0.01
+                            
+                            # 🔥 FIX #79b (Feb 20, 2026): Read actual SL from exchange orders
+                            # BEFORE: Used entry_price * 1.01 = $68,391 as SL (1% fallback)
+                            # ACTUAL: Real SL was $68,188 → trailing used 43% wider risk!
+                            # This distorted ALL R-multiple calculations (MFE, tiers, etc.)
+                            actual_sl = None
+                            try:
+                                open_orders = await self.execution.get_open_orders(self.symbol)
+                                for order in open_orders:
+                                    order_type = str(order.get('type', '')).lower()
+                                    order_info = order.get('info', {})
+                                    order_type_kraken = str(order_info.get('orderType', '')).lower() if order_info else ''
+                                    if order_type in ('stop', 'stop-loss', 'stop_loss') or order_type_kraken in ('stp', 'stop'):
+                                        trigger = 0.0
+                                        if order_info and order_info.get('triggerPrice'):
+                                            trigger = float(order_info.get('triggerPrice'))
+                                        elif order.get('stopPrice'):
+                                            trigger = float(order.get('stopPrice'))
+                                        elif order.get('triggerPrice'):
+                                            trigger = float(order.get('triggerPrice'))
+                                        if trigger > 0:
+                                            actual_sl = trigger
+                                            logger.info(f"🔄 FIX #79b: Exchange SL found at ${actual_sl:.2f}")
+                                            break
+                            except Exception as e:
+                                logger.debug(f"FIX #79b: Could not read exchange orders: {e}")
+                            
+                            if actual_sl is None:
+                                actual_sl = entry_price * (0.99 if direction == 'LONG' else 1.01)
+                                logger.warning(f"⚠️ FIX #79b: No exchange SL found, using 1% fallback: ${actual_sl:.2f}")
+                            
+                            fallback_atr = abs(entry_price - actual_sl)
                             self.risk_engine.create_position(
                                 symbol=self.symbol,
                                 direction=direction,
                                 entry_price=entry_price,
                                 position_size=size,
-                                stop_loss=entry_price * (0.99 if direction == 'LONG' else 1.01),  # Default SL 1%
+                                stop_loss=actual_sl,
                                 atr_1m=fallback_atr,
                                 market_time=market_time,
                                 trade_type=TradeType.LONG_MAIN if direction == 'LONG' else TradeType.SHORT_STRUCTURAL,
@@ -7509,30 +7657,8 @@ class SignalEngine:
                 self._current_trade_mae = abs(excursion)
 
         # ==================================================================
-        # � REFACTORED (Jan 27, 2026): PROBING + ANTICIPATION CHECKS
-        # Consolidated into PositionManager (AUDIT REFACTOR Point 5)
+        # ANTICIPATION TIMEOUT CHECK
         # ==================================================================
-        
-        # Run probing mode check
-        probing_result = ProbingModeChecker.check_probing_exit(
-            position, self._current_trade_tags, market_time, current_price
-        )
-        if probing_result.decision == ExitDecision.CLOSE:
-            logger.warning(f"🔴 {probing_result.reason}: {probing_result.extra_data}")
-            await self._close_position_with_full_flow(
-                reason=probing_result.reason,
-                current_price=current_price,
-                market_time=market_time,
-                position=position,
-                cooldown_minutes=probing_result.cooldown_minutes,
-                extra_log_data=probing_result.extra_data
-            )
-            return
-        
-        # Track PROBE_MAX observability (doesn't cause exit, just logs)
-        self._current_trade_tags = ProbingModeChecker.track_probe_max_sequence(
-            position, self._current_trade_tags, market_time
-        )
         
         # Run anticipation timeout check
         anticipation_result = AnticipationChecker.check_anticipation_timeout(
@@ -8730,6 +8856,9 @@ class SignalEngine:
             
             # 10. Clear risk engine
             await self.risk_engine.clear_position(reason)
+            
+            # 10b. Store direction BEFORE reset clears position data
+            self._last_trade_direction = position.direction
             
             # 11. Reset trade state
             self._reset_trade_state(f"Trade closed: {reason}")

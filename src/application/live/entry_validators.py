@@ -96,17 +96,6 @@ class RRValidationResult:
     tags: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class ProbeValidationResult:
-    """Result of PROBE-specific validation."""
-    is_valid: bool = True
-    block_reason: str = ""
-    expected_r: float = 0.0
-    expected_net_profit: float = 0.0
-    tp_r: float = 0.0
-    fees_usd: float = 0.0
-
-
 # ==============================================================================
 # CHASE VALIDATOR
 # ==============================================================================
@@ -559,20 +548,10 @@ class GraduatedSizer:
             result.tags['gate_size_cap'] = gate_size_cap
             result.combined_defensive *= gate_size_cap
         
-        # PROBING / RANGE SIZE MODIFIER
+        # RANGE SIZE MODIFIER
         range_size_mult = trade_tags.get('range_size_mult', 1.0)
         if range_size_mult < 1.0:
-            probing_mode = trade_tags.get('probing_mode', False)
-            if probing_mode:
-                if range_size_mult >= 0.65:
-                    level = "PROBE_MAX"
-                elif range_size_mult >= 0.50:
-                    level = "PROBE_MED"
-                else:
-                    level = "PROBE_MIN"
-                logger.info(f"🔍 {level} sizing: {range_size_mult:.0%}")
-            else:
-                logger.info(f"📊 RANGE sizing: {range_size_mult:.0%}")
+            logger.info(f"📊 RANGE sizing: {range_size_mult:.0%}")
             result.tags['range_size_mult_applied'] = range_size_mult
             result.combined_defensive *= range_size_mult
         
@@ -995,19 +974,18 @@ class HardEntryBlockValidator:
     NO HIGH SCORE BYPASS. NO ANTI-PARALYSIS OVERRIDE.
     """
     
-    # 🔥 FIX (Jan 28, 2026): Dynamic RR floor based on fees
-    # OLD: Fixed 0.7R floor
-    # NEW: max(0.5R, 0.2R + fees_buffer)
-    # This ensures we always cover costs PLUS have minimum edge
-    HARD_RR_FLOOR_MIN = 0.5  # Absolute minimum
-    FEES_BUFFER_R = 0.2      # Buffer above fees
-    DEFAULT_FEES_R = 0.25    # Default fee estimate (~0.25R roundtrip including spread)
+    # 🔥 FIX (Feb 20, 2026): Lowered for RANGE 0.30R TP
+    # With TP=0.30R and MaxLoss=-0.15R, effective RR = 2.0 (excellent)
+    # But TP/SL_distance = 0.30 which looks bad. The fee-based calc is misleading
+    # for tight-TP strategies. Use flat floor instead.
+    HARD_RR_FLOOR_MIN = 0.20  # Absolute minimum
+    FEES_BUFFER_R = 0.0       # Disabled — tight TP + tight MaxLoss makes this misleading
+    DEFAULT_FEES_R = 0.0      # Disabled
     
     @classmethod
     def calculate_dynamic_rr_floor(cls, estimated_fees_r: float | None = None) -> float:
-        """Calculate dynamic RR floor: max(0.5R, 0.2R + fees)"""
-        fees = estimated_fees_r if estimated_fees_r is not None else cls.DEFAULT_FEES_R
-        return max(cls.HARD_RR_FLOOR_MIN, cls.FEES_BUFFER_R + fees)
+        """Flat 0.20R floor — validated by Feb simulation data."""
+        return cls.HARD_RR_FLOOR_MIN
     
     # BLOCKED SESSION QUALITIES
     BLOCKED_SESSION_QUALITIES = {'poor'}  # Block all 'poor' sessions
@@ -1077,7 +1055,7 @@ class HardEntryBlockValidator:
         # Use HTFFilters.ADX_RANGE_MAX (18) for consistency across the system
         from src.config.trading_config import HTFFilters
         ADX_RANGE_THRESHOLD = HTFFilters.ADX_RANGE_MAX  # 18
-        RR_RANGE_FLOOR = rr_floor + 0.15  # Add buffer in ranging markets
+        RR_RANGE_FLOOR = rr_floor  # No extra buffer — RANGE uses tight TP + MaxLoss
 
         if adx is not None and adx < ADX_RANGE_THRESHOLD and worst_case_rr < RR_RANGE_FLOOR:
             result.is_blocked = True
@@ -1138,169 +1116,6 @@ class HardEntryBlockValidator:
 # PROBE VALIDATOR (Jan 28, 2026)
 # ==============================================================================
 
-class ProbeValidator:
-    """
-    Validates PROBE-specific entry requirements.
-    
-    PROBE trades have relaxed RR but MUST meet minimum profitability:
-    - expected_R ≥ 0.25
-    - expected_net_profit ≥ fees × 2
-    - TP ≥ 0.3R
-    - maker only (entrada + salida) - enforced elsewhere
-    
-    PROBE PROHIBIDO SI:
-    - TP < spread × 2 (ruido puro)
-    - SL < ATR × 0.3 (ruido puro)
-    """
-    
-    # Constants for PROBE validation
-    MIN_EXPECTED_R = 0.25
-    MIN_PROFIT_FEE_MULT = 2.0  # profit >= fees * 2
-    MIN_TP_R = 0.3
-    MIN_TP_SPREAD_MULT = 2.0  # TP must be > spread * 2
-    MIN_SL_ATR_MULT = 0.3     # SL must be > ATR * 0.3
-    
-    # Kraken maker fee for estimation
-    MAKER_FEE_PCT = 0.02 / 100  # 0.02%
-    
-    @classmethod
-    def validate_probe(
-        cls,
-        is_probe: bool,
-        position_size: float,
-        current_price: float,
-        stop_loss: float,
-        take_profit: float,
-        bias: str,
-        atr_1m: float,
-        spread_bps: float = 1.0,
-    ) -> ProbeValidationResult:
-        """
-        Validate a PROBE trade meets minimum profitability requirements.
-        
-        Only applies if is_probe=True. Non-probe trades pass through.
-        
-        Args:
-            is_probe: Whether this is a probe trade (probing_mode set)
-            position_size: Size in BTC
-            current_price: Current price
-            stop_loss: SL price
-            take_profit: TP price
-            bias: 'LONG' or 'SHORT'
-            atr_1m: 1-minute ATR
-            spread_bps: Current spread in basis points
-            
-        Returns:
-            ProbeValidationResult with validation status
-        """
-        result = ProbeValidationResult()
-        
-        # Non-probe trades pass through
-        if not is_probe:
-            return result
-        
-        # Calculate trade metrics
-        if bias == 'LONG':
-            risk_usd = (current_price - stop_loss) * position_size
-            reward_usd = (take_profit - current_price) * position_size
-            tp_distance = take_profit - current_price
-            sl_distance = current_price - stop_loss
-        else:
-            risk_usd = (stop_loss - current_price) * position_size
-            reward_usd = (current_price - take_profit) * position_size
-            tp_distance = current_price - take_profit
-            sl_distance = stop_loss - current_price
-        
-        # Ensure positive values
-        risk_usd = abs(risk_usd)
-        reward_usd = abs(reward_usd)
-        tp_distance = abs(tp_distance)
-        sl_distance = abs(sl_distance)
-        
-        # Calculate R values
-        result.expected_r = reward_usd / risk_usd if risk_usd > 0 else 0
-        result.tp_r = result.expected_r  # TP in R terms
-        
-        # Estimate fees (maker entry + maker exit)
-        notional = position_size * current_price
-        result.fees_usd = notional * cls.MAKER_FEE_PCT * 2  # entry + exit
-        
-        # Net profit
-        result.expected_net_profit = reward_usd - result.fees_usd
-        
-        # =========================================================================
-        # PROBE VALIDATION RULES
-        # =========================================================================
-        
-        # Rule 1: expected_R ≥ 0.25
-        if result.expected_r < cls.MIN_EXPECTED_R:
-            result.is_valid = False
-            result.block_reason = (
-                f"🔬 PROBE BLOCK: expected_R={result.expected_r:.2f} < {cls.MIN_EXPECTED_R} "
-                f"(need minimum edge)"
-            )
-            logger.warning(result.block_reason)
-            return result
-        
-        # Rule 2: expected_net_profit ≥ fees × 2
-        min_profit = result.fees_usd * cls.MIN_PROFIT_FEE_MULT
-        if result.expected_net_profit < min_profit:
-            result.is_valid = False
-            result.block_reason = (
-                f"🔬 PROBE BLOCK: net_profit=${result.expected_net_profit:.2f} < "
-                f"fees×{cls.MIN_PROFIT_FEE_MULT:.0f}=${min_profit:.2f} "
-                f"(fees would eat profit)"
-            )
-            logger.warning(result.block_reason)
-            return result
-        
-        # Rule 3: TP ≥ 0.3R
-        if result.tp_r < cls.MIN_TP_R:
-            result.is_valid = False
-            result.block_reason = (
-                f"🔬 PROBE BLOCK: TP={result.tp_r:.2f}R < {cls.MIN_TP_R}R "
-                f"(target too small)"
-            )
-            logger.warning(result.block_reason)
-            return result
-        
-        # Rule 4: TP > spread × 2 (avoid noise)
-        spread_usd = current_price * (spread_bps / 10000)
-        min_tp_spread = spread_usd * cls.MIN_TP_SPREAD_MULT
-        if tp_distance < min_tp_spread:
-            result.is_valid = False
-            result.block_reason = (
-                f"🔬 PROBE BLOCK: TP_dist=${tp_distance:.2f} < spread×{cls.MIN_TP_SPREAD_MULT:.0f}=${min_tp_spread:.2f} "
-                f"(pure noise)"
-            )
-            logger.warning(result.block_reason)
-            return result
-        
-        # Rule 5: SL > ATR × 0.3 (avoid noise)
-        min_sl_atr = atr_1m * cls.MIN_SL_ATR_MULT
-        if sl_distance < min_sl_atr:
-            result.is_valid = False
-            result.block_reason = (
-                f"🔬 PROBE BLOCK: SL_dist=${sl_distance:.2f} < ATR×{cls.MIN_SL_ATR_MULT}=${min_sl_atr:.2f} "
-                f"(SL in noise zone)"
-            )
-            logger.warning(result.block_reason)
-            return result
-        
-        # All PROBE checks passed
-        logger.info(
-            f"✅ PROBE VALID: R={result.expected_r:.2f} | "
-            f"net_profit=${result.expected_net_profit:.2f} | "
-            f"fees=${result.fees_usd:.2f}"
-        )
-        return result
-
-
 def get_hard_entry_validator() -> type:
     """Get the HardEntryBlockValidator class."""
     return HardEntryBlockValidator
-
-
-def get_probe_validator() -> type:
-    """Get the ProbeValidator class."""
-    return ProbeValidator
