@@ -39,6 +39,15 @@ class ADXThresholds:
     TRANSITION = 20         # Between RANGE and TREND
     TREND = 20              # Above this = TREND mode
     STRONG_TREND = 25       # Above this = STRONG TREND (runners OK)
+    VERY_STRONG_TREND = 35  # Above this = very strong intraday trend (5m ADX)
+    VERY_WEAK = 15          # Below this = dead market / no signal
+    
+    # Aliases for unified_constants compatibility (RANGE_MAX etc.)
+    RANGE_MAX = 20.0        # Alias: same as TRANSITION boundary
+    TRANSITION_MAX = 25.0   # Alias: same as STRONG_TREND
+    WEAK_TREND_MAX = 35.0   # Alias: same as VERY_STRONG_TREND
+    TREND_MIN = 20.0        # Alias: same as TREND
+    STRONG_TREND = 25       # Above this = STRONG TREND (runners OK)
     
     # Edge-specific thresholds
     INTRADAY_EDGE_MIN = 25  # Minimum for intraday edge confirmation
@@ -1013,9 +1022,10 @@ class EntryGateConfig:
     """
     
     # SCORE-BASED SIZING
-    # Score < 5.0 = BLOCK, 5.0-7.0 = 50%, 7.0+ = 100%
-    SCORE_BLOCK_FLOOR = 5.0          # Block below this
-    SCORE_FULL_MIN = 7.0             # Full size above this
+    # Calibrated to actual score distribution (typical good trade = 5-6)
+    # Score < 4.0 = BLOCK, 4.0-6.0 = 50%, 6.0+ = 100%
+    SCORE_BLOCK_FLOOR = 4.0          # Block below this (was 5.0 — too strict)
+    SCORE_FULL_MIN = 6.0             # Full size above this (was 7.0 — unreachable)
     
     # RR-BASED SIZING
     # HARD BLOCK at <0.7R in entry_validators.py
@@ -1035,7 +1045,7 @@ class EntryGateConfig:
     MIN_SIZE_MULTIPLIER = 0.50       # Never trade below 50% (fees floor)
     
     # SESSION LIMIT OVERRIDE
-    SESSION_LIMIT_OVERRIDE_SCORE = 7.0  # Score required to override limit
+    SESSION_LIMIT_OVERRIDE_SCORE = 6.0  # Score required to override limit (aligned with SCORE_FULL_MIN)
     SESSION_LIMIT_OVERRIDE_SIZE = 0.5   # Size reduction when overriding
     
     @classmethod

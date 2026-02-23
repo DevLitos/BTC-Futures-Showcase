@@ -43,9 +43,12 @@ class RiskEngine:
         self.capital = capital  # Will be updated from exchange balance
         
         # Equity tracking
-        self.initial_equity = capital if capital > 0 else 10000.0  # Default to 10k if not set
+        # FIX: Don't default to 10k — use 0 and gate drawdown calculations
+        # behind equity_synced flag. Prevents fake-low DD% during startup.
+        self.initial_equity = capital if capital > 0 else 0.0
         self.equity = self.initial_equity
         self.max_equity = self.initial_equity
+        self.equity_synced = capital > 0  # True only when real capital is known
         self.max_drawdown_pct = 0.0
         
         # Position tracking

@@ -100,13 +100,19 @@ class RiskProfileEngine:
         position_size *= assessment.size_multiplier
     """
     
-    def __init__(self, config: Optional[Dict] = None):
+    def __init__(self, config: Optional[Dict] = None, capital: float = 0.0):
         self.config = config or {}
         
-        # Daily limits
-        self.MAX_DAILY_LOSS_USD = self.config.get('max_daily_loss_usd', 1000)
-        self.DAILY_LOSS_REDUCED = self.config.get('daily_loss_reduced', 500)  # Go to REDUCED
-        self.DAILY_LOSS_PROBE = self.config.get('daily_loss_probe', 750)      # Go to PROBE
+        # Daily limits — derived from actual capital when available
+        # Old defaults ($1000/$500/$750) were 430% of $230 → completely inert
+        if capital > 0:
+            self.MAX_DAILY_LOSS_USD = self.config.get('max_daily_loss_usd', capital * 0.03)   # 3% of capital
+            self.DAILY_LOSS_REDUCED = self.config.get('daily_loss_reduced', capital * 0.015)   # 1.5% → REDUCED
+            self.DAILY_LOSS_PROBE = self.config.get('daily_loss_probe', capital * 0.02)        # 2% → PROBE
+        else:
+            self.MAX_DAILY_LOSS_USD = self.config.get('max_daily_loss_usd', 1000)
+            self.DAILY_LOSS_REDUCED = self.config.get('daily_loss_reduced', 500)
+            self.DAILY_LOSS_PROBE = self.config.get('daily_loss_probe', 750)
         
         # Consecutive losses
         self.CONSECUTIVE_LOSS_REDUCED = self.config.get('consecutive_loss_reduced', 2)
@@ -353,11 +359,14 @@ class RiskProfileEngine:
 _risk_profile_engine: Optional[RiskProfileEngine] = None
 
 
-def get_risk_profile_engine(config: Optional[Dict] = None) -> RiskProfileEngine:
+def get_risk_profile_engine(config: Optional[Dict] = None, capital: float = 0.0) -> RiskProfileEngine:
     """Get or create the risk profile engine singleton."""
     global _risk_profile_engine
     if _risk_profile_engine is None:
-        _risk_profile_engine = RiskProfileEngine(config)
+        _risk_profile_engine = RiskProfileEngine(config, capital=capital)
+    elif capital > 0 and _risk_profile_engine.MAX_DAILY_LOSS_USD > capital:
+        # Re-derive limits when capital is known and current limits are too loose
+        _risk_profile_engine = RiskProfileEngine(config, capital=capital)
     return _risk_profile_engine
 
 

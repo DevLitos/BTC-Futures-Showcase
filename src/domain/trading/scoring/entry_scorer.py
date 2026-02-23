@@ -569,13 +569,19 @@ class EntryScorer:
         return score
 
     def get_score_size_multiplier(self, score: int) -> float:
-        """Score-based position sizing multiplier."""
-        if score >= 7:
-            return 1.2
-        elif score >= 6:
-            return 1.0
+        """Score-based position sizing multiplier.
+        
+        Calibrated to actual score distribution:
+        - Typical good trade scores 5-6 (Structure 1, Timing 1-2, Momentum 1, Context 1)
+        - Score 7+ requires alignment across all 4 blocks + synergy → rare
+        - Old tiers (7/6/5) meant 80%+ of valid entries got 0.8x penalty
+        """
+        if score >= 6:
+            return 1.2  # Strong alignment → full confidence
+        elif score >= 5:
+            return 1.0  # Normal quality → neutral sizing
         else:
-            return 0.8
+            return 0.8  # Below median → cautious
 
 
 # Singleton instance

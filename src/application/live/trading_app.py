@@ -82,6 +82,7 @@ from src.infrastructure.storage.parquet.trade_logger import TradeLogger, get_tra
 from src.config.trading_config import (
     VolatilityRegime, VolatilityRegimeValue,
     LocationFilterOverride, MicroTrendADXConfig,
+    ADXThresholds,
     get_session_name
     # 🔥 REMOVED Feb 04: DynamicScoreThreshold, SessionTradeLimits, LossStreakConfig - unused
 )
@@ -1405,11 +1406,12 @@ class SignalEngine:
             self.risk_engine.capital = capital
             # 🔒 FIX (Jan 22, 2026): Also sync equity values from real exchange balance
             # Without this, equity stays at default 10k causing incorrect DD calculations
-            if self.risk_engine.initial_equity == 10000.0 or self.risk_engine.equity == 10000.0:
-                logger.info(f"💰 LIVE: Syncing equity from exchange (was default 10k)")
+            if self.risk_engine.initial_equity == 10000.0 or self.risk_engine.equity == 10000.0 or not self.risk_engine.equity_synced:
+                logger.info(f"[$] LIVE: Syncing equity from exchange (was default 10k)")
                 self.risk_engine.initial_equity = capital
                 self.risk_engine.equity = capital
                 self.risk_engine.max_equity = capital
+                self.risk_engine.equity_synced = True
             
             # 💰 NEW (Jan 28, 2026): Track session start capital for PnL reporting
             if self._session_start_capital is None:
@@ -2580,8 +2582,7 @@ class SignalEngine:
             is_range_bound = getattr(self, '_trend_phase', None) == TrendPhase.RANGE_BOUND
             has_expansion = getattr(self, '_expansion_mode', False)
             effective_adx = getattr(self, '_effective_adx', 25.0)
-            MIN_ADX_FOR_TRANSITION = 20.0
-            low_adx_no_trend = effective_adx < MIN_ADX_FOR_TRANSITION and not has_expansion
+            low_adx_no_trend = effective_adx < ADXThresholds.TRANSITION and not has_expansion
             skip_transition_for_range = (is_range_bound and not has_expansion) or low_adx_no_trend
             
             if not flip_contradicts_macro and not skip_transition_for_range:
@@ -3102,14 +3103,14 @@ class SignalEngine:
         # =====================================================================
         
         # Calculate effective ADX with TEMPORAL PRIORITY (with 1h floor guard)
-        if fast_adx >= 35 and htf_adx >= 18:
+        if fast_adx >= ADXThresholds.VERY_STRONG_TREND and htf_adx >= ADXThresholds.RANGE:
             # 5m shows STRONG TREND AND 1h is at least directional → trust 5m
             effective_adx = fast_adx
             if self._idle_eval_count % 180 == 1:
                 logger.info(
-                    f"⚡ FAST TREND: ADX 5m={fast_adx:.1f} ≥ 35, 1h={htf_adx:.1f} ≥ 18 → Using 5m"
+                    f"⚡ FAST TREND: ADX 5m={fast_adx:.1f} ≥ {ADXThresholds.VERY_STRONG_TREND}, 1h={htf_adx:.1f} ≥ {ADXThresholds.RANGE} → Using 5m"
                 )
-        elif fast_adx >= 35 and htf_adx < 18:
+        elif fast_adx >= ADXThresholds.VERY_STRONG_TREND and htf_adx < ADXThresholds.RANGE:
             # 🔥 FIX #263: 5m is hot BUT 1h says RANGE → blend conservatively
             # Don't let 5m noise create a fake trend in a ranging market
             effective_adx = fast_adx * 0.35 + htf_adx * 0.65
@@ -3118,10 +3119,10 @@ class SignalEngine:
                     f"⚡ FIX #263: ADX 5m={fast_adx:.1f} hot but 1h={htf_adx:.1f} RANGE → "
                     f"blend={effective_adx:.1f} (conservative)"
                 )
-        elif htf_adx >= 25:
+        elif htf_adx >= ADXThresholds.STRONG_TREND:
             # 1h confirms trend - use 1h
             effective_adx = htf_adx
-        elif fast_adx >= 25:
+        elif fast_adx >= ADXThresholds.STRONG_TREND:
             # 5m trending but not strong - blend but favor 5m for intraday
             effective_adx = fast_adx * 0.6 + htf_adx * 0.4
         else:

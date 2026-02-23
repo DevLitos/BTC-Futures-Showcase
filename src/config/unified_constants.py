@@ -296,29 +296,15 @@ PRICE = PriceConfirmation()
 
 
 # =============================================================================
-# ADX THRESHOLDS - UNIFIED
+# ADX THRESHOLDS — DELEGATED TO trading_config.ADXThresholds (single source)
 # =============================================================================
+# REMOVED: local ADXThresholds class (had RANGE_MAX=20 vs trading_config.RANGE=18)
+# This caused disagreement: ADX=19 was RANGE here but TRANSITION in trading_config.
+# Now both import paths resolve to the same class.
+from src.config.trading_config import ADXThresholds as _ADXThresholds  # noqa: E402
 
-@dataclass(frozen=True)
-class ADXThresholds:
-    """
-    ADX zone thresholds.
-    
-    AUDIT FIX: Had gap between 18-25 (undefined zone).
-    NOW: Continuous zones.
-    """
-    
-    # Zone boundaries
-    RANGE_MAX: float = 20.0           # Below 20 = RANGE
-    TRANSITION_MAX: float = 25.0      # 20-25 = TRANSITION
-    WEAK_TREND_MAX: float = 35.0      # 25-35 = WEAK_TREND
-    # Above 35 = STRONG_TREND
-    
-    # Aliases for compatibility
-    TREND_MIN: float = 20.0           # Alias: Above 20 = TREND (same as RANGE_MAX)
-
-
-ADX = ADXThresholds()
+# Singleton instance (compatible with existing `from unified_constants import ADX`)
+ADX = _ADXThresholds()
 
 
 # =============================================================================
