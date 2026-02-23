@@ -24,48 +24,6 @@ from src.shared.indicators import (
 logger = logging.getLogger(__name__)
 
 
-class ImpulseTracker:
-    """Tracks valid impulse legs for trend entries"""
-    
-    def __init__(self):
-        self.impulse_high = None
-        self.impulse_low = None
-        self.impulse_start_time = None
-        self.bos_confirmed = False
-        self.impulse_atr = None  # ATR at impulse time
-    
-    def update_impulse(self, current_high: float, current_low: float, 
-                      current_atr: float, bos_confirmed: bool, market_time: datetime | None = None):
-        """Update impulse after BOS confirmation"""
-        if bos_confirmed and not self.bos_confirmed:
-            # New impulse starts
-            self.impulse_high = current_high
-            self.impulse_low = current_low
-            # 🔒 FIX: Use market_time to prevent lookahead bias
-            self.impulse_start_time = market_time if market_time else datetime.now(UTC)
-            self.impulse_atr = current_atr
-            self.bos_confirmed = True
-            logger.info(f"IMPULSE_START: High={current_high:.2f}, Low={current_low:.2f}, ATR={current_atr:.2f}")
-    
-    def get_pullback_depth(self, pullback_low: float, atr_5m: float) -> float:
-        """Get normalized pullback depth from impulse"""
-        if not self.impulse_high:
-            return 0
-        
-        pullback_depth = self.impulse_high - pullback_low
-        normalized = pullback_depth / atr_5m if atr_5m > 0 else 0
-        return normalized
-    
-    def log_impulse_state(self, current_price: float, pullback_low: float, atr_5m: float):
-        """Log detailed impulse information"""
-        if self.impulse_high and self.impulse_low:
-            pullback = self.get_pullback_depth(pullback_low, atr_5m)
-            impulse_range = self.impulse_high - self.impulse_low
-            logger.debug(f"IMPULSE_STATE: High={self.impulse_high:.2f} Low={self.impulse_low:.2f} "
-                        f"Range={impulse_range:.2f} | PullbackLow={pullback_low:.2f} "
-                        f"NormalizedPullback={pullback:.2f}ATR | CurrentPrice={current_price:.2f}")
-
-
 class KillConditionsFilter:
     """BLOQUE 0 - Kill Conditions"""
     
@@ -340,7 +298,7 @@ class HTFFilter:
         self.last_htf_regime_mode: str = 'UNKNOWN'
         self.last_htf_adx: float = 0.0
     
-    def check(self, df_1h: pd.DataFrame, current_price: float, 
+    def check(self, df_1h: pd.DataFrame, current_price: float,
               correlation_data: Optional[dict] = None) -> Tuple[bool, Optional[str], str]:
         """
         Check HTF filters
@@ -605,61 +563,8 @@ class HTFFilter:
         if atr <= atr_ma * HTFFilters.MIN_ATR_VS_MA:
             return False, None, f"ATR {atr:.2f} <= MA {atr_ma:.2f}"
         
-        # Check correlation (NQ/ES)
-        if HTFFilters.CHECK_CORRELATION and correlation_data:
-            if not self._check_correlation(bias, correlation_data):
-                return False, None, f"Correlation check failed for {bias}"
-        
         logger.debug(f"[OK] HTF Filter PASSED - Bias: {bias} | ADX: {adx:.2f}")
         return True, bias, "HTF filter passed"
-    
-    def _check_correlation(self, bias: str, correlation_data: dict) -> bool:
-        """Check macro correlation with NQ/ES"""
-        # For LONG: NQ and ES should not be making Lower Lows
-        # For SHORT: NQ and ES should not be breaking highs
-        
-        # Simplified check - in production, would analyze actual price structure
-        if bias == 'LONG':
-            # Check if indices are not making lower lows
-            for symbol in ['NQ', 'ES']:
-                if symbol in correlation_data:
-                    data = correlation_data[symbol]
-                    if self._is_making_lower_lows(data):
-                        logger.warning(f"{symbol} making lower lows - blocking LONG")
-                        return False
-        
-        elif bias == 'SHORT':
-            # Check if indices are not breaking highs
-            for symbol in ['NQ', 'ES']:
-                if symbol in correlation_data:
-                    data = correlation_data[symbol]
-                    if self._is_breaking_highs(data):
-                        logger.warning(f"{symbol} breaking highs - blocking SHORT")
-                        return False
-        
-        return True
-    
-    def _is_making_lower_lows(self, df: pd.DataFrame, periods: int = 3) -> bool:
-        """Check if making lower lows"""
-        if len(df) < periods + 1:
-            return False
-        
-        recent_lows = df['low'].to_numpy()[-periods:]
-        for i in range(1, len(recent_lows)):
-            if recent_lows[i] < recent_lows[i-1]:
-                return True
-        return False
-    
-    def _is_breaking_highs(self, df: pd.DataFrame, periods: int = 3) -> bool:
-        """Check if breaking recent highs"""
-        if len(df) < periods + 1:
-            return False
-        
-        recent_highs = df['high'].to_numpy()[-periods-1:-1]
-        current_high = df['high'].iloc[-1]
-        
-        return current_high > float(np.amax(np.asarray(recent_highs)))
-
 
 
 # MTFStructureFilter DELETED - Feb 05, 2026 (lines 554-820)

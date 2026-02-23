@@ -93,182 +93,6 @@ class SlippageConfig:
     # Commission (Kraken Futures actual fees)
     MAKER_FEE_BPS: float = 2.0            # 0.02% maker fee
     TAKER_FEE_BPS: float = 5.0            # 0.05% taker fee
-    
-    # =========================================================================
-    # ADAPTIVE SLIPPAGE SETTINGS (Jan 23, 2026)
-    # Track real slippage and adjust estimates when consistently off
-    # =========================================================================
-    ADAPTIVE_WINDOW: int = 50             # Number of recent fills to track
-    ADAPTIVE_PERCENTILE: float = 75.0     # Use P75 of real slippage
-    ADAPTIVE_BUFFER_MULT: float = 1.2     # 20% buffer on top of P75
-    ADAPTIVE_UPDATE_THRESHOLD: float = 1.5  # Update if real > 1.5x estimate
-
-
-class AdaptiveSlippageTracker:
-    """
-    Tracks real slippage from fills and provides adaptive estimates.
-    
-    PRINCIPLE: If real slippage consistently exceeds estimates, increase estimates.
-    Uses P75 of recent fills + 20% buffer as adaptive estimate.
-    """
-    
-    def __init__(self, config: Optional[SlippageConfig] = None):
-        self.config = config or SlippageConfig()
-        # Separate tracking for different scenarios
-        self._entry_limit_slippages: list[float] = []
-        self._entry_market_slippages: list[float] = []
-        self._exit_tp_slippages: list[float] = []
-        self._exit_sl_slippages: list[float] = []
-        
-        # Adaptive estimates (start with config defaults)
-        self._adaptive_limit_bps: Optional[float] = None
-        self._adaptive_market_bps: Optional[float] = None
-        self._adaptive_tp_bps: Optional[float] = None
-        self._adaptive_sl_bps: Optional[float] = None
-        
-        logger.info("AdaptiveSlippageTracker initialized")
-    
-    def record_fill_slippage(
-        self, 
-        fill_type: str,  # 'entry_limit', 'entry_market', 'exit_tp', 'exit_sl'
-        expected_price: float,
-        actual_fill_price: float,
-        direction: str
-    ) -> float:
-        """
-        Record actual slippage from a fill.
-        
-        Args:
-            fill_type: Type of fill
-            expected_price: Price we expected
-            actual_fill_price: Actual fill price
-            direction: 'LONG' or 'SHORT'
-            
-        Returns:
-            float: Recorded slippage in bps
-        """
-        if expected_price <= 0:
-            return 0.0
-            
-        # Calculate slippage (positive = adverse, negative = favorable)
-        if direction.upper() == 'LONG':
-            if fill_type.startswith('entry'):
-                # Entry LONG: slippage if fill > expected
-                slippage_pct = (actual_fill_price - expected_price) / expected_price
-            else:
-                # Exit LONG: slippage if fill < expected
-                slippage_pct = (expected_price - actual_fill_price) / expected_price
-        else:  # SHORT
-            if fill_type.startswith('entry'):
-                # Entry SHORT: slippage if fill < expected
-                slippage_pct = (expected_price - actual_fill_price) / expected_price
-            else:
-                # Exit SHORT: slippage if fill > expected
-                slippage_pct = (actual_fill_price - expected_price) / expected_price
-        
-        slippage_bps = slippage_pct * 10000  # Convert to bps
-        # Only track adverse slippage (positive)
-        slippage_bps = max(0, slippage_bps)
-        
-        # Store in appropriate list
-        window = self.config.ADAPTIVE_WINDOW
-        if fill_type == 'entry_limit':
-            self._entry_limit_slippages.append(slippage_bps)
-            self._entry_limit_slippages = self._entry_limit_slippages[-window:]
-        elif fill_type == 'entry_market':
-            self._entry_market_slippages.append(slippage_bps)
-            self._entry_market_slippages = self._entry_market_slippages[-window:]
-        elif fill_type == 'exit_tp':
-            self._exit_tp_slippages.append(slippage_bps)
-            self._exit_tp_slippages = self._exit_tp_slippages[-window:]
-        elif fill_type == 'exit_sl':
-            self._exit_sl_slippages.append(slippage_bps)
-            self._exit_sl_slippages = self._exit_sl_slippages[-window:]
-        
-        # Update adaptive estimates if we have enough data
-        self._update_adaptive_estimates()
-        
-        return slippage_bps
-    
-    def _calculate_adaptive_estimate(self, slippages: list[float], default: float) -> Optional[float]:
-        """Calculate P75 + buffer from slippage history."""
-        if len(slippages) < 10:  # Need minimum samples
-            return None
-        
-        import numpy as np
-        p75 = float(np.percentile(slippages, self.config.ADAPTIVE_PERCENTILE))
-        buffered = p75 * self.config.ADAPTIVE_BUFFER_MULT
-        
-        # Only use adaptive if it's significantly higher than default
-        if buffered > default * self.config.ADAPTIVE_UPDATE_THRESHOLD:
-            return buffered
-        return None
-    
-    def _update_adaptive_estimates(self):
-        """Update all adaptive estimates from recorded data."""
-        self._adaptive_limit_bps = self._calculate_adaptive_estimate(
-            self._entry_limit_slippages, 
-            self.config.LIMIT_SLIPPAGE_BPS
-        )
-        self._adaptive_market_bps = self._calculate_adaptive_estimate(
-            self._entry_market_slippages,
-            self.config.TAKER_SLIPPAGE_BPS
-        )
-        self._adaptive_tp_bps = self._calculate_adaptive_estimate(
-            self._exit_tp_slippages,
-            self.config.EXIT_SLIPPAGE_BPS
-        )
-        self._adaptive_sl_bps = self._calculate_adaptive_estimate(
-            self._exit_sl_slippages,
-            self.config.SL_SLIPPAGE_BPS
-        )
-        
-        # Log when adaptive estimates kick in
-        if self._adaptive_limit_bps:
-            logger.info(f"📊 Adaptive LIMIT slippage: {self._adaptive_limit_bps:.2f} bps (default: {self.config.LIMIT_SLIPPAGE_BPS})")
-        if self._adaptive_market_bps:
-            logger.info(f"📊 Adaptive MARKET slippage: {self._adaptive_market_bps:.2f} bps (default: {self.config.TAKER_SLIPPAGE_BPS})")
-        if self._adaptive_sl_bps:
-            logger.info(f"📊 Adaptive SL slippage: {self._adaptive_sl_bps:.2f} bps (default: {self.config.SL_SLIPPAGE_BPS})")
-    
-    def get_entry_slippage_bps(self, order_type: OrderType) -> float:
-        """Get entry slippage, preferring adaptive estimate if available."""
-        if order_type == OrderType.LIMIT:
-            return self._adaptive_limit_bps or self.config.LIMIT_SLIPPAGE_BPS
-        else:
-            return self._adaptive_market_bps or self.config.TAKER_SLIPPAGE_BPS
-    
-    def get_exit_slippage_bps(self, exit_type: str) -> float:
-        """Get exit slippage, preferring adaptive estimate if available."""
-        if exit_type in ["SL", "TRAILING"]:
-            return self._adaptive_sl_bps or self.config.SL_SLIPPAGE_BPS
-        else:
-            return self._adaptive_tp_bps or self.config.EXIT_SLIPPAGE_BPS
-    
-    def get_status(self) -> dict:
-        """Get current adaptive slippage status."""
-        return {
-            'entry_limit_samples': len(self._entry_limit_slippages),
-            'entry_market_samples': len(self._entry_market_slippages),
-            'exit_tp_samples': len(self._exit_tp_slippages),
-            'exit_sl_samples': len(self._exit_sl_slippages),
-            'adaptive_limit_bps': self._adaptive_limit_bps,
-            'adaptive_market_bps': self._adaptive_market_bps,
-            'adaptive_tp_bps': self._adaptive_tp_bps,
-            'adaptive_sl_bps': self._adaptive_sl_bps,
-        }
-
-
-# Singleton for adaptive tracker
-_adaptive_tracker: Optional[AdaptiveSlippageTracker] = None
-
-
-def get_adaptive_slippage_tracker() -> AdaptiveSlippageTracker:
-    """Get singleton AdaptiveSlippageTracker instance."""
-    global _adaptive_tracker
-    if _adaptive_tracker is None:
-        _adaptive_tracker = AdaptiveSlippageTracker()
-    return _adaptive_tracker
 
 
 class SlippageModel:
@@ -294,9 +118,8 @@ class SlippageModel:
             # Proceed with entry
     """
     
-    def __init__(self, config: Optional[SlippageConfig] = None, use_adaptive: bool = True):
+    def __init__(self, config: Optional[SlippageConfig] = None):
         self.config = config or SlippageConfig()
-        self._adaptive_tracker = get_adaptive_slippage_tracker() if use_adaptive else None
     
     def get_volatility_multiplier(self, volatility_ratio: float) -> float:
         """
@@ -325,51 +148,21 @@ class SlippageModel:
         volatility_ratio: float = 1.0,
         mode: SlippageMode = SlippageMode.OPERATIONAL
     ) -> float:
-        """
-        Get entry slippage in basis points.
-        
-        Args:
-            order_type: LIMIT or MARKET
-            volatility_ratio: current_atr / avg_atr
-            mode: OPERATIONAL (P95 based) or STRESS (P99 based, never blocks)
-        
-        Returns:
-            Slippage in bps (including fees)
-            
-        ADAPTIVE (Jan 23, 2026): Uses P75 of recent fills + buffer if real slippage
-        consistently exceeds estimates.
-        STRESS MODE: Uses P99 values directly (not as caps)
-        This shows worst-case scenario for information only.
-        """
+        """Get entry slippage in basis points (including fees)."""
         vol_mult = self.get_volatility_multiplier(volatility_ratio)
         
         if order_type == OrderType.LIMIT:
             fee = self.config.MAKER_FEE_BPS
             if mode == SlippageMode.STRESS:
-                # Stress: use P99 value directly
                 return self.config.P99_ENTRY_SLIP_BPS + fee
-            else:
-                # Operational: use adaptive estimate if available, else config
-                if self._adaptive_tracker:
-                    base_slip = self._adaptive_tracker.get_entry_slippage_bps(order_type)
-                else:
-                    base_slip = self.config.LIMIT_SLIPPAGE_BPS
-                adjusted_slip = base_slip * vol_mult
-                adjusted_slip = min(adjusted_slip, self.config.P95_ENTRY_SLIP_BPS)
-                return adjusted_slip + fee
+            adjusted_slip = min(self.config.LIMIT_SLIPPAGE_BPS * vol_mult, self.config.P95_ENTRY_SLIP_BPS)
+            return adjusted_slip + fee
         else:  # MARKET
             fee = self.config.TAKER_FEE_BPS
             if mode == SlippageMode.STRESS:
                 return self.config.P99_ENTRY_SLIP_BPS + fee
-            else:
-                # Operational: use adaptive estimate if available
-                if self._adaptive_tracker:
-                    base_slip = self._adaptive_tracker.get_entry_slippage_bps(order_type)
-                else:
-                    base_slip = self.config.TAKER_SLIPPAGE_BPS
-                adjusted_slip = base_slip * vol_mult
-                adjusted_slip = min(adjusted_slip, self.config.P95_ENTRY_SLIP_BPS)
-                return adjusted_slip + fee
+            adjusted_slip = min(self.config.TAKER_SLIPPAGE_BPS * vol_mult, self.config.P95_ENTRY_SLIP_BPS)
+            return adjusted_slip + fee
     
     def get_exit_slippage_bps(
         self, 
@@ -377,49 +170,20 @@ class SlippageModel:
         volatility_ratio: float = 1.0,
         mode: SlippageMode = SlippageMode.OPERATIONAL
     ) -> float:
-        """
-        Get exit slippage in basis points.
-        
-        Args:
-            exit_type: Type of exit
-            volatility_ratio: current_atr / avg_atr
-            mode: OPERATIONAL (P95 based) or STRESS (P99 based, never blocks)
-        
-        Returns:
-            Slippage in bps (including fees)
-            
-        ADAPTIVE (Jan 23, 2026): Uses P75 of recent fills + buffer if real slippage
-        consistently exceeds estimates.
-        STRESS MODE: Uses P99 values directly for worst-case analysis.
-        """
+        """Get exit slippage in basis points (including fees)."""
         vol_mult = self.get_volatility_multiplier(volatility_ratio)
         fee = self.config.TAKER_FEE_BPS  # Exits usually taker
         
-        if exit_type == "SL" or exit_type == "TRAILING":
-            # SL/trailing usually execute as market in fast moves
+        if exit_type in ("SL", "TRAILING"):
             if mode == SlippageMode.STRESS:
-                # Stress: use P99 value directly
                 return self.config.P99_SL_SLIP_BPS + fee
-            else:
-                # Operational: use adaptive estimate if available
-                if self._adaptive_tracker:
-                    base_slip = self._adaptive_tracker.get_exit_slippage_bps(exit_type)
-                else:
-                    base_slip = self.config.SL_SLIPPAGE_BPS
-                adjusted_slip = base_slip * vol_mult
-                adjusted_slip = min(adjusted_slip, self.config.P95_SL_SLIP_BPS)
-                return adjusted_slip + fee
+            adjusted_slip = min(self.config.SL_SLIPPAGE_BPS * vol_mult, self.config.P95_SL_SLIP_BPS)
+            return adjusted_slip + fee
         else:  # TP
             if mode == SlippageMode.STRESS:
                 return self.config.P99_EXIT_SLIP_BPS + fee
-            else:
-                if self._adaptive_tracker:
-                    base_slip = self._adaptive_tracker.get_exit_slippage_bps("TP")
-                else:
-                    base_slip = self.config.EXIT_SLIPPAGE_BPS
-                adjusted_slip = base_slip * vol_mult
-                adjusted_slip = min(adjusted_slip, self.config.P95_EXIT_SLIP_BPS)
-                return adjusted_slip + fee
+            adjusted_slip = min(self.config.EXIT_SLIPPAGE_BPS * vol_mult, self.config.P95_EXIT_SLIP_BPS)
+            return adjusted_slip + fee
     
     def calculate_worst_case_entry(
         self,
@@ -566,92 +330,6 @@ class SlippageModel:
             )
         
         return rr_wc
-    
-    def get_slippage_adjusted_size(
-        self,
-        base_size: float,
-        volatility_ratio: float
-    ) -> float:
-        """
-        Optionally reduce position size in high volatility.
-        High slippage environments = reduce size for same dollar risk.
-        
-        Args:
-            base_size: Base position size
-            volatility_ratio: current_atr / avg_atr
-        
-        Returns:
-            Adjusted position size
-        """
-        vol_mult = self.get_volatility_multiplier(volatility_ratio)
-        
-        # If slippage is 2x, reduce size by ~15% to maintain same dollar exposure
-        if vol_mult > 1.5:
-            size_reduction = 1 - (vol_mult - 1) * 0.15
-            size_reduction = max(0.7, size_reduction)  # Min 70% of size
-            return base_size * size_reduction
-        
-        return base_size
-    
-    def calculate_dual_rr(
-        self,
-        entry_price: float,
-        stop_loss: float,
-        take_profit: float,
-        direction: str,
-        order_type: OrderType = OrderType.LIMIT,
-        volatility_ratio: float = 1.0
-    ) -> Tuple[float, float, bool, str]:
-        """
-        Calculate BOTH operational and stress RR in one call.
-        
-        CRITICAL PRINCIPLE:
-        - Operational RR (P95) is used for ENTRY DECISIONS
-        - Stress RR (P99) is for ALERTS only, NEVER BLOCKS
-        
-        Args:
-            entry_price: Planned entry price
-            stop_loss: Stop loss price
-            take_profit: Take profit price (TP1)
-            direction: 'LONG' or 'SHORT'
-            order_type: LIMIT or MARKET entry
-            volatility_ratio: current_atr / avg_atr
-        
-        Returns:
-            Tuple of:
-            - rr_operational: P95 RR for entry decision
-            - rr_stress: P99 RR for information only
-            - stress_alert: True if stress RR is significantly worse
-            - alert_message: Warning message if alert triggered
-        """
-        rr_operational = self.calculate_worst_case_rr(
-            entry_price, stop_loss, take_profit, direction,
-            order_type, volatility_ratio,
-            mode=SlippageMode.OPERATIONAL
-        )
-        
-        rr_stress = self.calculate_worst_case_rr(
-            entry_price, stop_loss, take_profit, direction,
-            order_type, volatility_ratio,
-            mode=SlippageMode.STRESS
-        )
-        
-        # Check if stress is significantly worse
-        stress_alert = False
-        alert_message = ""
-        
-        if rr_operational > 0:
-            degradation_pct = ((rr_operational - rr_stress) / rr_operational) * 100
-            if degradation_pct > self.config.STRESS_ALERT_THRESHOLD_PCT:
-                stress_alert = True
-                alert_message = (
-                    f"⚠️ STRESS ALERT: RR degrades {degradation_pct:.0f}% under P99 "
-                    f"(operational={rr_operational:.2f} → stress={rr_stress:.2f}). "
-                    f"Trade proceeds but monitor closely."
-                )
-                logger.warning(alert_message)
-        
-        return rr_operational, rr_stress, stress_alert, alert_message
 
 
 # Singleton instance for easy import

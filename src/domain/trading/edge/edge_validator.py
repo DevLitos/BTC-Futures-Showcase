@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta, UTC
 import numpy as np
-from src.config.trading_config import KillConditions, MTFFilters, IndicatorPeriods
+from src.config.trading_config import KillConditions, MTFFilters
 from src.domain.market.regime.activity_regime import (
     ActivityRegimeAnalyzer, 
     ActivityMetrics, 

@@ -25,7 +25,6 @@ from src.domain.market.regime.trend_intelligence import (
     TrendState,
     TrendTransition,
     get_trend_intelligence,
-    reset_trend_intelligence,
 )
 
 # Entry-time regime detection
@@ -34,7 +33,6 @@ from src.domain.market.regime.regime_detector import (
     EntryRegime,
     RegimeConfig,
     REGIME_CONFIGS,
-    calculate_chase_atr,
 )
 
 # Position management regime (used by risk_middleware.py)
@@ -67,7 +65,6 @@ __all__ = [
     'EntryRegime',
     'RegimeConfig', 
     'REGIME_CONFIGS',
-    'calculate_chase_atr',
     # Trend Intelligence
     'TrendIntelligence',
     'TrendPhase',
@@ -75,7 +72,6 @@ __all__ = [
     'TrendState',
     'TrendTransition',
     'get_trend_intelligence',
-    'reset_trend_intelligence',
     # Management regime
     'ManagementRegime',
     'RegimeGuidance',

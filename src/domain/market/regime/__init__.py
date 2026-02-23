@@ -28,7 +28,6 @@ from src.domain.market.regime.trend_intelligence import (
     TrendState,
     TrendTransition,
     get_trend_intelligence,
-    reset_trend_intelligence,
 )
 
 # Edge Regime - Edge validity classification (PRIMARY for edge analysis)
@@ -44,7 +43,6 @@ from src.domain.market.regime.regime_detector import (
     EntryRegime,
     RegimeConfig,
     REGIME_CONFIGS,
-    calculate_chase_atr,
 )
 
 # Activity regime for 24/7 markets (used via edge enforcement)
@@ -76,7 +74,6 @@ __all__ = [
     'TrendState',
     'TrendTransition',
     'get_trend_intelligence',
-    'reset_trend_intelligence',
     # Edge Regime
     'EdgeRegimeClassifier',
     'EdgeRegime',
@@ -86,7 +83,6 @@ __all__ = [
     'EntryRegime',
     'RegimeConfig', 
     'REGIME_CONFIGS',
-    'calculate_chase_atr',
     # Activity regime
     'ActivityRegimeAnalyzer',
     'EnforcementMode',

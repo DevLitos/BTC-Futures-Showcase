@@ -4,7 +4,8 @@ Entry Scorer - Score > Gates Architecture
 SIMPLIFIED (Feb 2026): Removed 15+ accumulated FIXes that contradicted each other.
 
 Score = Structure(0-2) + Timing(0-2) + Momentum(0-2) + Context(0-2) + Synergy(0-1) = max 9
-Adjustments: micro_trend_adj + filter_pipeline_adj (capped at -3.0 total penalty)
+Adjustments: micro_trend_adj only (capped at -3.0 total penalty)
+Weak momentum → sizing penalty (0.7x), NOT score penalty.
 
 Only Structure=0 blocks entry (the only real gate).
 Displacement/Expansion/Strong ADX (>=50) bypass the structure gate.
@@ -26,8 +27,7 @@ from src.shared.indicators import (
 from src.config.trading_config import OperatingMode, get_session_name
 
 if TYPE_CHECKING:
-    from src.domain.market.filters import EntryFilterPipeline
-    from src.domain.market.filters.filter_interface import FilterDecision
+    from src.domain.market.filters import EntryFilterPipeline  # Legacy caller compat
     from src.domain.market.filters import MicroTrendState
 
 logger = logging.getLogger(__name__)
@@ -42,8 +42,6 @@ class ScoreBreakdown:
     context: int = 0
     synergy: int = 0
     micro_trend_adj: float = 0.0
-    filter_pipeline_adj: float = 0.0
-    coherence_adj: float = 0.0
     adx_values: np.ndarray = field(default_factory=lambda: np.array([]))
 
     MAX_TOTAL_PENALTY = -3.0
@@ -52,7 +50,7 @@ class ScoreBreakdown:
     def total(self) -> int:
         """Calculate total score with penalty cap."""
         base = self.structure + self.timing + self.momentum + self.context + self.synergy
-        total_penalty = self.micro_trend_adj + self.filter_pipeline_adj + self.coherence_adj
+        total_penalty = self.micro_trend_adj
         capped_penalty = max(self.MAX_TOTAL_PENALTY, total_penalty)
         return max(0, int(base + capped_penalty))
 
@@ -65,8 +63,6 @@ class ScoreBreakdown:
             'context': self.context,
             'synergy': self.synergy,
             'micro_trend_adj': self.micro_trend_adj,
-            'filter_pipeline_adj': self.filter_pipeline_adj,
-            'coherence_adj': self.coherence_adj,
             'total': self.total
         }
 
@@ -134,11 +130,11 @@ class EntryScorer:
         current_price: float,
         market_time: datetime,
         micro_trend_state: Optional['MicroTrendState'] = None,
-        filter_pipeline: Optional['EntryFilterPipeline'] = None,
         displacement_edge_active: bool = False,
         expansion_mode_active: bool = False,
         strong_trend_adx: float = 0.0,
         # Legacy params kept for caller compatibility (ignored)
+        filter_pipeline: Optional['EntryFilterPipeline'] = None,
         bias_inverted: bool = False,
         bias_invalidated: bool = False,
         impulse_start_price: Optional[float] = None,
@@ -210,29 +206,18 @@ class EntryScorer:
         if htf_clean and bos_confirmed:
             self._breakdown.synergy = 1
 
-        # MOMENTUM COHERENCE: zero momentum = lateral market, no directional conviction
-        # A setup with zero momentum should not score above probe/reduced territory
-        # Max possible with momentum=0: 2+2+0+2+1 = 7 → with -2 penalty = 5 (probe)
-        if self._breakdown.momentum == 0:
-            self._breakdown.coherence_adj = -2.0
+        # MOMENTUM COHERENCE: zero momentum reduces sizing, not score.
+        # ADX naturally dips during pullbacks (consolidation before continuation).
+        # The -2.0 penalty killed ALL pullback entries: Structure=1, Timing=2,
+        # Momentum=0, Context=2 → raw 5 minus 2 = 3 → far below 5.0 floor.
+        # Instead, let the sizing system apply a 0.7x multiplier for weak momentum.
+        # This keeps the trade alive for validation while reducing risk.
 
         # 6️⃣ MICRO TREND ADJUSTMENT (applied directly)
         if micro_trend_state is not None:
             micro_adj = micro_trend_state.score_adjustment
             if micro_adj != 0:
                 self._breakdown.micro_trend_adj = micro_adj
-
-        # 7️⃣ FILTER PIPELINE ADJUSTMENT — DISABLED
-        # Data analysis Feb 16-20 (25 trades): filter_pipeline_adj is BACKWARDS.
-        # Score 5 (heavy penalty, raw 7-8) = 58% WR (BEST).
-        # Score 6 (light penalty, raw 6) = 14% WR (WORST).
-        # The pipeline penalizes GOOD setups and rewards BAD ones.
-        # Removing this noise lets the raw score (structure+timing+momentum+context+synergy)
-        # drive decisions accurately.
-        # if filter_pipeline is not None:
-        #     last_decision = filter_pipeline.get_last_decision()
-        #     if last_decision and last_decision.score_adjust != 0:
-        #         self._breakdown.filter_pipeline_adj = last_decision.score_adjust
 
         # Final score (MAX_TOTAL_PENALTY cap applied inside ScoreBreakdown.total)
         self._trade_tags.score = self._breakdown.total
@@ -272,8 +257,19 @@ class EntryScorer:
         if len(ema50_1h) >= 4:
             ema50_slope = (ema50_1h[-1] - ema50_1h[-4]) / ema50_1h[-4] * 100
 
-        # Price distance from EMA50
-        PROXIMITY_TOLERANCE = 0.003  # 0.3%
+        # Dynamic proximity tolerance using ATR (adapts to volatility)
+        # Fixed 0.3% was too tight in volatile markets, too loose in quiet ones.
+        # Using 1H ATR: ~$400 → 0.4%, ~$200 → 0.2%, ~$800 → 0.8%
+        highs_1h = df_1h['high'].to_numpy()
+        lows_1h = df_1h['low'].to_numpy()
+        atr_1h_vals = calculate_atr(highs_1h, lows_1h, closes_1h, 14)
+        if len(atr_1h_vals) > 0 and not np.isnan(atr_1h_vals[-1]):
+            atr_1h = atr_1h_vals[-1]
+            PROXIMITY_TOLERANCE = atr_1h / ema50_1h[-1]  # ~0.3-0.8% dynamically
+        else:
+            PROXIMITY_TOLERANCE = 0.005  # Fallback 0.5%
+        PROXIMITY_TOLERANCE = max(0.003, min(0.010, PROXIMITY_TOLERANCE))  # Clamp 0.3%–1.0%
+
         price_distance_pct = (current_price - ema50_1h[-1]) / ema50_1h[-1]
         is_near_ema50 = abs(price_distance_pct) <= PROXIMITY_TOLERANCE
 
@@ -293,8 +289,8 @@ class EntryScorer:
                 elif ema50_slope > 0.05:
                     htf_aligned = True
                     htf_slope_override = True
-                # Within 3% below EMA50 → reversal zone
-                elif price_distance_pct >= -0.03:
+                # Within 5% below EMA50 → reversal / pullback zone
+                elif price_distance_pct >= -0.05:
                     htf_aligned = True
                     htf_slope_override = True
         else:

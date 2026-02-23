@@ -27,42 +27,11 @@ def safe_float(value, default: float = 0.0) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
-        logger.warning(f"Invalid numeric value for conversion: {value!r}")
         return default
 
 
-def is_valid_position_response(position: Optional[Dict]) -> bool:
-    """
-    Check if position response is valid (not an error/timeout).
-    
-    Returns True if:
-      - position is a valid dict without error markers
-    Returns False if:
-      - position is None (no position - valid state)
-      - position has _error or _timeout keys (API failure)
-    
-    Use this to distinguish "no position" from "couldn't get position".
-    """
-    if position is None:
-        return True  # None = no position = valid
-    if isinstance(position, dict):
-        if position.get('_error') or position.get('_timeout'):
-            return False  # Error response
-        return True  # Valid position data
-    return False  # Invalid type
-
-
-def is_position_error(position: Optional[Dict]) -> bool:
-    """Check if position response represents an API error (not 'no position')."""
-    if position is None:
-        return False  # None = no position = not an error
-    if isinstance(position, dict):
-        return bool(position.get('_error') or position.get('_timeout'))
-    return True  # Invalid type = treat as error
-
-
 # =============================================================================
-# DOMAIN EXCEPTIONS - For precise error handling
+# DOMAIN EXCEPTIONS
 # =============================================================================
 
 class ExecutionError(Exception):
@@ -114,79 +83,9 @@ class PositionMismatchError(ExecutionError):
 # 🔥 FIX #167 (Feb 11, 2026): Reduced MEDIUM from 30s to 10s
 # 30s was causing system hangs during API issues. 10s is enough for 
 # order operations and with existing retry+backoff, transient failures recover.
-EXCHANGE_TIMEOUT_SHORT = 5.0    # Para consultas simples (was 10s)
-EXCHANGE_TIMEOUT_MEDIUM = 10.0  # Para órdenes (was 30s - too long)
-EXCHANGE_TIMEOUT_LONG = 30.0    # Para operaciones complejas (was 60s)
-
-
-def get_exchange_timeouts():
-    """
-    Get exchange timeouts from settings if available, otherwise use defaults.
-    This allows runtime configuration without hardcoding.
-    """
-    try:
-        from src.config.settings import get_settings
-        settings = get_settings()
-        # 🔥 FIX: Use getattr with defaults to avoid AttributeError
-        return (
-            getattr(settings, 'exchange_timeout_short', EXCHANGE_TIMEOUT_SHORT),
-            getattr(settings, 'exchange_timeout_medium', EXCHANGE_TIMEOUT_MEDIUM),
-            getattr(settings, 'exchange_timeout_long', EXCHANGE_TIMEOUT_LONG)
-        )
-    except Exception:
-        return EXCHANGE_TIMEOUT_SHORT, EXCHANGE_TIMEOUT_MEDIUM, EXCHANGE_TIMEOUT_LONG
-
-
-# =============================================================================
-# HELPER: Execute with Timeout + Lock
-# =============================================================================
-# 🔧 REFACTORED Feb 05, 2026: Centralized timeout+lock pattern
-# Previously duplicated ~15 times in this file
-
-async def execute_with_timeout(
-    coro,
-    lock: asyncio.Lock,
-    timeout: float,
-    operation: str,
-    default: Any = None,
-    raise_on_timeout: bool = False
-) -> Any:
-    """
-    Execute a coroutine with timeout and optional lock.
-    
-    This helper consolidates the repeated pattern of:
-        async with self._exchange_lock:
-            try:
-                result = await asyncio.wait_for(coro, timeout=N)
-            except asyncio.TimeoutError:
-                logger.error("...")
-                return None
-    
-    Args:
-        coro: The coroutine to execute
-        lock: The asyncio.Lock to acquire (can be None for no lock)
-        timeout: Timeout in seconds
-        operation: Name of the operation (for logging)
-        default: Value to return on timeout (if raise_on_timeout=False)
-        raise_on_timeout: If True, raise ExchangeTimeoutError instead of returning default
-    
-    Returns:
-        Result of the coroutine, or default on timeout
-    
-    Raises:
-        ExchangeTimeoutError: If raise_on_timeout=True and timeout occurs
-    """
-    try:
-        if lock:
-            async with lock:
-                return await asyncio.wait_for(coro, timeout=timeout)
-        else:
-            return await asyncio.wait_for(coro, timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.error(f"⏰ TIMEOUT after {timeout}s in {operation}")
-        if raise_on_timeout:
-            raise ExchangeTimeoutError(f"Timeout in {operation}")
-        return default
+EXCHANGE_TIMEOUT_SHORT = 5.0
+EXCHANGE_TIMEOUT_MEDIUM = 10.0
+EXCHANGE_TIMEOUT_LONG = 30.0
 
 
 # CRITICAL: Threshold for float comparison of position sizes
@@ -384,6 +283,29 @@ class RESTExecutionEngine:
             raise
         except Exception as e:
             logger.error(f"Failed to initialize exchange: {e}")
+            raise
+    
+    @with_retry(max_retries=3, base_delay=2.0)
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 100) -> list:
+        """Fetch OHLCV candles from exchange, returns list of dicts"""
+        try:
+            raw = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            if not raw:
+                return []
+            candles = []
+            for row in raw:
+                candles.append({
+                    'timestamp': row[0],
+                    'open': float(row[1]),
+                    'high': float(row[2]),
+                    'low': float(row[3]),
+                    'close': float(row[4]),
+                    'volume': float(row[5]) if len(row) > 5 else 0.0,
+                    'timeframe': timeframe,
+                })
+            return candles
+        except Exception as e:
+            logger.error(f"Error fetching OHLCV {timeframe}: {e}")
             raise
     
     async def place_limit_order(self, symbol: str, side: str, amount: float, 
@@ -707,65 +629,6 @@ class RESTExecutionEngine:
             logger.error(f"Error cancelling order: {e}")
             return False
     
-    async def get_order_status(self, order_id: str, symbol: str) -> Optional[Dict]:
-        """
-        Consultar estado de orden con timeout.
-        Kraken Futures no soporta fetch_order(id), usamos fallback a open/closed orders.
-        """
-        if not self.exchange:
-            return None
-        
-        # For Kraken Futures, skip fetch_order entirely - it doesn't work reliably
-        # and returns "UUID string too large" errors
-        is_kraken = self.exchange_name == 'krakenfutures'
-        
-        if not is_kraken:
-            try:
-                # Intento directo (funciona en Binance, no en Kraken Futures)
-                order = await asyncio.wait_for(
-                    self.exchange.fetch_order(order_id, symbol),
-                    timeout=EXCHANGE_TIMEOUT_SHORT
-                )
-                return order
-                
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout fetching order {order_id}")
-                return None
-            except Exception as e:
-                msg = str(e).lower()
-                if "not supported" not in msg and "method not implemented" not in msg and "uuid" not in msg:
-                    logger.error(f"Error fetching order: {e}")
-                    return None
-                # Fall through to fallback method
-        
-        # Fallback: Buscar en Open/Closed Orders (required for Kraken Futures)
-        try:
-            open_orders = await asyncio.wait_for(
-                self.exchange.fetch_open_orders(symbol),
-                timeout=EXCHANGE_TIMEOUT_SHORT
-            )
-            for o in open_orders:
-                if o['id'] == order_id:
-                    return o
-            
-            # Si no está en Open, buscar en Closed (recientes)
-            closed_orders = await asyncio.wait_for(
-                self.exchange.fetch_closed_orders(symbol, limit=50),
-                timeout=EXCHANGE_TIMEOUT_SHORT
-            )
-            for o in closed_orders:
-                if o['id'] == order_id:
-                    return o
-            
-            return None
-            
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout in fallback order fetch for {order_id}")
-            return None
-        except Exception as inner_e:
-            logger.error(f"Error in fallback order fetch: {inner_e}")
-            return None
-
     async def get_open_orders(self, symbol: str) -> list:
         """Consultar órdenes abiertas directamente del exchange"""
         if not self.exchange:
@@ -1336,121 +1199,6 @@ class RESTExecutionEngine:
             logger.debug(f"Exception details: {e}", exc_info=True)
             return False
     
-    async def set_position_stops_optimized(self, symbol: str, stop_loss: float, 
-                                           take_profit: float) -> bool:
-        """
-        FIX #4: REDUCIR ÓRDENES POR TRADE - Consolidate SL/TP Placement
-        
-        OPTIMIZACIÓN:
-        - Intenta colocar SL + TP sin reintentos innecesarios
-        - Usa fallback simple en lugar de 3 intentos por orden
-        - Resultado: 3-4 órdenes totales en lugar de 7-8
-        
-        Args:
-            symbol: Par a operar
-            stop_loss: Precio de stop loss
-            take_profit: Precio de take profit
-        
-        Returns: True si SL se colocó exitosamente (crítico)
-        """
-        if not self.exchange:
-            return False
-        
-        try:
-            position = await self.get_position(symbol)
-            if not position or abs(position.get('contracts', 0)) < MIN_POSITION_THRESHOLD:
-                logger.error("Cannot set stops: no open position")
-                return False
-            
-            contracts = position.get('contracts', 0)
-            # CRITICAL: Use 'side' field, not contracts sign (Kraken returns contracts always positive)
-            raw_side = position.get('side', '').lower()
-            if raw_side in ('long', 'short'):
-                position_side = raw_side
-            else:
-                # 🔒 FIX (Jan 22, 2026): Don't fallback - abort if side unknown
-                logger.error(f"❌ Cannot determine position side (raw_side='{raw_side}') - aborting SL/TP")
-                return False
-            position_size = abs(contracts)
-            
-            logger.info(f"📍 FIX#4 Optimized stops: SL={stop_loss:.2f}, TP={take_profit:.2f}")
-            
-            sl_side = 'sell' if position_side == 'long' else 'buy'
-            tp_side = 'sell' if position_side == 'long' else 'buy'
-            
-            # SL: Intento directo (sin reintentos) - 🔥 FIX: Added timeout
-            try:
-                await asyncio.wait_for(
-                    self.exchange.create_order(
-                        symbol=symbol, type='stop-loss', side=sl_side,
-                        amount=position_size, price=stop_loss,
-                        params={'reduceOnly': True, 'postOnly': False}
-                    ),
-                    timeout=EXCHANGE_TIMEOUT_MEDIUM
-                )
-                logger.info(f"✅ SL placed: {stop_loss:.2f}")
-            except asyncio.TimeoutError:
-                logger.error(f"❌ SL timeout after {EXCHANGE_TIMEOUT_MEDIUM}s")
-                return False
-            except Exception as e:
-                logger.error(f"❌ SL failed: {e}")
-                return False
-            
-            # TP: Secondary (SL is critical)
-            # PASO 2 — SALIDA: TP SIEMPRE LIMIT + post-only (no market TP)
-            try:
-                await asyncio.wait_for(
-                    self.exchange.create_order(
-                        symbol=symbol,
-                        type='limit',
-                        side=tp_side,
-                        amount=position_size,
-                        price=take_profit,
-                        params={'reduceOnly': True, 'postOnly': True}
-                    ),
-                    timeout=EXCHANGE_TIMEOUT_MEDIUM
-                )
-                logger.info(f"✅ TP (limit post-only) placed: {take_profit:.2f}")
-            except asyncio.TimeoutError:
-                logger.warning("⚠️ TP timeout (SL is OK)")
-            except Exception as e:
-                logger.warning(f"⚠️ TP failed (SL is OK): {e}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Exception in set_position_stops_optimized: {e}")
-            return False
-    
-    async def update_trailing_stop_throttled(self, old_sl_price: float, 
-                                            new_sl_price: float, 
-                                            min_move_pct: float = 0.005) -> bool:
-        """
-        FIX #4: THROTTLE Trailing Stop Updates
-        
-        Solo actualiza si el cambio es > 0.5% (configurable)
-        Reduce de ~50 updates → ~10 updates por trade
-        
-        Args:
-            old_sl_price: SL anterior
-            new_sl_price: Nuevo SL propuesto
-            min_move_pct: Mínimo movimiento (0.005 = 0.5%)
-        
-        Returns: True si cambio es significativo
-        """
-        if old_sl_price == 0:
-            return True
-        
-        min_move = old_sl_price * min_move_pct
-        change_pct = abs(new_sl_price - old_sl_price) / old_sl_price * 100
-        
-        if abs(new_sl_price - old_sl_price) < min_move:
-            logger.debug(f"SL throttled: {old_sl_price:.2f} → {new_sl_price:.2f} ({change_pct:.3f}%) < threshold")
-            return False
-        
-        logger.info(f"SL update: {old_sl_price:.2f} → {new_sl_price:.2f} ({change_pct:.3f}%)")
-        return True
-    
     async def update_stop_loss_on_exchange(
         self,
         symbol: str,
@@ -1658,66 +1406,6 @@ class RESTExecutionEngine:
         except Exception as e:
             logger.error(f"❌ Failed to update SL on exchange: {e}")
             return False, last_sent_sl
-    
-    async def sync_sl_on_restart(
-        self,
-        symbol: str,
-        local_sl: float,
-        direction: str = 'LONG'
-    ) -> Tuple[float, bool]:
-        """
-        Watchdog: On restart, sync local SL with exchange SL.
-        
-        Returns the BEST (tighter) SL and whether sync was needed.
-        
-        Args:
-            symbol: Trading pair
-            local_sl: Local trailing stop value
-            direction: 'LONG' or 'SHORT'
-        
-        Returns:
-            Tuple of (best_sl: float, sync_performed: bool)
-        """
-        if not self.exchange:
-            return local_sl, False
-        
-        try:
-            # Find exchange SL order
-            open_orders = await self.get_open_orders(symbol)
-            exchange_sl = None
-            
-            for order in open_orders:
-                order_type = order.get('type', '').lower()
-                is_reduce = order.get('info', {}).get('reduceOnly', False)
-                if is_reduce and order_type in ('stop', 'stop-loss', 'stop_loss'):
-                    exchange_sl = order.get('price') or order.get('stopPrice')
-                    break
-            
-            if exchange_sl is None:
-                logger.warning("⚠️ No SL found on exchange during restart sync")
-                return local_sl, False
-            
-            # Determine best SL (FAVOR_TIGHTER_SL)
-            if direction.upper() == 'LONG':
-                # For LONG, higher SL = tighter
-                best_sl = max(local_sl, exchange_sl)
-            else:
-                # For SHORT, lower SL = tighter
-                best_sl = min(local_sl, exchange_sl)
-            
-            if best_sl != local_sl:
-                logger.info(
-                    f"🔄 SL watchdog sync: local={local_sl:.2f}, exchange={exchange_sl:.2f} "
-                    f"→ using {best_sl:.2f}"
-                )
-                return best_sl, True
-            
-            logger.debug(f"SL watchdog: local and exchange aligned at {local_sl:.2f}")
-            return local_sl, False
-            
-        except Exception as e:
-            logger.error(f"Error in SL watchdog sync: {e}")
-            return local_sl, False
     
     async def verify_stops_on_exchange(self, symbol: str) -> dict:
         """
@@ -2049,82 +1737,6 @@ class RESTExecutionEngine:
             logger.error(f"Error setting leverage: {e}")
             return False
     
-    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 250) -> Optional[list]:
-        """Fetch historical OHLCV data with timeout"""
-        if not self.exchange:
-            return None
-        
-        try:
-            logger.info(f"Fetching {limit} {timeframe} candles for {symbol}...")
-            
-            # 🔥 FIX (Jan 21, 2026): Use lock to prevent concurrent CCXT access
-            async with self._exchange_lock:
-                try:
-                    ohlcv = await asyncio.wait_for(
-                        self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit),
-                        timeout=EXCHANGE_TIMEOUT_LONG
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"⏰ TIMEOUT fetching OHLCV (60s)")
-                    return None
-            
-            # Convert to our candle format
-            candles = []
-            for candle in ohlcv:
-                candles.append({
-                    'timestamp': candle[0],
-                    'open': candle[1],
-                    'high': candle[2],
-                    'low': candle[3],
-                    'close': candle[4],
-                    'volume': candle[5],
-                    'timeframe': timeframe
-                })
-            
-            logger.info(f"✓ Loaded {len(candles)} {timeframe} candles")
-            return candles
-        
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching OHLCV for {symbol} {timeframe}")
-            return None
-        except Exception as e:
-            logger.error(f"Error fetching OHLCV: {e}")
-            return None
-    
-    async def reconcile_position(self, symbol: str, expected_side: str, 
-                                 expected_size: float) -> bool:
-        """
-        Reconciliación: comparar posición real vs estado interno
-        
-        Returns: True si coincide, False si hay desync
-        """
-        try:
-            position = await self.get_position(symbol)
-            
-            if not position:
-                if expected_size == 0:
-                    return True  # OK: sin posición esperada, sin posición real
-                else:
-                    logger.error(f"DESYNC: Esperaba posición, no hay")
-                    return False
-            
-            actual_side = 'long' if position.get('contracts', 0) > 0 else 'short'
-            actual_size = abs(position.get('contracts', 0))
-            
-            # Tolerancia: 0.1%
-            tolerance = expected_size * 0.001
-            
-            if actual_side != expected_side.lower() or abs(actual_size - expected_size) > tolerance:
-                logger.error(f"DESYNC: Expected {expected_side} {expected_size}, "
-                           f"got {actual_side} {actual_size}")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error reconciling position: {e}")
-            return False
-    
     async def close(self):
         """Close exchange connection with timeout"""
         if self.exchange:
@@ -2138,66 +1750,6 @@ class RESTExecutionEngine:
                 logger.warning("Timeout closing exchange connection")
             except Exception as e:
                 logger.error(f"Error closing exchange: {e}")
-    
-    # =========================================================================
-    # ATOMIC SL/TP MANAGEMENT FOR KRAKEN FUTURES
-    # =========================================================================
-    
-    async def ensure_position_protected(self, symbol: str, stop_loss: float, 
-                                         take_profit: float, max_retries: int = 3) -> bool:
-        """
-        CRITICAL: Ensure position has SL protection with retries.
-        
-        This is the main method for SL/TP after position entry.
-        Implements automatic retry and verification.
-        
-        Args:
-            symbol: Trading pair
-            stop_loss: SL price (REQUIRED)
-            take_profit: TP price (optional)
-            max_retries: Max attempts
-            
-        Returns:
-            True if SL is confirmed on exchange
-        """
-        if not self.exchange:
-            return False
-        
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"🛡️ Protecting position attempt {attempt + 1}/{max_retries}")
-                
-                # 1. Verify position exists
-                position = await self.get_position(symbol)
-                if not position or abs(position.get('contracts', 0)) == 0:
-                    logger.warning("No position to protect")
-                    return False
-                
-                # 2. Place SL
-                sl_placed = await self.set_position_stops(symbol, stop_loss, take_profit)
-                
-                if not sl_placed:
-                    logger.warning(f"SL placement failed, attempt {attempt + 1}")
-                    await asyncio.sleep(1)
-                    continue
-                
-                # 3. VERIFY SL actually exists on exchange
-                await asyncio.sleep(0.5)  # Allow exchange to process
-                verification = await self.verify_stops_on_exchange(symbol)
-                
-                if verification['has_sl']:
-                    logger.info(f"✅ Position protected: SL @ {stop_loss:.2f}")
-                    return True
-                else:
-                    logger.warning(f"⚠️ SL verification failed, attempt {attempt + 1}")
-                    await asyncio.sleep(1)
-                    
-            except Exception as e:
-                logger.error(f"Error in ensure_position_protected: {e}")
-                await asyncio.sleep(1)
-        
-        logger.critical(f"❌ FAILED to protect position after {max_retries} attempts!")
-        return False
     
     async def auto_reconcile_orders(self, symbol: str, interval_seconds: int = 60) -> dict:
         """
@@ -2303,13 +1855,6 @@ class RESTExecutionEngine:
         if self._circuit_breaker_until == 0:
             return False
         return asyncio.get_event_loop().time() < self._circuit_breaker_until
-    
-    def get_circuit_breaker_wait_time(self) -> float:
-        """Get seconds until circuit breaker allows retry"""
-        if self._circuit_breaker_until == 0:
-            return 0
-        remaining = self._circuit_breaker_until - asyncio.get_event_loop().time()
-        return max(0, remaining)
     
     def _reset_circuit_breaker(self):
         """Reset circuit breaker on successful call"""

@@ -1389,7 +1389,7 @@ async def main():
     set_session_id(settings.run_id)
     
     audit_logger = get_audit_logger()
-    audit_logger.system_start(mode=settings.trading_mode.value, exchange=settings.exchange.value)
+    audit_logger._log_event("SYSTEM_START", mode=settings.trading_mode.value, exchange=settings.exchange.value)
     
     # Validate startup (fail fast on misconfig)
     try:
@@ -1457,13 +1457,13 @@ async def main():
         await orchestrator.start()
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
-        audit_logger.log("SYSTEM_SHUTDOWN", reason="user_interrupt")
+        audit_logger._log_event("SYSTEM_SHUTDOWN", reason="user_interrupt")
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
-        audit_logger.log("SYSTEM_CRASH", error=str(e), severity="CRITICAL")
+        audit_logger._log_event("SYSTEM_CRASH", error=str(e), severity="CRITICAL")
     finally:
         await orchestrator.shutdown()
-        audit_logger.log("SYSTEM_STOPPED")
+        audit_logger._log_event("SYSTEM_STOPPED")
 
 
 if __name__ == "__main__":

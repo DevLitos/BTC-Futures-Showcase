@@ -27,15 +27,6 @@ USAGE:
         is_maker=True
     )
     print(f"Estimated total cost: ${costs.total_usd:.2f}")
-    
-    # After trade, record actual costs
-    model.record_actual_costs(
-        trade_id='abc123',
-        expected_slippage_bps=5.0,
-        actual_slippage_bps=3.2,
-        fee_paid=0.85,
-        fill_type='MAKER'
-    )
 """
 
 from dataclasses import dataclass, field
@@ -183,8 +174,7 @@ class SlippageModel:
         self.size_impact_factor = size_impact_factor
         self.max_slippage_bps = max_slippage_bps
         
-        # Historical data for learning (LIVE mode)
-        self._actual_slippages: deque = deque(maxlen=500)
+        # Calibration factor (could be loaded from config)
         self._calibration_factor = 1.0
     
     def estimate(
@@ -233,38 +223,6 @@ class SlippageModel:
         
         # Cap at maximum
         return float(min(slippage, self.max_slippage_bps))
-    
-    def record_actual(self, estimated_bps: float, actual_bps: float) -> None:
-        """
-        Record actual slippage for model calibration.
-        
-        Called after each trade in LIVE mode.
-        """
-        if estimated_bps <= 0:
-            return
-        
-        ratio = actual_bps / estimated_bps
-        self._actual_slippages.append(ratio)
-        
-        # Recalibrate periodically
-        if len(self._actual_slippages) >= 20:
-            self._calibration_factor = np.median(list(self._actual_slippages))
-            logger.debug(f"Slippage model calibrated: factor={self._calibration_factor:.3f}")
-    
-    def get_calibration_stats(self) -> Dict:
-        """Get model calibration statistics."""
-        if not self._actual_slippages:
-            return {'samples': 0, 'calibration_factor': 1.0}
-        
-        ratios = list(self._actual_slippages)
-        return {
-            'samples': len(ratios),
-            'calibration_factor': self._calibration_factor,
-            'mean_ratio': np.mean(ratios),
-            'std_ratio': np.std(ratios),
-            'p10_ratio': np.percentile(ratios, 10),
-            'p90_ratio': np.percentile(ratios, 90),
-        }
 
 
 # =============================================================================
@@ -322,21 +280,6 @@ class FundingModel:
         hourly_rate = self._current_rate / self.funding_interval_hours
         
         return total_cost, hourly_rate
-    
-    def get_rate_stats(self) -> Dict:
-        """Get funding rate statistics."""
-        if not self._rate_history:
-            return {'current': 0.0, 'samples': 0}
-        
-        rates = [r for _, r in self._rate_history]
-        return {
-            'current': self._current_rate,
-            'samples': len(rates),
-            'mean': np.mean(rates),
-            'std': np.std(rates),
-            'min': min(rates),
-            'max': max(rates),
-        }
 
 
 # =============================================================================
@@ -366,9 +309,6 @@ class CostModel:
         self.funding_model = FundingModel(
             funding_interval_hours=fee_schedule.funding_interval_hours
         )
-        
-        # Track actual costs for analysis
-        self._cost_history: List[Dict] = []
     
     def estimate_costs(
         self,
@@ -452,136 +392,11 @@ class CostModel:
             notional_usd=size_usd,
             is_estimate=True,
         )
-    
-    def calculate_breakeven_distance(
-        self,
-        size_usd: float,
-        entry_price: float,
-        is_maker_entry: bool = True,
-        is_maker_exit: bool = False,
-        spread_bps: float = 5.0,
-        volatility_percentile: float = 50.0
-    ) -> float:
-        """
-        Calculate minimum price move needed to break even.
-        
-        This is critical for setting realistic TP targets.
-        
-        Returns:
-            Breakeven distance in price units
-        """
-        costs = self.estimate_costs(
-            side='LONG',  # Doesn't matter for this calculation
-            size_usd=size_usd,
-            entry_price=entry_price,
-            is_maker_entry=is_maker_entry,
-            is_maker_exit=is_maker_exit,
-            spread_bps=spread_bps,
-            volatility_percentile=volatility_percentile,
-            expected_hold_hours=0  # Ignore funding for breakeven
-        )
-        
-        # Convert total cost to price distance
-        size_base = size_usd / entry_price
-        breakeven_distance = costs.total_usd / size_base
-        
-        return breakeven_distance
-    
-    def record_actual_costs(
-        self,
-        trade_id: str,
-        side: str,
-        size_usd: float,
-        entry_price: float,
-        exit_price: float,
-        entry_fee_usd: float,
-        exit_fee_usd: float,
-        entry_slippage_bps: float,
-        exit_slippage_bps: float,
-        entry_fill_type: str,
-        exit_fill_type: str,
-        funding_paid_usd: float = 0.0,
-        hold_hours: float = 0.0
-    ) -> None:
-        """
-        Record actual costs from a completed trade.
-        
-        Used for model calibration in LIVE mode.
-        """
-        record = {
-            'trade_id': trade_id,
-            'timestamp': datetime.now(UTC).isoformat(),
-            'side': side,
-            'size_usd': size_usd,
-            'entry_price': entry_price,
-            'exit_price': exit_price,
-            'entry_fee_usd': entry_fee_usd,
-            'exit_fee_usd': exit_fee_usd,
-            'entry_slippage_bps': entry_slippage_bps,
-            'exit_slippage_bps': exit_slippage_bps,
-            'entry_fill_type': entry_fill_type,
-            'exit_fill_type': exit_fill_type,
-            'funding_paid_usd': funding_paid_usd,
-            'hold_hours': hold_hours,
-            'total_fees_usd': entry_fee_usd + exit_fee_usd,
-            'total_slippage_usd': size_usd * (entry_slippage_bps + exit_slippage_bps) / 10000,
-        }
-        
-        self._cost_history.append(record)
-        
-        # Update slippage model with actual data
-        # (Simplified: use exit slippage for calibration)
-        self.slippage_model.record_actual(
-            estimated_bps=5.0,  # Placeholder - should track expected
-            actual_bps=exit_slippage_bps
-        )
-        
-        logger.info(
-            f"📊 Cost recorded: trade={trade_id} | "
-            f"fees=${entry_fee_usd + exit_fee_usd:.4f} | "
-            f"slippage={entry_slippage_bps + exit_slippage_bps:.2f}bps | "
-            f"funding=${funding_paid_usd:.4f}"
-        )
-    
-    def get_cost_stats(self, last_n: int = 50) -> Dict:
-        """Get cost statistics from recent trades."""
-        if not self._cost_history:
-            return {'trades': 0}
-        
-        recent = self._cost_history[-last_n:]
-        
-        total_fees = sum(r['total_fees_usd'] for r in recent)
-        total_slippage = sum(r['total_slippage_usd'] for r in recent)
-        total_funding = sum(r['funding_paid_usd'] for r in recent)
-        total_volume = sum(r['size_usd'] for r in recent)
-        
-        entry_slippages = [r['entry_slippage_bps'] for r in recent]
-        exit_slippages = [r['exit_slippage_bps'] for r in recent]
-        
-        return {
-            'trades': len(recent),
-            'total_volume_usd': total_volume,
-            'total_fees_usd': total_fees,
-            'total_slippage_usd': total_slippage,
-            'total_funding_usd': total_funding,
-            'total_costs_usd': total_fees + total_slippage + total_funding,
-            'avg_fee_per_trade': total_fees / len(recent),
-            'avg_entry_slippage_bps': np.mean(entry_slippages),
-            'avg_exit_slippage_bps': np.mean(exit_slippages),
-            'p90_entry_slippage_bps': np.percentile(entry_slippages, 90),
-            'p90_exit_slippage_bps': np.percentile(exit_slippages, 90),
-            'slippage_calibration': self.slippage_model.get_calibration_stats(),
-        }
-    
-    def update_funding_rate(self, rate: float) -> None:
-        """Update current funding rate."""
-        self.funding_model.update_rate(rate)
 
 
 # =============================================================================
 # SINGLETON MANAGEMENT
 # =============================================================================
-
 _cost_model: Optional[CostModel] = None
 
 
@@ -604,9 +419,3 @@ def get_cost_model(exchange: str = 'krakenfutures') -> CostModel:
         logger.info(f"CostModel initialized for {exchange}")
     
     return _cost_model
-
-
-def reset_cost_model() -> None:
-    """Reset cost model. Only for testing."""
-    global _cost_model
-    _cost_model = None

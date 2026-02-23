@@ -177,6 +177,7 @@ def calculate_intraday_edge_data(
         current_trade_tags.setdefault('atr_1m_avg', 100.0)
         current_trade_tags.setdefault('volume_current', 1.0)
         current_trade_tags.setdefault('volume_average', 1.0)
+        current_trade_tags.setdefault('volume_ratio', 1.0)
         current_trade_tags.setdefault('swing_direction', 'NEUTRAL')
         current_trade_tags.setdefault('swing_count', 0)
         return current_trade_tags
@@ -207,8 +208,12 @@ def calculate_intraday_edge_data(
         
         # Volume current vs average
         if 'volume' in df_1m.columns:
-            vol_current = float(df_1m['volume'].iloc[-1])
-            vol_avg = float(df_1m['volume'].iloc[:-1].mean())
+            vol_series = df_1m['volume']
+            # Skip last candle if volume=0 (incomplete/just-started candle)
+            vol_current = float(vol_series.iloc[-1])
+            if vol_current == 0 and len(vol_series) > 2:
+                vol_current = float(vol_series.iloc[-2])
+            vol_avg = float(vol_series.iloc[:-1].mean()) if len(vol_series) > 1 else vol_current
             current_trade_tags['volume_current'] = vol_current
             current_trade_tags['volume_average'] = vol_avg
             current_trade_tags['volume_ratio'] = vol_current / vol_avg if vol_avg > 0 else 1.0

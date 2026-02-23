@@ -609,34 +609,6 @@ class PullbackShortEngine:
             if self._consecutive_losses >= self.config.MAX_CONSECUTIVE_LOSSES:
                 logger.warning(f"[PULLBACK] Disabled due to consecutive losses")
     
-    def disable_temporarily(self, duration_minutes: int, reason: str, market_time: datetime):
-        """Temporarily disable pullback shorts"""
-        self._disabled_until = market_time + timedelta(minutes=duration_minutes)
-        logger.warning(f"[PULLBACK] Disabled for {duration_minutes}m: {reason}")
-    
-    def reset_daily(self, market_time: datetime):
-        """Reset daily counters (call at day boundary)"""
-        self._daily_trade_count = 0
-        self._consecutive_losses = 0
-        self._cumulative_pnl = 0.0
-        self._last_trade_date = market_time.date()
-        logger.info("[PULLBACK] Daily reset completed")
-    
-    def get_status(self, market_time: datetime) -> Dict[str, Any]:
-        """Get current engine status"""
-        is_enabled, reason = self.is_enabled(market_time=market_time)
-        
-        return {
-            'enabled': is_enabled,
-            'reason': reason,
-            'daily_trades': self._daily_trade_count,
-            'max_daily': self.config.MAX_TRADES_PER_DAY,
-            'consecutive_losses': self._consecutive_losses,
-            'max_consecutive_losses': self.config.MAX_CONSECUTIVE_LOSSES,
-            'in_cooldown': self._breakout_cooldown_until is not None and market_time < self._breakout_cooldown_until,
-            'last_swing_high': self._last_swing_high
-        }
-    
     def get_daily_stats(self) -> Dict[str, Any]:
         """Get daily statistics for metrics reporting"""
         return {
@@ -659,9 +631,3 @@ def get_pullback_short_engine() -> PullbackShortEngine:
     if _pullback_engine_instance is None:
         _pullback_engine_instance = PullbackShortEngine()
     return _pullback_engine_instance
-
-
-def reset_pullback_short_engine() -> None:
-    """Reset the singleton (for testing)"""
-    global _pullback_engine_instance
-    _pullback_engine_instance = None

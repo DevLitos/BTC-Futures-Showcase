@@ -462,22 +462,6 @@ class ExchangeReconciler:
         
         logger.info(f"📋 Reconciler tracking order: {order_id[:12]}...")
     
-    def notify_cancel_sent(self, order_id: str):
-        """Called when a cancel request is sent"""
-        self.enter_hard_lock(
-            reason=f"Cancel sent: {order_id[:8]}...",
-            event=HardLockEvent.CANCEL_SENT,
-            max_duration_ms=3000  # 3s fallback for cancel
-        )
-    
-    def notify_sl_tp_set(self):
-        """Called when SL/TP orders are being placed"""
-        self.enter_hard_lock(
-            reason="Setting SL/TP orders",
-            event=HardLockEvent.SL_TP_SET,
-            max_duration_ms=3000  # 3s fallback for SL/TP
-        )
-    
     def notify_partial_close(self, reason: str = "Partial close"):
         """
         Called when a PARTIAL close is being executed.
@@ -527,14 +511,6 @@ class ExchangeReconciler:
         if self._hard_lock_event == HardLockEvent.EXIT_PENDING:
             logger.info("🔓 EXIT HARD_LOCK released: Exit completed")
             self._release_hard_lock("Exit completed")
-    
-    def is_exit_pending(self) -> bool:
-        """Check if we're in an exit hard-lock"""
-        return (
-            self._hard_lock_event == HardLockEvent.EXIT_PENDING and
-            self._hard_lock_until is not None and
-            datetime.now(UTC) < self._hard_lock_until
-        )
     
     async def reconcile(self) -> ExchangeSnapshot | None:
         """
@@ -750,77 +726,4 @@ class ExchangeReconciler:
             except Exception as e:
                 logger.error(f"Listener error: {e}")
     
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get reconciler statistics"""
-        return {
-            'reconcile_count': self._reconcile_count,
-            'state_changes': self._state_changes,
-            'hard_locks_triggered': self._hard_locks_triggered,
-            'current_state': self._state.value,
-            'public_state': self.get_public_state().value,
-            'has_confirmed_position': self.has_confirmed_position,
-            'is_hard_locked': self.is_hard_locked,
-            'hard_lock_event': self._hard_lock_event.value if self._hard_lock_event else None,
-            # FIX #3: Degradation stats
-            'is_degraded': self._degraded_mode,
-            'consecutive_failures': self._consecutive_failures,
-            'exchange_available': self._exchange_available,
-            'last_successful_poll': self._last_successful_poll.isoformat() if self._last_successful_poll else None
-        }
-    
-    # =========================================================================
-    # BACKTEST HELPERS - For synchronous backtest mode
-    # =========================================================================
-    
-    def backtest_set_position(self, side: str, size: float, entry_price: float):
-        """Set position state directly in backtest mode"""
-        if not self.backtest_mode:
-            logger.warning("backtest_set_position called in live mode - ignoring")
-            return
-            
-        self._confirmed_position_side = side.lower()
-        self._confirmed_position_size = size
-        self._confirmed_entry_price = entry_price
-        
-        # Create synthetic snapshot
-        snapshot = ExchangeSnapshot(
-            timestamp=datetime.now(UTC),
-            has_position=True,
-            position_side=side.lower(),
-            position_size=size,
-            position_entry_price=entry_price,
-            position_unrealized_pnl=0.0
-        )
-        self._last_snapshot = snapshot
-        self._transition_to(ReconcilerState.POSITION_OPEN, snapshot)
-    
-    def backtest_clear_position(self):
-        """Clear position state in backtest mode"""
-        if not self.backtest_mode:
-            logger.warning("backtest_clear_position called in live mode - ignoring")
-            return
-            
-        self._confirmed_position_side = None
-        self._confirmed_position_size = 0.0
-        self._confirmed_entry_price = 0.0
-        
-        snapshot = ExchangeSnapshot(
-            timestamp=datetime.now(UTC),
-            has_position=False
-        )
-        self._last_snapshot = snapshot
-        self._transition_to(ReconcilerState.IDLE, snapshot)
-    
-    def backtest_set_order_pending(self, order_id: str):
-        """Set order pending state in backtest mode"""
-        if not self.backtest_mode:
-            return
-            
-        self._tracked_order_id = order_id
-        snapshot = ExchangeSnapshot(
-            timestamp=datetime.now(UTC),
-            has_position=False,
-            pending_entry_orders=[{'id': order_id}]
-        )
-        self._last_snapshot = snapshot
-        self._transition_to(ReconcilerState.ORDER_PENDING, snapshot)
+

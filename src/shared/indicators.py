@@ -448,26 +448,6 @@ def calculate_orderbook_imbalance(bids: list, asks: list, depth: int = 10) -> fl
     return (bid_volume / total) * 100
 
 
-@jit(nopython=True)
-def detect_break_of_structure(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, 
-                               lookback: int = 5, direction: str = 'long') -> bool:
-    """
-    Detect Break of Structure (BOS)
-    For LONG: price breaks above recent high
-    For SHORT: price breaks below recent low
-    """
-    n = len(closes)
-    if n < lookback + 1:
-        return False
-
-    if direction == 'long':
-        recent_high = np.max(highs[n - lookback - 1:n - 1])
-        return closes[-1] > recent_high
-    else:  # short
-        recent_low = np.min(lows[n - lookback - 1:n - 1])
-        return closes[-1] < recent_low
-
-
 def check_hl_lh_structure(highs: np.ndarray, lows: np.ndarray, direction: str, periods: int = 3) -> bool:
     """
     Check if structure maintains Higher Lows (HL) for LONG or Lower Highs (LH) for SHORT
@@ -490,23 +470,6 @@ def check_hl_lh_structure(highs: np.ndarray, lows: np.ndarray, direction: str, p
             if recent_highs[i] > recent_highs[i - 1]:
                 return False
         return True
-
-
-@jit(nopython=True)
-def calculate_price_velocity(prices: np.ndarray, period: int = 1) -> float:
-    """
-    Calculate price velocity (rate of change over period)
-    """
-    n = len(prices)
-    if n < period + 1:
-        return 0.0
-
-    return abs(prices[-1] - prices[-(period + 1)])
-
-
-def is_price_between_emas(price: float, ema_fast: float, ema_slow: float) -> bool:
-    """Check if price is between two EMAs"""
-    return min(ema_fast, ema_slow) <= price <= max(ema_fast, ema_slow)
 
 
 def _base_calculate_bollinger_bands(prices: np.ndarray, period: int = 20, std_dev: float = 2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

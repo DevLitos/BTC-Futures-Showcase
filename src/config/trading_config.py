@@ -91,165 +91,6 @@ class ADXThresholds:
 
 
 # ============================================================================
-# SCORE ADJUSTMENTS (Feb 04, 2026) - AUDIT FIX
-# Centralizes ALL score adjustments dispersed across multiple files
-# 
-# BEFORE: Penalties defined in 3+ places with inconsistent values
-# NOW: Single source of truth for all score modifications
-# ============================================================================
-class ScoreAdjustments:
-    """
-    Centralized score adjustment values and methods.
-    
-    Replaces scattered adjustments in:
-    - entry_orchestrator.py (SOFT_MODE_SCORE_PENALTY)
-    - entry_scorer.py (micro_trend_adj, filter_pipeline_adj, etc.)
-    - trading_config.py (DailyRegimeDetector.score_adjust)
-    - BiasStrengthConfig (SCORE_PENALTY_*)
-    
-    All adjustments are negative for penalties, positive for bonuses.
-    """
-    
-    # =========================================================================
-    # REGIME-BASED ADJUSTMENTS (from DailyRegimeDetector)
-    # =========================================================================
-    TREND_DAY_ADJUST = 0.0       # Normal threshold
-    RANGE_DAY_ADJUST = +1.0      # Stricter (need higher score in range)
-    TRANSITION_DAY_ADJUST = +0.5 # Slightly stricter
-    
-    # =========================================================================
-    # MODE-BASED PENALTIES (from entry_orchestrator)
-    # =========================================================================
-    SOFT_MODE_PENALTY = -1.5     # When in SOFT mode (borderline entries)
-    DISCOVERY_MODE_PENALTY = -0.5  # When in discovery mode
-    
-    # =========================================================================
-    # MICRO-TREND ADJUSTMENTS (from trading_app/micro_trend_filter)
-    # =========================================================================
-    MICRO_TREND_ALIGNED_BONUS = +0.5   # When micro-trend aligns with bias
-    MICRO_TREND_OPPOSE_PENALTY = -1.0  # When micro-trend opposes bias
-    MICRO_TREND_RANGE_CAP = 0.5        # Max adjustment in range markets
-    
-    # =========================================================================
-    # MOMENTUM PENALTIES (from BiasStrengthConfig)
-    # =========================================================================
-    BULLISH_CONTEXT_MILD = -0.15      # 1-2 bullish signals when shorting
-    BULLISH_CONTEXT_MODERATE = -0.25  # 3 bullish signals
-    BULLISH_CONTEXT_SEVERE = -0.5     # 4+ bullish signals
-    
-    # =========================================================================
-    # FILTER PIPELINE ADJUSTMENTS (from filter decisions)
-    # =========================================================================
-    FILTER_BLOCK_PENALTY = -2.0    # Hard block from filters
-    FILTER_WARNING_PENALTY = -0.5  # Warning from filters
-    
-    # =========================================================================
-    # LATE CONFIRMATION PENALTIES
-    # =========================================================================
-    LATE_CONFIRMATION_MILD = -0.3     # Slightly late entry
-    LATE_CONFIRMATION_SEVERE = -0.75  # Very late entry
-    
-    # =========================================================================
-    # VOLUME PENALTIES
-    # =========================================================================
-    LOW_VOLUME_PENALTY = -0.5     # rel_vol < 0.6
-    
-    # =========================================================================
-    # ADX SLOPE PENALTIES
-    # =========================================================================
-    ADX_DECLINING_PENALTY = -0.25  # ADX slope < -0.5 (momentum dying)
-    
-    @classmethod
-    def get_regime_adjustment(cls, regime: str) -> float:
-        """Get score adjustment for daily regime."""
-        adjustments = {
-            'TREND_DAY': cls.TREND_DAY_ADJUST,
-            'RANGE_DAY': cls.RANGE_DAY_ADJUST,
-            'TRANSITION_DAY': cls.TRANSITION_DAY_ADJUST,
-        }
-        return adjustments.get(regime, 0.0)
-    
-    @classmethod
-    def get_bullish_context_penalty(cls, bullish_signals: int) -> float:
-        """Get penalty for shorting in bullish context."""
-        if bullish_signals <= 1:
-            return 0.0
-        elif bullish_signals == 2:
-            return cls.BULLISH_CONTEXT_MILD
-        elif bullish_signals == 3:
-            return cls.BULLISH_CONTEXT_MODERATE
-        else:
-            return cls.BULLISH_CONTEXT_SEVERE
-    
-    @classmethod
-    def calculate_total_adjustment(
-        cls,
-        regime: str = 'TREND_DAY',
-        is_soft_mode: bool = False,
-        is_discovery: bool = False,
-        micro_trend_aligned: bool = False,
-        micro_trend_opposed: bool = False,
-        is_range: bool = False,
-        bullish_signals: int = 0,
-        filter_warning: bool = False,
-        is_late: bool = False,
-        is_very_late: bool = False,
-        low_volume: bool = False,
-        adx_declining: bool = False
-    ) -> float:
-        """
-        Calculate total score adjustment from all factors.
-        
-        Returns total adjustment (can be positive or negative).
-        """
-        total = 0.0
-        
-        # Regime adjustment
-        total += cls.get_regime_adjustment(regime)
-        
-        # Mode penalties
-        if is_soft_mode:
-            total += cls.SOFT_MODE_PENALTY
-        if is_discovery:
-            total += cls.DISCOVERY_MODE_PENALTY
-        
-        # Micro-trend adjustments
-        if micro_trend_aligned:
-            adj = cls.MICRO_TREND_ALIGNED_BONUS
-            if is_range:
-                adj = min(cls.MICRO_TREND_RANGE_CAP, adj)
-            total += adj
-        elif micro_trend_opposed:
-            adj = cls.MICRO_TREND_OPPOSE_PENALTY
-            if is_range:
-                adj = max(-cls.MICRO_TREND_RANGE_CAP, adj)
-            total += adj
-        
-        # Bullish context penalty (when shorting)
-        total += cls.get_bullish_context_penalty(bullish_signals)
-        
-        # Filter warnings
-        if filter_warning:
-            total += cls.FILTER_WARNING_PENALTY
-        
-        # Late confirmation
-        if is_very_late:
-            total += cls.LATE_CONFIRMATION_SEVERE
-        elif is_late:
-            total += cls.LATE_CONFIRMATION_MILD
-        
-        # Volume penalty
-        if low_volume:
-            total += cls.LOW_VOLUME_PENALTY
-        
-        # ADX declining
-        if adx_declining:
-            total += cls.ADX_DECLINING_PENALTY
-        
-        return total
-
-
-# ============================================================================
 # DAILY REGIME DETECTOR (Jan 23, 2026) - IMPRESCINDIBLE
 # Determina si hoy es "día de tendencia" o "día de rango" al inicio
 # Esto cambia TODO el comportamiento del bot para el día
@@ -416,35 +257,6 @@ class AsymmetryConfig:
     ALLOW_RUNNERS = False           # Default OFF
     RUNNER_TRIGGER_MFE = 1.5        # Solo considera runner si MFE > 1.5R
     RUNNER_TRAIL_ATR = 2.0          # Trail a 2x ATR cuando tenemos runner
-    
-    # === VALIDACIÓN CONTINUA ===
-    @classmethod
-    def validate_trade_outcome(cls, exit_r: float, exit_reason: str) -> bool:
-        """
-        Validate that trade outcome respects asymmetry rules.
-        
-        Returns True if trade respected rules, False if violated.
-        Used for AUDIT and detection of bugs.
-        """
-        if exit_r < cls.ABSOLUTE_MAX_LOSS_R:
-            # VIOLATION: Lost more than allowed
-            return False
-        
-        if exit_reason == 'TIME_INVALIDATION' and exit_r < cls.TIME_INVALIDATION_MAX_LOSS_R:
-            # VIOLATION: TIME_INVALIDATION should exit at breakeven, not loss
-            return False
-        
-        return True
-    
-    @classmethod
-    def get_tp_for_regime(cls, daily_regime: str) -> float:
-        """Get TP target based on daily regime."""
-        if daily_regime == 'TREND_DAY':
-            return cls.TREND_DAY_TP_R
-        elif daily_regime == 'RANGE_DAY':
-            return cls.RANGE_DAY_TP_R
-        else:
-            return cls.BASE_TP_R
 
 
 # ============================================================================
@@ -607,122 +419,6 @@ class BiasStrengthConfig:
         else:
             return WorkingBias.BOTH
     
-    @classmethod
-    def get_counter_preference_rules(cls, working_bias: 'WorkingBias', direction: str) -> dict:
-        """
-        ⚠️ DEPRECATED: Use RegimeFusion.fuse() instead.
-        
-        RegimeFusion provides:
-        - size_mult based on alignment
-        - rr_min based on alignment
-        - is_blocked for "stupid fades"
-        
-        This function is kept for backward compatibility only.
-        See: src/domain/market/regime/regime_fusion.py
-        """
-        # Determine if trade is against preference
-        is_counter_pref = (
-            (working_bias == WorkingBias.LONG_PREF and direction == 'SHORT') or
-            (working_bias == WorkingBias.SHORT_PREF and direction == 'LONG')
-        )
-        
-        if is_counter_pref:
-            return {
-                'is_counter_preference': True,
-                'size_mult': 0.5,       # 50% size (meaningful, not tiny)
-                'rr_add': 0.3,          # Need 0.3R extra (1.3R min instead of 1.0R)
-                'score_penalty': -0.3,  # Small score deduction
-            }
-        else:
-            return {
-                'is_counter_preference': False,
-                'size_mult': 1.0,
-                'rr_add': 0.0,
-                'score_penalty': 0.0,
-            }
-    
-    @classmethod
-    def calculate_weighted_bias_score(
-        cls,
-        ema50_vs_ema200: str,      # 'BULL', 'BEAR', 'NEUTRAL'
-        di_direction: str | None,  # 'LONG', 'SHORT', or None
-        di_strength: float,        # abs(+DI - -DI)
-        price_vs_ema50_pct: float, # % distance from EMA50
-        ema50_slope: float,        # slope of EMA50
-        trade_direction: str       # 'LONG' or 'SHORT'
-    ) -> dict:
-        """
-        ⚠️ DEPRECATED: Use RegimeFusion.update_macro() and fuse() instead.
-        
-        This function is superseded by the 3-layer RegimeFusion architecture:
-        - CAPA 1 (MACRO): EMA50/200, +DI/-DI, EMA50 slope → macro_score
-        - CAPA 2 (MICRO): direction, confidence, displacement
-        - CAPA 3 (FUSION): alignment → size_mult, rr_min
-        
-        RegimeFusion provides cleaner separation and explicit BLOCK logic.
-        See: src/domain/market/regime/regime_fusion.py
-        """
-        scores = {}
-        
-        # Component 1: EMA50/200 macro (weight 0.35)
-        if ema50_vs_ema200 == 'BULL':
-            scores['macro'] = 1.0
-        elif ema50_vs_ema200 == 'BEAR':
-            scores['macro'] = -1.0
-        else:
-            scores['macro'] = 0.0
-        
-        # Component 2: DI direction (weight 0.30)
-        if di_direction == 'LONG' and di_strength >= 5:
-            scores['di'] = min(1.0, di_strength / 15.0)  # Scale: 5-15 → 0.33-1.0
-        elif di_direction == 'SHORT' and di_strength >= 5:
-            scores['di'] = -min(1.0, di_strength / 15.0)
-        else:
-            scores['di'] = 0.0
-        
-        # Component 3: Price vs EMA50 (weight 0.20)
-        # Positive = price above EMA50 (bullish)
-        # Negative = price below EMA50 (bearish)
-        # Cap at ±5% for normalization
-        scores['position'] = max(-1.0, min(1.0, price_vs_ema50_pct / 0.05))
-        
-        # Component 4: EMA50 slope (weight 0.15)
-        # Cap at ±0.1% for normalization
-        scores['slope'] = max(-1.0, min(1.0, ema50_slope / 0.001))
-        
-        # Calculate weighted score
-        weights = {'macro': 0.35, 'di': 0.30, 'position': 0.20, 'slope': 0.15}
-        weighted_score = sum(scores[k] * weights[k] for k in scores)
-        
-        # Calculate alignment with trade direction
-        # LONG trade: positive score = aligned, negative = misaligned
-        # SHORT trade: negative score = aligned, positive = misaligned
-        if trade_direction == 'LONG':
-            alignment = weighted_score  # LONG wants positive score
-        else:
-            alignment = -weighted_score  # SHORT wants negative score
-        
-        # Size multiplier based on alignment
-        # alignment >= 0.5: Full size (1.0)
-        # alignment 0 to 0.5: 0.7 to 1.0
-        # alignment -0.5 to 0: 0.4 to 0.7
-        # alignment < -0.5: 0.3
-        if alignment >= 0.5:
-            size_mult = 1.0
-        elif alignment >= 0:
-            size_mult = 0.7 + (alignment * 0.6)  # 0.7 to 1.0
-        elif alignment >= -0.5:
-            size_mult = 0.4 + ((alignment + 0.5) * 0.6)  # 0.4 to 0.7
-        else:
-            size_mult = 0.3
-        
-        return {
-            'score': round(weighted_score, 3),
-            'alignment': round(alignment, 3),
-            'size_mult': round(size_mult, 2),
-            'breakdown': {k: round(v, 3) for k, v in scores.items()},
-        }
-
 
 # ============================================================================
 # TREND DAY / EXPANSION DETECTOR (Jan 22, 2026)
@@ -779,17 +475,6 @@ class TrendExpansionConfig:
     
     # Anti-fade: Don't short after expansion starts in bull
     ANTI_FADE_CANDLES = 4               # No counter-trend for 4 candles (20m) - corrections can come quick
-    
-    @classmethod
-    def get_expansion_modifiers(cls) -> dict:
-        """Get behavior modifiers when expansion detected."""
-        return {
-            'disable_mean_reversion': cls.DISABLE_MEAN_REVERSION,
-            'chase_penalty_mult': cls.CHASE_PENALTY_MULT,
-            'allow_extreme_breakouts': cls.ALLOW_EXTREME_BREAKOUTS,
-            'runner_hold_mult': cls.RUNNER_HOLD_MULT,
-            'anti_fade_candles': cls.ANTI_FADE_CANDLES,
-        }
 
 
 # ============================================================================
@@ -1028,16 +713,6 @@ class PullbackShortConfig:
             activity_score: 0.0 (dead) to 1.0 (active)
         """
         return cls.TP2_K_LOW + activity_score * (cls.TP2_K_HIGH - cls.TP2_K_LOW)
-    
-    @classmethod
-    def get_tp_k(cls, activity_score: float, is_tp2: bool = False) -> float:
-        """
-        Get TP k-factor based on market activity (backwards compat).
-        """
-        if is_tp2:
-            return cls.get_tp2_k(activity_score)
-        # TP1 not used with k anymore (fixed VWAP), but keep for compat
-        return cls.TP1_K_ATR_DEAD + activity_score * (cls.TP1_K_ATR_ACTIVE - cls.TP1_K_ATR_DEAD)
 
 
 # ============================================================================
@@ -1063,25 +738,13 @@ class OperatingMode:
         """Get current operating mode - dynamic based on trade count."""
         if cls._MODE_OVERRIDE:
             return cls._MODE_OVERRIDE
-        
-        # Check trade count from storage
         try:
             from pathlib import Path
-            import json
             trades_dir = Path('/home/trading/traderAgents/FideiRatioCapital/systems/btc/trade_logs')
-            total_trades = 0
-            for f in trades_dir.glob('trades_*.jsonl'):
-                with open(f) as fh:
-                    total_trades += sum(1 for _ in fh)
-            
-            if total_trades >= cls.TRADE_THRESHOLD_FOR_PRODUCTION:
-                return "PRODUCTION"
-            return "DISCOVERY"
+            total_trades = sum(1 for f in trades_dir.glob('trades_*.jsonl') for _ in open(f))
+            return "PRODUCTION" if total_trades >= cls.TRADE_THRESHOLD_FOR_PRODUCTION else "DISCOVERY"
         except Exception:
             return "DISCOVERY"
-    
-    # Legacy property for backward compatibility
-    MODE = property(lambda self: OperatingMode.get_mode())
     
     # Mode-specific thresholds
     # 🔥 FIX #155 (Feb 10, 2026): Score threshold raised from 5 to 6
@@ -1175,10 +838,6 @@ class OperatingMode:
     # If 2+ losses occur during DEAD_HOURS, block trading until next session
     DEAD_HOURS_MAX_LOSSES = 2       # Block after 2 losses in dead hours
     DEAD_HOURS_UTC = (0, 8)         # 🔥 FIX #293: Aligned with get_session_name()
-    
-    @classmethod
-    def get_min_rr(cls) -> float:
-        return cls.DISCOVERY_MIN_RR if cls.is_discovery() else cls.PRODUCTION_MIN_RR
     
     @classmethod
     def get_loss_sizing_multiplier(cls, consecutive_losses: int) -> float:
@@ -1305,110 +964,6 @@ class OperatingMode:
     @classmethod
     def get_risk_pct(cls) -> float:
         return cls.DISCOVERY_RISK_PCT if cls.is_discovery() else cls.PRODUCTION_RISK_PCT
-
-
-# ============================================================================
-# STATISTICAL DISCIPLINE - DO NOT MODIFY DURING DISCOVERY
-# ============================================================================
-class StatisticalDiscipline:
-    """
-    Rules to prevent premature optimization and system tampering.
-    Your future self WILL try to break these. Don't let them.
-    
-    These are not suggestions. They are constraints.
-    """
-    
-    # EVALUATION HORIZON
-    # Evaluate by TRADE COUNT, not by time.
-    # 200 trades = 1 evaluation cycle
-    EVALUATION_HORIZON_TRADES = 200
-    
-    # MINIMUM SAMPLE SIZE
-    # Do not draw ANY conclusions before this
-    MIN_SAMPLE_SIZE = 100
-    
-    # SIGNAL DEATH CRITERIA
-    # If expectancy < 0 after N trades, signal is dead
-    SIGNAL_DEATH_TRADES = 500
-    SIGNAL_DEATH_EXPECTANCY = 0.0  # Must be > 0 to survive
-    
-    # SCORE DISTRIBUTION SANITY
-    # If > 35% of trades have score >= 7, something is wrong
-    # (or market is exceptionally trending - verify manually)
-    MAX_HIGH_SCORE_RATIO = 0.35
-    HIGH_SCORE_THRESHOLD = 7
-    
-    # SCORE INTERPRETATION
-    # 5 = mediocre but valid event (not "neutral")
-    # 6-7 = core edge
-    # 8-9 = tail event (rare, don't expect these often)
-    SCORE_5_MEANING = "mediocre_valid"
-    SCORE_6_7_MEANING = "core_edge"
-    SCORE_8_9_MEANING = "tail_rare"
-    
-    # =========================================================================
-    # EXPLICIT PROHIBITIONS
-    # =========================================================================
-    
-    # ❌ DO NOT optimize score weights before SIGNAL_DEATH_TRADES
-    # ❌ DO NOT add new synergy bonuses (max = 1)
-    # ❌ DO NOT change DISCOVERY_RISK_PCT until 500+ trades
-    # ❌ DO NOT switch to PRODUCTION until drawdowns are known
-    # ❌ DO NOT interpret "mediocre" score (5) as "bad"
-    # ❌ DO NOT discard session data that contradicts expectations
-    #    (edge may be WORSE in London+NY, BETTER in "ugly" zones)
-    
-    # When tempted to break these rules, re-read this:
-    # "If a trade hurts, it's fulfilling its function."
-    # "Renaissance would accept the data. So should you."
-    
-    @classmethod
-    def can_evaluate(cls, trade_count: int) -> bool:
-        """Check if we have enough trades to evaluate."""
-        return trade_count >= cls.MIN_SAMPLE_SIZE
-    
-    @classmethod
-    def should_kill_signal(cls, trade_count: int, expectancy: float) -> bool:
-        """Check if a signal should be killed based on data."""
-        if trade_count < cls.SIGNAL_DEATH_TRADES:
-            return False  # Not enough data
-        return expectancy < cls.SIGNAL_DEATH_EXPECTANCY
-    
-    @classmethod
-    def is_score_distribution_suspect(cls, high_score_ratio: float) -> bool:
-        """Check if too many trades are scoring high (suspicious)."""
-        return high_score_ratio > cls.MAX_HIGH_SCORE_RATIO
-
-
-# ============================================================================
-# TIMEFRAME CONFIGURATION
-# ============================================================================
-class Timeframes:
-    HTF = '1h'      # High Timeframe - Bias and Strength
-    MTF = '5m'      # Mid Timeframe - Structure and ZOI
-    LTF = '1m'      # Low Timeframe - Trigger and Management
-
-
-# ============================================================================
-# INDICATOR PERIODS
-# ============================================================================
-class IndicatorPeriods:
-    # HTF (1H)
-    EMA_50_HTF = 50
-    EMA_200_HTF = 200
-    ADX_HTF = 14
-    ATR_HTF = 14
-    ATR_MA_HTF = 20  # Moving average of ATR for comparison
-    
-    # MTF (5M)
-    EMA_20_MTF = 20
-    EMA_50_MTF = 50
-    
-    # LTF (1M)
-    VOLUME_MA_LTF = 20  # For relative volume calculation
-    
-    # Common
-    ATR_1M = 14
 
 
 # ============================================================================
@@ -1552,187 +1107,6 @@ class HTFFilters:
     
     # Counter-trend trading in defensive mode
     ALLOW_COUNTERTREND_DEFENSIVE = True  # Allow counter-trend with reduced size
-    
-    # Correlation filters (for NQ/ES)
-    CHECK_CORRELATION = True
-    CORRELATION_TIMEFRAME = '5m'
-
-
-# ============================================================================
-# RANGE MODE CONFIGURATION (Jan 23, 2026)
-# When ADX < 18, market is ranging - different rules apply
-# ============================================================================
-class RangeModeConfig:
-    """
-    Configuration for RANGE market regime (ADX < 18).
-    
-    🔥 CORRECCIÓN (Jan 23, 2026):
-    NO bloquear trades en RANGE - usar reglas diferentes.
-    BTC pasa 60-70% del tiempo en rango - hay que explotarlo.
-    
-    RANGE MODE RULES:
-    - Trades SÍ permitidos, pero SOLO en extremos (VAH/VAL/bands)
-    - Size reducido (50%)
-    - Stop más tight (2x ATR vs 3x en trend)
-    - TP corto + salida rápida
-    - Score threshold más alto
-    
-    TRANSITION MODE (ADX 18-20):
-    - Size 70%
-    - Score threshold +0.5
-    
-    TREND MODE (ADX > 20):
-    - Full size, normal rules
-    """
-    
-    # =========================================================================
-    # TRADE PERMISSIONS IN RANGE
-    # =========================================================================
-    ALLOW_TREND_TRADES = False      # NO trend trades at MID-RANGE
-    ALLOW_EXTREME_TRADES = True     # YES at VAH/VAL/extremes (mean-reversion)
-    
-    # Extreme definition (percentile of 60-day range)
-    EXTREME_HIGH_PERCENTILE = 90    # >= 90% = HIGH extreme (SHORT only)
-    EXTREME_LOW_PERCENTILE = 10     # <= 10% = LOW extreme (LONG only)
-    
-    # =========================================================================
-    # SIZE MULTIPLIERS BY MODE
-    # =========================================================================
-    RANGE_SIZE_MULT = 0.50          # 50% size in RANGE
-    TRANSITION_SIZE_MULT = 0.70     # 70% size in TRANSITION
-    TREND_SIZE_MULT = 1.0           # 100% size in TREND
-    
-    # =========================================================================
-    # SCORE THRESHOLD ADJUSTMENTS
-    # =========================================================================
-    RANGE_SCORE_ADD = 1.0           # +1.0 to threshold in RANGE (stricter)
-    TRANSITION_SCORE_ADD = 0.5      # +0.5 to threshold in TRANSITION
-    TREND_SCORE_ADD = 0.0           # No adjustment in TREND
-    
-    # =========================================================================
-    # STOP LOSS IN RANGE (tighter than trend)
-    # =========================================================================
-    RANGE_SL_ATR_MULTIPLIER = 2.0   # 2x ATR (vs 3x in trend)
-    RANGE_SL_MAX_PCT = 0.8          # Max 0.8% stop (tighter in chop)
-    
-    # =========================================================================
-    # TARGET/EXIT IN RANGE (faster exits)
-    # =========================================================================
-    RANGE_TP_R = 1.0                # TP at 1R (quick target)
-    RANGE_MAX_DURATION_MIN = 30     # Max 30 min in trade (vs 90 in trend)
-    RANGE_MIN_RR = 1.2              # Need RR >= 1.2 neto in range
-    
-    # =========================================================================
-    # TIME MANAGEMENT IN RANGE (faster exits)
-    # 🔥 FIX (Jan 25, 2026): 4 candles too tight - BTC needs time to develop
-    # =========================================================================
-    RANGE_TIME_INVALIDATION_CANDLES = 6   # 6 candles (was 4 - too aggressive)
-    RANGE_MFE_THRESHOLD = 0.15            # Lower MFE threshold (faster exit if no MFE)
-    
-    # =========================================================================
-    # TRADE LIMITS IN RANGE (prevent re-entry at same level)
-    # =========================================================================
-    RANGE_MAX_TRADES_PER_SESSION = 2      # Max 2 trades per session in range
-    RANGE_COOLDOWN_AFTER_LOSS_MIN = 20    # 20 min cooldown after loss in range
-    
-    # =========================================================================
-    # ADX THRESHOLDS FOR MODE CLASSIFICATION
-    # 🔥 FIX (Feb 04, 2026): Aligned with RiskManagement thresholds
-    # ADX < 18 = RANGE (no trend)
-    # ADX 18-22 = TRANSITION (weak trend developing)
-    # ADX > 22 = TREND (tradeable trend)
-    # =========================================================================
-    ADX_RANGE_MAX = 18              # ADX < 18 = RANGE
-    ADX_TRANSITION_MAX = 22         # ADX 18-22 = TRANSITION (was 20 - too narrow)
-    # ADX > 22 = TREND
-    
-    @classmethod
-    def get_trading_mode(cls, adx: float) -> str:
-        """Classify trading mode based on ADX."""
-        if adx < cls.ADX_RANGE_MAX:
-            return 'RANGE'
-        elif adx < cls.ADX_TRANSITION_MAX:
-            return 'TRANSITION'
-        else:
-            return 'TREND'
-    
-    @classmethod
-    def get_size_multiplier(cls, mode: str) -> float:
-        """Get position size multiplier for mode."""
-        if mode == 'RANGE':
-            return cls.RANGE_SIZE_MULT
-        elif mode == 'TRANSITION':
-            return cls.TRANSITION_SIZE_MULT
-        return cls.TREND_SIZE_MULT
-    
-    @classmethod
-    def get_score_adjustment(cls, mode: str) -> float:
-        """Get score threshold adjustment for mode."""
-        if mode == 'RANGE':
-            return cls.RANGE_SCORE_ADD
-        elif mode == 'TRANSITION':
-            return cls.TRANSITION_SCORE_ADD
-        return cls.TREND_SCORE_ADD
-    
-    @classmethod
-    def is_at_extreme(cls, percentile: float, bias: str) -> tuple:
-        """
-        Check if at valid extreme for the given bias.
-        
-        Returns:
-            (is_valid: bool, extreme_type: str or None)
-        """
-        if percentile >= cls.EXTREME_HIGH_PERCENTILE:
-            # At HIGH extreme - only SHORT is valid
-            if bias == 'SHORT':
-                return (True, 'HIGH')
-            return (False, 'HIGH')  # LONG not valid at top
-        elif percentile <= cls.EXTREME_LOW_PERCENTILE:
-            # At LOW extreme - only LONG is valid
-            if bias == 'LONG':
-                return (True, 'LOW')
-            return (False, 'LOW')  # SHORT not valid at bottom
-        
-        # Not at extreme
-        return (False, None)
-
-
-# ============================================================================
-# LOCATION FILTER (MACRO CONTEXT) - Jan 14, 2026
-# ============================================================================
-class LocationFilters:
-    """
-    Location-based veto system - prevents buying tops in ranging markets.
-    
-    "Location" is distinct from momentum/structure. EMA/ADX/BOS measure dynamics,
-    not absolute context: WHERE you are in the HTF map (20-60 day range).
-    
-    This "macro veto" differentiates a bot that survives from one that
-    self-liquidates by buying tops.
-    
-    Rules:
-    1. EXTREMES_VETO: In RANGE, prohibit longs in top 10% / shorts in bottom 10%
-    2. HEADROOM_VETO: If distance to structure high < k*ATR, no longs in RANGE
-    3. BREAKOUT_OVERRIDE: Allow extremes if ADX high + volume expansion
-    """
-    # Percentile thresholds for extremes veto
-    EXTREME_HIGH_PERCENTILE = 90.0   # Top 10% of 60-day range → no LONG in RANGE
-    EXTREME_LOW_PERCENTILE = 10.0    # Bottom 10% of 60-day range → no SHORT in RANGE
-    
-    # Lookback periods
-    RANGE_LOOKBACK_DAYS = 60         # Primary lookback for range calculation
-    RANGE_LOOKBACK_SHORT_DAYS = 20   # Short-term confirmation
-    
-    # Headroom thresholds (in ATR units)
-    MIN_HEADROOM_ATR = 0.5           # Minimum space to target
-    MIN_HEADROOM_ATR_STRICT = 1.0    # For weaker setups
-    
-    # Breakout override thresholds
-    BREAKOUT_ADX_MIN = 30.0          # ADX required for breakout override
-    BREAKOUT_VOLUME_EXPANSION = 1.3  # Volume > 130% of avg for breakout
-    
-    # Enable/disable the filter
-    ENABLED = True
 
 
 # ============================================================================
@@ -2091,17 +1465,6 @@ class OrderExecution:
 
 
 # ============================================================================
-# POST-TRADE MANAGEMENT
-# ============================================================================
-class PostTrade:
-    COOLDOWN_MINUTES = 5           # Mandatory cooldown after trade (was 15)
-    
-    # Performance thresholds
-    MIN_PROFIT_FACTOR = 1.5        # Minimum acceptable profit factor
-    MIN_EXPECTANCY = 0.0           # Expectancy must be positive
-
-
-# ============================================================================
 # SMART EXITS - Advanced profit taking and early exit detection
 # Implemented: Jan 13, 2026
 # ============================================================================
@@ -2218,43 +1581,6 @@ class SmartExits:
 
 
 # ============================================================================
-# SESSION DEFINITIONS (EST)
-# ============================================================================
-class TradingSessions:
-    # Session windows (hour, minute)
-    LONDON_START = (3, 0)
-    LONDON_END = (11, 0)
-    
-    NY_START = (9, 30)
-    NY_END = (16, 0)
-    
-    NY_OPEN_VOLATILE_START = (9, 30)
-    NY_OPEN_VOLATILE_END = (9, 45)
-    
-    ASIA_START = (18, 0)
-    ASIA_END = (3, 0)
-
-
-# ============================================================================
-# DATA & MONITORING
-# ============================================================================
-class DataConfig:
-    # Minimum bars for warm-up
-    MIN_BARS_1H = 200              # For EMA 200 on 1H
-    MIN_BARS_5M = 50               # For EMA 50 on 5M
-    MIN_BARS_1M = 50               # For indicators on 1M
-    
-    # Kafka topics
-    RAW_DATA_TOPIC = 'raw_trades'
-    SIGNALS_TOPIC = 'trading_signals'
-    ORDERS_TOPIC = 'trading_orders'
-    
-    # Symbols
-    PRIMARY_SYMBOL = 'BTC/USDT'
-    CORRELATION_SYMBOLS = ['NQ', 'ES']  # For macro correlation
-
-
-# ============================================================================
 # FIX #6: FUNDING RATE CONTROL
 # ============================================================================
 class FundingRateControl:
@@ -2333,63 +1659,6 @@ class FundingRateControl:
     FUNDING_EXTREME_THRESHOLD = 0.0007      # > 0.07% → EXTREME, increase size
     FUNDING_BIAS_SCORE_BOOST = 0.5          # Score boost when funding aligns
     FUNDING_BIAS_SCORE_PENALTY = -0.5       # Score penalty when funding contradicts
-    
-    @classmethod
-    def get_funding_directional_bias(cls, funding_rate: float) -> tuple:
-        """
-        Use funding rate as directional bias signal.
-        
-        Returns: (preferred_direction, confidence, is_extreme)
-        - preferred_direction: 'SHORT', 'LONG', or 'NEUTRAL'
-        - confidence: 0.0-1.0
-        - is_extreme: True if funding is extreme (> 0.07%)
-        """
-        abs_rate = abs(funding_rate)
-        is_extreme = abs_rate >= cls.FUNDING_EXTREME_THRESHOLD
-        
-        if funding_rate >= cls.FUNDING_BIAS_THRESHOLD_SHORT:
-            # High positive funding = longs paying = bearish pressure
-            confidence = min(1.0, funding_rate / cls.FUNDING_EXTREME_THRESHOLD)
-            return ('SHORT', confidence, is_extreme)
-        elif funding_rate <= cls.FUNDING_BIAS_THRESHOLD_LONG:
-            # Negative funding = shorts paying = bullish pressure  
-            confidence = min(1.0, abs(funding_rate) / cls.FUNDING_EXTREME_THRESHOLD)
-            return ('LONG', confidence, is_extreme)
-        
-        return ('NEUTRAL', 0.0, False)
-    
-    @classmethod
-    def get_funding_score_adjustment(cls, funding_rate: float, bias: str) -> float:
-        """
-        Get score adjustment based on funding alignment with trade direction.
-        
-        Returns: Score adjustment (-0.5 to +0.5)
-        """
-        preferred_dir, confidence, is_extreme = cls.get_funding_directional_bias(funding_rate)
-        
-        if preferred_dir == 'NEUTRAL':
-            return 0.0
-        
-        # Funding aligns with our bias → boost score
-        if preferred_dir == bias:
-            adjustment = cls.FUNDING_BIAS_SCORE_BOOST * confidence
-            if is_extreme:  # Extreme funding alignment → double boost
-                adjustment *= 1.5
-            return adjustment
-        
-        # Funding contradicts our bias → penalty
-        adjustment = cls.FUNDING_BIAS_SCORE_PENALTY * confidence
-        return adjustment
-
-
-# ============================================================================
-# FIX #7: TRAIN-TEST SPLIT VALIDATION
-# ============================================================================
-class BacktestValidation:
-    ENABLED = True
-    TRAIN_SPLIT_PCT = 0.70           # 70% training, 30% test
-    MAX_OVERFITTING_PCT = 10.0       # Alert if overfitting > 10%
-    MIN_TEST_DAYS = 7                # Minimum test period
 
 
 # ============================================================================
@@ -2459,11 +1728,6 @@ class SessionQuality:
         'WEEKEND': 'moderate',
         'OTHER': 'moderate',
     }
-    
-    @classmethod
-    def session_to_quality(cls, session_name: str) -> str:
-        """Convert session name to quality tier ('good', 'moderate', 'poor')."""
-        return cls.SESSION_TO_QUALITY.get(session_name.upper(), 'moderate')
     
     @classmethod
     def get_session_size_mult(cls, session_name: str) -> float:
@@ -2567,18 +1831,6 @@ class TimeBasedExits:
     ATR_CONTRACTION_RATIO = 0.7     # ATR < 70% of entry ATR
     REQUIRE_MOMENTUM_LOSS = True    # Only exit if momentum dead
     MOMENTUM_LOSS_THRESHOLD = 0.2   # Price velocity < 0.2 ATR/candle
-
-
-# ============================================================================
-# LOGGING & MONITORING
-# ============================================================================
-class Monitoring:
-    LOG_LEVEL = 'INFO'
-    METRICS_PORT = 8000            # Prometheus metrics port
-    
-    # Performance tracking
-    TRACK_SLIPPAGE = True
-    TRACK_LATENCY = True
 
 
 # ============================================================================
@@ -2738,25 +1990,9 @@ class VolatilityRegime:
             return cls.LOW
     
     @classmethod
-    def get_trailing_mult(cls, regime: str) -> float:
-        return cls.TRAILING_ATR_MULT.get(regime, 2.0)
-    
-    @classmethod
-    def get_min_sl_atr(cls, regime: str) -> float:
-        return cls.MIN_SL_ATR.get(regime, 1.0)
-    
-    @classmethod
-    def get_slippage_mult(cls, regime: str) -> float:
-        return cls.SLIPPAGE_MULT.get(regime, 1.0)
-    
-    @classmethod
     def get_size_multiplier(cls, regime: str) -> float:
         """Get position size multiplier based on volatility regime."""
         return cls.SIZE_MULTIPLIER.get(regime, 1.0)
-    
-    @classmethod
-    def get_cooldown_mult(cls, regime: str) -> float:
-        return cls.COOLDOWN_MULT.get(regime, 1.0)
     
     @classmethod
     def from_atr_ratio(cls, atr_ratio: float) -> 'VolatilityRegimeValue':
@@ -2905,23 +2141,8 @@ class SessionTradeLimits:
     OVERRIDE_SCORE_THRESHOLD_RANGE = 8.5  # 🔥 FIX: 8.5 in RANGE (was 8.0)
     
     # Max trades per day (across all sessions)
-    # PASO 5 — REDUCE EJECUCIONES (NO TRADES): target 2–4 trades/day
-    MAX_TRADES_PER_DAY = 4
-    
-    @classmethod
-    def get_limit(cls, session: str, regime_mode: str | None = None) -> int:
-        base_limit = cls.MAX_TRADES_PER_SESSION.get(session.upper(), 2)
-        if regime_mode:
-            mode_cap = cls.MODE_TRADE_LIMIT_CAP.get(regime_mode, 5)
-            return min(base_limit, mode_cap)
-        return base_limit
-    
-    @classmethod
-    def can_override(cls, score: float, regime_mode: str | None = None) -> bool:
-        threshold = cls.OVERRIDE_SCORE_THRESHOLD
-        if regime_mode == 'RANGE':
-            threshold = cls.OVERRIDE_SCORE_THRESHOLD_RANGE
-        return score >= threshold
+    # Aligned with HARD_DAILY_LIMIT = 5 in GuardOrchestrator
+    MAX_TRADES_PER_DAY = 5
 
 
 # ============================================================================
@@ -3295,120 +2516,3 @@ class ExitHierarchy:
     
     # Evaluar "dentro de tesis" cada candle
     EVALUATE_THESIS_EACH_CANDLE = True
-    
-    @classmethod
-    def get_time_action_for_pnl(cls, current_r: float) -> dict:
-        """
-        Determina acción en timeout según P&L actual.
-        
-        Returns:
-            dict con 'action', 'details'
-        """
-        if current_r >= 0.1:
-            # En profit: parcial + runner
-            return {
-                'action': cls.TIME_IN_PROFIT_ACTION,
-                'partial_pct': cls.TIME_IN_PROFIT_PARTIAL_PCT,
-                'allow_close': False,  # No cerrar todo
-                'reason': f'Profit {current_r:.2f}R - keeping runner'
-            }
-        elif current_r >= cls.TIME_INVALIDATION_MAX_LOSS_R:
-            # Flat o pérdida pequeña: evaluar tesis
-            return {
-                'action': cls.TIME_IN_LOSS_ACTION,
-                'evaluate_structure': True,
-                'allow_close': False,  # Solo cerrar si estructura invalida
-                'max_loss': cls.TIME_IN_LOSS_MAX_R,
-                'reason': f'Flat/small loss {current_r:.2f}R - evaluating thesis'
-            }
-        else:
-            # En pérdida > límite: cerrar inmediatamente
-            return {
-                'action': 'CLOSE_IMMEDIATELY',
-                'allow_close': True,
-                'reason': f'Loss {current_r:.2f}R exceeds limit {cls.TIME_INVALIDATION_MAX_LOSS_R}R'
-            }
-
-
-# ============================================================================
-# COUNTERTREND MODE CONFIG (Jan 23, 2026)
-# Reglas específicas para modo CT - stop quirúrgico + target ambicioso
-# ============================================================================
-class CountertrendConfig:
-    """
-    Modo CT = fade táctico, NO countertrend puro.
-    Requiere: stop quirúrgico + target más ambicioso (o parcial).
-    
-    Size CT: subir a 40-50% solo si:
-    - Stop efectivo (incluyendo slippage) está por debajo de un umbral
-    - Volatilidad no está en expansión extrema
-    
-    RR CT: permitir 1.5-2R pero vía runner, no obligatoriamente TP fijo.
-    Límite CT: "1 por contexto" = mismo balance area / sesión / zona de valor
-    """
-    ENABLED = True
-    
-    # =========================================================================
-    # SIZING CT - Más agresivo solo bajo condiciones óptimas
-    # =========================================================================
-    CT_BASE_SIZE_MULTIPLIER = 0.35     # Base: 35% del size normal
-    CT_OPTIMAL_SIZE_MULTIPLIER = 0.50  # Óptimo: 50% si condiciones met
-    
-    # Condiciones para size óptimo (50%)
-    CT_OPTIMAL_CONDITIONS = {
-        'max_stop_distance_atr': 1.0,  # Stop < 1 ATR
-        'max_volatility_ratio': 1.2,   # Volatilidad < 120% promedio
-        'min_adx': 15,                 # ADX mínimo (tendencia presente)
-        'max_adx': 35,                 # ADX máximo (no sobreextendido)
-    }
-    
-    # =========================================================================
-    # TARGETS CT - Más ambiciosos que trend
-    # =========================================================================
-    CT_TP1_R = 1.0                    # TP1 a 1R (igual que trend)
-    CT_TP2_R = 2.0                    # TP2 a 2R (runner objetivo)
-    CT_RUNNER_TARGET_R = 2.5          # Target ideal del runner
-    
-    # Parciales CT
-    CT_TP1_CLOSE_PCT = 0.50           # 50% en TP1
-    CT_RUNNER_PCT = 0.50              # 50% como runner
-    
-    # =========================================================================
-    # STOP CT - Quirúrgico (más tight que trend)
-    # =========================================================================
-    CT_STOP_ATR_MULTIPLIER = 0.8      # 0.8 ATR (vs 1.0-1.2 en trend)
-    CT_STOP_MAX_R = 0.6               # Max 0.6R de stop (tight)
-    
-    # =========================================================================
-    # LÍMITES CT - 1 por contexto
-    # =========================================================================
-    CT_MAX_PER_BALANCE_AREA = 1       # Max 1 CT por balance area
-    CT_MAX_PER_SESSION = 2            # Max 2 CT por sesión
-    CT_COOLDOWN_AFTER_LOSS_MIN = 15   # 15 min cooldown tras CT perdedor
-    
-    # =========================================================================
-    # BE LOGIC CT - Diferente a trend
-    # =========================================================================
-    CT_MOVE_BE_AFTER_R = 0.6          # Mover BE después de +0.6R (no 0.4)
-    CT_BE_BUFFER_R = 0.1              # BE a entry + 0.1R (lock some profit)
-    
-    @classmethod
-    def get_ct_size_multiplier(cls, stop_distance_atr: float, 
-                                volatility_ratio: float, adx: float) -> float:
-        """
-        Calcula multiplier de size para CT basado en condiciones.
-        """
-        conditions = cls.CT_OPTIMAL_CONDITIONS
-        
-        # Verificar todas las condiciones óptimas
-        stop_ok = stop_distance_atr <= conditions['max_stop_distance_atr']
-        vol_ok = volatility_ratio <= conditions['max_volatility_ratio']
-        adx_ok = conditions['min_adx'] <= adx <= conditions['max_adx']
-        
-        if stop_ok and vol_ok and adx_ok:
-            return cls.CT_OPTIMAL_SIZE_MULTIPLIER
-        elif stop_ok and vol_ok:
-            # Sin ADX óptimo pero otras condiciones OK
-            return (cls.CT_BASE_SIZE_MULTIPLIER + cls.CT_OPTIMAL_SIZE_MULTIPLIER) / 2
-        else:
-            return cls.CT_BASE_SIZE_MULTIPLIER

@@ -889,44 +889,6 @@ class MicroTrendFilter:
         
         self._last_state = state
         return allowed, reason, state
-    
-    def should_reset_cooldown(self, min_bullish_bars: int = 3, 
-                               min_strength: float = 0.5) -> Tuple[bool, str]:
-        """
-        Check if conditions warrant resetting the loss cooldown.
-        
-        Called from signal_engine to allow early cooldown exit.
-        
-        Returns:
-            (should_reset, reason)
-        """
-        if self._last_state is None:
-            return False, "No state available"
-        
-        # Reset if micro trend is BULLISH with strength for N bars
-        if (self._consecutive_bullish_bars >= min_bullish_bars and 
-            self._last_state.confirmed_strength >= min_strength):
-            return True, f"Bullish for {self._consecutive_bullish_bars} bars (str={self._last_state.confirmed_strength:.0%})"
-        
-        # Reset if RSI has bullish reversal
-        if self._last_state.rsi_has_bullish_reversal and self._last_state.has_1m_bullish_confirmation:
-            return True, "RSI bullish reversal + 1m confirmation"
-        
-        return False, "Conditions not met"
-    
-    def get_cooldown_reset_info(self) -> dict:
-        """Get info for smart cooldown reset decisions"""
-        return {
-            'consecutive_bullish_bars': self._consecutive_bullish_bars,
-            'consecutive_bearish_bars': self._consecutive_bearish_bars,
-            'current_trend': self._current_trend,
-            'bars_in_trend': self._bars_in_trend,
-            'last_strength': self._last_state.confirmed_strength if self._last_state else 0,
-            'has_bullish_reversal': self._last_state.rsi_has_bullish_reversal if self._last_state else False
-        }
-    
-    def get_last_state(self) -> Optional[MicroTrendState]:
-        return self._last_state
 
 
 # =============================================================================
@@ -941,8 +903,3 @@ def get_micro_trend_filter(hard_block_enabled: bool = True) -> MicroTrendFilter:
     if _micro_trend_filter is None:
         _micro_trend_filter = MicroTrendFilter(hard_block_enabled=hard_block_enabled)
     return _micro_trend_filter
-
-
-def reset_micro_trend_filter():
-    global _micro_trend_filter
-    _micro_trend_filter = None

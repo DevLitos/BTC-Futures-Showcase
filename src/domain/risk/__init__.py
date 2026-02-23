@@ -10,20 +10,16 @@ Migration Status: ALIAS (re-exports from src.engine.risk)
 Target: Move logic here, make engine/ re-export from here
 """
 
-# Re-export from legacy location for backward compatibility
-from src.domain.risk.risk_engine import (
-    RiskEngine,
+# Position class extracted to position.py for maintainability
+from src.domain.risk.position import (
     Position,
     REGIME_NORMAL,
     REGIME_RUNNER,
     RUNNER_PROMOTION_MFE,
     RUNNER_TIME_EXIT_CANDLES,
+    normalize_regime_mode,
 )
-from src.domain.risk.risk_middleware import (
-    RiskManagerMiddleware,
-    SetupGrade,
-    get_risk_middleware,
-)
+from src.domain.risk.risk_engine import RiskEngine
 from src.domain.risk.risk_profile import (
     RiskProfile,
     RiskAssessment,
@@ -38,10 +34,7 @@ __all__ = [
     'REGIME_RUNNER',
     'RUNNER_PROMOTION_MFE',
     'RUNNER_TIME_EXIT_CANDLES',
-    # Middleware
-    'RiskManagerMiddleware',
-    'SetupGrade',
-    'get_risk_middleware',
+    'normalize_regime_mode',
     # Profile
     'RiskProfile',
     'RiskAssessment',

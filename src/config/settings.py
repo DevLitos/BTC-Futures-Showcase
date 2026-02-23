@@ -440,12 +440,6 @@ class Settings(BaseSettings):
     
     @computed_field
     @property
-    def is_paper_mode(self) -> bool:
-        """True if running in PAPER mode (WARNING: still executes real orders!)."""
-        return self.trading_mode == TradingMode.PAPER
-    
-    @computed_field
-    @property
     def is_backtest_mode(self) -> bool:
         """True if running in BACKTEST mode with simulated execution."""
         return self.trading_mode == TradingMode.BACKTEST
@@ -510,29 +504,6 @@ class Settings(BaseSettings):
             creds["options"] = {"defaultType": "future"}
         
         return creds
-    
-    def is_kill_switch_active(self) -> bool:
-        """
-        Check if kill switch is active.
-        
-        Kill switch can be activated by:
-        1. TRADING_KILL_SWITCH=true environment variable
-        2. Presence of KILL_SWITCH_FILE
-        
-        When active, no new trades will be opened, but existing positions
-        will continue to be managed (SL/TP active).
-        """
-        if self.kill_switch_enabled:
-            return True
-        
-        if self.kill_switch_file.exists():
-            return True
-        
-        # Also check env var dynamically (for hot reload)
-        if os.environ.get("TRADING_KILL_SWITCH", "").lower() in ("true", "1", "yes"):
-            return True
-        
-        return False
 
 
 # =========================================================================

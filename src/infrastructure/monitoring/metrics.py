@@ -1,620 +1,146 @@
 # monitoring/metrics.py
+"""Prometheus metrics for the trading system. Only ALIVE metrics included."""
 
 from prometheus_client import Counter, Gauge, Histogram, Info
 
-# --- Métricas de Ingesta de Datos ---
-# Counter: Un valor que solo puede aumentar (ej. número total de mensajes).
-MESSAGES_INGESTED = Counter(
-    'data_ingest_messages_total',
-    'Número total de mensajes recibidos del proveedor de datos',
-    ['provider', 'symbol'] # Etiquetas para filtrar (ej. por proveedor o por símbolo)
-)
-
 # =============================================================================
-# PRODUCTION METRICS (P0/P1) - Orders, Reconciliation, Latency
+# PRODUCTION METRICS - Orders, Reconciliation, Latency
 # =============================================================================
 
-# Build/Version info
-BUILD_INFO = Info(
-    'trading_build_info',
-    'Build information and version'
-)
+BUILD_INFO = Info('trading_build_info', 'Build information and version')
 
-# Order metrics
 ORDERS_PLACED_TOTAL = Counter(
-    'trading_orders_placed_total',
-    'Total number of orders placed on exchange',
-    ['symbol', 'side', 'order_type', 'status']  # status: success, failed
-)
-
+    'trading_orders_placed_total', 'Orders placed on exchange',
+    ['symbol', 'side', 'order_type', 'status'])
 ORDERS_FAILED_TOTAL = Counter(
-    'trading_orders_failed_total',
-    'Total number of failed order placements',
-    ['symbol', 'reason']  # reason: timeout, rejected, insufficient_margin, etc.
-)
-
+    'trading_orders_failed_total', 'Failed order placements',
+    ['symbol', 'reason'])
 ORDERS_CANCELLED_TOTAL = Counter(
-    'trading_orders_cancelled_total',
-    'Total number of orders cancelled',
-    ['symbol', 'reason']  # reason: user, stale, reconcile, shutdown
-)
+    'trading_orders_cancelled_total', 'Orders cancelled',
+    ['symbol', 'reason'])
 
-# Reconciliation metrics
-RECONCILE_CYCLES_TOTAL = Counter(
-    'trading_reconcile_cycles_total',
-    'Total number of reconciliation cycles completed'
-)
+RECONCILE_CYCLES_TOTAL = Counter('trading_reconcile_cycles_total', 'Reconciliation cycles')
+RECONCILE_ERRORS_TOTAL = Counter('trading_reconcile_errors_total', 'Reconciliation errors', ['error_type'])
+RECONCILE_DRIFT_DETECTED = Counter('trading_reconcile_drift_detected_total', 'Position drift detected')
 
-RECONCILE_ERRORS_TOTAL = Counter(
-    'trading_reconcile_errors_total',
-    'Total number of reconciliation errors detected',
-    ['error_type']  # position_drift, order_mismatch, unknown
-)
+WS_RECONNECTS_TOTAL = Counter('trading_ws_reconnects_total', 'WebSocket reconnections', ['exchange', 'status'])
+WS_MESSAGES_TOTAL = Counter('trading_ws_messages_total', 'WebSocket messages', ['exchange', 'feed'])
 
-RECONCILE_DRIFT_DETECTED = Counter(
-    'trading_reconcile_drift_detected_total',
-    'Number of times position drift was detected'
-)
-
-# WebSocket metrics
-WS_RECONNECTS_TOTAL = Counter(
-    'trading_ws_reconnects_total',
-    'Total number of WebSocket reconnection attempts',
-    ['exchange', 'status']  # status: success, failed
-)
-
-WS_MESSAGES_TOTAL = Counter(
-    'trading_ws_messages_total',
-    'Total WebSocket messages received',
-    ['exchange', 'feed']  # feed: trade, book, ticker
-)
-
-# Latency histograms
 REST_REQUEST_LATENCY = Histogram(
-    'trading_rest_request_latency_seconds',
-    'Latency of REST API requests to exchange',
-    ['exchange', 'endpoint'],  # endpoint: place_order, cancel_order, get_position, etc.
-    buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
-)
-
+    'trading_rest_request_latency_seconds', 'REST API latency',
+    ['exchange', 'endpoint'], buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
 WS_MESSAGE_LATENCY = Histogram(
-    'trading_ws_message_latency_seconds',
-    'Latency from WebSocket message to processing complete',
-    ['exchange', 'feed'],
-    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25]
-)
-
+    'trading_ws_message_latency_seconds', 'WebSocket processing latency',
+    ['exchange', 'feed'], buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25])
 STRATEGY_LOOP_LATENCY = Histogram(
-    'trading_strategy_loop_latency_seconds',
-    'Latency of each strategy loop iteration',
-    ['phase'],  # phase: data_fetch, signal_calc, risk_check, execution
-    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
-)
+    'trading_strategy_loop_latency_seconds', 'Strategy loop latency',
+    ['phase'], buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5])
 
 # Position gauges
-OPEN_POSITION_QTY = Gauge(
-    'trading_open_position_qty',
-    'Current open position quantity (negative for short)',
-    ['symbol', 'side']
-)
-
-OPEN_POSITION_ENTRY_PRICE = Gauge(
-    'trading_open_position_entry_price',
-    'Entry price of current open position',
-    ['symbol']
-)
-
-OPEN_POSITION_UNREALIZED_PNL = Gauge(
-    'trading_open_position_unrealized_pnl',
-    'Unrealized PnL of current open position in USD',
-    ['symbol']
-)
+OPEN_POSITION_QTY = Gauge('trading_open_position_qty', 'Open position quantity', ['symbol', 'side'])
+OPEN_POSITION_ENTRY_PRICE = Gauge('trading_open_position_entry_price', 'Entry price', ['symbol'])
+OPEN_POSITION_UNREALIZED_PNL = Gauge('trading_open_position_unrealized_pnl', 'Unrealized PnL', ['symbol'])
 
 # Account gauges
-ACCOUNT_EQUITY = Gauge(
-    'trading_account_equity',
-    'Current account equity in USD',
-    ['exchange']
-)
+ACCOUNT_EQUITY = Gauge('trading_account_equity', 'Account equity USD', ['exchange'])
+ACCOUNT_FREE_MARGIN = Gauge('trading_account_free_margin', 'Free margin', ['exchange'])
+ACCOUNT_MARGIN_RATIO = Gauge('trading_account_margin_ratio', 'Margin ratio', ['exchange'])
 
-ACCOUNT_FREE_MARGIN = Gauge(
-    'trading_account_free_margin',
-    'Current free margin available for trading',
-    ['exchange']
-)
-
-ACCOUNT_MARGIN_RATIO = Gauge(
-    'trading_account_margin_ratio',
-    'Current margin usage ratio (0-1)',
-    ['exchange']
-)
-
-# Kill switch status
-KILL_SWITCH_ACTIVE = Gauge(
-    'trading_kill_switch_active',
-    'Whether kill switch is currently active (1=active, 0=inactive)'
-)
-
-# Health status
-HEALTH_WS_CONNECTED = Gauge(
-    'trading_health_ws_connected',
-    'WebSocket connection status (1=connected, 0=disconnected)',
-    ['exchange']
-)
-
-HEALTH_EXCHANGE_REACHABLE = Gauge(
-    'trading_health_exchange_reachable',
-    'Exchange API reachability (1=reachable, 0=unreachable)',
-    ['exchange']
-)
-
-HEALTH_TIME_DRIFT_MS = Gauge(
-    'trading_health_time_drift_ms',
-    'Clock drift between local and exchange time in milliseconds',
-    ['exchange']
-)
+# Kill switch & health
+KILL_SWITCH_ACTIVE = Gauge('trading_kill_switch_active', 'Kill switch active')
+HEALTH_WS_CONNECTED = Gauge('trading_health_ws_connected', 'WS connected', ['exchange'])
+HEALTH_EXCHANGE_REACHABLE = Gauge('trading_health_exchange_reachable', 'Exchange reachable', ['exchange'])
+HEALTH_TIME_DRIFT_MS = Gauge('trading_health_time_drift_ms', 'Clock drift ms', ['exchange'])
 
 # Rate limiting
-RATE_LIMIT_REMAINING = Gauge(
-    'trading_rate_limit_remaining',
-    'Remaining API calls before rate limit',
-    ['exchange', 'endpoint']
-)
-
-RATE_LIMIT_RESET_SECONDS = Gauge(
-    'trading_rate_limit_reset_seconds',
-    'Seconds until rate limit resets',
-    ['exchange']
-)
+RATE_LIMIT_REMAINING = Gauge('trading_rate_limit_remaining', 'Rate limit remaining', ['exchange', 'endpoint'])
+RATE_LIMIT_RESET_SECONDS = Gauge('trading_rate_limit_reset_seconds', 'Rate limit reset', ['exchange'])
 
 # =============================================================================
-# EDGE HEALTH METRICS (Grafana Panel)
+# EDGE HEALTH METRICS
 # =============================================================================
 
-# Expectancy tracking (for Edge Health Panel)
-EDGE_EXPECTANCY_CURRENT = Gauge(
-    'edge_expectancy_current',
-    'Expectancy actual de los últimos N trades (en R)',
-    ['window']  # 'last_20', 'last_50', 'historical'
-)
+EDGE_EXPECTANCY_CURRENT = Gauge('edge_expectancy_current', 'Current expectancy (R)', ['window'])
+EDGE_EXPECTANCY_HISTORICAL = Gauge('edge_expectancy_historical', 'Historical expectancy (R)', ['symbol'])
+EDGE_HEALTH_RATIO = Gauge('edge_health_ratio', 'Expectancy ratio current/historical', ['symbol'])
 
-EDGE_EXPECTANCY_HISTORICAL = Gauge(
-    'edge_expectancy_historical',
-    'Expectancy histórico del sistema (en R)',
-    ['symbol']
-)
+MARKET_REGIME_CURRENT = Gauge('market_regime_current', 'Market regime (1=TREND,2=MEAN_REV,3=CHOPPY)', ['symbol'])
+MARKET_ATR_RATIO = Gauge('market_atr_ratio', 'ATR ratio vs baseline', ['symbol'])
 
-EDGE_HEALTH_RATIO = Gauge(
-    'edge_health_ratio',
-    'Ratio de expectancy actual vs histórico (alerta si < 0.5)',
-    ['symbol']
-)
+RISK_STREAK_CURRENT = Gauge('risk_streak_current', 'Current win/loss streak', ['symbol'])
+RISK_ESCALATION_ACTIVE = Gauge('risk_escalation_active', 'Risk escalation active', ['symbol'])
+RISK_CURRENT_PCT = Gauge('risk_current_pct', 'Current risk pct', ['symbol'])
 
-# Market Regime tracking
-MARKET_REGIME_CURRENT = Gauge(
-    'market_regime_current',
-    'Régimen de mercado actual (1=TREND, 2=MEAN_REV, 3=CHOPPY)',
-    ['symbol']
-)
+# =============================================================================
+# SIGNAL & RISK ENGINE METRICS
+# =============================================================================
 
-MARKET_ATR_RATIO = Gauge(
-    'market_atr_ratio',
-    'ATR actual vs baseline (>2.0 = pánico)',
-    ['symbol']
-)
-
-# Risk Escalation tracking
-RISK_STREAK_CURRENT = Gauge(
-    'risk_streak_current',
-    'Racha actual de trades (positivo=wins, negativo=losses)',
-    ['symbol']
-)
-
-RISK_ESCALATION_ACTIVE = Gauge(
-    'risk_escalation_active',
-    '1 si escalación activa, 0 si no',
-    ['symbol']
-)
-
-RISK_CURRENT_PCT = Gauge(
-    'risk_current_pct',
-    'Porcentaje de riesgo actual por trade',
-    ['symbol']
-)
-
-# Shadow Trading comparison
-SHADOW_PNL_REAL = Gauge(
-    'shadow_pnl_real',
-    'PnL real acumulado',
-    ['symbol']
-)
-
-SHADOW_PNL_ESCALATED = Gauge(
-    'shadow_pnl_escalated',
-    'PnL que habría sido con riesgo escalado',
-    ['symbol']
-)
-
-SHADOW_OUTPERFORM_STREAK = Gauge(
-    'shadow_outperform_streak',
-    'Trades consecutivos donde escalated > real',
-    ['symbol']
-)
-
-# PPO (Profit Per Opportunity)
-PPO_CURRENT = Gauge(
-    'ppo_current',
-    'Profit Per Opportunity actual',
-    ['symbol']
-)
-
-PPO_EXECUTION_RATE = Gauge(
-    'ppo_execution_rate',
-    'Tasa de ejecución de señales (trades/señales)',
-    ['symbol']
-)
-
-# SL Bin performance
-SL_BIN_EXPECTANCY = Gauge(
-    'sl_bin_expectancy',
-    'Expectancy por SL bin',
-    ['bin']  # 'MICRO', 'NORMAL', 'WIDE'
-)
-
-SL_BIN_TRADE_COUNT = Counter(
-    'sl_bin_trade_count_total',
-    'Número de trades por SL bin',
-    ['bin']
-)
-
-# Setup performance
-SETUP_EXPECTANCY = Gauge(
-    'setup_expectancy',
-    'Expectancy por tipo de setup',
-    ['setup']
-)
-
-SETUP_GRADE = Gauge(
-    'setup_grade',
-    'Grado del setup (1=A, 2=B, 3=C)',
-    ['setup']
-)
-
-# TP1 Optimization
-TP1_CURRENT_R = Gauge(
-    'tp1_current_r',
-    'TP1 recomendado actual (en R)',
-    ['symbol']
-)
-
-TP1_PF_IF_ONLY = Gauge(
-    'tp1_pf_if_only',
-    'Profit Factor teórico si cerráramos todo en TP1',
-    ['symbol']
-)
-
-# --- Métricas del Motor de Señales ---
-SIGNALS_GENERATED = Counter(
-    'engine_signals_generated_total',
-    'Número total de señales de trading preliminares generadas',
-    ['symbol', 'direction']
-)
-
-# Histogram: Mide la distribución de un valor (ej. latencia).
-# Rastrea cuánto tiempo pasa desde que se recibe un tick hasta que se genera una señal.
+SIGNALS_GENERATED = Counter('engine_signals_generated_total', 'Signals generated', ['symbol', 'direction'])
 SIGNAL_PROCESSING_LATENCY = Histogram(
-    'engine_signal_processing_latency_seconds',
-    'Latencia en el procesamiento de señales (desde el tick hasta la señal)',
-    ['symbol']
-)
+    'engine_signal_processing_latency_seconds', 'Signal processing latency', ['symbol'])
 
-# --- Métricas del Motor de Riesgo ---
-ORDERS_RECOMMENDED = Counter(
-    'risk_orders_recommended_total',
-    'Número total de recomendaciones de órdenes finales generadas',
-    ['symbol', 'direction']
-)
-
-ORDERS_REJECTED = Counter(
-    'risk_orders_rejected_total',
-    'Número total de señales descartadas por el motor de riesgo',
-    ['symbol', 'reason'] # Razón del rechazo (ej. 'daily_loss_limit')
-)
-
-# Gauge: Un valor que puede subir y bajar (ej. PnL actual).
-INTERNAL_PNL = Gauge(
-    'risk_internal_pnl_current',
-    'PnL actual de la posición interna',
-    ['symbol']
-)
-
-# --- Métricas de Salida ---
-NOTIFICATIONS_SENT = Counter(
-    'output_notifications_sent_total',
-    'Número total de notificaciones enviadas',
-    ['channel'] # Canal (ej. 'telegram')
-)
+ORDERS_RECOMMENDED = Counter('risk_orders_recommended_total', 'Orders recommended', ['symbol', 'direction'])
+ORDERS_REJECTED = Counter('risk_orders_rejected_total', 'Orders rejected', ['symbol', 'reason'])
+INTERNAL_PNL = Gauge('risk_internal_pnl_current', 'Internal PnL', ['symbol'])
+NOTIFICATIONS_SENT = Counter('output_notifications_sent_total', 'Notifications sent', ['channel'])
 
 # =============================================================================
-# ML MODEL METRICS (Jan 24, 2026)
-# Monitoring for ML model performance, drift, and health
+# PULLBACK SHORT ENGINE METRICS
 # =============================================================================
 
-# Model phase and status
-ML_MODEL_PHASE = Gauge(
-    'ml_model_phase',
-    'Current ML deployment phase (0=DISABLED, 1=SHADOW, 2=HYBRID, 3=PRIMARY)',
-    ['model']  # 'entry_score', 'exit_timing', etc.
-)
-
-ML_MODEL_LOADED = Gauge(
-    'ml_model_loaded',
-    'Whether ML model is loaded and ready (1=loaded, 0=not loaded)',
-    ['model']
-)
-
-ML_MODEL_AUC = Gauge(
-    'ml_model_auc',
-    'Current model AUC (area under ROC curve)',
-    ['model']
-)
-
-# Drift detection
-ML_DRIFT_DETECTED = Gauge(
-    'ml_drift_detected',
-    'Whether model drift is detected (1=drift, 0=ok)',
-    ['model']
-)
-
-ML_ROLLING_AUC = Gauge(
-    'ml_rolling_auc',
-    'Rolling AUC over recent predictions window',
-    ['model']
-)
-
-ML_NEEDS_RETRAINING = Gauge(
-    'ml_needs_retraining',
-    'Whether model needs retraining based on drift (1=yes, 0=no)',
-    ['model']
-)
-
-# Prediction statistics
-ML_PREDICTIONS_TOTAL = Counter(
-    'ml_predictions_total',
-    'Total number of ML predictions made',
-    ['model', 'phase']
-)
-
-ML_PREDICTION_FAILURES = Counter(
-    'ml_prediction_failures_total',
-    'Total number of ML prediction failures',
-    ['model', 'reason']  # reason: timeout, model_error, feature_error
-)
-
-ML_PREDICTION_LATENCY = Histogram(
-    'ml_prediction_latency_seconds',
-    'Latency of ML predictions',
-    ['model'],
-    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1]
-)
-
-# Score adjustments (HYBRID mode)
-ML_SCORE_ADJUSTMENTS = Counter(
-    'ml_score_adjustments_total',
-    'Number of score adjustments by ML in HYBRID mode',
-    ['model', 'adjustment_type']  # boost, penalty, neutral
-)
-
-# Trade outcome tracking
-ML_TRADE_OUTCOMES = Counter(
-    'ml_trade_outcomes_total',
-    'Trade outcomes for ML accuracy tracking',
-    ['model', 'predicted', 'actual']  # predicted: high_prob/low_prob, actual: win/loss
-)
+PULLBACK_SHORT_SIGNALS_TOTAL = Counter('pullback_short_signals_total', 'Pullback short signals', ['symbol'])
+PULLBACK_SHORT_ENTRIES_TOTAL = Counter('pullback_short_entries_total', 'Pullback short entries', ['symbol'])
+PULLBACK_SHORT_BLOCKS_TOTAL = Counter('pullback_short_blocks_total', 'Pullback short blocks', ['symbol', 'reason'])
+PULLBACK_SHORT_PNL_TOTAL = Gauge('pullback_short_pnl_total', 'Pullback short cumulative PnL', ['symbol'])
+PULLBACK_SHORT_WINS_TOTAL = Counter('pullback_short_wins_total', 'Pullback short wins', ['symbol'])
+PULLBACK_SHORT_LOSSES_TOTAL = Counter('pullback_short_losses_total', 'Pullback short losses', ['symbol'])
+PULLBACK_SHORT_MFE_R = Histogram(
+    'pullback_short_mfe_r', 'Pullback short MFE (R)', ['symbol'],
+    buckets=[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0])
+PULLBACK_SHORT_MAE_R = Histogram(
+    'pullback_short_mae_r', 'Pullback short MAE (R)', ['symbol'],
+    buckets=[0.0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5])
+PULLBACK_SHORT_EXTENSION_Z = Histogram(
+    'pullback_short_extension_z', 'Pullback short extension Z', ['symbol'],
+    buckets=[1.5, 1.8, 2.0, 2.3, 2.5, 3.0, 4.0, 5.0])
+PULLBACK_SHORT_DAILY_COUNT = Gauge('pullback_short_daily_count', 'Pullback shorts today', ['symbol'])
+PULLBACK_SHORT_CONSECUTIVE_LOSSES = Gauge('pullback_short_consecutive_losses', 'Consecutive losses', ['symbol'])
 
 
-def update_ml_metrics(stats: dict, model_name: str = 'entry_score'):
-    """
-    Update all ML metrics from inference engine stats.
-    
-    Called periodically from main loop or after each prediction.
-    """
-    # Map phase name to number
-    phase_map = {'DISABLED': 0, 'SHADOW': 1, 'HYBRID': 2, 'PRIMARY': 3}
-    phase_num = phase_map.get(stats.get('phase', 'DISABLED'), 0)
-    
-    ML_MODEL_PHASE.labels(model=model_name).set(phase_num)
-    ML_MODEL_LOADED.labels(model=model_name).set(1 if stats.get('model_loaded') else 0)
-    ML_MODEL_AUC.labels(model=model_name).set(stats.get('model_auc', 0.0))
-    
-    # Drift metrics
-    ML_DRIFT_DETECTED.labels(model=model_name).set(1 if stats.get('drift_detected') else 0)
-    ML_ROLLING_AUC.labels(model=model_name).set(stats.get('rolling_auc', 0.0))
-    ML_NEEDS_RETRAINING.labels(model=model_name).set(1 if stats.get('needs_retraining') else 0)
+# =============================================================================
+# UPDATER FUNCTIONS (only those with external callers)
+# =============================================================================
 
-
-# Para que estas métricas sean accesibles, necesitas exponer un endpoint HTTP.
-# Esto se hace fácilmente si tus servicios están construidos con FastAPI o Flask,
-# o puedes usar la función `start_http_server` de la librería.
-
-def start_metrics_server(port: int = 8000 ):
-    """
-    Inicia un servidor HTTP para exponer las métricas a Prometheus.
-    """
+def start_metrics_server(port: int = 8000):
+    """Start Prometheus HTTP metrics server."""
     from prometheus_client import start_http_server
     import logging
-    
     try:
-        start_http_server(port )
-        logging.info(f"Servidor de métricas de Prometheus iniciado en el puerto {port}")
+        start_http_server(port)
+        logging.info(f"Prometheus metrics server started on port {port}")
     except Exception as e:
-        logging.error(f"No se pudo iniciar el servidor de métricas: {e}")
+        logging.error(f"Failed to start metrics server: {e}")
 
 
-# =============================================================================
-# EDGE HEALTH UPDATERS
-# =============================================================================
-
-def update_edge_health(symbol: str, 
-                       expectancy_last_20: float,
-                       expectancy_historical: float):
-    """
-    Update Edge Health metrics for Grafana.
-    
-    Alerta: Si expectancy_last_20 < 0.5 * expectancy_historical → Modo Observación
-    """
+def update_edge_health(symbol: str, expectancy_last_20: float, expectancy_historical: float):
+    """Update Edge Health metrics."""
     EDGE_EXPECTANCY_CURRENT.labels(window='last_20').set(expectancy_last_20)
     EDGE_EXPECTANCY_HISTORICAL.labels(symbol=symbol).set(expectancy_historical)
-    
-    # Calculate health ratio
-    if expectancy_historical > 0:
-        ratio = expectancy_last_20 / expectancy_historical
-    else:
-        ratio = 1.0
-    
+    ratio = expectancy_last_20 / expectancy_historical if expectancy_historical > 0 else 1.0
     EDGE_HEALTH_RATIO.labels(symbol=symbol).set(ratio)
 
 
-def update_market_regime(symbol: str,
-                         regime_value: int,  # 1=TREND, 2=MEAN_REV, 3=CHOPPY
-                         atr_ratio: float):
+def update_market_regime(symbol: str, regime_value: int, atr_ratio: float):
     """Update market regime metrics."""
     MARKET_REGIME_CURRENT.labels(symbol=symbol).set(regime_value)
     MARKET_ATR_RATIO.labels(symbol=symbol).set(atr_ratio)
 
 
-def update_risk_escalation(symbol: str,
-                           streak: int,
-                           is_active: bool,
-                           current_risk_pct: float):
+def update_risk_escalation(symbol: str, streak: int, is_active: bool, current_risk_pct: float):
     """Update risk escalation metrics."""
     RISK_STREAK_CURRENT.labels(symbol=symbol).set(streak)
     RISK_ESCALATION_ACTIVE.labels(symbol=symbol).set(1 if is_active else 0)
     RISK_CURRENT_PCT.labels(symbol=symbol).set(current_risk_pct)
-
-
-def update_shadow_trading(symbol: str,
-                          pnl_real: float,
-                          pnl_escalated: float,
-                          outperform_streak: int):
-    """Update shadow trading comparison metrics."""
-    SHADOW_PNL_REAL.labels(symbol=symbol).set(pnl_real)
-    SHADOW_PNL_ESCALATED.labels(symbol=symbol).set(pnl_escalated)
-    SHADOW_OUTPERFORM_STREAK.labels(symbol=symbol).set(outperform_streak)
-
-
-def update_ppo(symbol: str, ppo: float, execution_rate: float):
-    """Update PPO metrics."""
-    PPO_CURRENT.labels(symbol=symbol).set(ppo)
-    PPO_EXECUTION_RATE.labels(symbol=symbol).set(execution_rate)
-
-
-def update_sl_bin(bin_name: str, expectancy: float, increment_count: bool = False):
-    """Update SL bin metrics."""
-    SL_BIN_EXPECTANCY.labels(bin=bin_name).set(expectancy)
-    if increment_count:
-        SL_BIN_TRADE_COUNT.labels(bin=bin_name).inc()
-
-
-def update_setup_metrics(setup_name: str, expectancy: float, grade: int):
-    """Update setup performance metrics (grade: 1=A, 2=B, 3=C)."""
-    SETUP_EXPECTANCY.labels(setup=setup_name).set(expectancy)
-    SETUP_GRADE.labels(setup=setup_name).set(grade)
-
-
-def update_tp1_metrics(symbol: str, current_r: float, pf_if_only: float):
-    """Update TP1 optimization metrics."""
-    TP1_CURRENT_R.labels(symbol=symbol).set(current_r)
-    TP1_PF_IF_ONLY.labels(symbol=symbol).set(pf_if_only)
-
-
-def check_edge_health_alert(expectancy_last_20: float,
-                            expectancy_historical: float,
-                            threshold: float = 0.5) -> bool:
-    """
-    Check if Edge Health alert should trigger.
-    
-    Returns True if should enter Observation Mode (reduce risk).
-    """
-    if expectancy_historical <= 0:
-        return False
-    
-    ratio = expectancy_last_20 / expectancy_historical
-    return ratio < threshold
-
-
-# =============================================================================
-# PULLBACK SHORT ENGINE METRICS (Jan 14, 2026)
-# =============================================================================
-
-PULLBACK_SHORT_SIGNALS_TOTAL = Counter(
-    'pullback_short_signals_total',
-    'Total pullback short signals generated',
-    ['symbol']
-)
-
-PULLBACK_SHORT_ENTRIES_TOTAL = Counter(
-    'pullback_short_entries_total',
-    'Total pullback short entries executed',
-    ['symbol']
-)
-
-PULLBACK_SHORT_BLOCKS_TOTAL = Counter(
-    'pullback_short_blocks_total',
-    'Total pullback short signals blocked',
-    ['symbol', 'reason']  # reason: ext_z_low, no_trigger, breakout_cooldown, daily_limit, etc.
-)
-
-PULLBACK_SHORT_PNL_TOTAL = Gauge(
-    'pullback_short_pnl_total',
-    'Cumulative PnL from pullback shorts in USD',
-    ['symbol']
-)
-
-PULLBACK_SHORT_WINS_TOTAL = Counter(
-    'pullback_short_wins_total',
-    'Total winning pullback short trades',
-    ['symbol']
-)
-
-PULLBACK_SHORT_LOSSES_TOTAL = Counter(
-    'pullback_short_losses_total',
-    'Total losing pullback short trades',
-    ['symbol']
-)
-
-PULLBACK_SHORT_MFE_R = Histogram(
-    'pullback_short_mfe_r',
-    'Maximum Favorable Excursion for pullback shorts (in R)',
-    ['symbol'],
-    buckets=[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0]
-)
-
-PULLBACK_SHORT_MAE_R = Histogram(
-    'pullback_short_mae_r',
-    'Maximum Adverse Excursion for pullback shorts (in R)',
-    ['symbol'],
-    buckets=[0.0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5]
-)
-
-PULLBACK_SHORT_EXTENSION_Z = Histogram(
-    'pullback_short_extension_z',
-    'Extension Z-score at entry for pullback shorts',
-    ['symbol'],
-    buckets=[1.5, 1.8, 2.0, 2.3, 2.5, 3.0, 4.0, 5.0]
-)
-
-PULLBACK_SHORT_DAILY_COUNT = Gauge(
-    'pullback_short_daily_count',
-    'Number of pullback short trades today',
-    ['symbol']
-)
-
-PULLBACK_SHORT_CONSECUTIVE_LOSSES = Gauge(
-    'pullback_short_consecutive_losses',
-    'Current consecutive pullback short losses',
-    ['symbol']
-)
 
 
 def update_pullback_short_signal(symbol: str | None, blocked: bool = False, reason: str = ""):
@@ -633,15 +159,9 @@ def update_pullback_short_entry(symbol: str | None, extension_z: float):
 def update_pullback_short_exit(symbol: str | None, pnl: float, is_win: bool, mfe_r: float, mae_r: float):
     """Update pullback short exit metrics."""
     _sym = symbol or 'UNKNOWN'
-    if is_win:
-        PULLBACK_SHORT_WINS_TOTAL.labels(symbol=_sym).inc()
-    else:
-        PULLBACK_SHORT_LOSSES_TOTAL.labels(symbol=_sym).inc()
-    
-    # Update cumulative PnL (get current and add)
-    # Note: For proper cumulative, you'd track in the engine and set here
-    PULLBACK_SHORT_MFE_R.labels(symbol=symbol).observe(mfe_r)
-    PULLBACK_SHORT_MAE_R.labels(symbol=symbol).observe(mae_r)
+    (PULLBACK_SHORT_WINS_TOTAL if is_win else PULLBACK_SHORT_LOSSES_TOTAL).labels(symbol=_sym).inc()
+    PULLBACK_SHORT_MFE_R.labels(symbol=_sym).observe(mfe_r)
+    PULLBACK_SHORT_MAE_R.labels(symbol=_sym).observe(mae_r)
 
 
 def update_pullback_short_status(symbol: str | None, daily_count: int, consecutive_losses: int, cumulative_pnl: float):

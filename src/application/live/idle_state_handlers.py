@@ -85,10 +85,9 @@ def check_candle_gate(
     Event-based evaluation gate for intraday trading.
     
     Evaluates when:
-    1. WAIT_LTF state (every tick for fast trigger)
-    2. New 1m candle closed (candle-based, always)
-    3. Significant price movement (>= 0.3 ATR since last eval)
-    4. Max ticks reached (fallback every 30 ticks)
+    1. New 1m candle closed (candle-based, always)
+    2. Significant price movement (>= 0.3 ATR since last eval)
+    3. Max ticks reached (fallback every 30 ticks)
     
     Args:
         engine: SignalEngine instance
@@ -103,13 +102,7 @@ def check_candle_gate(
     new_count = idle_eval_count + 1
     
     # =========================================================================
-    # 1. WAIT_LTF: Evaluate every tick for fast LTF trigger response
-    # =========================================================================
-    if setup_state == "WAIT_LTF":
-        return True, new_count
-    
-    # =========================================================================
-    # 2. NEW CANDLE: Always evaluate on candle close (backward compatible)
+    # 1. NEW CANDLE: Always evaluate on candle close (backward compatible)
     # =========================================================================
     if engine._is_new_candle():
         engine._mark_candle_evaluated()
@@ -276,98 +269,6 @@ async def sync_with_exchange_if_needed(
         logger.warning("Exchange sync lock acquisition timeout - will retry next cycle")
     
     return False, None
-
-
-# ==============================================================================
-# WAIT_LTF STATE HANDLER
-# ==============================================================================
-
-async def handle_wait_ltf_state(
-    engine: "SignalEngine",
-    current_price: float,
-    atr_1m: float,
-    market_time: datetime,
-) -> Optional[str]:
-    """
-    Handle WAIT_LTF state - waiting for LTF trigger after HTF setup.
-    
-    Returns:
-        - "EXECUTING" if triggered and should proceed to execute
-        - "RESET" if setup invalidated or timed out
-        - None to stay in WAIT_LTF
-    """
-    if engine.setup_state != "WAIT_LTF":
-        return None
-    
-    if engine.setup_start_time is None:
-        logger.error("WAIT_LTF state with no setup_start_time - resetting")
-        engine.setup_state = "IDLE"
-        return "RESET"
-    
-    elapsed = (market_time - engine.setup_start_time).total_seconds()
-    
-    # 1. Check timeout
-    if elapsed > engine.ltf_wait_timeout:
-        logger.warning(f"WAIT_LTF timeout after {elapsed:.0f}s - Discarding setup")
-        _reset_wait_ltf_state(engine)
-        return "RESET"
-    
-    # 2. Check invalidation conditions - EMA50 break
-    candles_5m = engine.market_data.get_candles('5m')
-    if candles_5m and len(candles_5m) >= 20:
-        df_5m = pd.DataFrame(candles_5m)
-        closes_5m = df_5m['close'].to_numpy()
-        ema_50 = calculate_ema(closes_5m, 50)[-1]
-        
-        if engine.current_bias == "LONG" and current_price < ema_50:
-            logger.warning("Setup invalidated: Price broke EMA50 down during WAIT_LTF")
-            _reset_wait_ltf_state(engine)
-            return "RESET"
-        
-        if engine.current_bias == "SHORT" and current_price > ema_50:
-            logger.warning("Setup invalidated: Price broke EMA50 up during WAIT_LTF")
-            _reset_wait_ltf_state(engine)
-            return "RESET"
-    
-    # 3. Try LTF trigger
-    logger.debug(f"WAIT_LTF state: Checking LTF trigger ({elapsed:.0f}s/{engine.ltf_wait_timeout}s)")
-    candles_1m = engine.market_data.get_candles('1m')
-    
-    if candles_1m and len(candles_1m) >= 20:
-        df_1m = pd.DataFrame(candles_1m)
-        
-        # Get regime info for volume-aware filtering
-        regime_value = engine.regime_classifier.current_regime.value if engine.regime_classifier.current_regime else None
-        regime_conf = engine.regime_classifier.regime_confidence
-        
-        if engine.current_bias is None:
-            logger.warning("WAIT_LTF without bias - resetting")
-            engine.setup_state = "IDLE"
-            return "RESET"
-        
-        ltf_passed, ltf_reason = engine.ltf_filter.check(
-            df_1m,
-            engine.current_bias,
-            {},
-            regime=regime_value,
-            regime_confidence=regime_conf
-        )
-        
-        if ltf_passed:
-            logger.info(f"✅ LTF TRIGGER FIRED - Executing {engine.current_bias}")
-            engine.setup_state = "EXECUTING"
-            return "EXECUTING"
-        else:
-            logger.debug(f"LTF not ready yet: {ltf_reason}")
-    
-    return None  # Stay in WAIT_LTF
-
-
-def _reset_wait_ltf_state(engine: "SignalEngine"):
-    """Reset WAIT_LTF state to IDLE."""
-    engine.setup_state = "IDLE"
-    engine.setup_frozen_htf = False
-    engine.current_bias = None
 
 
 # ==============================================================================

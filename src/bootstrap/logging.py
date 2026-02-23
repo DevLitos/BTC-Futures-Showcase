@@ -407,55 +407,25 @@ class CleanTextFormatter(logging.Formatter):
 # Audit Logger
 # =========================================================================
 
-@dataclass
-class AuditEvent:
-    """Structured audit event."""
-    timestamp: datetime
-    event_type: str
-    run_id: str
-    session_id: str
-    data: Dict[str, Any]
-
 
 class AuditLogger:
     """
     Dedicated audit logger for critical trading events.
-    
-    Audit events are:
-    - Always logged (never rate-limited)
-    - Written to a separate file
-    - Structured for easy parsing
-    - Include full context for reconstruction
-    
-    Events logged:
-    - ORDER_PLACED: Every order placed on exchange
-    - ORDER_CANCELLED: Every order cancellation
-    - ORDER_FILLED: Order fill confirmations
-    - POSITION_OPENED: Position entry
-    - POSITION_CLOSED: Position exit
-    - SL_SET: Stop loss set/modified
-    - TP_SET: Take profit set/modified
-    - KILL_SWITCH: Kill switch activated
-    - RECONCILE_ERROR: State discrepancy detected
-    - SYSTEM_START: System startup
-    - SYSTEM_STOP: System shutdown
+    Events are always logged (never rate-limited), written to a separate file,
+    structured for easy parsing with full context.
     """
     
     def __init__(self, log_path: Path, run_id: str):
         self.log_path = log_path
         self.run_id = run_id
         
-        # Create dedicated logger
         self.logger = logging.getLogger(AUDIT_LOG_NAME)
         self.logger.setLevel(logging.INFO)
-        self.logger.propagate = False  # Don't propagate to root
+        self.logger.propagate = False
         
-        # File handler (JSON format, one event per line)
         log_file = log_path / AUDIT_LOG_FILE
         handler = logging.handlers.RotatingFileHandler(
-            log_file,
-            maxBytes=50 * 1024 * 1024,  # 50MB
-            backupCount=10
+            log_file, maxBytes=50 * 1024 * 1024, backupCount=10
         )
         handler.setFormatter(JSONFormatter())
         self.logger.addHandler(handler)
@@ -471,148 +441,9 @@ class AuditLogger:
         }
         self.logger.info(json.dumps(event))
     
-    def log(self, event_type: str, **data):
-        """Public method to log an audit event."""
-        self._log_event(event_type, **data)
-    
-    # Order events
-    def order_placed(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
-                    order_type: str = "limit", client_order_id: Optional[str] = None, **extra):
-        """Log order placement."""
-        self._log_event(
-            "ORDER_PLACED",
-            symbol=symbol,
-            side=side,
-            amount=amount,
-            price=price,
-            order_type=order_type,
-            client_order_id=client_order_id,
-            **extra
-        )
-    
-    def order_cancelled(self, order_id: str, symbol: str, reason: str = "", **extra):
-        """Log order cancellation."""
-        self._log_event(
-            "ORDER_CANCELLED",
-            order_id=order_id,
-            symbol=symbol,
-            reason=reason,
-            **extra
-        )
-    
-    def order_filled(self, order_id: str, symbol: str, side: str, amount: float,
-                    price: float, fill_type: str = "full", **extra):
-        """Log order fill."""
-        self._log_event(
-            "ORDER_FILLED",
-            order_id=order_id,
-            symbol=symbol,
-            side=side,
-            amount=amount,
-            price=price,
-            fill_type=fill_type,
-            **extra
-        )
-    
-    def order_failed(self, symbol: str, side: str, amount: float, error: str,
-                    client_order_id: Optional[str] = None, **extra):
-        """Log order failure."""
-        self._log_event(
-            "ORDER_FAILED",
-            symbol=symbol,
-            side=side,
-            amount=amount,
-            error=error,
-            client_order_id=client_order_id,
-            **extra
-        )
-    
-    # Position events
-    def position_opened(self, symbol: str, side: str, size: float, entry_price: float,
-                       stop_loss: float, **extra):
-        """Log position open."""
-        self._log_event(
-            "POSITION_OPENED",
-            symbol=symbol,
-            side=side,
-            size=size,
-            entry_price=entry_price,
-            stop_loss=stop_loss,
-            **extra
-        )
-    
-    def position_closed(self, symbol: str, side: str, size: float, entry_price: float,
-                       exit_price: float, pnl: float, pnl_r: float, reason: str, **extra):
-        """Log position close."""
-        self._log_event(
-            "POSITION_CLOSED",
-            symbol=symbol,
-            side=side,
-            size=size,
-            entry_price=entry_price,
-            exit_price=exit_price,
-            pnl=pnl,
-            pnl_r=pnl_r,
-            reason=reason,
-            **extra
-        )
-    
-    # SL/TP events
-    def sl_set(self, symbol: str, order_id: str, price: float, **extra):
-        """Log stop loss set."""
-        self._log_event(
-            "SL_SET",
-            symbol=symbol,
-            order_id=order_id,
-            price=price,
-            **extra
-        )
-    
-    def tp_set(self, symbol: str, order_id: str, price: float, **extra):
-        """Log take profit set."""
-        self._log_event(
-            "TP_SET",
-            symbol=symbol,
-            order_id=order_id,
-            price=price,
-            **extra
-        )
-    
-    # System events
     def kill_switch_activated(self, reason: str, **extra):
         """Log kill switch activation."""
-        self._log_event(
-            "KILL_SWITCH",
-            reason=reason,
-            **extra
-        )
-    
-    def reconcile_error(self, expected: Any, actual: Any, action: str, **extra):
-        """Log reconciliation error."""
-        self._log_event(
-            "RECONCILE_ERROR",
-            expected=str(expected),
-            actual=str(actual),
-            action=action,
-            **extra
-        )
-    
-    def system_start(self, mode: str, exchange: str, **extra):
-        """Log system startup."""
-        self._log_event(
-            "SYSTEM_START",
-            mode=mode,
-            exchange=exchange,
-            **extra
-        )
-    
-    def system_stop(self, reason: str, **extra):
-        """Log system shutdown."""
-        self._log_event(
-            "SYSTEM_STOP",
-            reason=reason,
-            **extra
-        )
+        self._log_event("KILL_SWITCH", reason=reason, **extra)
 
 
 # =========================================================================
@@ -690,7 +521,8 @@ def configure_logging(settings: Settings) -> None:
     _audit_logger = AuditLogger(settings.log_path, settings.run_id)
     
     # Log startup
-    _audit_logger.system_start(
+    _audit_logger._log_event(
+        "SYSTEM_START",
         mode=settings.trading_mode.value,
         exchange=settings.exchange.value,
         version=settings.app_version,

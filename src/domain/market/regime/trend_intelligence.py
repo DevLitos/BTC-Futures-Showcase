@@ -898,9 +898,3 @@ def get_trend_intelligence() -> TrendIntelligence:
     if _trend_intelligence is None:
         _trend_intelligence = TrendIntelligence()
     return _trend_intelligence
-
-
-def reset_trend_intelligence():
-    """Reset singleton (for testing)"""
-    global _trend_intelligence
-    _trend_intelligence = None

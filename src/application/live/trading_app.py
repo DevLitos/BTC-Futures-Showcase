@@ -18,42 +18,30 @@ from src.domain.trading.state.state_machine import StateMachine, BotState
 from src.domain.market.filters import (
     KillConditionsFilter, BlackSwanFilter, HTFFilter,
     LTFTriggerFilter,
-    # MTFStructureFilter removed (FIX #1: Enable earlier entries)
-    # Advanced filters
-    check_funding_rate_safe,
     should_exit_on_funding,
-    check_session_quality,
-    check_htf_divergence,
-    calculate_vpoc,
-    check_vpoc_validity,
-    check_btc_trend,
-    # Specialized filters
-    LocationFilter, get_location_filter, LocationContext,
-    MicroTrendFilter, get_micro_trend_filter, MicroTrendState,
-    EntryFilterPipeline, get_entry_filter_pipeline,
-    SpreadFilter, get_spread_filter,  # 🔥 REMOVED Feb 04: check_spread_for_entry, SpreadCheckResult - unused
+    get_location_filter, LocationContext,
+    get_micro_trend_filter, MicroTrendState,
+    get_entry_filter_pipeline,
+    SpreadFilter, get_spread_filter,
 )
 from src.domain.risk.risk_engine import RiskEngine
 from src.infrastructure.exchanges.kraken.execution import round_size_to_exchange, KRAKEN_BTC_MIN_SIZE  # 🔒 FIX: Centralized size rounding + min size
 from src.shared.indicators import (
-    calculate_ema, calculate_atr, calculate_adx, calculate_rsi, calculate_bollinger_bands,
-    calculate_adx_with_di  # 🔥 FIX #83: For RegimeFusion +DI/-DI
+    calculate_ema, calculate_atr, calculate_adx, calculate_bollinger_bands,
+    calculate_adx_with_di
 )
-from src.config.trading_config import HTFFilters, RiskManagement, OperatingMode  # For logging thresholds + MODE
+from src.config.trading_config import HTFFilters, OperatingMode
 from src.config.trading_config import DailyRegimeDetector  # 🔥 FIX (Jan 23): Daily regime classification
 from src.domain.market.regime import EdgeRegimeClassifier, RegimeDetector, EntryRegime  # 🔥 REMOVED Feb 04: calculate_chase_atr - unused
-from src.domain.market.regime import TrendIntelligence, TrendPhase, get_trend_intelligence  # 🔥 NEW: Trend cycle detection
+from src.domain.market.regime import TrendPhase, get_trend_intelligence
 from src.domain.trading.edge.edge_enforcement import EdgeEnforcement
 from src.domain.trading.edge.edge_validator import ContextValidity
-# NOTE: PositionSizer class removed - using risk_engine for sizing
-from src.shared.time_provider import get_time_provider  # 🔥 REMOVED Feb 04: TimeProvider - unused
 from src.infrastructure.monitoring.error_tracker import get_error_tracker, ErrorSeverity
 from src.infrastructure.monitoring.system_health import SystemHealthMonitor
 from src.infrastructure.exchanges.kraken.exchange_reconciler import ExchangeReconciler  # 🔥 REMOVED Feb 04: ReconcilerState - unused
 from src.domain.market.structure.important_levels import (
     ImportantLevelsProvider, get_important_levels_provider,
-    initialize_important_levels, LevelContext
-    # 🔥 REMOVED Feb 04: LevelType - unused
+    LevelContext
 )
 from src.domain.trading.strategy.pullback_short import (
     get_pullback_short_engine,
@@ -97,7 +85,7 @@ from src.config.trading_config import (
     get_session_name
     # 🔥 REMOVED Feb 04: DynamicScoreThreshold, SessionTradeLimits, LossStreakConfig - unused
 )
-from src.domain.trading.scoring import EntryScorer, get_entry_scorer
+from src.domain.trading.scoring import get_entry_scorer
 
 # Extracted helper modules (Jan 20, 2026 - Phase 4 refactoring)
 # 🔥 CLEANED Feb 04: Removed 4 unused imports (_check_trend_pure, _check_volatility_expansion_pure, 
@@ -119,12 +107,6 @@ from src.shared.indicator_helpers import (
 from src.domain.trading.execution_logic.entry_quality import (
     get_entry_quality_gate
     # 🔥 REMOVED Feb 04: EntryQualityGate, GateDecision, GateResult - unused
-)
-
-# NEW (Jan 24, 2026): Intelligent Filter - Multi-layer decision system
-from src.domain.trading.execution_logic.intelligent_filter import (
-    get_intelligent_filter, FilterSeverity
-    # 🔥 REMOVED Feb 04: IntelligentFilter - unused
 )
 
 # NEW (Feb 2, 2026): Direction Orchestrator - Unified direction determination
@@ -160,55 +142,33 @@ from src.application.live.displacement_detector import (
     DisplacementDetector, MicroMomentumDetector
     # 🔥 REMOVED Feb 04: DisplacementResult - unused
 )
-from src.application.live.bias_invalidation_handler import (
-    BiasInvalidationHandler, ExpansionActivationHandler
-)
+from src.application.live.bias_invalidation_handler import BiasInvalidationHandler
 
 # 🔥 NEW (Feb 04, 2026): Extracted handlers
 from src.application.live.indicator_cache import IndicatorCache
-from src.application.live.exit_executor import ExitExecutor
-from src.application.live.displacement_handler import DisplacementHandler
-from src.application.live.cooldown_manager import CooldownManager, get_cooldown_manager
-from src.application.live.wait_fill_handler import (
-    WaitFillHandler, get_wait_fill_handler, FillHandlerContext
-)
+from src.application.live.cooldown_manager import get_cooldown_manager
 
 # NEW (Jan 24, 2026): ML Entry Score Refinement - Shadow mode logging
 from src.ml.inference import get_ml_inference_engine
 
 # NEW ARCHITECTURE: Position Store as Single Source of Truth
 from src.bootstrap.runtime import RuntimeMode, get_runtime_config
-from src.infrastructure.storage import get_position_store  # 🔥 REMOVED Feb 04: TrackedPosition - unused
-from src.domain.trading.cost.cost_model import get_cost_model  # 🔥 FIX (Jan 24): Cost validator
+from src.infrastructure.storage import get_position_store
 
 # 🔥 NEW (Jan 27, 2026 - AUDIT REFACTOR Point 3): Centralized indicator caching
 from src.application.live.indicator_cache import get_indicator_cache  # Canonical location
 
 # 🔥 NEW (Jan 27, 2026 - AUDIT REFACTOR Point 5): Position management utilities
 from src.application.live.position_manager import (
-    check_bos_against_position,
-    calculate_smart_trailing_stop,
-    get_position_manager,
     AnticipationChecker, MomentumDecayChecker, BOSInvalidationChecker,
     ExitDecision,
     ExhaustionTighteningChecker
-    # 🔥 REMOVED Feb 04: calculate_current_r, get_position_health_checker, PositionManager, ExitCheckResult - unused
 )
 
 # 🔥 REMOVED Feb 04: Entry execution utilities (ExecutionGuards, PositionSizeCalculator, 
 #                    LocationGuards, StopLossCalculator) - unused in trading_app.py
 
-# 🔥 NEW (Jan 27, 2026 - AUDIT REFACTOR): Entry validators
-from src.application.live.entry_validators import (
-    get_chase_validator,
-    get_graduated_sizer,
-    get_rr_validator,
-    get_cost_validator,
-    get_momentum_validator,
-    # 🔥 REMOVED Feb 04: ChaseValidator, GraduatedSizer, RRValidator, CostValidator, 
-    #                    MomentumValidator, ChaseResult, DefensiveSizingResult, 
-    #                    RRValidationResult, CostValidationResult - unused
-)
+
 
 # 🔧 AUDIT REFACTOR (Jan 27, 2026): Exit action handlers
 from src.application.live.exit_actions import (
@@ -226,7 +186,6 @@ from src.application.live.idle_state_handlers import (
     check_candle_gate,
     check_pending_state_conflicts,
     sync_with_exchange_if_needed,
-    handle_wait_ltf_state,
     check_anticipation_signal,
     update_daily_regime_if_needed,
     check_pre_trade_conditions,
@@ -237,22 +196,16 @@ from src.application.live.idle_state_handlers import (
 from src.application.live.market_analysis import (
     get_bias_strength_detector,
     get_trend_expansion_detector,
-    get_probing_checker,
-    get_short_obstinacy_calculator,
-    get_expected_r_calculator,
-    # 🔥 REMOVED Feb 04: calculate_chase_atr_helper, BiasStrengthDetector, TrendExpansionDetector, 
-    #                    ProbingCriteriaChecker, ShortObstinacyCalculator, ExpectedRCalculator, 
-    #                    BiasStrengthResult, TrendExpansionResult, ProbingResult, ExpectedRResult - unused
 )
 
 # 🔧 AUDIT REFACTOR (Jan 27, 2026): Trade recording module
 from src.application.live.trade_recording import (
-    TradeRecorder, get_trade_recorder, TradeRecordingState
+    get_trade_recorder
 )
 
 # 🔧 AUDIT REFACTOR (Jan 28, 2026): Entry orchestrator - consolidates _execute_entry
 from src.application.live.entry_orchestrator import (
-    orchestrate_entry, GuardOrchestrator, ScoreOrchestrator, SizingOrchestrator
+    orchestrate_entry
 )
 
 # 🎯 EDGE STATE MANAGER (Jan 27, 2026): Edge como evento discreto
@@ -260,7 +213,7 @@ from src.application.live.entry_orchestrator import (
 # 🔥 Extended (Jan 27, 2026): Soporte para RANGE y BREAKOUT edges
 # 🔥 Extended (Feb 04, 2026): Added RangeEdgeCriteria for flexible RANGE edge
 from src.domain.trading.edge_state_manager import (
-    EdgeStateManager, get_edge_manager, EdgeState, EdgeType, RangeEdgeCriteria
+    get_edge_manager, EdgeState, EdgeType, RangeEdgeCriteria
 )
 
 logger = logging.getLogger(__name__)
@@ -287,20 +240,6 @@ SIGNALS_GENERATED = Counter(
 
 # Configuration
 ENTRY_TIMEOUT_MINUTES = 3  # 3 candles at 1m = 3 minutes
-
-# =============================================================================
-# 🔥 FIX #135: SIMPLE_MODE ELIMINATED (Feb 10, 2026)
-# =============================================================================
-# The SIMPLE_MODE flag disabled several features that were causing bad trades.
-# Those features have now been COMPLETELY REMOVED from the codebase:
-# - ❌ REMOVED: SHORT OBSTINACY blocks
-# - ❌ REMOVED: BIAS INVERSION
-# - ❌ REMOVED: EMA Distance VETO (converted to context tagging)
-# - ❌ REMOVED: Micro Trend VETO (converted to context tagging)
-#
-# The constant SIMPLE_MODE = True is no longer needed.
-# Code now runs directly without conditional branches.
-# =============================================================================
 
 
 def _create_safe_task(coro, name: str = "anonymous"):
@@ -428,7 +367,6 @@ class SignalEngine:
         self.displacement_detector = DisplacementDetector()
         self.micro_momentum_detector = MicroMomentumDetector()
         self.bias_invalidation_handler = BiasInvalidationHandler()
-        self.expansion_activation_handler = ExpansionActivationHandler()
         
         # 🔥 NEW (Feb 04, 2026 - AUDIT FIX): Unified cooldown management
         # Consolidates: _cooldown_until, _rejection_cooldown_until, _short_cooldown_until
@@ -494,11 +432,6 @@ class SignalEngine:
         self._entry_gate = get_entry_quality_gate()
         
         # =====================================================================
-        # 🧠 INTELLIGENT FILTER - Multi-layer decision system (Jan 24, 2026)
-        # Accumulates penalties, no "entering anyway" - blocks if accumulated risk is too high
-        # =====================================================================
-        self._intelligent_filter = get_intelligent_filter()
-        
         # =====================================================================
         # 🤖 ML INFERENCE ENGINE (Jan 24, 2026) - Entry Score Refinement
         # SHADOW MODE: Logs predictions without affecting decisions
@@ -614,7 +547,6 @@ class SignalEngine:
         
         # 🔧 FIX #129 (Feb 09, 2026): Throttle repetitive evaluation logs
         self._last_vol_divergence_log: datetime | None = None  # Rate limit VOLUME DIVERGENCE logs
-        self._last_transition_mode_log: datetime | None = None  # Rate limit TRANSITION_MODE logs
         
         # =====================================================================
         # 💰 SESSION TRACKING (Jan 28, 2026)
@@ -973,6 +905,11 @@ class SignalEngine:
         self._short_cooldown_until: datetime | None = None  # Short obstinacy cooldown
         self._last_expansion_check_ts: int = 0  # Cache for expansion check
         
+        # ── Idle-pipeline inter-stage state (set by idle_stages/) ──
+        self._pending_pullback_short: dict | None = None
+        self._df_5m_micro: pd.DataFrame | None = None
+        self._df_1m_micro: pd.DataFrame | None = None
+        
         # =========================================================================
         # 🔥 FIX #37 (Feb 05, 2026): OBSTINACY BLOCK COUNTER
         # When SHORT_OBSTINACY blocks 3+ times consecutively, invalidate edge
@@ -1042,31 +979,11 @@ class SignalEngine:
         self._last_exhaustion_state: ExhaustionState | None = None
         
         # =====================================================================
-        # 🔧 AUDIT REFACTOR (Jan 27, 2026): Position Manager
-        # Orchestrates all position exit checks (anticipation, BOS, momentum decay)
-        # =====================================================================
-        self._position_manager = get_position_manager()
-        
-        # =====================================================================
-        # 🔧 AUDIT REFACTOR (Jan 27, 2026): Entry Validators
-        # Extracted from _execute_entry: chase, sizing, RR, cost validation
-        # =====================================================================
-        self._chase_validator = get_chase_validator(self.regime_detector, self._entry_threshold)
-        self._graduated_sizer = get_graduated_sizer()
-        self._rr_validator = get_rr_validator(self.slippage_model)
-        self._cost_validator = get_cost_validator()
-        self._momentum_validator = get_momentum_validator()
-        
-        # =====================================================================
         # 🔧 AUDIT REFACTOR (Jan 27, 2026): Market Analysis Helpers
         # Extracted: bias strength, trend expansion, probing, short obstinacy, expected R
         # =====================================================================
         self._bias_strength_detector = get_bias_strength_detector()
         self._trend_expansion_detector = get_trend_expansion_detector()
-        self._probing_checker = get_probing_checker()
-        self._short_obstinacy_calculator = get_short_obstinacy_calculator()
-        self._expected_r_calculator = get_expected_r_calculator()
-        
         # 🔧 AUDIT REFACTOR (Jan 27, 2026): Trade recording module
         self._trade_recorder = get_trade_recorder()
         
@@ -2009,27 +1926,11 @@ class SignalEngine:
             logger.debug("In OBSERVATION state, skipping entry evaluation")
             return
         
-        # =================================================================
-        # 🔥 FIX #304 (Feb 19, 2026): DEAD_HOURS HARD BLOCK
-        #
-        # PROBLEMA: Trade 5 entró SHORT @ $66,631 a las 03:45 UTC
-        # (DEAD_HOURS). El sizing mostró SESS=0.90 (moderate) en vez de
-        # 'poor' (blocked). El bug está en que session_quality no se
-        # setea correctamente antes del sizing, defaulteando a 'moderate'.
-        #
-        # SOLUCIÓN: Hard block aquí, ANTES de cualquier evaluación.
-        # Si la hora UTC es DEAD_HOURS (0-7), no evaluar nada.
-        # Esto es infalible — no depende de tags ni sizing.
-        # =================================================================
+        # DEAD_HOURS: Tag session early so sizing applies 0.30x multiplier
         _session = get_session_name(market_time.hour, market_time.minute, market_time.weekday())
         if _session == 'DEAD_HOURS':
-            self._idle_eval_count += 1
-            if self._idle_eval_count % 600 == 1:
-                logger.info(
-                    f"🌙 FIX #304: DEAD_HOURS HARD BLOCK | hour={market_time.hour} | "
-                    f"No trading during 0-8 UTC"
-                )
-            return
+            self._current_trade_tags['session'] = 'DEAD_HOURS'
+            self._current_trade_tags['session_quality'] = 'poor'
         
         # =====================================================================
         # � REFACTORED (Jan 27, 2026): Using idle_state_handlers
@@ -2104,16 +2005,6 @@ class SignalEngine:
             self.state_machine.transition_to(BotState.MANAGE, "Synced with exchange position")
             return
         
-        # ===== 5. WAIT_LTF STATE HANDLER =====
-        wait_ltf_result = await handle_wait_ltf_state(self, current_price, atr_1m, market_time)
-        if wait_ltf_result == "EXECUTING":
-            await self._execute_entry(current_price, atr_1m, market_time)
-            return
-        elif wait_ltf_result == "RESET":
-            return  # Setup invalidated or timed out
-        elif self.setup_state == "WAIT_LTF":
-            return  # Still waiting, stay in WAIT_LTF
-        
         # ===== 6. PRE-TRADE CHECKS =====
         can_trade, trade_reason = await check_pre_trade_conditions(self, market_time)
         if not can_trade:
@@ -2150,7 +2041,6 @@ class SignalEngine:
             htf_passed, bias, htf_reason = self.htf_filter.check(
                 df_1h,
                 current_price,
-                correlation_data=None
             )
             # Guardar en caché
             self._htf_cache_ts = last_1h_ts
@@ -2983,518 +2873,51 @@ class SignalEngine:
         displacement_detected = False
         displacement_direction = None  # str | None
         
-        # Calculate displacement from session prices
+        # =====================================================================
+        # REFACTORED: Displacement detection using symmetric method
+        # Replaces ~700 lines of near-identical SHORT/LONG copy-paste
+        # =====================================================================
         if drop_from_high >= displacement_threshold:
-            # Strong downward displacement detected
-            # NOTE: _active_direction is set by orchestrator, not here
             displacement_detected = True
             displacement_direction = 'SHORT'
-            # displacement_bypass se activa DESPUÉS de validar stale/range_floor/bad_phase
-            _short_disp_stale = False  # Se pone True si range_floor/stale/bad_phase bloquean
-            
-            # 🔥 STRONG DISPLACEMENT → ACTIVATE EXPANSION_MODE + DIRECTION_LOCK
-            if drop_from_high >= strong_displacement_threshold:
-                self._strong_displacement = True
-                
-                # =========================================================
-                # 🔥 FIX #9: STALE DISPLACEMENT CHECK (with active drop override)
-                # 
-                # STALE = precio cerca del mínimo Y el mínimo NO está descendiendo.
-                # Si rolling_low sigue bajando → caída activa → NOT stale.
-                # Solo es stale si el low se estabilizó (momentum agotado).
-                # =========================================================
-                distance_from_low = current_price - self._bias_low_since
-                stale_threshold = atr_5m * 0.5
-                is_stale_displacement = distance_from_low < stale_threshold and distance_from_low >= 0
-                
-                # Override stale if drop is actively continuing
-                if is_stale_displacement and hasattr(self, '_prev_rolling_low'):
-                    low_is_descending = self._bias_low_since < self._prev_rolling_low - atr_5m * 0.1
-                    if low_is_descending:
-                        is_stale_displacement = False
-                        if self._idle_eval_count % 30 == 1:
-                            logger.info(
-                                f"📉 ACTIVE DROP OVERRIDE: Low descending ${self._prev_rolling_low:.0f} → "
-                                f"${self._bias_low_since:.0f} | Displacement NOT stale"
-                            )
-                # Track previous rolling low for next eval
-                self._prev_rolling_low = self._bias_low_since
-                
-                if is_stale_displacement:
-                    _short_disp_stale = True
-                
-                # =========================================================
-                # 🔥 FIX #10 (Feb 4, 2026): RANGE_BOUND FLOOR CHECK
-                #
-                # PROBLEMA: En RANGE_BOUND, el displacement hacia abajo
-                # simplemente te lleva al FLOOR del rango, no es breakout.
-                # Hacer SHORT en el floor del rango = atrapado.
-                #
-                # SOLUCIÓN: Si TrendPhase=RANGE_BOUND y distancia al low
-                # es < 1.5 ATR → NO armar edge (estamos en el floor).
-                # El rango necesita romperse primero.
-                # =========================================================
-                trend_phase_check = getattr(self, '_trend_phase', TrendPhase.RANGE_BOUND)
-                is_range_bound = trend_phase_check == TrendPhase.RANGE_BOUND
-                range_floor_threshold = atr_5m * 1.5  # Cerca del floor si < 1.5 ATR
-                is_at_range_floor = is_range_bound and distance_from_low < range_floor_threshold
-                
-                if is_at_range_floor:
-                    self._current_trade_tags['range_floor_block'] = True
-                    self._current_trade_tags['range_floor_distance'] = distance_from_low
-                    self._current_trade_tags['range_floor_threshold'] = range_floor_threshold
-                    if self._idle_eval_count % 30 == 1 or not hasattr(self, '_last_range_floor_log'):
-                        logger.warning(
-                            f"🚫 RANGE FLOOR BLOCK SHORT: TrendPhase=RANGE_BOUND and price ${current_price:.0f} "
-                            f"is only ${distance_from_low:.0f} from low ${self._bias_low_since:.0f} "
-                            f"(< {range_floor_threshold:.0f} = 1.5 ATR) | "
-                            f"Cannot SHORT at the floor of a range - wait for breakout"
-                        )
-                        self._last_range_floor_log = True
-                    # Treat as stale for the purpose of blocking
-                    is_stale_displacement = True
-                    _short_disp_stale = True
-                
-                # =========================================================
-                # 🚫 FIX #222: NO ARMAR EDGE EN FASES MALAS
-                # 
-                # PROBLEMA: El sistema arma edge al detectar displacement, pero
-                # si la tendencia está en EXHAUSTION/DISTRIBUTION/DEATH, ese
-                # displacement es el FINAL del movimiento, no el inicio.
-                # Entrar aquí = entrar al final de la tendencia = pérdida.
-                #
-                # SOLUCIÓN: Para SHORT, verificar que la tendencia BAJISTA no
-                # esté en fase terminal. TrendPhase usa la tendencia mayor,
-                # así que TREND_EXHAUSTION en tendencia bajista = final de caída.
-                # =========================================================
-                is_bad_phase_for_short = trend_phase_check in [
-                    TrendPhase.TREND_EXHAUSTION, 
-                    TrendPhase.DISTRIBUTION, 
-                    TrendPhase.TREND_DEATH
-                ]
-                # Solo bloquear si la tendencia detectada es BEARISH (estamos persiguiendo short al final)
-                trend_dir_from_ti = getattr(self, '_trend_direction_from_ti', None)
-                if is_bad_phase_for_short and trend_dir_from_ti == 'BEARISH':
-                    self._current_trade_tags['bad_phase_block_short'] = True
-                    self._current_trade_tags['bad_phase'] = trend_phase_check.value if hasattr(trend_phase_check, 'value') else str(trend_phase_check)
-                    if self._idle_eval_count % 30 == 1 or not hasattr(self, '_last_bad_phase_log_short'):
-                        logger.warning(
-                            f"🚫 FIX #222 BAD PHASE BLOCK SHORT: TrendPhase={trend_phase_check.value if hasattr(trend_phase_check, 'value') else trend_phase_check} "
-                            f"+ Trend=BEARISH | Displacement ${drop_from_high:.0f} detected but trend is DYING | "
-                            f"NOT arming edge - would enter at END of bearish move"
-                        )
-                        self._last_bad_phase_log_short = True
-                    # Treat as stale to prevent edge arming
-                    is_stale_displacement = True
-                    _short_disp_stale = True
-                
-                if is_stale_displacement and not is_at_range_floor:
-                    self._current_trade_tags['stale_displacement'] = True
-                    self._current_trade_tags['stale_distance_from_extreme'] = distance_from_low
-                    self._current_trade_tags['stale_threshold'] = stale_threshold
-                    if self._idle_eval_count % 30 == 1 or not hasattr(self, '_last_stale_log_short'):
-                        logger.warning(
-                            f"⚠️ STALE DISPLACEMENT SHORT: Price ${current_price:.0f} is only ${distance_from_low:.0f} "
-                            f"from low ${self._bias_low_since:.0f} (< {stale_threshold:.0f} ATR threshold) | "
-                            f"Momentum exhausted → NOT arming edge"
-                        )
-                        self._last_stale_log_short = True
-                
-                # =========================================================
-                # 🚫 RANGE_BOUND BLOCK: No displacement in range mode
-                # Range markets bounce between extremes. A displacement in
-                # a range is noise (false breakout), not a trend signal.
-                # Entering on displacement at range extremes = buying tops,
-                # selling bottoms = guaranteed losses.
-                # =========================================================
-                if getattr(self, '_trend_phase', None) == TrendPhase.RANGE_BOUND:
-                    if not is_stale_displacement:
-                        if self._idle_eval_count % 60 == 1:
-                            logger.info(
-                                f"🚫 RANGE_BOUND BLOCK SHORT: Displacement ${drop_from_high:.0f} "
-                                f"detected but TrendPhase=RANGE_BOUND | NOT arming edge"
-                            )
-                        is_stale_displacement = True
-                        _short_disp_stale = True
-
-                # 🔥 EXPANSION_MODE ACTIVATION: Only activate if not already in expansion
-                # or if this is a stronger displacement in the same direction
-                # 🔥 FIX #9: Also check for stale displacement
-                # EXPANSION_MODE: Activar SOLO si displacement no es stale
-                # Si expansion YA estaba activa en la misma dirección pero ahora es stale,
-                # DESACTIVAR — el momentum se agotó o estamos en el extremo del rango.
-                if is_stale_displacement and self._expansion_mode and self._expansion_direction == 'SHORT':
-                    logger.warning(
-                        f"🔄 EXPANSION_MODE CLEARED: SHORT displacement now STALE | "
-                        f"range_floor={is_at_range_floor} | dist_from_low=${distance_from_low:.0f}"
-                    )
-                    self._expansion_mode = False
-                    self._expansion_direction = None
-                    self._direction_lock = None
-                    self._direction_lock_expires_at = None
-                # 🔥 DIRECTION MEMORY: Block same-direction displacement for 30 minutes
-                # After a SHORT trade exits, don't re-enter SHORT at exhaustion.
-                # Feb 19 evidence: TP hit → 66s re-entry at bottom → instant SL.
-                # For OPPOSITE direction: only 3 minutes (displacement consumed).
-                _SAME_DIR_BLOCK_SECONDS = 1800  # 30 minutes
-                _ANY_DIR_BLOCK_SECONDS = 180    # 3 minutes
-                
-                _elapsed_since_exit = (
-                    (datetime.now() - self._last_trade_exit_time).total_seconds()
-                    if self._last_trade_exit_time else 99999
-                )
-                _same_dir_block = (
-                    self._last_trade_direction == 'SHORT' and
-                    _elapsed_since_exit < _SAME_DIR_BLOCK_SECONDS
-                )
-                _any_dir_block = _elapsed_since_exit < _ANY_DIR_BLOCK_SECONDS
-                
-                if (_same_dir_block or _any_dir_block) and not self._expansion_mode:
-                    if self._idle_eval_count % 60 == 1:
-                        block_type = "SAME DIR 30min" if _same_dir_block else "CONSUMED 3min"
-                        remaining = (_SAME_DIR_BLOCK_SECONDS if _same_dir_block else _ANY_DIR_BLOCK_SECONDS) - _elapsed_since_exit
-                        logger.info(
-                            f"⏳ SHORT displacement ${drop_from_high:.0f} BLOCKED ({block_type}) | "
-                            f"Last trade={self._last_trade_direction} {_elapsed_since_exit:.0f}s ago | "
-                            f"Wait {remaining:.0f}s"
-                        )
-                elif (not self._expansion_mode or self._expansion_direction != 'SHORT') and not is_stale_displacement:
-                    self._expansion_mode = True
-                    self._expansion_direction = 'SHORT'
-                    self._expansion_start_time = datetime.now()
-                    self._expansion_initial_displacement = drop_from_high
-                    self._last_stale_log_short = False  # Reset stale log flag
-                    
-                    # 🔒 DIRECTION_LOCK ACTIVATION: Lock direccional post-DISPLACEMENT
-                    self._direction_lock = 'SHORT'
-                    self._direction_lock_reason = 'STRONG_DISPLACEMENT'
-                    self._direction_lock_expires_at = datetime.now() + timedelta(minutes=self._direction_lock_timeout_minutes)
-                    self._direction_lock_initial_move = drop_from_high
-                    
-                    logger.warning(
-                        f"🚀 EXPANSION_MODE + DIRECTION_LOCK ACTIVATED: SHORT | "
-                        f"Initial displacement ${drop_from_high:.0f} ≥ {strong_displacement_threshold:.0f} | "
-                        f"BIAS FLIP threshold now 3x | Lock: {self._direction_lock_timeout_minutes}min | "
-                        f"INVALIDATION requires ${drop_from_high * self._asymmetric_invalidation_mult:.0f} opposite (3x)"
-                    )
-                    self._current_trade_tags['expansion_mode_activated'] = True
-                    self._current_trade_tags['expansion_direction'] = 'SHORT'
-                    self._current_trade_tags['direction_lock'] = 'SHORT'
-                    
-                    # =========================================================
-                    # 🌊 FIX CRÍTICO (Jan 30, 2026): ARM DISPLACEMENT_EDGE
-                    # 
-                    # PROBLEMA: EXPANSION_MODE + DIRECTION_LOCK funcionaban
-                    # pero NO generaban EDGE → 0 trades en caída de 2.3%
-                    # 
-                    # SOLUCIÓN: Armar DISPLACEMENT_EDGE automáticamente
-                    # El displacement ES el edge - no necesita más confirmación
-                    # 🔥 FIX (Feb 4, 2026): Pass STALE info to block stale edges
-                    # =========================================================
-                    displacement_edge_armed = self._edge_manager.arm_displacement_edge(
-                        current_price=current_price,
-                        direction='SHORT',
-                        displacement_amount=drop_from_high,
-                        atr=atr_5m,
-                        market_time=market_time,
-                        initial_price=self._bias_high_since,
-                        is_stale=is_stale_displacement,
-                        stale_distance=distance_from_low
-                    )
-                    if displacement_edge_armed:
-                        self._current_trade_tags['displacement_edge_armed'] = True
-                        self._current_trade_tags['edge_type'] = 'DISPLACEMENT'
-                        logger.info(
-                            f"🌊 DISPLACEMENT EDGE ARMED: SHORT | "
-                            f"Displacement ${drop_from_high:.0f} | Initial ${self._bias_high_since:.0f}"
-                        )
-                    else:
-                        # 🔥 FIX #241: Edge already active — refresh origin if same direction
-                        # This keeps the edge "fresh" when continuation signals occur
-                        if (self._edge_manager.state == EdgeState.EDGE_ACTIVE and 
-                            self._edge_manager.direction == 'SHORT'):
-                            self._edge_manager.refresh_edge_origin(current_price, market_time)
-                
-                # Clear forbidden direction - displacement wins
-                if self._forbidden_direction == 'SHORT':
-                    logger.info(
-                        f"🔥 DISPLACEMENT OVERRIDE BIAS FLIP: Down ${drop_from_high:.0f} ≥ {strong_displacement_threshold:.0f} | "
-                        f"Clearing FORBIDDEN=SHORT - momentum wins"
-                    )
-                    self._forbidden_direction = None
-                    self._current_trade_tags['displacement_override_bias_flip'] = True
-            
-            # Activar displacement_bypass SOLO si no fue bloqueado por
-            # range floor, stale, o bad phase.
-            if not _short_disp_stale:
-                self._displacement_bypass = True
-            
-            if self._idle_eval_count % 30 == 1:
-                logger.info(
-                    f"🔥 DISPLACEMENT DETECTED: Down ${drop_from_high:.0f} ≥ {displacement_threshold:.0f} "
-                    f"→ ACTIVE_DIRECTION=SHORT | Bypass={'ON' if self._displacement_bypass else 'BLOCKED(stale)'}"
-                    f"{' | STRONG DISPLACEMENT' if self._strong_displacement else ''}"
-                    f"{' | EXPANSION_MODE' if self._expansion_mode else ''}"
-                )
+            is_stale = self._process_strong_displacement(
+                'SHORT', drop_from_high, strong_displacement_threshold,
+                current_price, atr_5m, market_time,
+            )
+            self._displacement_bypass = not is_stale
             self._current_trade_tags['displacement_direction'] = 'SHORT'
             self._current_trade_tags['displacement_amount'] = drop_from_high
             self._current_trade_tags['strong_displacement'] = self._strong_displacement
-            
-        elif rise_from_low >= displacement_threshold:
-            # Strong upward displacement detected
-            # NOTE: _active_direction is set by orchestrator, not here
-            displacement_detected = True
-            displacement_direction = 'LONG'
-            # displacement_bypass se activa DESPUÉS de validar stale/range_ceiling/bad_phase
-            _long_disp_stale = False  # Se pone True si range_ceiling/stale/bad_phase bloquean
-            
-            # 🔥 STRONG DISPLACEMENT → ACTIVATE EXPANSION_MODE + DIRECTION_LOCK
-            if rise_from_low >= strong_displacement_threshold:
-                self._strong_displacement = True
-                
-                # =========================================================
-                # 🔥 FIX #9: STALE DISPLACEMENT CHECK (LONG, with active rise override)
-                # 
-                # STALE = precio cerca del máximo Y el máximo NO está subiendo.
-                # Si rolling_high sigue subiendo → subida activa → NOT stale.
-                # =========================================================
-                distance_from_high = self._bias_high_since - current_price
-                stale_threshold_long = atr_5m * 0.5
-                is_stale_displacement_long = distance_from_high < stale_threshold_long and distance_from_high >= 0
-                
-                # Override stale if rise is actively continuing
-                if is_stale_displacement_long and hasattr(self, '_prev_rolling_high'):
-                    high_is_ascending = self._bias_high_since > self._prev_rolling_high + atr_5m * 0.1
-                    if high_is_ascending:
-                        is_stale_displacement_long = False
-                        if self._idle_eval_count % 30 == 1:
-                            logger.info(
-                                f"📈 ACTIVE RISE OVERRIDE: High ascending ${self._prev_rolling_high:.0f} → "
-                                f"${self._bias_high_since:.0f} | Displacement NOT stale"
-                            )
-                # Track previous rolling high for next eval
-                self._prev_rolling_high = self._bias_high_since
-                
-                if is_stale_displacement_long:
-                    _long_disp_stale = True
-                
-                # =========================================================
-                # 🔥 FIX #10 (Feb 4, 2026): RANGE_BOUND CEILING CHECK
-                #
-                # PROBLEMA: En RANGE_BOUND, el displacement hacia arriba
-                # simplemente te lleva al CEILING del rango, no es breakout.
-                # Hacer LONG en el ceiling del rango = atrapado.
-                #
-                # SOLUCIÓN: Si TrendPhase=RANGE_BOUND y distancia al high
-                # es < 1.5 ATR → NO armar edge (estamos en el ceiling).
-                # =========================================================
-                trend_phase_check_long = getattr(self, '_trend_phase', TrendPhase.RANGE_BOUND)
-                is_range_bound_long = trend_phase_check_long == TrendPhase.RANGE_BOUND
-                range_ceiling_threshold = atr_5m * 1.5  # Cerca del ceiling si < 1.5 ATR
-                is_at_range_ceiling = is_range_bound_long and distance_from_high < range_ceiling_threshold
-                
-                if is_at_range_ceiling:
-                    self._current_trade_tags['range_ceiling_block'] = True
-                    self._current_trade_tags['range_ceiling_distance'] = distance_from_high
-                    self._current_trade_tags['range_ceiling_threshold'] = range_ceiling_threshold
-                    if self._idle_eval_count % 30 == 1 or not hasattr(self, '_last_range_ceiling_log'):
-                        logger.warning(
-                            f"🚫 RANGE CEILING BLOCK LONG: TrendPhase=RANGE_BOUND and price ${current_price:.0f} "
-                            f"is only ${distance_from_high:.0f} from high ${self._bias_high_since:.0f} "
-                            f"(< {range_ceiling_threshold:.0f} = 1.5 ATR) | "
-                            f"Cannot LONG at the ceiling of a range - wait for breakout"
-                        )
-                        self._last_range_ceiling_log = True
-                    # Treat as stale for the purpose of blocking
-                    is_stale_displacement_long = True
-                    _long_disp_stale = True
-                
-                # =========================================================
-                # 🚫 FIX #222: NO ARMAR EDGE EN FASES MALAS (LONG)
-                # 
-                # PROBLEMA: El sistema arma edge al detectar displacement, pero
-                # si la tendencia está en EXHAUSTION/DISTRIBUTION/DEATH, ese
-                # displacement es el FINAL del movimiento, no el inicio.
-                # Entrar aquí = entrar al final de la tendencia = pérdida.
-                #
-                # SOLUCIÓN: Para LONG, verificar que la tendencia ALCISTA no
-                # esté en fase terminal. TrendPhase usa la tendencia mayor,
-                # así que TREND_EXHAUSTION en tendencia alcista = final de subida.
-                # =========================================================
-                is_bad_phase_for_long = trend_phase_check_long in [
-                    TrendPhase.TREND_EXHAUSTION, 
-                    TrendPhase.DISTRIBUTION, 
-                    TrendPhase.TREND_DEATH
-                ]
-                # Solo bloquear si la tendencia detectada es BULLISH (estamos persiguiendo long al final)
-                trend_dir_from_ti_long = getattr(self, '_trend_direction_from_ti', None)
-                if is_bad_phase_for_long and trend_dir_from_ti_long == 'BULLISH':
-                    self._current_trade_tags['bad_phase_block_long'] = True
-                    self._current_trade_tags['bad_phase'] = trend_phase_check_long.value if hasattr(trend_phase_check_long, 'value') else str(trend_phase_check_long)
-                    if self._idle_eval_count % 30 == 1 or not hasattr(self, '_last_bad_phase_log_long'):
-                        logger.warning(
-                            f"🚫 FIX #222 BAD PHASE BLOCK LONG: TrendPhase={trend_phase_check_long.value if hasattr(trend_phase_check_long, 'value') else trend_phase_check_long} "
-                            f"+ Trend=BULLISH | Displacement ${rise_from_low:.0f} detected but trend is DYING | "
-                            f"NOT arming edge - would enter at END of bullish move"
-                        )
-                        self._last_bad_phase_log_long = True
-                    # Treat as stale to prevent edge arming
-                    is_stale_displacement_long = True
-                    _long_disp_stale = True
-                
-                if is_stale_displacement_long and not is_at_range_ceiling:
-                    self._current_trade_tags['stale_displacement'] = True
-                    self._current_trade_tags['stale_distance_from_extreme'] = distance_from_high
-                    self._current_trade_tags['stale_threshold'] = stale_threshold_long
-                    if self._idle_eval_count % 30 == 1 or not hasattr(self, '_last_stale_log_long'):
-                        logger.warning(
-                            f"⚠️ STALE DISPLACEMENT LONG: Price ${current_price:.0f} is only ${distance_from_high:.0f} "
-                            f"from high ${self._bias_high_since:.0f} (< {stale_threshold_long:.0f} ATR threshold) | "
-                            f"Momentum exhausted → NOT arming edge"
-                        )
-                        self._last_stale_log_long = True
-                
-                # =========================================================
-                # 🚫 RANGE_BOUND BLOCK: No displacement in range mode
-                # Range markets bounce between extremes. A displacement in
-                # a range is noise (false breakout), not a trend signal.
-                # Entering on displacement at range extremes = buying tops,
-                # selling bottoms = guaranteed losses.
-                # =========================================================
-                if getattr(self, '_trend_phase', None) == TrendPhase.RANGE_BOUND:
-                    if not is_stale_displacement_long:
-                        if self._idle_eval_count % 60 == 1:
-                            logger.info(
-                                f"🚫 RANGE_BOUND BLOCK LONG: Displacement ${rise_from_low:.0f} "
-                                f"detected but TrendPhase=RANGE_BOUND | NOT arming edge"
-                            )
-                        is_stale_displacement_long = True
-                        _long_disp_stale = True
-
-                # 🔥 EXPANSION_MODE ACTIVATION: Only activate if not already in expansion
-                # or if this is a stronger displacement in the same direction
-                # 🔥 FIX #9: Also check for stale displacement
-                # EXPANSION_MODE: Activar SOLO si displacement no es stale
-                # Si expansion YA estaba activa en la misma dirección pero ahora es stale,
-                # DESACTIVAR — el momentum se agotó o estamos en el extremo del rango.
-                if is_stale_displacement_long and self._expansion_mode and self._expansion_direction == 'LONG':
-                    logger.warning(
-                        f"🔄 EXPANSION_MODE CLEARED: LONG displacement now STALE | "
-                        f"range_ceiling={is_at_range_ceiling} | dist_from_high=${distance_from_high:.0f}"
-                    )
-                    self._expansion_mode = False
-                    self._expansion_direction = None
-                    self._direction_lock = None
-                    self._direction_lock_expires_at = None
-                # 🔥 DIRECTION MEMORY: Block same-direction displacement for 30 minutes
-                _SAME_DIR_BLOCK_SECONDS = 1800  # 30 minutes
-                _ANY_DIR_BLOCK_SECONDS = 180    # 3 minutes
-                
-                _elapsed_since_exit_long = (
-                    (datetime.now() - self._last_trade_exit_time).total_seconds()
-                    if self._last_trade_exit_time else 99999
-                )
-                _same_dir_block_long = (
-                    self._last_trade_direction == 'LONG' and
-                    _elapsed_since_exit_long < _SAME_DIR_BLOCK_SECONDS
-                )
-                _any_dir_block_long = _elapsed_since_exit_long < _ANY_DIR_BLOCK_SECONDS
-                
-                if (_same_dir_block_long or _any_dir_block_long) and not self._expansion_mode:
-                    if self._idle_eval_count % 60 == 1:
-                        block_type = "SAME DIR 30min" if _same_dir_block_long else "CONSUMED 3min"
-                        remaining = (_SAME_DIR_BLOCK_SECONDS if _same_dir_block_long else _ANY_DIR_BLOCK_SECONDS) - _elapsed_since_exit_long
-                        logger.info(
-                            f"⏳ LONG displacement ${rise_from_low:.0f} BLOCKED ({block_type}) | "
-                            f"Last trade={self._last_trade_direction} {_elapsed_since_exit_long:.0f}s ago | "
-                            f"Wait {remaining:.0f}s"
-                        )
-                elif (not self._expansion_mode or self._expansion_direction != 'LONG') and not is_stale_displacement_long:
-                    self._expansion_mode = True
-                    self._expansion_direction = 'LONG'
-                    self._expansion_start_time = datetime.now()
-                    self._expansion_initial_displacement = rise_from_low
-                    self._last_stale_log_long = False  # Reset stale log flag
-                    
-                    # 🔒 DIRECTION_LOCK ACTIVATION: Lock direccional post-DISPLACEMENT
-                    self._direction_lock = 'LONG'
-                    self._direction_lock_reason = 'STRONG_DISPLACEMENT'
-                    self._direction_lock_expires_at = datetime.now() + timedelta(minutes=self._direction_lock_timeout_minutes)
-                    self._direction_lock_initial_move = rise_from_low
-                    
-                    logger.warning(
-                        f"🚀 EXPANSION_MODE + DIRECTION_LOCK ACTIVATED: LONG | "
-                        f"Initial displacement ${rise_from_low:.0f} ≥ {strong_displacement_threshold:.0f} | "
-                        f"BIAS FLIP threshold now 3x | Lock: {self._direction_lock_timeout_minutes}min | "
-                        f"INVALIDATION requires ${rise_from_low * self._asymmetric_invalidation_mult:.0f} opposite (3x)"
-                    )
-                    self._current_trade_tags['expansion_mode_activated'] = True
-                    self._current_trade_tags['expansion_direction'] = 'LONG'
-                    self._current_trade_tags['direction_lock'] = 'LONG'
-                    
-                    # =========================================================
-                    # 🌊 FIX CRÍTICO (Jan 30, 2026): ARM DISPLACEMENT_EDGE
-                    # 
-                    # PROBLEMA: EXPANSION_MODE + DIRECTION_LOCK funcionaban
-                    # pero NO generaban EDGE → 0 trades
-                    # 
-                    # SOLUCIÓN: Armar DISPLACEMENT_EDGE automáticamente
-                    # El displacement ES el edge - no necesita más confirmación
-                    # 🔥 FIX (Feb 4, 2026): Pass STALE info to block stale edges
-                    # =========================================================
-                    displacement_edge_armed = self._edge_manager.arm_displacement_edge(
-                        current_price=current_price,
-                        direction='LONG',
-                        displacement_amount=rise_from_low,
-                        atr=atr_5m,
-                        market_time=market_time,
-                        initial_price=self._bias_low_since,
-                        is_stale=is_stale_displacement_long,
-                        stale_distance=distance_from_high
-                    )
-                    if displacement_edge_armed:
-                        self._current_trade_tags['displacement_edge_armed'] = True
-                        self._current_trade_tags['edge_type'] = 'DISPLACEMENT'
-                        logger.info(
-                            f"🌊 DISPLACEMENT EDGE ARMED: LONG | "
-                            f"Displacement ${rise_from_low:.0f} | Initial ${self._bias_low_since:.0f}"
-                        )
-                    else:
-                        # 🔥 FIX #241: Edge already active — refresh origin if same direction
-                        if (self._edge_manager.state == EdgeState.EDGE_ACTIVE and 
-                            self._edge_manager.direction == 'LONG'):
-                            self._edge_manager.refresh_edge_origin(current_price, market_time)
-                
-                # Clear forbidden direction - displacement wins
-                if self._forbidden_direction == 'LONG':
-                    logger.info(
-                        f"🔥 DISPLACEMENT OVERRIDE BIAS FLIP: Up ${rise_from_low:.0f} ≥ {strong_displacement_threshold:.0f} | "
-                        f"Clearing FORBIDDEN=LONG - momentum wins"
-                    )
-                    self._forbidden_direction = None
-                    self._current_trade_tags['displacement_override_bias_flip'] = True
-            
-            # Activar displacement_bypass SOLO si no fue bloqueado por
-            # range ceiling, stale, o bad phase.
-            if not _long_disp_stale:
-                self._displacement_bypass = True
-            
             if self._idle_eval_count % 30 == 1:
                 logger.info(
-                    f"🔥 DISPLACEMENT DETECTED: Up ${rise_from_low:.0f} ≥ {displacement_threshold:.0f} "
-                    f"→ ACTIVE_DIRECTION=LONG | Bypass={'ON' if self._displacement_bypass else 'BLOCKED(stale)'}"
-                    f"{' | STRONG DISPLACEMENT' if self._strong_displacement else ''}"
-                    f"{' | EXPANSION_MODE' if self._expansion_mode else ''}"
+                    f"🔥 DISPLACEMENT: Down ${drop_from_high:.0f} ≥ ${displacement_threshold:.0f} → "
+                    f"Bypass={'ON' if self._displacement_bypass else 'BLOCKED(stale)'}"
+                    f"{' | STRONG' if self._strong_displacement else ''}"
+                    f"{' | EXPANSION' if self._expansion_mode else ''}"
                 )
+
+        elif rise_from_low >= displacement_threshold:
+            displacement_detected = True
+            displacement_direction = 'LONG'
+            is_stale = self._process_strong_displacement(
+                'LONG', rise_from_low, strong_displacement_threshold,
+                current_price, atr_5m, market_time,
+            )
+            self._displacement_bypass = not is_stale
             self._current_trade_tags['displacement_direction'] = 'LONG'
             self._current_trade_tags['displacement_amount'] = rise_from_low
             self._current_trade_tags['strong_displacement'] = self._strong_displacement
-            
+            if self._idle_eval_count % 30 == 1:
+                logger.info(
+                    f"🔥 DISPLACEMENT: Up ${rise_from_low:.0f} ≥ ${displacement_threshold:.0f} → "
+                    f"Bypass={'ON' if self._displacement_bypass else 'BLOCKED(stale)'}"
+                    f"{' | STRONG' if self._strong_displacement else ''}"
+                    f"{' | EXPANSION' if self._expansion_mode else ''}"
+                )
+
         else:
-            # No displacement - reset flags
+            # No displacement
             self._strong_displacement = False
-            displacement_detected = False
-            displacement_direction = None
         
         # =====================================================================
         # 🎭 UNIFIED DIRECTION ORCHESTRATION (Feb 2, 2026 - REFACTORED)
@@ -3856,2457 +3279,272 @@ class SignalEngine:
         # ===================================================================
         # Sources considered "quality" enough to trade on
         # Used by RANGE_MID, TRANSITION, and TREND mode gates
-        # Sources considered "quality" enough to trade on
-        # Used by RANGE_MID, TRANSITION, and TREND mode gates
         # Matches the commit +$4 proven list + TRANSITION_MODE (with macro guard)
         _core_sources = ('EXPANSION_MODE', 'EDGE_BREAKOUT', 'DISPLACEMENT', 
                          'ANTICIPATION', 'TRANSITION_MODE', 'RANGE_MR_LOW', 
-                         'RANGE_MR_HIGH', 'BIAS_FLIP', 'BIAS_RECOVERY')
+                         'RANGE_MR_HIGH', 'BIAS_FLIP', 'BIAS_RECOVERY',
+                         'STRUCTURAL_RANGE_FALLBACK')
         
         # ===================================================================
-        # RANGE MODE RULES (ADX < 18)
-        # Not a block - different entry rules for ranging markets
-        # 🔥 FIX (Jan 23): MUST have location_context, otherwise NO TRADE
-        # 🔥 FIX (Jan 24): Calculate location_context EARLY if in RANGE mode
-        # 🔥 FIX (Jan 30): SKIP RANGE ANALYSIS when DISPLACEMENT EDGE is active
+        # IDLE PIPELINE — stages extracted to idle_stages/
         # ===================================================================
-        skip_range_analysis = False  # 🔥 FIX (Jan 30)
-        if trading_mode == 'RANGE':
-            # =================================================================
-            # 🔥 FIX #287 (Feb 17, 2026): MICRO-RANGE DETECTION
-            #
-            # ROOT CAUSE: System entered 3 LONGs in a 0.30% micro-range
-            # ($68,720-$68,951 = $230 over 2 hours). The 60-day swing range 
-            # is $3,694 (fine) but the REAL recent price action was dead.
-            #
-            # SOLUTION: Check the actual range of recent 1m candles.
-            # If (max_high - min_low) / price < 0.40% over the last 60 candles,
-            # the market is in a micro-consolidation. No directional trade
-            # will work here — wait for the breakout.
-            #
-            # 0.40% of $69,000 ≈ $276. This filters $230 ranges but allows
-            # $300+ ranges where a 1R trade ($100+ SL) can develop.
-            # Bypass: DISPLACEMENT/EXPANSION (they break the micro-range).
-            # =================================================================
-            if not self._displacement_bypass and not self._expansion_mode:
-                try:
-                    _candles_micro = self.market_data.get_candles('1m')
-                    if _candles_micro and len(_candles_micro) >= 30:
-                        _n_check = min(60, len(_candles_micro))
-                        _recent_candles = _candles_micro[-_n_check:]
-                        _micro_high = max(float(c.get('high', 0) or 0) for c in _recent_candles)
-                        _micro_low = min(float(c.get('low', 1e9) or 1e9) for c in _recent_candles)
-                        _micro_range = _micro_high - _micro_low
-                        _micro_range_pct = (_micro_range / current_price) * 100 if current_price > 0 else 0
-                        MIN_MICRO_RANGE_PCT = 0.40
-                    if _micro_range_pct < MIN_MICRO_RANGE_PCT:
-                        if self._idle_eval_count % 300 == 1:
-                            logger.warning(
-                                f"🚫 FIX #287 MICRO-RANGE: Last 60 candles H=${_micro_high:.0f} L=${_micro_low:.0f} | "
-                                f"Range=${_micro_range:.0f} ({_micro_range_pct:.2f}%) < {MIN_MICRO_RANGE_PCT}% | "
-                                f"Dead market — no profitable edge | Waiting for breakout"
-                            )
-                        self._regime_blocked = True
-                        self._regime_block_reason = f"MICRO_RANGE ({_micro_range_pct:.2f}% < {MIN_MICRO_RANGE_PCT}%)"
-                        return
-                except Exception:
-                    pass  # If candle data unavailable, skip check
-            
-            # 🔥 DISPLACEMENT EDGE KILLS RANGE ANALYSIS (Jan 30, 2026)
-            # When DISPLACEMENT edge is active, RANGE analysis is NOISE
-            # The market already broke out of range - don't confuse the system
-            has_displacement_edge_active = (
-                hasattr(self, '_edge_manager') and
-                self._edge_manager.state == EdgeState.EDGE_ACTIVE and
-                self._edge_manager.current_bos is not None and
-                self._edge_manager.current_bos.edge_type == EdgeType.DISPLACEMENT
-            )
-            if has_displacement_edge_active:
-                # Skip ALL range analysis - displacement edge takes over
-                skip_range_analysis = True
-                if self._idle_eval_count % 60 == 1:
-                    disp_dir = self._edge_manager.current_bos.direction if self._edge_manager.current_bos else 'UNKNOWN'
-                    logger.info(
-                        f"🌊 RANGE SKIPPED: DISPLACEMENT EDGE {disp_dir} is active | "
-                        f"Range analysis disabled - market already broke range"
-                    )
-        
-        # Only process RANGE rules if not skipping
-        if trading_mode == 'RANGE' and not skip_range_analysis:
-            # EARLY location_context calculation if missing
-            # This fixes timing bug where we check before calculating
-            if not self._location_context:
-                try:
-                    closes_1h_early = np.asarray(df_1h['close'].to_numpy())
-                    highs_1h_early = np.asarray(df_1h['high'].to_numpy())
-                    lows_1h_early = np.asarray(df_1h['low'].to_numpy())
-                    volumes_1h_early = np.asarray(df_1h['volume'].to_numpy()) if 'volume' in df_1h.columns else np.ones(len(closes_1h_early))
-                    
-                    atr_1h_vals_early = calculate_atr(highs_1h_early, lows_1h_early, closes_1h_early, 14)
-                    atr_1h_early = atr_1h_vals_early[-1] if len(atr_1h_vals_early) > 0 else current_price * 0.01
-                    
-                    adx_1h_vals_early, _ = calculate_adx(highs_1h_early, lows_1h_early, closes_1h_early, 14)
-                    adx_1h_early = adx_1h_vals_early[-1] if len(adx_1h_vals_early) > 0 else 20.0
-                    
-                    location_cache_key_early = _ts_to_int(df_1h.iloc[-1].get('timestamp', 0))
-                    _, _, self._location_context = self.location_filter.check(
-                        closes_1h=closes_1h_early,
-                        highs_1h=highs_1h_early,
-                        lows_1h=lows_1h_early,
-                        volumes_1h=volumes_1h_early,
-                        current_price=current_price,
-                        atr_1h=atr_1h_early,
-                        adx_1h=adx_1h_early,
-                        bias=bias,
-                        regime='RANGE',
-                        cache_key=location_cache_key_early
-                    )
-                    logger.debug(f"📍 RANGE MODE: Calculated early location_context")
-                except Exception as e:
-                    logger.warning(f"⚠️ RANGE MODE: Failed to calculate early location_context: {e}")
-            
-            # In RANGE: Only trade at EXTREMES (VAH/VAL/VWAP deviation)
-            # Check if we're at an extreme using location context
-            at_extreme = False
-            extreme_type = None
-            
-            # 🔥 FIX: If no location_context, we can't determine if at extreme
-            # In RANGE mode without context = NO TRADE (conservative)
-            # 🔥 FIX (Jan 29, 2026): DON'T BLOCK if DISPLACEMENT/EXPANSION is active!
-            if not self._location_context:
-                # Check if we should bypass due to displacement
-                if self._displacement_bypass or self._expansion_mode:
-                    logger.info(
-                        f"🔥 RANGE MODE: No location_context but DISPLACEMENT active | "
-                        f"BYPASSING range check - displacement takes priority"
-                    )
-                    # Don't return - continue to trade
-                else:
-                    if self._idle_eval_count % 120 == 1:
-                        logger.info(
-                            f"⏸️ RANGE MODE: No location context available | "
-                            f"Cannot determine if at extreme - SKIPPING"
-                        )
-                    return
-            
-            pct_60d = self._location_context.percentile_60d if self._location_context else 50.0
-            self._current_trade_tags['percentile_60d'] = pct_60d
-            
-            # 🌊 BE WATER: ADAPTIVE VOLUME THRESHOLD
-            # En volatilidad alta, volumen importa más (necesitamos confirmación)
-            # En volatilidad baja, podemos aceptar menos volumen (mercado lento)
-            BASE_MIN_VOLUME_RATIO = 0.5  # Base: 50% of average
-            vol_volume_adj = 1.0 + (self._current_volatility_ratio - 1.0) * 0.2  # +/- 20%
-            vol_volume_adj = max(0.7, min(1.3, vol_volume_adj))
-            MIN_VOLUME_RATIO_RANGE = BASE_MIN_VOLUME_RATIO * vol_volume_adj
-            MIN_VOLUME_RATIO_RANGE = max(0.3, min(0.7, MIN_VOLUME_RATIO_RANGE))  # Floor 30%, cap 70%
-            
-            volume_ratio = self._current_trade_tags.get('volume_ratio', 1.0)
-            if volume_ratio < MIN_VOLUME_RATIO_RANGE:
-                # Check displacement bypass
-                if self._displacement_bypass or self._expansion_mode:
-                    # 🔥 FIX #290: Throttle RANGE VOLUME BYPASS log (was spamming every tick)
-                    if self._idle_eval_count % 180 == 1:
-                        logger.info(
-                            f"🔥 RANGE VOLUME BYPASS: vol_ratio={volume_ratio:.0%} < {MIN_VOLUME_RATIO_RANGE:.0%} | "
-                            f"But DISPLACEMENT active - proceeding"
-                        )
-                else:
-                    # 🔥 FIX #83: NO HARD BLOCK → PENALIZE
-                    # Low volume = riskier, so reduce size instead of blocking
-                    low_vol_penalty = max(0.3, volume_ratio / MIN_VOLUME_RATIO_RANGE)
-                    self._current_trade_tags['low_volume_penalty'] = low_vol_penalty
-                    # 🔥 FIX #122: Throttle 60 → 180 ticks
-                    if self._idle_eval_count % 180 == 1:
-                        logger.info(
-                            f"⚠️ RANGE: Low volume | vol_ratio={volume_ratio:.0%} < {MIN_VOLUME_RATIO_RANGE:.0%} | "
-                            f"PENALTY: size_mult={low_vol_penalty:.2f}"
-                        )
-                    # Continue with penalty instead of blocking
-            
-            # 🌊 BE WATER: ADAPTIVE EXTREME PERCENTILES
-            # En volatilidad alta, los extremos se alcanzan más fácil → más estrictos (10/90)
-            # En volatilidad baja, ajustar → menos estrictos (20/80)
-            # Esto permite capturar más oportunidades en mercados lentos
-            BASE_EXTREME_HIGH_PCT = 85
-            BASE_EXTREME_LOW_PCT = 15
-            
-            # Volatility adjustment: alta vol → estricto, baja vol → flexible
-            vol_extreme_adj = (self._current_volatility_ratio - 1.0) * 5  # +/- 5 percentile points
-            vol_extreme_adj = max(-5, min(5, vol_extreme_adj))
-            
-            EXTREME_HIGH_PCT = BASE_EXTREME_HIGH_PCT + vol_extreme_adj  # 80-90
-            EXTREME_LOW_PCT = BASE_EXTREME_LOW_PCT - vol_extreme_adj  # 10-20
-            
-            # Ensure valid bounds
-            EXTREME_HIGH_PCT = max(80, min(95, EXTREME_HIGH_PCT))
-            EXTREME_LOW_PCT = max(5, min(20, EXTREME_LOW_PCT))
-            
-            self._current_trade_tags['adaptive_extreme_high'] = EXTREME_HIGH_PCT
-            self._current_trade_tags['adaptive_extreme_low'] = EXTREME_LOW_PCT
-            
-            if pct_60d >= EXTREME_HIGH_PCT:
-                at_extreme = True
-                extreme_type = 'HIGH'  # Only SHORT allowed here
-                if bias == 'LONG':
-                    # 🔥 UNIFIED: Use has_momentum_override instead of scattered checks
-                    if self.has_momentum_override:
-                        logger.info(
-                            f"🔥 RANGE HIGH BYPASS: pct={pct_60d:.0f}% (HIGH) but MOMENTUM_OVERRIDE active | "
-                            f"Allowing LONG - potential ATH breakout"
-                        )
-                        self._current_trade_tags['range_high_bypass'] = True
-                    else:
-                        logger.debug(f"⛔ RANGE MODE: At {pct_60d:.0f}% (HIGH≥{EXTREME_HIGH_PCT:.0f}%) - LONG blocked, only SHORT")
-                        return  # Can't long at the top in range (unless momentum override)
-            elif pct_60d <= EXTREME_LOW_PCT:
-                at_extreme = True
-                extreme_type = 'LOW'  # Only LONG allowed here
-                if bias == 'SHORT':
-                    # 🔥 UNIFIED: Use has_momentum_override instead of scattered checks
-                    if self.has_momentum_override:
-                        logger.info(
-                            f"🔥 RANGE LOW BYPASS: pct={pct_60d:.0f}% (LOW) but MOMENTUM_OVERRIDE active | "
-                            f"Allowing SHORT - potential breakdown"
-                        )
-                        self._current_trade_tags['range_low_bypass'] = True
-                    else:
-                        logger.debug(f"⛔ RANGE MODE: At {pct_60d:.0f}% (LOW) - SHORT blocked, only LONG")
-                        return  # Can't short at the bottom in range (unless momentum override)
-            
-            if not at_extreme:
-                # =========================================================================
-                # 🔥 UNIFIED BYPASS CHECK (Feb 04, 2026)
-                # Replaces 50+ lines of scattered bypass logic with ONE call
-                # =========================================================================
-                should_bypass, bypass_reason = self._should_bypass_regime_filter('RANGE_MID')
-                
-                if should_bypass:
-                    # 🔥 FIX #290: Throttle RANGE BYPASS log (was spamming every tick)
-                    if self._idle_eval_count % 180 == 1:
-                        logger.info(
-                            f"🔥 RANGE BYPASS: {bypass_reason} | pct={pct_60d:.0f}% ignored | "
-                            f"ACTIVE_DIRECTION={self._active_direction} | "
-                            f"{'EXPANSION=' + str(self._expansion_direction) + ' | ' if self._expansion_mode else ''}"
-                            f"Range filter bypassed - continuing evaluation"
-                        )
-                    self._current_trade_tags['range_bypass_reason'] = bypass_reason
-                    self._current_trade_tags['range_size_mult'] = 0.60  # Slightly reduced size for range-break
-                    
-                    # 🔥 FIX #160 (Feb 10): ARM EDGE ON RANGE BYPASS
-                    # Si hay bypass (displacement/expansion), armar edge
-                    bypass_direction = self._active_direction or self._expansion_direction
-                    if bypass_direction:
-                        # 🔥 FIX #260: Block edge during post-BIAS-FLIP stabilization
-                        if self._is_post_bias_flip_blocked(current_price, atr_1m):
-                            return
-                        macro_str = self._current_bias_strength.value if self._current_bias_strength else None
-                        edge_armed = self._edge_manager.arm_consensus_edge(
-                            direction=bypass_direction,
-                            current_price=current_price,
-                            atr=atr_1m,
-                            market_time=market_time,
-                            reason=f"RANGE_BYPASS ({bypass_reason})",
-                            macro_bias_strength=macro_str,
-                            has_momentum_override=self.has_momentum_override,
-                            forbidden_direction=self._forbidden_direction  # 🔥 FIX #191
-                        )
-                        if edge_armed:
-                            self._current_trade_tags['range_edge_armed'] = True
-                            self._current_trade_tags['edge_source'] = f'RANGE_BYPASS'
-                            logger.info(
-                                f"🎯 EDGE ARMED: RANGE_BYPASS {bypass_direction} | {bypass_reason}"
-                            )
-                    # Continue to trade
-                else:
-                    # =========================================================================
-                    # 🔥 SIMPLIFIED RANGE_MID LOGIC (Feb 05, 2026)
-                    # 
-                    # PROBLEMA: EdgeScore con 7 componentes era sobre-ingeniería
-                    # - Pesos arbitrarios sin validación
-                    # - Demasiada complejidad = más bugs potenciales
-                    #
-                    # SOLUCIÓN SIMPLE (como un trader real):
-                    # 1. Si structural == active → tradear (dos fuentes coinciden)
-                    # 2. Si fast_reversal confirma structural → tradear temprano
-                    # 3. Si no hay consenso → no tradear
-                    #
-                    # Size reducido siempre (40%) porque estamos en zona media
-                    # =========================================================================
-                    
-                    # Direction from orchestrator (single source of truth)
-                    direction = self._active_direction
-                    source = self._active_direction_source
-                    confidence = self._active_direction_confidence
-                    
-                    # =============================================================
-                    # RANGE MEAN-REVERSION DIRECTION (refactored Feb 18, 2026)
-                    #
-                    # In RANGE mode, price position in the range IS the signal:
-                    # - pct < 30% → LONG (buy near support)
-                    # - pct > 70% → SHORT (sell near resistance)
-                    # - 30-70% → need external direction signal
-                    #
-                    # CRITICAL FIX: Previously required direction!=None from
-                    # orchestrator, but HTF_BIAS_ALONE veto made direction=None
-                    # at pct=25-27%. Result: system NEVER went LONG at range
-                    # bottom, waited for BIAS FLIP ($200+ move), entered late.
-                    #
-                    # Now: if direction=None AND in MR zone, we GENERATE
-                    # direction from the range position itself. The range
-                    # position IS the edge in a ranging market.
-                    # =============================================================
-                    RANGE_MR_LOW_PCT = 30.0
-                    RANGE_MR_HIGH_PCT = 70.0
-                    
-                    # Guard 1: No override if active edge exists
-                    _has_armed_edge = self._edge_manager.is_edge_active()
-                    
-                    # Guard 2: No MR override during TREND EXPANSION
-                    if self._trend_expansion_active:
-                        if self._idle_eval_count % 120 == 1:
-                            logger.info(
-                                f"⛔ RANGE MR BLOCKED: TREND EXPANSION active | "
-                                f"Expansion contradicts RANGE classification"
-                            )
-                        self._current_trade_tags['range_mr_blocked'] = 'TREND_EXPANSION'
-                        _has_armed_edge = True  # Prevents override below
-                    
-                    if not _has_armed_edge and pct_60d < RANGE_MR_LOW_PCT:
-                        # Near range bottom → LONG regardless of structural bias
-                        original_dir = direction
-                        direction = 'LONG'
-                        source = 'RANGE_MR_LOW'
-                        confidence = 0.65
-                        self._active_direction = direction
-                        self._active_direction_source = 'RANGE_MR_LOW'
-                        self._active_direction_confidence = confidence
-                        if self._idle_eval_count % 60 == 1:
-                            logger.info(
-                                f"🔄 RANGE MR LOW: pct={pct_60d:.0f}% < {RANGE_MR_LOW_PCT:.0f}% | "
-                                f"Direction={original_dir} → LONG (buy near range support)"
-                            )
-                        self._current_trade_tags['range_mr_override'] = True
-                        self._current_trade_tags['range_mr_from'] = original_dir
-                        self._current_trade_tags['range_mr_pct'] = pct_60d
-                    elif not _has_armed_edge and pct_60d > RANGE_MR_HIGH_PCT:
-                        # Near range top → SHORT regardless of structural bias
-                        original_dir = direction
-                        direction = 'SHORT'
-                        source = 'RANGE_MR_HIGH'
-                        confidence = 0.65
-                        self._active_direction = direction
-                        self._active_direction_source = 'RANGE_MR_HIGH'
-                        self._active_direction_confidence = confidence
-                        if self._idle_eval_count % 60 == 1:
-                            logger.info(
-                                f"🔄 RANGE MR HIGH: pct={pct_60d:.0f}% > {RANGE_MR_HIGH_PCT:.0f}% | "
-                                f"Direction={original_dir} → SHORT (sell near range resistance)"
-                            )
-                        self._current_trade_tags['range_mr_override'] = True
-                        self._current_trade_tags['range_mr_from'] = original_dir
-                        self._current_trade_tags['range_mr_pct'] = pct_60d
-                    
-                    self._current_trade_tags['range_mid_mode'] = True
-                    self._current_trade_tags['range_mid_direction'] = direction
-                    self._current_trade_tags['range_mid_source'] = source
-                    self._current_trade_tags['range_mid_confidence'] = confidence
-                    
-                    # Need high-quality signal for RANGE_MID
-                    # 🔥 REFACTOR: _core_sources defined above mode branching section
-                    if direction and (source in _core_sources or confidence >= 0.6):
-                        # 🔥 FIX #276/278: RANGE DIRECTION COHERENCE GUARD (second layer)
-                        # Regardless of how direction was determined, in RANGE mode:
-                        # - SHORT at pct<20% = shorting the floor → ALWAYS wrong
-                        # - LONG at pct>80% = longing the ceiling → ALWAYS wrong
-                        # Coherence guard: don't trade AGAINST the range position
-                        if direction == 'SHORT' and pct_60d < 20.0:
-                            if self._idle_eval_count % 120 == 1:
-                                logger.warning(
-                                    f"🚫 RANGE COHERENCE: SHORT at pct={pct_60d:.0f}% < 20% | "
-                                    f"Cannot SHORT at range floor | source={source}"
-                                )
-                            return
-                        if direction == 'LONG' and pct_60d > 80.0:
-                            if self._idle_eval_count % 120 == 1:
-                                logger.warning(
-                                    f"🚫 RANGE COHERENCE: LONG at pct={pct_60d:.0f}% > 80% | "
-                                    f"Cannot LONG at range ceiling | source={source}"
-                                )
-                            return
-                        
-                        # 🔥 FIX #83: In RANGE mode, we WANT to short at HIGH / long at LOW
-                        # Don't use price_confirms_direction which blocks this exact behavior
-                        # Instead, trust the range extremes (percentile_60d)
-                        price_confirms = True
-                        price_change = 0.0
-                        confirm_reason = f"RANGE: {direction} at pct={pct_60d:.0f}% (extremes trusted)"
-                        
-                        # 🔥 FIX #122: Throttle 120 → 300 ticks para reducir spam
-                        if self._idle_eval_count % 300 == 1:
-                            logger.info(
-                                f"✅ RANGE MID: {source} | direction={direction} | conf={confidence:.0%} | "
-                                f"price: {confirm_reason} | pct={pct_60d:.0f}% | Size=40% | TRADING"
-                            )
-                        self._current_trade_tags['range_size_mult'] = 0.40
-                        self._current_trade_tags['range_mid_reason'] = source
-                        
-                        # 🔥 FIX #160 (Feb 10): ARM EDGE IN RANGE MODE
-                        # Problema: RANGE nunca armaba edge → can_evaluate_entry() False → no trades
-                        # Solución: Si hay CONSENSUS en RANGE, armar edge igual que en TREND
-                        #
-                        # 🔥 FIX #286 (Feb 17, 2026): MINIMUM ATR FOR RANGE ENTRY
-                        # LOG EVIDENCE: System entered 3 trades in a 0.30% micro-range
-                        # ($68,720-$68,951). ATR_1m was ~$25-30 but the price was barely
-                        # moving — no room for a 1R trade to develop.
-                        # FIX: Require ATR_1m ratio > 0.7 (vs average) before arming
-                        # RANGE_CONSENSUS. If volatility is dead, wait for expansion.
-                        atr_1m_avg = self._current_trade_tags.get('atr_1m_avg', atr_1m)
-                        atr_ratio_check = atr_1m / atr_1m_avg if atr_1m_avg > 0 else 1.0
-                        MIN_ATR_RATIO_FOR_RANGE = 0.50
-                        if atr_ratio_check < MIN_ATR_RATIO_FOR_RANGE:
-                            if self._idle_eval_count % 300 == 1:
-                                logger.warning(
-                                    f"🚫 FIX #286 RANGE LOW VOL: ATR ratio {atr_ratio_check:.2f} < {MIN_ATR_RATIO_FOR_RANGE} | "
-                                    f"ATR_1m=${atr_1m:.1f} vs avg=${atr_1m_avg:.1f} | "
-                                    f"Not enough volatility for RANGE entry | Waiting for expansion"
-                                )
-                            return
-                        
-                        # 🔥 FIX #260: Block edge during post-BIAS-FLIP stabilization
-                        if self._is_post_bias_flip_blocked(current_price, atr_1m):
-                            return
-                        macro_str = self._current_bias_strength.value if self._current_bias_strength else None
-                        edge_armed = self._edge_manager.arm_consensus_edge(
-                            direction=direction,
-                            current_price=current_price,
-                            atr=atr_1m,
-                            market_time=market_time,
-                            reason=f"RANGE_CONSENSUS (pct={pct_60d:.0f}%, conf={confidence:.0%})",
-                            macro_bias_strength=macro_str,
-                            has_momentum_override=self.has_momentum_override,
-                            forbidden_direction=self._forbidden_direction  # 🔥 FIX #191
-                        )
-                        if edge_armed:
-                            self._current_trade_tags['range_edge_armed'] = True
-                            self._current_trade_tags['edge_source'] = f'RANGE_{source}'
-                            logger.info(
-                                f"🎯 EDGE ARMED: RANGE_{source} {direction} | pct={pct_60d:.0f}% | "
-                                f"conf={confidence:.0%} | Size=40%"
-                            )
-                        # Continue to evaluate trade
-                    else:
-                        # No consensus - no trade
-                        self._current_trade_tags['range_mid_reason'] = 'NO_CONSENSUS'
-                        self._regime_blocked = True
-                        self._regime_block_reason = f"RANGE_MID_NO_CONSENSUS (source={source}, conf={confidence:.0%})"
-                        
-                        # 🔥 FIX #122: Throttle 60 → 300 ticks
-                        if self._idle_eval_count % 300 == 1:
-                            logger.info(
-                                f"📊 RANGE MID: NO CONSENSUS | source={source} | conf={confidence:.0%} | "
-                                f"pct={pct_60d:.0f}% | NO TRADE"
-                            )
-                        return  # No trade - but not a hard deadlock
-                            
-            else:
-                # At extreme in RANGE - apply RANGE rules with standard sizing
-                self._current_trade_tags['range_mode_extreme'] = extreme_type
-                
-                # Simple sizing based on how extreme we are
-                if extreme_type == 'LOW':
-                    extremity = (EXTREME_LOW_PCT - pct_60d) / EXTREME_LOW_PCT  # 1.0 at 0%, 0.0 at 15%
-                else:
-                    extremity = (pct_60d - EXTREME_HIGH_PCT) / (100 - EXTREME_HIGH_PCT)  # 1.0 at 100%, 0.0 at 85%
-                
-                extremity = max(0.0, min(1.0, extremity))
-                
-                # Size: 35% base + up to 25% more based on extremity
-                size_mult = 0.35 + extremity * 0.25  # Range: 35-60%
-                self._current_trade_tags['range_size_mult'] = size_mult
-                self._current_trade_tags['range_extremity'] = round(extremity, 2)
-                
-                # 🔥 FIX #160 (Feb 10): ARM EDGE IN RANGE EXTREME
-                # Problema: RANGE EXTREME nunca armaba edge → no trades
-                # En extremos, armar edge en dirección contraria (mean reversion)
-                range_direction = 'SHORT' if extreme_type == 'HIGH' else 'LONG'
-                # 🔥 FIX #260: Block edge during post-BIAS-FLIP stabilization
-                if self._is_post_bias_flip_blocked(current_price, atr_1m):
-                    return
-                macro_str = self._current_bias_strength.value if self._current_bias_strength else None
-                edge_armed = self._edge_manager.arm_consensus_edge(
-                    direction=range_direction,
-                    current_price=current_price,
-                    atr=atr_1m,
-                    market_time=market_time,
-                    reason=f"RANGE_EXTREME_{extreme_type} (pct={pct_60d:.0f}%, extremity={extremity:.0%})",
-                    macro_bias_strength=macro_str,
-                    has_momentum_override=self.has_momentum_override,
-                    forbidden_direction=self._forbidden_direction  # 🔥 FIX #191
+        from src.application.live.idle_stages import (
+            IdleCtx,
+            stage_range_mode, stage_transition_mode, stage_trend_mode,
+            stage_counter_trend_htf, stage_edge_detection,
+            stage_location_filter, stage_decision_center,
+            stage_regime_fusion, stage_micro_trend,
+            stage_filters_and_ltf, stage_finalize_entry,
+        )
+
+        ctx = IdleCtx(
+            price=current_price, atr_1m=atr_1m, time=market_time,
+            bias=bias, mode=trading_mode, regime_score=regime_score,
+            effective_adx=effective_adx, df_1h=df_1h,
+            candles_5m=candles_5m, core_sources=_core_sources,
+            htf_passed=htf_passed, htf_reason=htf_reason,
+        )
+
+        # Stage 1: Trading mode handlers
+        if ctx.mode == 'RANGE':
+            if stage_range_mode(self, ctx):
+                return
+        elif ctx.mode == 'TRANSITION':
+            if stage_transition_mode(self, ctx):
+                return
+        elif ctx.mode == 'TREND':
+            if stage_trend_mode(self, ctx):
+                return
+
+        # Stage 2: Counter-trend / HTF final gate
+        if stage_counter_trend_htf(self, ctx):
+            return
+
+        # Stage 3: Edge detection pipeline
+        if stage_edge_detection(self, ctx):
+            return
+
+        # Stage 4: Location filter
+        if stage_location_filter(self, ctx):
+            # Handle async pullback short if flagged
+            if hasattr(self, '_pending_pullback_short') and self._pending_pullback_short:
+                ps = self._pending_pullback_short
+                self._pending_pullback_short = None
+                await self._evaluate_pullback_short(
+                    current_price=ps['current_price'],
+                    df_1h=ps['df_1h'],
+                    candles_5m=ps['candles_5m'],
+                    htf_bias=ps['htf_bias'],
+                    regime=ps['regime'],
+                    market_time=ps['market_time'],
+                    veto_reason=ps['veto_reason'],
                 )
-                if edge_armed:
-                    self._current_trade_tags['range_edge_armed'] = True
-                    self._current_trade_tags['edge_source'] = f'RANGE_EXTREME_{extreme_type}'
-                    logger.info(
-                        f"🎯 EDGE ARMED: RANGE_EXTREME_{extreme_type} {range_direction} | "
-                        f"pct={pct_60d:.0f}% | extremity={extremity:.0%} | Size={size_mult:.0%}"
-                    )
-                
-                if self._idle_eval_count % 60 == 1:
-                    logger.info(
-                        f"📊 RANGE EXTREME: {extreme_type} | pct={pct_60d:.0f}% | extremity={extremity:.0%} | "
-                        f"Size={size_mult:.0%} | TRADING"
-                    )
-        
-        # ===================================================================
-        # ===================================================================
-        # TRANSITION MODE (RegimeScore 0.35-0.50)
-        # 🔥 REFACTORED Feb 04: Uses DirectionOrchestrator as single source of truth
-        # ===================================================================
-        elif trading_mode == 'TRANSITION':
-            self._current_trade_tags['transition_mode'] = True
-            
-            # Gradual size based on regime_score
-            # 🔥 FIX #33 (Feb 05): Use correct SIZE_MULT_TRANSITION → SIZE_MULT_TREND interpolation
-            transition_progress = (regime_score - REGIME.RANGE_MAX) / (REGIME.TRANSITION_MAX - REGIME.RANGE_MAX)
-            transition_progress = max(0.0, min(1.0, transition_progress))
-            gradual_size = SIZING.SIZE_MULT_TRANSITION + (transition_progress * (SIZING.SIZE_MULT_TREND - SIZING.SIZE_MULT_TRANSITION))
-            
-            self._current_trade_tags['transition_size_mult'] = gradual_size
-            self._current_trade_tags['transition_progress'] = transition_progress
-            
-            # Direction from orchestrator (single source of truth)
-            direction = self._active_direction
-            source = self._active_direction_source
-            confidence = self._active_direction_confidence
-            self._current_trade_tags['transition_direction'] = direction
-            self._current_trade_tags['transition_source'] = source
-            self._current_trade_tags['transition_confidence'] = confidence
-            
-            # Need CORE signal or high confidence for TRANSITION
-            # 🔥 REFACTOR: Use orchestrator source names instead of old 'CONSENSUS'
-            if direction and (source in _core_sources or confidence >= 0.6):
-                # 🔥 FIX #79 (Feb 07): Skip price validation if EDGE already ACTIVE in same direction
-                # Problem: EDGE_ACTIVE SHORT during trend, but _price_confirms_direction blocks
-                # because price bounced 0.2% in last 5 candles. This missed $600 drop.
-                # Solution: Once EDGE is ACTIVE, trust it - don't second-guess every tick
-                edge_already_active = (
-                    self._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE] and
-                    self._edge_manager.current_bos is not None and
-                    self._edge_manager.current_bos.direction == direction
-                )
-                
-                if not edge_already_active:
-                    price_confirms, price_change, confirm_reason = self._price_confirms_direction(direction)
-                    
-                    if not price_confirms:
-                        # Rate-limit warning to reduce log spam
-                        if self._idle_eval_count % 30 == 1:
-                            logger.warning(f"⚠️ TRANSITION: {source} BLOCKED BY PRICE | {confirm_reason}")
-                        self._current_trade_tags['transition_reason'] = 'PRICE_CONTRADICTED'
-                        self._regime_blocked = True
-                        self._regime_block_reason = f"PRICE_CONTRADICTS: {confirm_reason}"
-                        return
-                
-                # 🔥 FIX #151 (Feb 10, 2026): Rate-limit TRANSITION log to 60s
-                now = market_time
-                last_trans_log = getattr(self, '_last_transition_log', None)
-                last_trans_dir = getattr(self, '_last_transition_dir', None)
-                should_log = (
-                    last_trans_log is None or 
-                    (now - last_trans_log).total_seconds() >= 60 or
-                    last_trans_dir != direction  # Always log direction changes
-                )
-                if should_log:
-                    logger.info(
-                        f"✅ TRANSITION: {source} | dir={direction} | conf={confidence:.0%} | "
-                        f"Score={regime_score:.2f} | Size={gradual_size:.0%} | TRADING"
-                    )
-                    self._last_transition_log = now
-                    self._last_transition_dir = direction
-                self._current_trade_tags['transition_reason'] = source
-                
-                # 🔥 FIX #35 (Feb 05): ARM EDGE for TRANSITION - handle all sources
-                # Use arm_consensus_edge for all TRANSITION signals (simpler, direct to ACTIVE)
-                # 🔥 FIX #36: Always TRY to arm - method handles state internally (including EXPIRED reset)
-                # 🔥 FIX #78 (Feb 07): Pass macro bias for coherence check
-                
-                # 🔥 FIX #260: Block edge during post-BIAS-FLIP stabilization
-                if self._is_post_bias_flip_blocked(current_price, atr_1m):
-                    return
-                
-                macro_str = self._current_bias_strength.value if self._current_bias_strength else None
-                edge_armed = self._edge_manager.arm_consensus_edge(
-                    direction=direction,
-                    current_price=current_price,
-                    atr=atr_1m,
-                    market_time=market_time,
-                    reason=f"TRANSITION_{source} (Score={regime_score:.2f}, conf={confidence:.0%})",
-                    macro_bias_strength=macro_str,
-                    has_momentum_override=self.has_momentum_override,
-                    forbidden_direction=self._forbidden_direction  # 🔥 FIX #191
-                )
-                if edge_armed:
-                    self._current_trade_tags['consensus_edge_armed'] = True
-                    self._current_trade_tags['edge_source'] = f'TRANSITION_{source}'
-            else:
-                # No consensus - no trade
-                self._current_trade_tags['transition_reason'] = 'NO_CONSENSUS'
-                self._regime_blocked = True
-                self._regime_block_reason = f"TRANSITION_NO_CONSENSUS (source={source}, conf={confidence:.0%})"
-                
+            return
+
+        # Stage 5: Decision center (TrendIntelligence)
+        if stage_decision_center(self, ctx):
+            return
+
+        # Stage 6: Regime fusion + expansion / anti-fade
+        if stage_regime_fusion(self, ctx):
+            return
+
+        # Stage 7: Micro trend filter
+        if stage_micro_trend(self, ctx):
+            return
+
+        # Stage 8: Filter pipeline + LTF trigger
+        if stage_filters_and_ltf(self, ctx):
+            return
+
+        # Stage 9: Delta volume, direction validation, and entry execution
+        await stage_finalize_entry(self, ctx)
+
+    # =========================================================================
+    # REFACTORED: Symmetric displacement processing (replaces 700 lines of
+    # near-identical SHORT/LONG code)
+    # =========================================================================
+    def _process_strong_displacement(
+        self,
+        direction: str,
+        move_amount: float,
+        strong_threshold: float,
+        current_price: float,
+        atr_5m: float,
+        market_time: datetime,
+    ) -> bool:
+        """Process displacement in one direction. Returns True if stale/blocked.
+
+        Handles: stale check, active-move override, range extreme check,
+        bad phase check (FIX #222), RANGE_BOUND block, direction memory,
+        expansion/lock activation, displacement edge arming, forbidden
+        direction override.  Symmetric for SHORT and LONG.
+        """
+        if move_amount < strong_threshold:
+            return False  # Not strong enough for expansion/edge
+
+        self._strong_displacement = True
+        is_stale = False
+
+        # --- Geometry: extreme, distance, origin depend on direction ---
+        if direction == 'SHORT':
+            extreme_price = self._bias_low_since
+            dist_from_extreme = current_price - extreme_price
+            prev_extreme_attr = '_prev_rolling_low'
+            extreme_moving_fn = lambda ext, prev: ext < prev - atr_5m * 0.1
+            origin_price = self._bias_high_since
+            extreme_label = 'FLOOR'
+            bad_trend_dir = 'BEARISH'
+        else:
+            extreme_price = self._bias_high_since
+            dist_from_extreme = extreme_price - current_price
+            prev_extreme_attr = '_prev_rolling_high'
+            extreme_moving_fn = lambda ext, prev: ext > prev + atr_5m * 0.1
+            origin_price = self._bias_low_since
+            extreme_label = 'CEILING'
+            bad_trend_dir = 'BULLISH'
+
+        # --- 1. Stale check: price near extreme AND extreme not moving ---
+        stale_threshold = atr_5m * 0.5
+        if dist_from_extreme < stale_threshold and dist_from_extreme >= 0:
+            is_stale = True
+            # Override if move is actively continuing
+            prev_extreme = getattr(self, prev_extreme_attr, extreme_price)
+            if extreme_moving_fn(extreme_price, prev_extreme):
+                is_stale = False
                 if self._idle_eval_count % 30 == 1:
                     logger.info(
-                        f"📊 TRANSITION: NO CONSENSUS | source={source} | conf={confidence:.0%} | "
-                        f"Score={regime_score:.2f} | NO TRADE"
+                        f"📈 ACTIVE MOVE OVERRIDE {direction}: extreme still moving | NOT stale"
                     )
-                return
-        
-        # ===================================================================
-        # TREND MODE (RegimeScore >= 0.50)
-        # 🔥 REFACTORED: Uses DirectionOrchestrator as single source of truth
-        # ===================================================================
-        elif trading_mode == 'TREND':
-            self._current_trade_tags['trend_mode'] = True
-            
-            # Direction from orchestrator (single source of truth)
-            direction = self._active_direction
-            source = self._active_direction_source
-            confidence = self._active_direction_confidence
-            self._current_trade_tags['trend_direction'] = direction
-            self._current_trade_tags['trend_source'] = source
-            self._current_trade_tags['trend_confidence'] = confidence
-            
-            # Check for displacement
-            has_displacement = self._displacement_bypass or self._expansion_mode
-            self._current_trade_tags['trend_displacement'] = has_displacement
-            
-            # In TREND, more permissive - accept momentum alone
-            if direction and confidence >= 0.5:
-                # 🔥 FIX #52 (Feb 05): Validate price for ALL sources except DISPLACEMENT/EXPANSION
-                # Problem: CONSENSUS check passed once, edge armed, edge expired, edge re-armed
-                # from EDGE_ACTIVE source without price check → kept trying SHORT during $1000 rally
-                # Solution: Always check price direction before arming/re-arming edge
-                # 🔥 FIX (Feb 06): ALSO skip price check if EDGE is already ACTIVE
-                # The edge already validated price when it was armed - don't second-guess
-                edge_already_active = (
-                    self._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE] and
-                    self._edge_manager.current_bos is not None and
-                    self._edge_manager.current_bos.direction == direction
-                )
-                
-                if source not in ('DISPLACEMENT', 'EXPANSION_LOCK', 'DIRECTION_LOCK') and not edge_already_active:
-                    price_confirms, price_change, confirm_reason = self._price_confirms_direction(direction)
-                    
-                    if not price_confirms:
-                        # 🔥 FIX #122: Throttle 60 → 120 ticks
-                        if self._idle_eval_count % 120 == 1:
-                            logger.warning(f"⚠️ TREND: {source} BLOCKED BY PRICE | {confirm_reason}")
-                        self._current_trade_tags['trend_reason'] = 'PRICE_CONTRADICTED'
-                        return
-                
-                # Size based on ADX strength
-                adx_strength = min(1.0, (effective_adx - ADX.TREND_MIN) / 30)
-                trend_size = SIZING.TREND_BASE + adx_strength * SIZING.TREND_ADX_BONUS
-                
-                # 🔥 FIX #122: Throttle 60 → 180 ticks
-                if self._idle_eval_count % 180 == 1:
-                    logger.info(
-                        f"✅ TREND: {source} | dir={direction} | conf={confidence:.0%} | "
-                        f"ADX={effective_adx:.1f} | Size={trend_size:.0%} | TRADING"
+
+        # Track previous rolling extreme for next eval
+        if direction == 'SHORT':
+            self._prev_rolling_low = self._bias_low_since
+        else:
+            self._prev_rolling_high = self._bias_high_since
+
+        # --- 2. Range extreme check ---
+        trend_phase = getattr(self, '_trend_phase', TrendPhase.RANGE_BOUND)
+        if trend_phase == TrendPhase.RANGE_BOUND:
+            range_threshold = atr_5m * 1.5
+            if dist_from_extreme < range_threshold:
+                is_stale = True
+                if self._idle_eval_count % 30 == 1:
+                    logger.warning(
+                        f"🚫 RANGE {extreme_label} BLOCK {direction}: "
+                        f"price ${current_price:.0f} only ${dist_from_extreme:.0f} "
+                        f"from extreme ${extreme_price:.0f} (< {range_threshold:.0f} = 1.5 ATR)"
                     )
-                self._current_trade_tags['trend_size_mult'] = trend_size
-                self._current_trade_tags['trend_reason'] = source
-                
-                # 🔥 FIX #34 (Feb 05): ARM EDGE for any source in TREND mode
-                # All sources (CONSENSUS/DISPLACEMENT/MOMENTUM) can arm edge via arm_consensus_edge
-                # arm_consensus_edge transitions DIRECTLY to EDGE_ACTIVE (no waiting for pullback)
-                # 🔥 FIX #36: Always TRY to arm - method handles state internally (including EXPIRED reset)
-                # 🔥 FIX #78 (Feb 07): Pass macro bias for coherence check
-                
-                # RANGE FLOOR/CEILING GUARD: No shortear en el suelo ni longear en el techo de un rango
-                # Aunque TREND MODE esté activo, si TrendPhase=RANGE_BOUND y estamos
-                # en el extremo del rango, el precio va a rebotar, no a romper.
-                # 🔥 FIX #277: Extender zona de bloqueo a DEBAJO del low / ARRIBA del high
-                # Un breakout falso cruza el nivel brevemente y rebota. Solo un breakout
-                # real se aleja >1 ATR_5m del extremo. Bloquear zona [-1ATR_5m, +1.5ATR_5m].
-                _trend_phase_guard = getattr(self, '_trend_phase', None)
-                if _trend_phase_guard == TrendPhase.RANGE_BOUND and not self._expansion_mode:
-                    _floor_ceiling_threshold = atr_1m * 4.5  # ~1.5 ATR_5m arriba del extremo
-                    _breakout_confirm_dist = atr_1m * 3.0    # ~1 ATR_5m debajo para confirmar breakout real
-                    if direction == 'SHORT' and hasattr(self, '_bias_low_since') and self._bias_low_since > 0:
-                        _dist_to_low = current_price - self._bias_low_since
-                        # Bloquear si: precio dentro de [-1 ATR_5m, +1.5 ATR_5m] del low
-                        if _dist_to_low < _floor_ceiling_threshold and _dist_to_low > -_breakout_confirm_dist:
-                            if self._idle_eval_count % 60 == 1:
-                                logger.warning(
-                                    f"🚫 TREND RANGE FLOOR BLOCK: SHORT blocked | "
-                                    f"Price ${current_price:.0f} is ${_dist_to_low:.0f} from low ${self._bias_low_since:.0f} "
-                                    f"(need >{_breakout_confirm_dist:.0f} below or >{_floor_ceiling_threshold:.0f} above) | RANGE_BOUND"
-                                )
-                            return
-                    elif direction == 'LONG' and hasattr(self, '_bias_high_since') and self._bias_high_since > 0:
-                        _dist_to_high = self._bias_high_since - current_price
-                        # Bloquear si: precio dentro de [-1 ATR_5m, +1.5 ATR_5m] del high
-                        if _dist_to_high < _floor_ceiling_threshold and _dist_to_high > -_breakout_confirm_dist:
-                            if self._idle_eval_count % 60 == 1:
-                                logger.warning(
-                                    f"🚫 TREND RANGE CEILING BLOCK: LONG blocked | "
-                                    f"Price ${current_price:.0f} is ${_dist_to_high:.0f} from high ${self._bias_high_since:.0f} "
-                                    f"(need >{_breakout_confirm_dist:.0f} above or >{_floor_ceiling_threshold:.0f} below) | RANGE_BOUND"
-                                )
-                            return
-                
-                # 🔥 FIX #260: Block edge during post-BIAS-FLIP stabilization
-                if self._is_post_bias_flip_blocked(current_price, atr_1m):
-                    return
-                
-                macro_str = self._current_bias_strength.value if self._current_bias_strength else None
-                edge_armed = self._edge_manager.arm_consensus_edge(
-                    direction=direction,
-                    current_price=current_price,
-                    atr=atr_1m,
-                    market_time=market_time,
-                    reason=f"TREND_{source} (ADX={effective_adx:.1f}, conf={confidence:.0%})",
-                    macro_bias_strength=macro_str,
-                    has_momentum_override=self.has_momentum_override,
-                    forbidden_direction=self._forbidden_direction  # 🔥 FIX #191
-                )
-                if edge_armed:
-                    self._current_trade_tags['consensus_edge_armed'] = True
-                    self._current_trade_tags['edge_source'] = f'TREND_{source}'
-                    logger.info(
-                        f"🎯 EDGE ARMED: TREND_{source} {direction} | ADX={effective_adx:.1f} | "
-                        f"conf={confidence:.0%} | DIRECT TO ACTIVE"
+
+        # --- 3. Bad phase check (FIX #222) ---
+        bad_phases = (TrendPhase.TREND_EXHAUSTION, TrendPhase.DISTRIBUTION, TrendPhase.TREND_DEATH)
+        if trend_phase in bad_phases:
+            trend_dir = getattr(self, '_trend_direction_from_ti', None)
+            if trend_dir == bad_trend_dir:
+                is_stale = True
+                if self._idle_eval_count % 30 == 1:
+                    logger.warning(
+                        f"🚫 BAD PHASE BLOCK {direction}: {trend_phase.value} + {bad_trend_dir} "
+                        f"| Displacement ${move_amount:.0f} but trend is DYING"
                     )
-            else:
-                # Waiting for edge
-                self._current_trade_tags['trend_reason'] = 'WAITING_EDGE'
-                
-                # 🔥 FIX #122: Throttle 60 → 180 ticks
-                if self._idle_eval_count % 180 == 1:
-                    logger.info(
-                        f"📊 TREND: WAITING EDGE | source={source} | conf={confidence:.0%} | "
-                        f"ADX={effective_adx:.1f} | Need BOS/breakout"
-                    )
-                # DON'T return - let EdgeStateManager try to find edge
-        
-        # IMPROVED: Allow counter-trend trading in defensive mode
-        # When market is volatile, both directions can present opportunities
-        allow_countertrend = False
-        if not htf_passed and HTFFilters.ALLOW_COUNTERTREND_DEFENSIVE:
-            if self.black_swan_filter.is_defensive(market_time):
-                # In defensive mode, allow trading against HTF with reduced size
-                # Derive counter-trend bias from EMA relationship
-                ema_50 = df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
-                ema_200 = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
-                
-                if ema_50 > ema_200:
-                    counter_bias = 'SHORT'  # Counter to bullish HTF
-                else:
-                    counter_bias = 'LONG'   # Counter to bearish HTF
-                
-                logger.info(f"⚠️ HTF rejected but DEFENSIVE MODE active - allowing counter-trend {counter_bias}")
-                allow_countertrend = True
-                bias = counter_bias
-                htf_passed = True  # Override for this trade
-        
-        if not htf_passed:
-            # HTF filter rechazado - loguear cada 5 minutos (cada vela 5m cerrada)
-            if self._last_htf_reject_log_time is None:
-                self._last_htf_reject_log_time = market_time
-            
-            seconds_since_log = (market_time - self._last_htf_reject_log_time).total_seconds()
-            
-            # Log cada 5 minutos (300 segundos) o si cambió de razón
-            should_log = (seconds_since_log >= 300) or (self._last_htf_state != 'rejected')
-            
-            if should_log:
-                logger.info(f"[BLOCK] HTF filter: {htf_reason}")
-                
-                # Show detailed HTF values
-                ema_50 = df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
-                ema_200 = df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1]
-                adx_vals, _ = calculate_adx(df_1h['high'].to_numpy(), df_1h['low'].to_numpy(), df_1h['close'].to_numpy(), 14)
-                # 🔥 FIX (Jan 25, 2026): Ensure ADX is Python float
-                adx = float(adx_vals[-1]) if len(adx_vals) > 0 else 0.0
-                adx_slope = float(adx_vals[-1] - adx_vals[-2]) if len(adx_vals) > 1 else 0.0
-                
-                logger.debug(f"   [DATA] Price: ${current_price:.2f} | EMA50: ${ema_50:.2f} | EMA200: ${ema_200:.2f}")
-                logger.debug(f"   [UP] ADX: {adx:.2f} | Slope: {adx_slope:.4f}")
-                
-                self._last_htf_reject_log_time = market_time
-                self._last_htf_state = 'rejected'
-            return
-        
-        self.current_bias = bias
-        bias_label = f'{bias} (counter-trend)' if allow_countertrend else bias
-        if self._last_htf_state != f'passed_{bias}':
-            logger.debug(f"[OK] HTF filter passed - Bias: {bias_label}")
-            self._last_htf_state = f'passed_{bias}'
-        
-        # =====================================================================
-        # 🎯 EDGE STATE MANAGER (Jan 27, 2026) - Edge como EVENTO DISCRETO
-        # 
-        # El sistema SOLO evalúa entradas si hay un EDGE ACTIVO.
-        # Sin edge → NO hay evaluación → NO hay overtrading basura.
-        # 
-        # Flujo:
-        # 1. Detectar swings para BOS detection
-        # 2. Check for new BOS (arma el edge)
-        # 3. Check for pullback (activa el edge)
-        # 4. Check expiration/invalidation
-        # 5. Si no hay edge activo → skip evaluación
-        # =====================================================================
-        
-        # Preparar datos para edge detection
-        closes_1h = np.asarray(df_1h['close'].to_numpy())
-        highs_1h = np.asarray(df_1h['high'].to_numpy())
-        lows_1h = np.asarray(df_1h['low'].to_numpy())
-        
-        atr_1h_vals = calculate_atr(highs_1h, lows_1h, closes_1h, 14)
-        atr_1h = float(atr_1h_vals[-1]) if len(atr_1h_vals) > 0 else current_price * 0.01
-        
-        # =========================================================================
-        # 🔥 FIX #58 (Feb 06, 2026): Reducir swing lookback de 5→3
-        # 
-        # ANTES: lookback=5 en 1H = ~5 horas de delay para detectar swing
-        # AHORA: lookback=3 en 1H = ~3 horas (40% más rápido)
-        # 
-        # Esto acelera la detección de swings y reduce latencia en BOS detection.
-        # El tradeoff es swings menos "robustos" pero más reactivos.
-        # =========================================================================
-        SWING_LOOKBACK_1H = 3  # Reducido de 5 para detección más temprana
-        
-        from src.shared.indicators import detect_swing_high, detect_swing_low
-        
-        swing_high_detected, swing_high_price, _ = detect_swing_high(highs_1h, lows_1h, closes_1h, lookback=SWING_LOOKBACK_1H)
-        swing_low_detected, swing_low_price, _ = detect_swing_low(highs_1h, lows_1h, closes_1h, lookback=SWING_LOOKBACK_1H)
-        
-        # =====================================================================
-        # 🔥 FIX #166 (Feb 10, 2026): VALIDATE BEFORE UPDATING SWINGS
-        # 
-        # PROBLEMA: detect_swing_* puede retornar swings de hace semanas ($90K)
-        # que están "técnicamente" bien, pero son irrelevantes para el precio actual.
-        # El código antiguo sobrescribía el swing corregido con el malo en cada tick.
-        # 
-        # SOLUCIÓN: Solo aceptar swings nuevos si están dentro del 15% del precio.
-        # Esto evita el bucle infinito de: detectar malo → corregir → detectar malo...
-        # =====================================================================
-        MAX_SWING_DISTANCE_PCT = 0.15  # 15% max distance from current price
-        
-        def is_swing_relevant(swing_price: float, ref_price: float) -> bool:
-            """Check if swing is within relevant distance of reference price"""
-            if swing_price <= 0 or ref_price <= 0:
-                return False
-            distance_pct = abs(swing_price - ref_price) / ref_price
-            return distance_pct <= MAX_SWING_DISTANCE_PCT
-        
-        # Actualizar swings si se detectaron nuevos Y SON RELEVANTES
-        if swing_high_detected and swing_high_price > 0:
-            if swing_high_price != self._last_swing_high:
-                # 🔥 FIX #166: Solo aceptar si está dentro del rango relevante
-                if is_swing_relevant(swing_high_price, current_price):
-                    self._prev_swing_high = self._last_swing_high
-                    self._last_swing_high = swing_high_price
-                    logger.info(f"📍 NEW SWING HIGH: ${swing_high_price:.0f} (prev: ${self._prev_swing_high:.0f})")
-                # else: ignorar swing obsoleto silenciosamente
-        
-        if swing_low_detected and swing_low_price > 0:
-            if swing_low_price != self._last_swing_low:
-                # 🔥 FIX #166: Solo aceptar si está dentro del rango relevante
-                if is_swing_relevant(swing_low_price, current_price):
-                    self._prev_swing_low = self._last_swing_low
-                    self._last_swing_low = swing_low_price
-                    logger.info(f"📍 NEW SWING LOW: ${swing_low_price:.0f} (prev: ${self._prev_swing_low:.0f})")
-                # else: ignorar swing obsoleto silenciosamente
-        
-        # =====================================================================
-        # 🔥 FIX #166b: FALLBACK INITIALIZATION
-        # 
-        # Si los swings siguen en 0 o inválidos (primer inicio), inicializar
-        # desde datos recientes. Esto solo corre UNA VEZ al inicio.
-        # =====================================================================
-        # 🔥 FIX (Feb 20, 2026): Was 48 bars (48h) → created $2697 range when ATR=$100.
-        # Location gate saw everything as "73% of range" and blocked LONGs with displacement.
-        # Now: 24 bars (24h) with sanity check — if range > 10×ATR, shrink to 12 bars.
-        if self._last_swing_high == 0 or not is_swing_relevant(self._last_swing_high, current_price):
-            RECENT_BARS = 24
-            if len(highs_1h) >= RECENT_BARS:
-                candidate_high = float(np.max(highs_1h[-RECENT_BARS:]))
-                candidate_low = float(np.min(lows_1h[-RECENT_BARS:])) if len(lows_1h) >= RECENT_BARS else current_price * 0.98
-                # Sanity: if range > 10×ATR, use even shorter window (atr_1h from line ~4668)
-                if atr_1h > 0 and (candidate_high - candidate_low) > 10 * atr_1h:
-                    RECENT_BARS = 12
-                    candidate_high = float(np.max(highs_1h[-RECENT_BARS:]))
-                    logger.info(f"📍 SWING SANITY: 24-bar range too wide, using {RECENT_BARS} bars")
-                self._last_swing_high = candidate_high
-                self._prev_swing_high = self._last_swing_high
-                logger.info(f"📍 INIT SWING HIGH: ${self._last_swing_high:.0f} (from last {RECENT_BARS} bars)")
-            else:
-                self._last_swing_high = current_price * 1.02
-                self._prev_swing_high = self._last_swing_high
-        
-        if self._last_swing_low == 0 or not is_swing_relevant(self._last_swing_low, current_price):
-            RECENT_BARS = 24
-            if len(lows_1h) >= RECENT_BARS:
-                candidate_low = float(np.min(lows_1h[-RECENT_BARS:]))
-                candidate_high = float(np.max(highs_1h[-RECENT_BARS:])) if len(highs_1h) >= RECENT_BARS else current_price * 1.02
-                # Sanity: if range > 10×ATR, use even shorter window (atr_1h from line ~4668)
-                if atr_1h > 0 and (candidate_high - candidate_low) > 10 * atr_1h:
-                    RECENT_BARS = 12
-                    candidate_low = float(np.min(lows_1h[-RECENT_BARS:]))
-                    logger.info(f"📍 SWING SANITY: 24-bar range too wide, using {RECENT_BARS} bars")
-                self._last_swing_low = candidate_low
-                self._prev_swing_low = self._last_swing_low
-                logger.info(f"📍 INIT SWING LOW: ${self._last_swing_low:.0f} (from last {RECENT_BARS} bars)")
-            else:
-                self._last_swing_low = current_price * 0.98
-                self._prev_swing_low = self._last_swing_low
-        
-        # 🔥 FIX #32 (Feb 05, 2026): Edge invalidation MOVED to top of _handle_idle_state
-        # The check below is now REDUNDANT - the early check runs on EVERY tick unconditionally.
-        # Keeping this as secondary check with ATR 1h (larger buffer, more permissive) 
-        # in case the early check with ATR 1m missed something due to execution order.
-        # This secondary check only runs if we get past all filters, so it's "belt and suspenders".
-        # 🔥 FIX #77b: Pass swing_range for adaptive buffer
-        swing_range_1h = self._last_swing_high - self._last_swing_low if (self._last_swing_high > 0 and self._last_swing_low > 0) else 0.0
-        self._edge_manager.check_expiration(market_time, current_price)
-        self._edge_manager.check_invalidation(current_price, atr_1h, swing_range_1h)
-        
-        # NOTE: EdgeType already imported at module level (line 220)
-        # Do NOT import locally - causes UnboundLocalError at earlier uses
-        
-        # =====================================================================
-        # 🌊 FIX (Jan 30, 2026): Update DISPLACEMENT entry window
-        # 
-        # Si hay DISPLACEMENT edge activo, actualizar la ventana de entrada
-        # y matar el edge si está demasiado tarde (NO PERSEGUIR)
-        # 
-        # 🔥 FIX #159b: El cooldown ahora se activa automáticamente en _expire_edge()
-        # No es necesario llamar set_post_displacement_cooldown() aquí.
-        # =====================================================================
-        if self._edge_manager.current_bos and self._edge_manager.current_bos.edge_type == EdgeType.DISPLACEMENT:
-            should_kill, kill_reason = self._edge_manager.update_displacement_entry_window(market_time)
-            if should_kill:
-                logger.warning(f"🚫 {kill_reason}")
-                self._edge_manager._expire_edge(kill_reason)  # Cooldown auto-activado
-                self._current_trade_tags['displacement_killed_late'] = True
-                self._current_trade_tags['post_displacement_cooldown'] = True
-        
-        # =====================================================================
-        # 🔥 CRITICAL FIX (Jan 29, 2026): ANTICIPATION/EDGE NOW HANDLED BY ORCHESTRATOR
-        # 
-        # The DirectionOrchestrator now handles all direction signal priority:
-        # EXPANSION(100) > EDGE(95) > DISPLACEMENT(90) > ANTICIPATION(85) > etc.
-        #
-        # This block is SIMPLIFIED to only handle edge INVALIDATION logic.
-        # Direction overrides are NO LONGER DONE HERE - orchestrator decides.
-        # =====================================================================
-        anticipation_signal = self._current_trade_tags.get('anticipation_signal')
-        anticipation_direction = self._current_trade_tags.get('anticipation_direction')
-        # 🔥 FIX #95 (Feb 09): Aceptar todos los tipos de anticipation
-        valid_anticipation_signals = ['COMPRESSION_BREAKOUT', 'TREND_PULLBACK', 'FAILED_TEST', 'MOMENTUM_EXHAUSTION']
-        has_anticipation_breakout = (anticipation_signal in valid_anticipation_signals and anticipation_direction)
-        
-        # NOTE: Anticipation direction override REMOVED - orchestrator handles this
-        # The orchestrator already set _active_direction with ANTICIPATION priority 85
-        
-        # =====================================================================
-        # 🔥 EDGE INVALIDATION LOGIC (Jan 29, 2026)
-        # 
-        # When there's an edge active but direction MISMATCHES with orchestrated direction:
-        # - BREAKOUT/DISPLACEMENT edges: DO NOT INVALIDATE (they have sovereign authority
-        #   in the orchestrator, so mismatch means orchestrator chose a higher priority signal)
-        # - TREND/RANGE edges: INVALIDATE if direction mismatch
-        # - ANTICIPATION PENDING: Do not invalidate (new breakout will replace)
-        # =====================================================================
-        if self._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
-            edge_direction = None
-            edge_type = None
-            if self._edge_manager.current_bos:
-                edge_direction = self._edge_manager.current_bos.direction
-                edge_type = self._edge_manager.current_bos.edge_type
-            
-            if edge_direction and self._active_direction:
-                if edge_direction != self._active_direction:
-                    # BREAKOUT/DISPLACEMENT: The orchestrator already gave them priority 95.
-                    # If we reached here with mismatch, it means EXPANSION_MODE (100) overrode.
-                    # Log but do NOT invalidate - expansion mode should still use the edge.
-                    if edge_type in [EdgeType.BREAKOUT, EdgeType.DISPLACEMENT]:
-                        # 🔥 FIX #122: Throttle 60 → 120 ticks
-                        if self._idle_eval_count % 120 == 1:
-                            logger.debug(
-                                f"📊 Edge-Direction divergence: Edge={edge_direction} vs "
-                                f"Orchestrated={self._active_direction} | Edge type={edge_type.value} | "
-                                f"Not invalidating - higher priority signal active"
-                            )
-                        # NOTE: Direction override REMOVED - orchestrator already decided
-                    # ANTICIPATION PENDING: Don't invalidate
-                    elif has_anticipation_breakout:
-                        # 🔥 FIX #122: Throttle 60 → 120 ticks
-                        if self._idle_eval_count % 120 == 1:
-                            logger.debug(
-                                f"🎯 ANTICIPATION BREAKOUT PENDING: Skipping edge invalidation | "
-                                f"Old edge will be replaced by BREAKOUT {anticipation_direction}"
-                            )
-                    else:
-                        # TREND/RANGE: invalidate if there's mismatch
-                        logger.info(
-                            f"🔄 EDGE INVALIDATED: Direction mismatch | "
-                            f"Edge={edge_direction} vs Active={self._active_direction} | "
-                            f"Market changed direction → resetting edge"
-                        )
-                        self._edge_manager._transition_to(
-                            EdgeState.NO_EDGE,
-                            f"Direction flip: {edge_direction}→{self._active_direction}",
-                            market_time
-                        )
-                        self._current_trade_tags['edge_invalidated_by'] = 'direction_flip'
-        
-        # =====================================================================
-        # 🔥 FIX (Jan 27, 2026): DETECCIÓN DE EDGE POR TIPO DE MERCADO
-        # 
-        # PROBLEMA ORIGINAL:
-        #   - En RANGE (ADX<18), no hay BOS → NO_EDGE → NO TRADES
-        #   - El sistema detectaba PROBING/EXTREMOS pero EdgeStateManager
-        #     solo entendía TREND (BOS+pullback)
-        #
-        # SOLUCIÓN:
-        #   - TREND (ADX≥18): BOS + Pullback (original)
-        #   - RANGE (ADX<18): Extremos (85%/15%) o PROBING con alta confluencia
-        #   - BREAKOUT: Compresión + ruptura (para ANTICIPATION)
-        # =====================================================================
-        
-        # 2. Detectar edge según modo de trading
-        if self._edge_manager.state == EdgeState.NO_EDGE:
-            
-            # =====================================================================
-            # 🔥 FIX (Jan 28, 2026): BREAKOUT EDGE - Integrar con ANTICIPATION
-            # 🔥 FIX #30 (Feb 05): QUICK CONFIRMATION MODE
-            # 🔥 FIX #95 (Feb 09): Expandir a TODOS los tipos de anticipation
-            # 
-            # ANTICIPATION casi siempre acierta - necesita MENOS confirmación.
-            # Nueva lógica:
-            # 1. Si ANTICIPATION + micro_swing roto en esa dirección → entrada rápida
-            # 2. Si solo ANTICIPATION conf≥60% → edge tradicional
-            # =====================================================================
-            anticipation_signal = self._current_trade_tags.get('anticipation_signal')
-            # 🔥 FIX #95: Aceptar TODOS los tipos válidos de anticipation
-            valid_anticipation_signals = ['COMPRESSION_BREAKOUT', 'TREND_PULLBACK', 'FAILED_TEST', 'MOMENTUM_EXHAUSTION']
-            if anticipation_signal in valid_anticipation_signals:
-                anticipation_direction = self._current_trade_tags.get('anticipation_direction', 'LONG')
-                anticipation_bb_pct = self._current_trade_tags.get('anticipation_bb_percentile', 50.0)
-                anticipation_vol_ratio = self._current_trade_tags.get('anticipation_volume_ratio', 1.0)
-                anticipation_confidence = self._current_trade_tags.get('anticipation_confidence', 0.55)
-                structure_level = self._current_trade_tags.get('anticipation_structure_level', 0.0)
-                
-                # =========================================================
-                # 🔥 QUICK CONFIRMATION: Micro swing break = entrada rápida
-                # =========================================================
-                micro_high = getattr(self, '_current_micro_swing_high', None)
-                micro_low = getattr(self, '_current_micro_swing_low', None)
-                
-                quick_confirmed = False
-                if anticipation_direction == 'LONG' and micro_high is not None:
-                    # LONG: si precio rompe micro_swing_high → confirmación rápida
-                    if current_price > micro_high:
-                        quick_confirmed = True
-                        logger.info(
-                            f"⚡ ANTICIPATION QUICK CONFIRM: LONG | price ${current_price:.0f} > "
-                            f"micro_high ${micro_high:.0f} | conf={anticipation_confidence:.0%}"
-                        )
-                elif anticipation_direction == 'SHORT' and micro_low is not None:
-                    # SHORT: si precio rompe micro_swing_low → confirmación rápida
-                    if current_price < micro_low:
-                        quick_confirmed = True
-                        logger.info(
-                            f"⚡ ANTICIPATION QUICK CONFIRM: SHORT | price ${current_price:.0f} < "
-                            f"micro_low ${micro_low:.0f} | conf={anticipation_confidence:.0%}"
-                        )
-                
-                if quick_confirmed and anticipation_confidence >= 0.50:
-                    # QUICK PATH: Micro break + ANTICIPATION = entrar ahora
-                    self._current_trade_tags['anticipation_quick_confirm'] = True
-                    self._current_trade_tags['anticipation_entry'] = True
-                    self._current_trade_tags['anticipation_probe_size'] = 0.35  # 35% size
-                    self._active_direction = anticipation_direction
-                    self._active_direction_source = 'ANTICIPATION'  # 🔥 FIX #275
-                    self._active_direction_confidence = anticipation_confidence
-                    logger.info(
-                        f"🚀 ANTICIPATION QUICK ENTRY ARMED | {anticipation_direction} | "
-                        f"Confidence: {anticipation_confidence:.0%} | Quick confirm via micro break"
-                    )
-                    # Skip edge arming - go directly to entry pipeline
-                elif anticipation_confidence >= 0.50:  # 🔥 FIX #97 (Feb 09): Bajado de 0.60 a 0.50
-                    # STANDARD PATH: Edge tradicional
-                    breakout_armed = self._edge_manager.check_for_breakout_edge(
-                        current_price=current_price,
-                        bb_width_percentile=anticipation_bb_pct,
-                        volume_ratio=anticipation_vol_ratio,
-                        direction=anticipation_direction,
-                        atr=atr_1h,
-                        market_time=market_time,
-                        structure_level=structure_level
-                    )
-                    
-                    if breakout_armed:
-                        self._current_trade_tags['breakout_edge_armed'] = True
-                        self._current_trade_tags['edge_type'] = 'BREAKOUT'
-                        self._current_trade_tags['breakout_structure_level'] = structure_level
-                        logger.info(
-                            f"🔥 BREAKOUT EDGE ARMED from ANTICIPATION | "
-                            f"Direction: {anticipation_direction} | conf={anticipation_confidence:.0%} | "
-                            f"Structure: ${structure_level:.0f}"
-                        )
-            
-            # =====================================================================
-            # 🔥 NEW (Feb 04, 2026): RANGE edge more flexible
-            # RANGE edge can activate when:
-            #   1. trading_mode == 'RANGE' (classic)
-            #   2. OR ADX < RANGE_EDGE_MAX (25) with extreme location
-            # This allows mean-reversion in "soft trend" conditions
-            # =====================================================================
-            from src.config.trading_config import ADXThresholds
-            
-            # Check if we should try RANGE edge
-            try_range_edge = trading_mode == 'RANGE'
-            range_edge = False  # Initialize to avoid NameError
-            
-            # 🔥 NEW: Also try RANGE edge in TREND/TRANSITION if ADX is soft
-            if not try_range_edge and effective_adx < ADXThresholds.RANGE_EDGE_MAX:
-                percentile_check = self._location_context.percentile_60d if self._location_context else 50.0
-                # Only if at extreme location (≤15% or ≥85%)
-                if percentile_check <= RangeEdgeCriteria.EXTREME_LOW_PCT or percentile_check >= RangeEdgeCriteria.EXTREME_HIGH_PCT:
-                    try_range_edge = True
-                    logger.info(
-                        f"📊 RANGE EDGE OVERRIDE: ADX={effective_adx:.1f}<{ADXThresholds.RANGE_EDGE_MAX} "
-                        f"+ extreme pct={percentile_check:.0f}% → trying RANGE edge in {trading_mode} mode"
-                    )
-            
-            if try_range_edge:
-                # RANGE: Buscar edge en extremos CON SWEEP + REJECTION obligatorio
-                percentile_60d = self._location_context.percentile_60d if self._location_context else 50.0
-                
-                # =====================================================================
-                # 🔥 FIX (Jan 28, 2026): PROBING ≠ EDGE
-                # 
-                # PROBING es un TAG INFORMATIVO, NO activa edge automáticamente.
-                # Solo indica que estamos cerca de VWAP/VPOC para referencia.
-                #
-                # Para entrar necesitamos:
-                # - EXTREMOS (pct <=15% o >=85%) + sweep/rejection, O
-                # - CONFIRMACIÓN adicional (BOS, delta aligned, etc.)
-                #
-                # 🔥 FIX (Jan 28, 2026): PROBING ELIMINADO EN RANGE
-                # Ya no hay probing en RANGE - solo trades en extremos reales
-                # Este código solo registra para observabilidad, no activa nada
-                # =====================================================================
-                
-                # =====================================================================
-                # 🔥 SWEEP + REJECTION: Obtener datos de últimas 2 velas 5m
-                # Sin sweep+rejection NO hay edge, solo localización
-                # =====================================================================
-                curr_high, curr_low, curr_open, curr_close = 0.0, 0.0, 0.0, 0.0
-                prev_high, prev_low = 0.0, 0.0
-                
-                if candles_5m and len(candles_5m) >= 2:
-                    curr_candle = candles_5m[-1]
-                    prev_candle = candles_5m[-2]
-                    
-                    curr_high = float(curr_candle.get('high', 0))
-                    curr_low = float(curr_candle.get('low', 0))
-                    curr_open = float(curr_candle.get('open', 0))
-                    curr_close = float(curr_candle.get('close', 0))
-                    prev_high = float(prev_candle.get('high', 0))
-                    prev_low = float(prev_candle.get('low', 0))
-                
-                # =====================================================================
-                # 🔥 COMPRESIÓN CHECK: Calcular BB width percentile
-                # Si BB width <= 5% percentile → RANGE deshabilitado (pre-breakout)
-                # =====================================================================
-                bb_width_percentile = 50.0  # Default neutral
-                try:
-                    candles_1m = self.market_data.get_candles('1m')
-                    if candles_1m and len(candles_1m) >= 50:
-                        from src.shared.indicators import calculate_bollinger_bands
-                        df_1m = pd.DataFrame(candles_1m)
-                        closes_1m = df_1m['close'].to_numpy()
-                        bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(closes_1m, period=20, std_dev=2)
-                        if len(bb_upper) >= 20:
-                            bb_widths = bb_upper[-20:] - bb_lower[-20:]
-                            current_bb_width = bb_upper[-1] - bb_lower[-1]
-                            # Percentile: qué % de valores son MENORES que el actual
-                            bb_width_percentile = (np.sum(bb_widths < current_bb_width) / len(bb_widths)) * 100
-                except Exception as e:
-                    logger.debug(f"BB width percentile calc failed: {e}")
-                
-                range_edge = self._edge_manager.check_for_range_edge(
-                    current_price=current_price,
-                    htf_bias=bias,
-                    percentile_60d=percentile_60d,
-                    atr=atr_1h,
-                    market_time=market_time,
-                    # Datos para sweep + rejection
-                    curr_high=curr_high,
-                    curr_low=curr_low,
-                    curr_open=curr_open,
-                    curr_close=curr_close,
-                    prev_high=prev_high,
-                    prev_low=prev_low,
-                    # 🔥 BB width percentile para compresión check
-                    bb_width_percentile=bb_width_percentile
-                )
-                
-                if range_edge:
-                    self._current_trade_tags['range_edge_activated'] = True
-                    self._current_trade_tags['edge_type'] = 'RANGE'
-                    self._current_trade_tags['sweep_rejection_confirmed'] = True
-                    # El SL binario está en el BOSEvent.bos_level
-                    if self._edge_manager.current_bos:
-                        self._current_trade_tags['range_invalidation_level'] = self._edge_manager.current_bos.bos_level
-            
-            # TREND/TRANSITION: Buscar BOS clásico (only if no RANGE edge found)
-            if not try_range_edge or not range_edge:
-                bos_detected = self._edge_manager.check_for_bos(
-                    current_price=current_price,
-                    htf_bias=bias,
-                    swing_high=self._last_swing_high,
-                    swing_low=self._last_swing_low,
-                    prev_swing_high=self._prev_swing_high,
-                    prev_swing_low=self._prev_swing_low,
-                    atr=atr_1h,
-                    market_time=market_time
-                )
-                if bos_detected:
-                    self._current_trade_tags['bos_detected'] = True
-                    self._current_trade_tags['edge_type'] = 'TREND'
-        
-        # 3. Check for pullback o breakout confirmation (si edge está armado)
-        if self._edge_manager.state == EdgeState.EDGE_ARMED:
-            current_bos = self._edge_manager.current_bos
-            
-            if current_bos and current_bos.edge_type == EdgeType.DISPLACEMENT:
-                # =====================================================================
-                # 🌊 DISPLACEMENT CONFIRMATION (Jan 30, 2026)
-                # 
-                # El displacement edge se confirma si:
-                # 1. Hay pullback pequeño (15-50% del displacement) = entrada óptima
-                # 2. O hay continuación (+10% más) = follow-through
-                # =====================================================================
-                current_displacement = 0.0
-                if current_bos.direction == 'SHORT':
-                    current_displacement = self._bias_high_since - current_price
-                else:
-                    current_displacement = current_price - self._bias_low_since
-                
-                displacement_confirmed = self._edge_manager.confirm_displacement_edge(
-                    current_price=current_price,
-                    displacement_direction=current_bos.direction,
-                    initial_displacement=self._expansion_initial_displacement if hasattr(self, '_expansion_initial_displacement') else 0,
-                    current_displacement=current_displacement,
-                    atr=atr_1h,
-                    market_time=market_time
-                )
-                
-                if displacement_confirmed:
-                    self._current_trade_tags['displacement_confirmed'] = True
-                    logger.info(
-                        f"🌊 DISPLACEMENT EDGE CONFIRMED: {current_bos.direction} | "
-                        f"Current disp: ${current_displacement:.0f}"
-                    )
-            
-            elif current_bos and current_bos.edge_type == EdgeType.BREAKOUT:
-                # =====================================================================
-                # 🔥 BREAKOUT CONFIRMATION (Jan 28, 2026): Criterios institucionales
-                # 
-                # No solo distancia ATR - necesitamos:
-                # 1. Close FUERA de Bollinger Bands
-                # 2. Dirección coincide con anticipation
-                # 3. Expansión de BB comenzando
-                # =====================================================================
-                
-                # Obtener datos de BB para confirmación institucional
-                bb_upper, bb_lower, bb_expansion_ratio = 0.0, 0.0, 0.0
-                close_price = current_price  # Default al precio actual
-                
-                try:
-                    candles_1m = self.market_data.get_candles('1m')
-                    if candles_1m and len(candles_1m) >= 50:
-                        from src.shared.indicators import calculate_bollinger_bands
-                        df_1m = pd.DataFrame(candles_1m)
-                        closes_1m = df_1m['close'].to_numpy()
-                        bb_upper_arr, bb_middle, bb_lower_arr = calculate_bollinger_bands(closes_1m, period=20, std_dev=2)
-                        
-                        if len(bb_upper_arr) >= 20:
-                            bb_upper = float(bb_upper_arr[-1])
-                            bb_lower = float(bb_lower_arr[-1])
-                            close_price = float(closes_1m[-1])
-                            
-                            # Calcular ratio de expansión
-                            bb_widths = bb_upper_arr[-20:] - bb_lower_arr[-20:]
-                            avg_bb_width = float(np.mean(bb_widths[:-1]))  # Excluir actual
-                            current_bb_width = bb_upper - bb_lower
-                            bb_expansion_ratio = float(current_bb_width / avg_bb_width) if avg_bb_width > 0 else 1.0
-                except Exception as e:
-                    logger.debug(f"BB data for breakout confirmation failed: {e}")
-                
-                # Verificar dirección correcta primero
-                direction_ok = (
-                    (current_bos.direction == 'LONG' and current_price > current_bos.price) or
-                    (current_bos.direction == 'SHORT' and current_price < current_bos.price)
-                )
-                
-                if direction_ok:
-                    breakout_confirmed = self._edge_manager.confirm_breakout(
-                        current_price=current_price,
-                        breakout_direction=current_bos.direction,
-                        atr=atr_1h,
-                        market_time=market_time,
-                        bb_upper=bb_upper,
-                        bb_lower=bb_lower,
-                        close_price=close_price,
-                        expansion_ratio=bb_expansion_ratio
-                    )
-                    if breakout_confirmed:
-                        self._current_trade_tags['breakout_confirmed'] = True
-                        self._current_trade_tags['bb_expansion_ratio'] = bb_expansion_ratio
-            else:
-                # TREND edge - check pullback
-                pullback_valid = self._edge_manager.check_for_pullback(
-                    current_price=current_price,
-                    atr=atr_1h,
-                    market_time=market_time
-                )
-                if pullback_valid:
-                    self._current_trade_tags['pullback_validated'] = True
-        
-        # 4. Guardar estado del edge en tags para observabilidad
-        edge_status = self._edge_manager.get_status()
-        self._current_trade_tags['edge_state'] = edge_status['state']
-        self._current_trade_tags['edge_can_trade'] = edge_status['can_trade']
-        if edge_status.get('current_bos'):
-            self._current_trade_tags['edge_bos_direction'] = edge_status['current_bos']['direction']
-            self._current_trade_tags['edge_trades_remaining'] = edge_status['current_bos']['trades_remaining']
-        
-        # =====================================================================
-        # 🔥 ARQUITECTURA CORRECTA (Jan 29, 2026): EDGE OWNS DIRECTION
-        # 
-        # NOTA (Feb 2, 2026): Esta lógica fue MIGRADA al DirectionOrchestrator.
-        # El edge ahora tiene Priority 95 (SOVEREIGN AUTHORITY) en el orchestrator.
-        # Este bloque solo sincroniza la variable `bias` local con la decisión
-        # ya tomada por el orchestrator - NO modifica _active_direction aquí.
-        # =====================================================================
-        if self._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
-            edge_bos = self._edge_manager.current_bos
-            if edge_bos and edge_bos.direction:
-                edge_direction = edge_bos.direction
-                
-                # Sincronizar bias local (para este scope) con edge direction
-                # NOTE: _active_direction ya fue seteado por el orchestrator
-                if bias != edge_direction and edge_direction == self._active_direction:
-                    old_bias = bias
-                    bias = edge_direction
-                    self.current_bias = bias
-                    # NOTE: _active_direction override REMOVED - orchestrator handles this
-                    
-                    if self._idle_eval_count % 60 == 1:
-                        logger.debug(
-                            f"📊 Syncing local bias with orchestrated direction: {old_bias}→{edge_direction}"
-                        )
-        
-        # 🔧 FIX #128 (Feb 09, 2026): Actualizar razón de NO_EDGE para logging informativo
-        if self._edge_manager.state == EdgeState.NO_EDGE:
-            # Determinar razón basada en el contexto actual
-            percentile_60d = self._current_trade_tags.get('percentile_60d', 50.0)
-            regime = self._current_trade_tags.get('regime_mode', self._htf_cache_regime_mode)
-            anticipation = self._current_trade_tags.get('anticipation_signal')
-            
-            if regime == 'RANGE':
-                if 15 < percentile_60d < 85:
-                    reason = f"RANGE pero pct={percentile_60d:.0f}% no extremo (need <15 o >85)"
-                else:
-                    reason = "RANGE extremo pero sin sweep+rejection"
-            elif anticipation:
-                reason = f"ANTICIPATION {anticipation} sin confirmación micro-swing"
-            else:
-                reason = "Sin BOS/displacement detectado"
-            
-            self._edge_manager._no_edge_reason = reason
-        
-        # 5. Si NO hay edge activo → skip evaluación
-        #    Si llegamos aquí con NO_EDGE, significa que no hubo CONSENSUS ni condición válida
-        
-        if not self._edge_manager.can_evaluate_entry():
-            block_reason = self._edge_manager.get_block_reason()
-            
-            # 🔧 FIX #128 (Feb 09, 2026): Log diagnóstico informativo cada minuto
+
+        # --- 4. RANGE_BOUND displacement block ---
+        if trend_phase == TrendPhase.RANGE_BOUND and not is_stale:
+            is_stale = True
             if self._idle_eval_count % 60 == 1:
-                # Recopilar información diagnóstica
-                diag_parts = []
-                
-                # Modo de trading
-                regime = self._current_trade_tags.get('regime_mode', self._htf_cache_regime_mode)
-                diag_parts.append(f"mode={regime}")
-                
-                # Percentil de precio (ubicación)
-                percentile = self._current_trade_tags.get('percentile_60d', 50.0)
-                diag_parts.append(f"pct={percentile:.0f}%")
-                
-                # ADX (tendencia)
-                adx_eff = self._current_trade_tags.get('adx_effective', 20.0)
-                diag_parts.append(f"ADX={adx_eff:.0f}")
-                
-                # Anticipation si hay
-                anticipation = self._current_trade_tags.get('anticipation_signal')
-                if anticipation:
-                    ant_dir = self._current_trade_tags.get('anticipation_direction', '?')
-                    ant_conf = self._current_trade_tags.get('anticipation_confidence', 0)
-                    diag_parts.append(f"ANT={anticipation}_{ant_dir}@{ant_conf:.0%}")
-                
-                # BB width (compresión)
-                bb_pct = self._current_trade_tags.get('bb_width_percentile', 50.0)
-                if bb_pct <= 10:
-                    diag_parts.append(f"⚡SQUEEZE={bb_pct:.0f}%")
-                
-                # Bias
-                bias = self._active_direction or 'NONE'
-                diag_parts.append(f"bias={bias}")
-                
-                diag_str = " | ".join(diag_parts)
-                logger.info(f"⏸️ {block_reason} | {diag_str}")
-                
-                # Log expectancy stats si hay datos
-                stats = self._edge_manager.stats
-                if stats.total_bos_events > 0:
-                    logger.info(
-                        f"   📊 Edge Stats: {stats.total_bos_events} BOS events | "
-                        f"Expectancy/BOS: {stats.get_expectancy_per_bos():.3f}R"
-                    )
-            
-            # En estado EDGE_ARMED, no salir - el edge está esperando pullback
-            # Solo bloquear si estamos en NO_EDGE o EXPIRED
-            if self._edge_manager.state not in [EdgeState.EDGE_ARMED]:
-                return
-        
-        # Edge activo - continuar con evaluación normal
-        if self._edge_manager.can_trade():
-            bos = self._edge_manager.current_bos
-            if bos:
-                # 🔥 FIX #122: Throttle 60 → 180 ticks
-                if self._idle_eval_count % 180 == 1:
-                    logger.info(
-                        f"🎯 EDGE ACTIVE: {bos.direction} | BOS level: {bos.bos_level:.2f} | "
-                        f"Trades: {bos.trades_attempted}/{self._edge_manager.MAX_TRADES_PER_EDGE}"
-                    )
-        
-        # ===== BLOQUE 1.5: LOCATION FILTER (MACRO VETO) =====
-        # Check if location in market structure allows this trade direction
-        # This is a HARD VETO that prevents buying tops in RANGE regime
-        
-        volumes_1h = np.asarray(df_1h['volume'].to_numpy()) if 'volume' in df_1h.columns else np.ones(len(closes_1h))
-        atr_1h = atr_1h_vals[-1] if len(atr_1h_vals) > 0 else current_price * 0.01
-        
-        adx_1h_vals, _ = calculate_adx(highs_1h, lows_1h, closes_1h, 14)
-        adx_1h = adx_1h_vals[-1] if len(adx_1h_vals) > 0 else 20.0
-        
-        # Get current regime for location filter — NORMALIZE to canonical form
-        from src.domain.risk.risk_engine import normalize_regime_mode
-        raw_regime = self.regime_classifier.current_regime.value if self.regime_classifier.current_regime else "RANGE"
-        regime_for_location = normalize_regime_mode(raw_regime)
-        
-        # HTF ADX can further override TREND/BREAKOUT to RANGE
-        htf_regime_mode = self._htf_cache_regime_mode
-        if htf_regime_mode in ('RANGE', 'WEAK_TREND', 'LOW_ADX'):
-            if regime_for_location in ('TREND', 'BREAKOUT'):
-                logger.info(f"⚠️ HTF ADX override: classifier={raw_regime} → {regime_for_location} but ADX={self._htf_cache_adx:.1f} → forcing RANGE logic")
-                regime_for_location = 'RANGE'
-        
-        # 🔥 FIX (Jan 22, 2026): Store regime for trailing stop to use SAME regime
-        self._current_trade_regime = regime_for_location
-        
-        # 🔥 FIX (Jan 23, 2026): Store HTF regime mode in trade tags for analysis
-        self._current_trade_tags['htf_regime_mode'] = htf_regime_mode
-        self._current_trade_tags['htf_adx'] = self._htf_cache_adx
-        
-        # Calculate location context (cached by 1h bar close)
-        # Ensure bias is set before location check
-        if bias is None:
-            logger.warning("HTF passed but no bias set - skipping")
-            return
-        
-        location_cache_key = _ts_to_int(df_1h.iloc[-1].get('timestamp', 0))
-        location_allowed, location_reason, self._location_context = self.location_filter.check(
-            closes_1h=closes_1h,
-            highs_1h=highs_1h,
-            lows_1h=lows_1h,
-            volumes_1h=volumes_1h,
-            current_price=current_price,
-            atr_1h=atr_1h,
-            adx_1h=adx_1h,
-            bias=bias,
-            regime=regime_for_location,
-            cache_key=location_cache_key
-        )
-        
-        # Store location context in trade tags
-        if self._location_context:
-            self._current_trade_tags['location_pct_60d'] = self._location_context.percentile_60d
-            self._current_trade_tags['location_headroom_atr'] = (
-                self._location_context.headroom_to_high_atr if bias == 'LONG' 
-                else self._location_context.headroom_to_low_atr
-            )
-            self._current_trade_tags['location_in_extreme'] = (
-                self._location_context.in_extreme_high or self._location_context.in_extreme_low
-            )
-            self._current_trade_tags['location_is_breakout'] = (
-                self._location_context.is_breakout_up or self._location_context.is_breakout_down
-            )
-            
-            # 🔥 FIX #68: REMOVED FIX #39b - Was causing log spam conflict with BIAS FLIP
-            # The forbidden_direction can be set by:
-            # 1. BIAS FLIP (bias_invalidation) → has its own reclaim logic
-            # 2. Location extreme zone → should only be cleared by Location
-            # 
-            # Problem: FIX #39b was clearing ALL forbids based on Location,
-            # including those set by BIAS FLIP, causing infinite spam:
-            # - BIAS FLIP sets forbidden='SHORT' every tick
-            # - FIX #39b clears it every tick (not in extreme_low)
-            # - Log spams "SHORT ALLOWED AGAIN" on every tick
-            #
-            # Solution: Let each subsystem manage its own forbidden state.
-            # BIAS FLIP already has reclaim logic in bias_invalidation_handler.
-            # Location filter already applies penalties without needing this clear.
-            pass  # Intentionally empty - each subsystem handles its own state
-            
-            # 🔥 FIX (Jan 22, 2026): Store location penalties for scoring
-            self._current_trade_tags['location_penalty_long'] = self._location_context.location_penalty_long
-            self._current_trade_tags['location_penalty_short'] = self._location_context.location_penalty_short
-            self._current_trade_tags['location_size_cap_long'] = self._location_context.size_cap_long
-            self._current_trade_tags['location_size_cap_short'] = self._location_context.size_cap_short
-        
-        # 🔥 FIX (Jan 22, 2026): In TREND regime, convert hard veto to penalty + continue
-        # Only hard block in RANGE regime
-        is_range_regime = regime_for_location in ['RANGE', 'CHOPPY_DEAD', 'MEAN_REVERSION']
-        
-        if not location_allowed:
-            # =====================================================================
-            # LOCATION FILTER BREAKOUT OVERRIDE (Jan 16, 2026)
-            # Allow entry if HTF ADX is strong AND we have a valid BOS (breakout)
-            # This prevents blocking genuine breakouts that look like "extreme" locations
-            # =====================================================================
-            breakout_override = False
-            
-            if self._location_context:
-                is_breakout = self._location_context.is_breakout_up or self._location_context.is_breakout_down
-                htf_adx_strong = adx_1h >= LocationFilterOverride.MIN_HTF_ADX
-                
-                # Check for BOS (Break of Structure) if required
-                has_bos = True  # Default
-                if LocationFilterOverride.REQUIRE_BOS:
-                    # BOS = price breaking recent swing high/low
-                    if bias == 'LONG' and self._location_context.is_breakout_up:
-                        # Breaking above recent highs
-                        has_bos = current_price > np.max(highs_1h[-5:]) if len(highs_1h) >= 5 else False
-                    elif bias == 'SHORT' and self._location_context.is_breakout_down:
-                        # Breaking below recent lows
-                        has_bos = current_price < np.min(lows_1h[-5:]) if len(lows_1h) >= 5 else False
-                
-                if is_breakout and htf_adx_strong and has_bos:
-                    breakout_override = True
-                    self._current_trade_tags['location_breakout_override'] = True
-                    self._current_trade_tags['breakout_adx'] = adx_1h
-                    logger.info(f"🚀 LOCATION OVERRIDE: Breakout with ADX={adx_1h:.1f} (threshold={LocationFilterOverride.MIN_HTF_ADX})")
-            
-            if not breakout_override:
-                # 🔥 FIX (Jan 22, 2026): In TREND regime, DON'T hard block - use penalty and continue
-                if not is_range_regime:
-                    # TREND/TRANSITION: Apply penalty and continue (don't return)
-                    location_penalty = (
-                        self._location_context.location_penalty_long if bias == 'LONG' 
-                        else self._location_context.location_penalty_short
-                    ) if self._location_context else -1.0
-                    self._current_trade_tags['location_penalty_applied'] = location_penalty
-                    logger.info(f"📍 LOCATION PENALTY (TREND): {location_reason} → penalty {location_penalty:.1f} (continuing)")
-                    # Don't return - continue with penalty applied in scoring
-                else:
-                    # RANGE regime: Hard block only for extreme cases
-                    # Log location veto (once per bias change)
-                    if self._last_location_state is None or self._last_location_state != f'vetoed_{bias}':
-                        logger.warning(f"📍 LOCATION VETO (RANGE): {location_reason}")
-                        if self._location_context:
-                            logger.info(self.location_filter.get_location_summary(self._location_context))
-                        self._last_location_state = f'vetoed_{bias}'
-                    
-                    # =====================================================================
-                    # PULLBACK SHORT ENGINE EVALUATION (Jan 14, 2026)
-                    # When LONG is blocked by location (price at extreme high), check if
-                    # pullback short conditions are met for tactical correction capture
-                    # =====================================================================
-                    if bias == 'LONG' and PullbackShortConfig.ENABLED:
-                        await self._evaluate_pullback_short(
-                            current_price=current_price,
-                            df_1h=df_1h,
-                            candles_5m=self.market_data.get_candles('5m'),
-                            htf_bias=bias,
-                            regime=regime_for_location,
-                            market_time=market_time,
-                            veto_reason=location_reason
-                        )
-                    
-                    return
-        else:
-            self._last_location_state = f'allowed_{bias}'
-            # Log location context on first pass or regime change
-            if self._location_context and self._idle_eval_count % 60 == 0:
-                logger.debug(self.location_filter.get_location_summary(self._location_context))
-            
-            # 🔥 FIX (Jan 22, 2026): Apply location penalty even when allowed
-            # In RANGE regime with extreme positions, penalty is set but no hard block
-            if self._location_context:
-                location_penalty = (
-                    self._location_context.location_penalty_long if bias == 'LONG' 
-                    else self._location_context.location_penalty_short
-                )
-                if location_penalty < 0:
-                    self._current_trade_tags['location_penalty_applied'] = location_penalty
-                    logger.debug(f"📍 Location penalty (allowed): {location_penalty:.1f}")
-        
-        # =========================================================================
-        # 🧠 DECISION CENTER - INTELLIGENT TRADE GATING (Feb 06, 2026)
-        # =========================================================================
-        # Uses TrendIntelligence to make SMART decisions based on:
-        # - MACRO: TrendPhase (BIRTH/ACCEL/MATURE/EXHAUST/DEATH)
-        # - MACRO: Direction (BULLISH/BEARISH/NEUTRAL)
-        # - MACRO: Confidence level
-        #
-        # This replaces the 20+ lagging filters with ONE intelligent decision:
-        # "Is this the RIGHT phase and direction to enter this trade?"
-        #
-        # Key insight: TREND_BIRTH and TREND_ACCELERATION are the BEST phases.
-        # TREND_EXHAUSTION and DISTRIBUTION should NOT have new entries.
-        # =========================================================================
-        
-        # 🔥 FIX (Feb 06, 2026): Use ACTIVE direction, not HTF bias
-        # The EdgeManager already decided "I want SHORT" based on analysis
-        # Use that direction to check if TrendIntelligence allows it
-        ti_check_direction = bias  # Default to HTF bias
-        if self._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
-            if self._edge_manager.current_bos:
-                ti_check_direction = self._edge_manager.current_bos.direction
-        elif self._active_direction:
-            ti_check_direction = self._active_direction
-        
-        entry_recommendation = self._trend_intelligence.get_entry_recommendation(ti_check_direction)
-        self._current_trade_tags['ti_allowed'] = entry_recommendation['allowed']
-        self._current_trade_tags['ti_phase'] = entry_recommendation['phase']
-        self._current_trade_tags['ti_direction_bias'] = entry_recommendation['direction_bias']
-        self._current_trade_tags['ti_entry_mode'] = entry_recommendation['entry_mode']
-        self._current_trade_tags['ti_size_mult'] = entry_recommendation['size_multiplier']
-        self._current_trade_tags['ti_score_adj'] = entry_recommendation['score_adjustment']
-        self._current_trade_tags['ti_confidence'] = entry_recommendation['confidence']
-        
-        # INTELLIGENT GATING based on TrendIntelligence
-        if not entry_recommendation['allowed']:
-            # Check if we have a displacement/edge that overrides
-            edge_state = self._edge_manager.state
-            edge_bos = self._edge_manager.current_bos
-            has_edge_override = (
-                edge_state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE] and
-                edge_bos is not None
-            )
-            has_displacement_override = self._displacement_bypass
-            
-            # 🔥 DEBUG: Log what we're checking
-            logger.debug(
-                f"🔍 TI CHECK: allowed={entry_recommendation['allowed']} | "
-                f"edge_state={edge_state.value if edge_state else 'None'} | "
-                f"edge_bos={edge_bos is not None} | "
-                f"has_edge_override={has_edge_override} | "
-                f"displacement={has_displacement_override}"
-            )
-            
-            # 🔥 FIX (Feb 06, 2026): ANY EDGE should override TI block, not just BREAKOUT/DISPLACEMENT
-            # If EdgeManager has a signal, trust it - that's the whole point of having EdgeManager
-            # 🔥 FIX #221 (Feb 12, 2026): PERO NO si estamos en EXHAUSTION/DISTRIBUTION
-            # El edge se armó ANTES de detectar exhaustion - ahora no es válido
-            # NOTE: TrendPhase is imported globally at line 45 - DO NOT import locally here
-            # as it causes UnboundLocalError in earlier parts of this function
-            ti_phase_check = entry_recommendation.get('phase', '')
-            is_bad_phase_for_override = ti_phase_check in ['TREND_EXHAUSTION', 'DISTRIBUTION', 'TREND_DEATH']
-            
-            if (has_edge_override or has_displacement_override) and not is_bad_phase_for_override:
-                override_type = "DISPLACEMENT" if has_displacement_override else (
-                    edge_bos.edge_type.value if edge_bos else "EDGE"
-                )
                 logger.info(
-                    f"🌊 TI OVERRIDE: {entry_recommendation['reason']} but {override_type} active → allowing"
+                    f"🚫 RANGE_BOUND BLOCK {direction}: Displacement ${move_amount:.0f} "
+                    f"but TrendPhase=RANGE_BOUND"
                 )
-                self._current_trade_tags['ti_overridden'] = True
-            elif is_bad_phase_for_override:
-                # 🔥 FIX #221: HARD BLOCK even with edge - edge is stale
-                logger.warning(
-                    f"🚫 FIX #221: TI HARD BLOCK (BAD PHASE) | Phase={ti_phase_check} | "
-                    f"Edge present but phase is END-OF-TREND | NOT overriding"
-                )
-                self._current_trade_tags['skip_reason'] = f"ti_hard_block_{ti_phase_check}"
-                return
-            else:
-                # 🔥 FIX #221: Lowered confidence threshold from 0.8 to 0.6
-                # 0.8 was too permissive - let through too many bad trades
-                if entry_recommendation['confidence'] >= 0.6:
-                    logger.warning(
-                        f"🧠 DECISION CENTER BLOCK: {entry_recommendation['reason']} | "
-                        f"Confidence: {entry_recommendation['confidence']:.0%}"
-                    )
-                    self._current_trade_tags['skip_reason'] = f"ti_block_{entry_recommendation['phase']}"
-                    return
-                else:
-                    logger.info(
-                        f"📊 TI LOW CONFIDENCE ({entry_recommendation['confidence']:.0%}): "
-                        f"{entry_recommendation['reason']} - proceeding with caution"
-                    )
-                    self._current_trade_tags['ti_low_confidence_proceed'] = True
-        
-        # Apply TI size multiplier for sizing decisions later
-        self._ti_size_multiplier = entry_recommendation['size_multiplier']
-        self._ti_score_adjustment = entry_recommendation['score_adjustment']
-        
-        # 🧠 ADDITIONAL INTELLIGENCE: Volume and Structure Analysis
-        ti_state = self._trend_intelligence.state
-        self._current_trade_tags['ti_volume_trend'] = ti_state.volume_trend
-        self._current_trade_tags['ti_volume_confirms'] = ti_state.volume_on_moves
-        self._current_trade_tags['ti_hh_count'] = ti_state.higher_highs_count
-        self._current_trade_tags['ti_ll_count'] = ti_state.lower_lows_count
-        self._current_trade_tags['ti_adx_slope'] = ti_state.adx_slope
-        self._current_trade_tags['ti_adx_accel'] = ti_state.adx_acceleration
-        
-        # Volume divergence = reduce conviction
-        if ti_state.volume_on_moves == "diverges":
-            self._ti_size_multiplier *= 0.7
-            # 🔧 FIX #129: Throttle log to once per 2 minutes
-            market_time = self.market_data.get_market_time()
-            if self._last_vol_divergence_log is None or \
-               (market_time - self._last_vol_divergence_log).total_seconds() >= 120:
-                logger.info(f"📉 VOLUME DIVERGENCE: Reducing size by 30%")
-                self._last_vol_divergence_log = market_time
-            self._current_trade_tags['ti_volume_penalty'] = True
-        
-        # Structure alignment bonus
-        if bias == 'LONG' and ti_state.higher_highs_count >= 2:
-            self._ti_score_adjustment -= 0.5  # Lower threshold (easier entry)
-            self._current_trade_tags['ti_structure_aligned'] = True
-        elif bias == 'SHORT' and ti_state.lower_lows_count >= 2:
-            self._ti_score_adjustment -= 0.5
-            self._current_trade_tags['ti_structure_aligned'] = True
-        
-        # ADX acceleration: if momentum is building, boost size
-        if ti_state.adx_acceleration > 1.0:
-            self._ti_size_multiplier = min(1.3, self._ti_size_multiplier * 1.1)
-            logger.debug(f"📈 ADX ACCELERATION +: Size boost (accel={ti_state.adx_acceleration:.2f})")
-        elif ti_state.adx_acceleration < -1.0:
-            self._ti_size_multiplier *= 0.85
-            logger.debug(f"📉 ADX DECELERATION: Size reduction (accel={ti_state.adx_acceleration:.2f})")
-        
-        # Log significant recommendations (rate-limited to avoid spam)
-        if entry_recommendation['entry_mode'] == 'AGGRESSIVE':
-            # 🔥 FIX #151 (Feb 10, 2026): Rate-limit AGGRESSIVE log to 60s
-            now = market_time
-            last_agg_log = getattr(self, '_last_ti_aggressive_log', None)
-            if last_agg_log is None or (now - last_agg_log).total_seconds() >= 60:
-                logger.info(
-                    f"🚀 TI AGGRESSIVE MODE: {entry_recommendation['phase']} | "
-                    f"Direction: {entry_recommendation['direction_bias']} | "
-                    f"Best entry opportunity!"
-                )
-                self._last_ti_aggressive_log = now
-        elif entry_recommendation['entry_mode'] == 'WAIT':
-            # Even if allowed, WAIT mode = lower conviction
-            logger.debug(f"⏳ TI WAIT MODE: {entry_recommendation['phase']} - proceed with reduced size")
-        
-        # =========================================================================
-        # 🔥 FIX #83 (Feb 07, 2026): 3-LAYER REGIME FUSION - TRADE DECISION
-        # 
-        # Reemplaza la lógica fragmentada de counter-preference con:
-        # - MICRO: direction + confidence + displacement/structure
-        # - FUSION: alignment-based sizing y RR, ÚNICO bloqueo para fade estúpido
-        # =========================================================================
-        
-        # Determinar si hay edge explosivo (displacement/structure)
-        has_displacement = self._displacement_bypass or self._strong_displacement
-        has_structure = (
-            self._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE] and
-            self._edge_manager.current_bos is not None
-        )
-        
-        # Calcular confianza del micro signal
-        micro_confidence = 0.5  # Base
-        if has_displacement:
-            micro_confidence = 0.9  # Alta confianza con displacement
-        elif has_structure:
-            micro_confidence = 0.7  # Buena confianza con estructura
-        
-        # Actualizar MICRO state
-        self._regime_fusion.update_micro(
-            direction=bias,  # "LONG" o "SHORT"
-            confidence=micro_confidence,
-            has_displacement=has_displacement,
-            has_structure=has_structure,
-        )
-        
-        # FUSIÓN: Obtener decisión final
-        regime_decision = self._regime_fusion.fuse(micro_direction=bias)
-        self._last_regime_decision = regime_decision
-        
-        # Guardar en tags
-        self._current_trade_tags['regime_alignment'] = regime_decision.alignment
-        self._current_trade_tags['regime_size_mult'] = regime_decision.size_mult
-        self._current_trade_tags['regime_rr_min'] = regime_decision.rr_min
-        self._current_trade_tags['regime_is_fade'] = regime_decision.is_fade
-        self._current_trade_tags['regime_blocked'] = regime_decision.is_blocked
-        
-        # =====================================================================
-        # 🔥 ÚNICO BLOQUEO: Fade estúpido (macro fuerte + contra + sin edge)
-        # =====================================================================
-        if regime_decision.is_blocked:
+
+        # --- 5. Clear expansion if now stale ---
+        if is_stale and self._expansion_mode and self._expansion_direction == direction:
             logger.warning(
-                f"☠️ REGIME FUSION BLOCK: {regime_decision.reason} | "
-                f"macro={self._regime_fusion.regime_state.regime.value}, "
-                f"score={self._regime_fusion.regime_state.macro_score:.2f}, "
-                f"micro={bias}"
+                f"🔄 EXPANSION_MODE CLEARED: {direction} displacement now STALE"
             )
-            self._current_trade_tags['skip_reason'] = 'regime_fade_block'
-            return
-        
-        # Log decisión de fusión (rate limited)
-        if regime_decision.is_fade:
-            should_log_fusion = (
-                self._last_countertrend_log is None or 
-                (market_time - self._last_countertrend_log) > self._log_rate_limit_interval
-            )
-            if should_log_fusion:
-                self._last_countertrend_log = market_time
+            self._expansion_mode = False
+            self._expansion_direction = None
+            self._direction_lock = None
+            self._direction_lock_expires_at = None
+
+        # --- 6. Direction memory: block same-dir 30min ---
+        SAME_DIR_BLOCK_S = 1800
+        ANY_DIR_BLOCK_S = 180
+        elapsed = (
+            (datetime.now() - self._last_trade_exit_time).total_seconds()
+            if self._last_trade_exit_time else 99999
+        )
+        same_dir_block = (self._last_trade_direction == direction and elapsed < SAME_DIR_BLOCK_S)
+        any_dir_block = elapsed < ANY_DIR_BLOCK_S
+        dir_memory_block = (same_dir_block or any_dir_block) and not self._expansion_mode
+
+        if dir_memory_block:
+            if self._idle_eval_count % 60 == 1:
+                block_type = "SAME DIR 30min" if same_dir_block else "CONSUMED 3min"
+                remaining = (SAME_DIR_BLOCK_S if same_dir_block else ANY_DIR_BLOCK_S) - elapsed
                 logger.info(
-                    f"🔀 REGIME FADE ALLOWED: {bias} vs macro={self._regime_fusion.regime_state.regime.value} | "
-                    f"size={regime_decision.size_mult:.0%}, rr_min={regime_decision.rr_min:.1f}R | "
-                    f"override={regime_decision.override_type or 'none'}"
+                    f"⏳ {direction} displacement ${move_amount:.0f} BLOCKED ({block_type}) | "
+                    f"Last={self._last_trade_direction} {elapsed:.0f}s ago | Wait {remaining:.0f}s"
                 )
-        
-        # Usar los valores del RegimeFusion en lugar de counter_pref
-        self._current_trade_tags['is_counter_preference'] = regime_decision.is_fade
-        self._current_trade_tags['counter_pref_size_mult'] = regime_decision.size_mult
-        self._current_trade_tags['counter_pref_rr_add'] = regime_decision.rr_min - 1.0  # Compatibilidad
-        
-        # 2. Get old countertrend rules for compatibility (kept for logs only)
-        ct_rules = BiasStrengthConfig.get_countertrend_rules(self._current_bias_strength, bias)
-        is_countertrend = ct_rules['is_countertrend']
-        
-        self._current_trade_tags['is_countertrend'] = is_countertrend
-        self._current_trade_tags['ct_size_mult'] = regime_decision.size_mult  # Usar fusion
-        self._current_trade_tags['ct_max_rr'] = ct_rules['max_rr']
-        
-        # 3. Detect Trend Expansion (uses extracted detector)
-        # 🔥 FIX #292b: Create DataFrames from candles already fetched earlier in pipeline
-        # (candles_5m at fast_adx, candles_1m at intraday_edge_data)
-        df_5m_pre = pd.DataFrame(candles_5m) if candles_5m and len(candles_5m) >= 30 else None
-        df_1m_pre = pd.DataFrame(candles_1m) if candles_1m and len(candles_1m) >= 20 else None
-        if df_5m_pre is not None and df_1m_pre is not None:
-            atr_5m_pre = calculate_atr(df_5m_pre['high'].to_numpy(), df_5m_pre['low'].to_numpy(), df_5m_pre['close'].to_numpy(), 14)
-            atr_5m_val = atr_5m_pre[-1] if len(atr_5m_pre) > 0 else current_price * 0.005
-            
-            expansion_result = self._trend_expansion_detector.detect(
-                df_5m_pre, df_1m_pre, current_price, atr_5m_val
-            )
-            expansion_detected = expansion_result.is_expanding
-            expansion_criteria = expansion_result.criteria_met
-            
-            if expansion_detected and not self._trend_expansion_active:
-                self._trend_expansion_active = True
-                self._trend_expansion_start_time = market_time
-                # Set anti-fade period
-                anti_fade_minutes = TrendExpansionConfig.ANTI_FADE_CANDLES * 5
-                self._anti_fade_until = market_time + timedelta(minutes=anti_fade_minutes)
-                logger.info(f"🚀 TREND EXPANSION MODE ACTIVATED - anti-fade for {anti_fade_minutes}min")
-            elif not expansion_detected and self._trend_expansion_active:
-                # Check if expansion ended
-                if self._trend_expansion_start_time and (market_time - self._trend_expansion_start_time).total_seconds() > 1800:  # 30min min duration
-                    self._trend_expansion_active = False
-                    self._trend_expansion_start_time = None
-                    logger.info("📉 TREND EXPANSION MODE ENDED")
-            
-            self._current_trade_tags['trend_expansion'] = self._trend_expansion_active
-            self._current_trade_tags['expansion_criteria'] = expansion_criteria
-        
-        # 4. HARD BLOCK: No entries opposite to active expansion direction
-        # Data Feb 19: LONG during SHORT expansion → -$1.485 (catastrophic).
-        # A bounce during expansion is NOT a reversal signal.
-        if self._expansion_mode and self._expansion_direction:
-            if bias != self._expansion_direction:
-                should_log = (
-                    self._last_antifade_log is None or
-                    (market_time - self._last_antifade_log) > self._log_rate_limit_interval
+        elif not is_stale:
+            # --- 7. Activate expansion + direction lock + arm edge ---
+            if not self._expansion_mode or self._expansion_direction != direction:
+                self._expansion_mode = True
+                self._expansion_direction = direction
+                self._expansion_start_time = datetime.now()
+                self._expansion_initial_displacement = move_amount
+
+                self._direction_lock = direction
+                self._direction_lock_reason = 'STRONG_DISPLACEMENT'
+                self._direction_lock_expires_at = datetime.now() + timedelta(
+                    minutes=self._direction_lock_timeout_minutes
                 )
-                if should_log:
-                    self._last_antifade_log = market_time
-                    logger.warning(
-                        f"🚫 EXPANSION BLOCK: Cannot enter {bias} during "
-                        f"{self._expansion_direction} expansion | HARD BLOCK"
+                self._direction_lock_initial_move = move_amount
+
+                logger.warning(
+                    f"🚀 EXPANSION + LOCK: {direction} | "
+                    f"Displacement ${move_amount:.0f} ≥ ${strong_threshold:.0f} | "
+                    f"Lock: {self._direction_lock_timeout_minutes}min"
+                )
+
+                self._current_trade_tags['expansion_mode_activated'] = True
+                self._current_trade_tags['expansion_direction'] = direction
+                self._current_trade_tags['direction_lock'] = direction
+
+                # Arm displacement edge
+                armed = self._edge_manager.arm_displacement_edge(
+                    current_price=current_price,
+                    direction=direction,
+                    displacement_amount=move_amount,
+                    atr=atr_5m,
+                    market_time=market_time,
+                    initial_price=origin_price,
+                    is_stale=False,
+                    stale_distance=dist_from_extreme,
+                )
+                if armed:
+                    self._current_trade_tags['displacement_edge_armed'] = True
+                    self._current_trade_tags['edge_type'] = 'DISPLACEMENT'
+                    logger.info(
+                        f"🌊 DISPLACEMENT EDGE ARMED: {direction} | "
+                        f"${move_amount:.0f} | Origin ${origin_price:.0f}"
                     )
-                self._current_trade_tags['skip_reason'] = 'expansion_opposite_block'
-                return
-        
-        # 4b. HARD BLOCK: No fades during trend expansion anti-fade period
-        if self._anti_fade_until and market_time < self._anti_fade_until:
-            if regime_decision.is_fade:
-                remaining = (self._anti_fade_until - market_time).total_seconds() / 60
-                should_log_af = (
-                    self._last_antifade_log is None or
-                    (market_time - self._last_antifade_log) > self._log_rate_limit_interval
-                )
-                if should_log_af:
-                    self._last_antifade_log = market_time
-                    logger.warning(
-                        f"🚫 ANTI-FADE BLOCK: Cannot fade during expansion "
-                        f"({remaining:.0f}min remaining) | HARD BLOCK"
-                    )
-                self._current_trade_tags['skip_reason'] = 'anti_fade_expansion_block'
-                return
-        
-        # =====================================================================
-        # 5. Short Obstinacy Check - 🔥 FIX #135: ELIMINATED (Feb 10, 2026)
-        # =====================================================================
-        # REASON FOR REMOVAL: SHORT OBSTINACY checked lagging signals (VWAP, 
-        # EMA20>EMA50) that react AFTER price moved. This blocked good trades.
-        # The STRUCTURE GATE (EMA50_1h alignment) is the correct filter.
-        # This entire feature was disabled via SIMPLE_MODE=True since Feb 06.
-        # Now removed completely to reduce code complexity.
-        # =====================================================================
-        self._current_trade_tags['short_obstinacy_disabled'] = True
-        
-        # ===== BLOQUE 2.5: MICRO TREND FILTER (5m) =====
-        candles_1m_list = self.market_data.get_candles('1m')
-        candles_5m_list = self.market_data.get_candles('5m')
-        
-        # Initialize to None for type safety
-        df_5m_micro: pd.DataFrame | None = None
-        df_1m_micro: pd.DataFrame | None = None
-        
-        if candles_5m_list and len(candles_5m_list) >= 60:
-            df_5m_micro = pd.DataFrame(candles_5m_list)
-            df_1m_micro = pd.DataFrame(candles_1m_list) if candles_1m_list and len(candles_1m_list) >= 30 else None
-            
-            micro_allowed, micro_reason, self._micro_trend_state = self.micro_trend_filter.check(
-                df_5m=df_5m_micro,
-                df_1m=df_1m_micro,
-                current_price=current_price,
-                htf_bias=bias,
-                market_time=market_time
-            )
-            
-            # Store micro trend state in trade tags for analysis
-            if self._micro_trend_state:
-                self._current_trade_tags['micro_trend'] = self._micro_trend_state.micro_trend
-                self._current_trade_tags['micro_trend_strength'] = self._micro_trend_state.strength
-                self._current_trade_tags['micro_ema20_5m'] = self._micro_trend_state.ema20_5m
-                self._current_trade_tags['micro_ema50_5m'] = self._micro_trend_state.ema50_5m
-                self._current_trade_tags['micro_rsi_5m'] = self._micro_trend_state.rsi_5m
-                self._current_trade_tags['micro_score_adj'] = self._micro_trend_state.score_adjustment
-                self._current_trade_tags['micro_has_ll'] = self._micro_trend_state.has_lower_low
-                
-                # =========================================================================
-                # 🔥 FIX (Jan 22, 2026): REGIME-AWARE MICRO TREND ADJUSTMENT
-                # In RANGE regime: micro trends are ephemeral, reduce their weight
-                # This prevents over-shorting/longing in the middle of ranges
-                # =========================================================================
-                regime_for_micro = self._current_trade_regime
-                is_range_for_micro = regime_for_micro in ['RANGE', 'CHOPPY_DEAD', 'MEAN_REVERSION', 'TREND_EXHAUSTION']
-                
-                if is_range_for_micro and self._micro_trend_state.score_adjustment != 0:
-                    original_adj = self._micro_trend_state.score_adjustment
-                    # In RANGE: cap bonus at 0.5, cap penalty at -0.3
-                    if original_adj > 0:
-                        self._micro_trend_state.score_adjustment = min(0.5, original_adj)
-                    else:
-                        self._micro_trend_state.score_adjustment = max(-0.3, original_adj)
-                    
-                    if original_adj != self._micro_trend_state.score_adjustment:
-                        logger.info(
-                            f"📊 MICRO ADJ CAPPED (RANGE regime): {original_adj:+.1f} → "
-                            f"{self._micro_trend_state.score_adjustment:+.1f}"
-                        )
-                        self._current_trade_tags['micro_score_adj'] = self._micro_trend_state.score_adjustment
-                        self._current_trade_tags['micro_regime_capped'] = True
-            
-            if not micro_allowed:
-                # =====================================================================
-                # MICRO TREND ADX CONDITIONING (Jan 16, 2026)
-                # Only apply hard block if HTF trend is WEAK (low ADX)
-                # In STRONG trends (ADX >= 30), micro-corrections are normal - allow entry
-                # In WEAK trends (ADX < 20), micro-trend signals are more meaningful - block
-                #
-                # 🔥 FIX (Jan 22, 2026): Penalty caps based on ADX
-                # ADX > 30: penalty = 0 (strong trend, pullbacks are opportunities)
-                # ADX 15-25: penalty max = -0.5 (transitional, be cautious but allow)
-                # ADX < 15: keep current penalty (weak/ranging, micro trend is significant)
-                # =====================================================================
-                adx_override = False
-                
-                if adx_1h >= MicroTrendADXConfig.STRONG_TREND_ADX:
-                    # Strong HTF trend - override micro block, NO penalty
-                    adx_override = True
-                    self._current_trade_tags['micro_adx_override'] = True
-                    self._current_trade_tags['micro_htf_adx'] = adx_1h
-                    logger.info(f"⚡ MICRO TREND override: HTF ADX={adx_1h:.1f} >= {MicroTrendADXConfig.STRONG_TREND_ADX} (strong trend - NO penalty)")
-                    # Zero penalty in strong trends
-                    if self._micro_trend_state:
-                        self._micro_trend_state.score_adjustment = 0.0
-                elif adx_1h >= 15:  # 15-30 range
-                    # Mid-range ADX: Apply capped penalty
-                    adx_override = True
-                    self._current_trade_tags['micro_adx_override'] = True
-                    self._current_trade_tags['micro_htf_adx'] = adx_1h
-                    
-                    # Progressive penalty: 15 ADX = -0.5, 25 ADX = -0.25, 30 ADX = 0
-                    penalty_factor = (30 - adx_1h) / 30  # 0 at ADX=30, 0.5 at ADX=15
-                    capped_penalty = max(-0.5, -penalty_factor)
-                    
-                    if self._micro_trend_state:
-                        self._micro_trend_state.score_adjustment = capped_penalty
-                    
-                    logger.info(f"⚠️ MICRO TREND: HTF ADX={adx_1h:.1f} (mid-range) → capped penalty {capped_penalty:.2f}")
                 else:
-                    # Weak HTF trend (ADX < 15) - micro signals are very significant
-                    logger.info(f"⛔ MICRO TREND: HTF ADX={adx_1h:.1f} < 15 (weak trend, full block)")
-                
-                if not adx_override:
-                    # 🔥 FIX #135: MICRO TREND VETO disabled - only context tagging, no blocking
-                    self._current_trade_tags['micro_trend_veto'] = True
-                    self._current_trade_tags['micro_veto_reason'] = micro_reason
-                    # No block - just log for context
-                    logger.debug(f"📊 [CONTEXT] Micro Trend opposes {bias} - no block (FIX #135)")
-            else:
-                self._last_micro_state = f'allowed_{bias}'
-                if self._micro_trend_state and self._micro_trend_state.score_adjustment != 0:
-                    logger.debug(f"📊 MICRO TREND: {self._micro_trend_state.micro_trend} (strength={self._micro_trend_state.strength:.0%}, score_adj={self._micro_trend_state.score_adjustment:+.1f})")
-        else:
-            # Not enough data - allow but log
-            self._micro_trend_state = None
-            logger.debug("⚠️ MICRO TREND: Insufficient 5m data - skipping filter")
-        
-        # =========================================================================
-        # =========================================================================
-        # 🔥 FIX #135: BIAS INVERSION - ELIMINATED (Feb 10, 2026)
-        # =========================================================================
-        # REASON FOR REMOVAL: BIAS INVERSION caused countertrend trades when 
-        # micro-trend was "strong" but was just a pullback within a larger trend.
-        # The HTF bias (EMA50_1h) is the correct directional filter.
-        # This feature was disabled via SIMPLE_MODE=True since Feb 06.
-        # Now removed completely to reduce code complexity.
-        # 
-        # Context tagging preserved for analysis:
-        # =========================================================================
-        MICRO_STRENGTH_FOR_INVERSION = 0.65
-        if self._micro_trend_state is not None and hasattr(self._micro_trend_state, 'strength'):
-            if self._micro_trend_state.strength >= MICRO_STRENGTH_FOR_INVERSION:
-                micro_trend = self._micro_trend_state.micro_trend
-                if (bias == 'LONG' and micro_trend == 'BEARISH') or (bias == 'SHORT' and micro_trend == 'BULLISH'):
-                    self._current_trade_tags['bias_inversion_would_trigger'] = True
-                    self._current_trade_tags['micro_trend_opposing'] = micro_trend
-                    self._current_trade_tags['micro_trend_strength'] = self._micro_trend_state.strength
-                    logger.debug(
-                        f"📊 [CONTEXT] BIAS INVERSION would trigger: HTF={bias}, micro={micro_trend} "
-                        f"(strength={self._micro_trend_state.strength:.0%}) - disabled (FIX #135)"
-                    )
-        
-        # ===== BLOQUE 2.6: EMA DISTANCE GUARD (Jan 15, 2026) =====
-        # PROBLEM: Bot enters LONGs when price is significantly below EMA20/EMA50 on 5m,
-        # which indicates strong bearish micro-structure. MicroTrendFilter hysteresis 
-        # may not catch fast moves.
-        # SOLUTION: Hard block if price is >1% below EMA20 for LONG (or >1% above for SHORT)
-        # This is a FAIL-SAFE to prevent entries against obvious micro-structure.
-        #
-        # Why 1%? On BTC at 95000, 1% = $950. If we're $950+ below EMA20 (5m),
-        # we're clearly in a pullback/correction - not a good LONG entry point.
-        
-        EMA_DISTANCE_BLOCK_PCT = 0.01  # 1% threshold
-        EMA_DISTANCE_WARNING_PCT = 0.005  # 0.5% warning (apply score penalty)
-        
-        if df_5m_micro is not None and len(df_5m_micro) >= 50:
-            closes_5m = df_5m_micro['close'].to_numpy()
-            ema20_5m_val = calculate_ema(closes_5m, 20)[-1]
-            ema50_5m_val = calculate_ema(closes_5m, 50)[-1]
-            
-            if not np.isnan(ema20_5m_val) and not np.isnan(ema50_5m_val) and ema20_5m_val > 0:
-                if bias == 'LONG':
-                    # For LONG: Block if price is significantly BELOW EMAs
-                    distance_to_ema20 = (current_price - ema20_5m_val) / ema20_5m_val
-                    distance_to_ema50 = (current_price - ema50_5m_val) / ema50_5m_val
-                    
-                    # HARD BLOCK: Price >1% below EMA20 AND below EMA50
-                    # 🔥 BYPASS: DISPLACEMENT edge has sovereign authority (Jan 30, 2026)
-                    has_displacement_edge = (
-                        self._edge_manager.current_bos and 
-                        self._edge_manager.current_bos.edge_type == EdgeType.DISPLACEMENT and
-                        self._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]
-                    )
-                    if distance_to_ema20 < -EMA_DISTANCE_BLOCK_PCT and distance_to_ema50 < 0:
-                        if has_displacement_edge or self._expansion_mode:
-                            logger.info(
-                                f"🌊 EMA DISTANCE BYPASS: DISPLACEMENT/EXPANSION active - "
-                                f"price {abs(distance_to_ema20)*100:.1f}% below EMA20 but momentum overrides"
-                            )
-                            self._current_trade_tags['ema_distance_bypassed'] = True
-                        else:
-                            # 🔥 FIX #135: EMA Distance VETO eliminated - context tagging only
-                            # REASON: This veto was too aggressive and blocked entries at mean-reversion opportunities
-                            self._current_trade_tags['ema_distance_veto_would_trigger'] = True
-                            self._current_trade_tags['ema20_distance_pct'] = distance_to_ema20 * 100
-                            self._current_trade_tags['ema50_distance_pct'] = distance_to_ema50 * 100
-                            logger.debug(
-                                f"📊 [CONTEXT] EMA Distance: LONG {abs(distance_to_ema20)*100:.1f}% below EMA20 (veto disabled FIX #135)"
-                            )
-                    
-                    # WARNING: Price 0.5-1% below EMA20 - apply extra penalty (handled in micro_trend)
-                    elif distance_to_ema20 < -EMA_DISTANCE_WARNING_PCT:
-                        logger.debug(
-                            f"[WARN] EMA DISTANCE: LONG {abs(distance_to_ema20)*100:.1f}% below EMA20"
-                        )
-                        self._current_trade_tags['ema_distance_warning'] = True
-                        self._current_trade_tags['ema20_distance_pct'] = distance_to_ema20 * 100
-                
-                elif bias == 'SHORT':
-                    # For SHORT: Block if price is significantly ABOVE EMAs
-                    distance_to_ema20 = (current_price - ema20_5m_val) / ema20_5m_val
-                    distance_to_ema50 = (current_price - ema50_5m_val) / ema50_5m_val
-                    
-                    # HARD BLOCK: Price >1% above EMA20 AND above EMA50
-                    # 🔥 BYPASS: DISPLACEMENT edge has sovereign authority (Jan 30, 2026)
-                    has_displacement_edge_short = (
-                        self._edge_manager.current_bos and 
-                        self._edge_manager.current_bos.edge_type == EdgeType.DISPLACEMENT and
-                        self._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]
-                    )
-                    if distance_to_ema20 > EMA_DISTANCE_BLOCK_PCT and distance_to_ema50 > 0:
-                        if has_displacement_edge_short or self._expansion_mode:
-                            logger.info(
-                                f"🌊 EMA DISTANCE BYPASS: DISPLACEMENT/EXPANSION active - "
-                                f"price {distance_to_ema20*100:.1f}% above EMA20 but momentum overrides"
-                            )
-                            self._current_trade_tags['ema_distance_bypassed'] = True
-                        else:
-                            # 🔥 FIX #135: EMA Distance VETO eliminated - context tagging only
-                            # REASON: This veto was too aggressive and blocked entries at mean-reversion opportunities
-                            self._current_trade_tags['ema_distance_veto_would_trigger'] = True
-                            self._current_trade_tags['ema20_distance_pct'] = distance_to_ema20 * 100
-                            self._current_trade_tags['ema50_distance_pct'] = distance_to_ema50 * 100
-                            logger.debug(
-                                f"📊 [CONTEXT] EMA Distance: SHORT {distance_to_ema20*100:.1f}% above EMA20 (veto disabled FIX #135)"
-                            )
-        
-        # ===== BLOQUE 2.7: UNIFIED FILTER PIPELINE (Jan 15, 2026) =====
-        # Runs all new filters: BB Width, Volatility Shock, Macro Trend, 
-        # Post-Sweep, Cost, Overtrade
-        # NOTE: System doesn't have 15m candles, using 5m as proxy for intermediate TF
-        df_15m_proxy = df_5m_micro
-        
-        # Calculate spread from order book if available
-        spread = None
-        if hasattr(self, 'order_book') and self.order_book:
-            bid_price, ask_price, spread_pct = self.order_book.get_spread()
-            if bid_price and ask_price:
-                # Update spread filter with bid/ask for rolling window analysis
-                self.spread_filter.update_spread(bid_price, ask_price, current_price)
-                spread = spread_pct  # Use the percentage for other calculations
-                # 🔥 FIX (Jan 28, 2026): Store spread for SL updates in exit_actions
-                if spread_pct:
-                    self._last_spread_bps = spread_pct * 100  # Convert to basis points
-        
-        # 🔥 FIX #46 (Feb 05): Check if ANTICIPATION bypass should be active
-        # ANTICIPATION has its own confirmation - bypasses macro slope (reduces size, not blocks)
-        # 🔥 FIX #95 (Feb 09): Aceptar todos los tipos de anticipation
-        # 🔥 FIX #179 (Feb 11): Alinear umbral con idle_state_handlers (0.50, no 0.55)
-        valid_anticipation_signals = ['COMPRESSION_BREAKOUT', 'TREND_PULLBACK', 'FAILED_TEST', 'MOMENTUM_EXHAUSTION']
-        anticipation_bypass = (
-            self._current_trade_tags.get('anticipation_signal') in valid_anticipation_signals and
-            self._current_trade_tags.get('anticipation_confidence', 0) >= 0.50  # 🔥 FIX #179: was 0.55
-        )
-        
-        # 🔥 FIX #67 (Feb 06): Check if BIAS FLIP bypass should be active
-        # BIAS FLIP = market structure changed, old sweeps are stale
-        bias_flip_bypass = (
-            self._current_trade_tags.get('bias_invalidated', False) or
-            self._current_trade_tags.get('bias_inverted', False)
-        )
-        
-        filter_decision = self.filter_pipeline.evaluate(
-            df_1m=df_1m_micro,  # pyright: ignore[reportArgumentType]
-            df_5m=df_5m_micro,  # pyright: ignore[reportArgumentType]
-            df_15m=df_15m_proxy,  # pyright: ignore[reportArgumentType]
-            df_1h=df_1h,
-            current_price=current_price,
-            bias=bias,
-            atr=atr_1m,
-            spread=spread,
-            market_time=market_time,
-            displacement_bypass=self._displacement_bypass,  # 🔥 FIX (Jan 29): Pass displacement state
-            anticipation_bypass=anticipation_bypass,  # 🔥 FIX #46 (Feb 05): ANTICIPATION bypasses macro slope
-            bias_flip_bypass=bias_flip_bypass  # 🔥 FIX #67 (Feb 06): BIAS FLIP bypasses sweep
-        )
-        
-        # Store filter pipeline tags
-        if filter_decision.tags:
-            for key, value in filter_decision.tags.items():
-                self._current_trade_tags[f'fp_{key}'] = value
-        
-        if not filter_decision.allow:
-            # Log which filter blocked
-            blocker = filter_decision.tags.get('blocked_by', 'unknown')
-            if self._last_fp_block is None or self._last_fp_block != f'{blocker}_{bias}':
-                logger.warning(f"[BLOCK] FILTER [{blocker}]: {filter_decision.reasons[0] if filter_decision.reasons else 'veto'}")
-                self._last_fp_block = f'{blocker}_{bias}'
-            return
-        else:
-            self._last_fp_block = None
-            if filter_decision.score_adjust != 0:
-                logger.debug(f"📊 FILTER PIPELINE: score_adj={filter_decision.score_adjust:+.1f}")
-        
-        # ===== BLOQUE 3: LTF TRIGGER (1m) =====
-        logger.debug("Evaluating LTF trigger (1m)...")
-        candles_1m = self.market_data.get_candles('1m')
-        df_1m = pd.DataFrame(candles_1m)
-        
-        # Get regime info for volume-aware filtering
-        regime_value = self.regime_classifier.current_regime.value if self.regime_classifier.current_regime else None
-        regime_conf = self.regime_classifier.regime_confidence
-        
-        ltf_passed, ltf_reason = self.ltf_filter.check(
-            df_1m,
-            bias,
-            {},  # Order book would go here but we'll use execution for real book
-            regime=regime_value,
-            regime_confidence=regime_conf
-        )
-        
-        # ===== STORE LTF INFO AS TAGS (regardless of pass/fail) =====
-        ltf_info = self.ltf_filter.get_last_ltf_info()
-        if ltf_info:
-            self._current_trade_tags['ltf_bos'] = ltf_info.get('bos_confirmed', False)
-            self._current_trade_tags['ltf_ema_reclaim'] = ltf_info.get('ema_reclaim', False)
-            self._current_trade_tags['ltf_slope_positive'] = ltf_info.get('slope_positive', False)
-            self._current_trade_tags['ltf_confirmations'] = ltf_info.get('confirmations', 0)
-            self._current_trade_tags['ltf_ema_slope'] = ltf_info.get('ema_slope', 0.0)
-            # Volume tags (never blocks, only info)
-            self._current_trade_tags['rel_vol'] = ltf_info.get('rel_vol', 1.0)
-            self._current_trade_tags['volume_bucket'] = ltf_info.get('volume_bucket', 'unknown')
-        
-        if not ltf_passed:
-            if self._last_ltf_state != f'rejected_{ltf_reason}':
-                logger.info(f"⛔ LTF filter rejected: {ltf_reason}")
-                
-                # Show detailed LTF values
-                ema_9_ltf = df_1m['close'].ewm(span=9, adjust=False).mean().iloc[-1]
-                ema_20_ltf = df_1m['close'].ewm(span=20, adjust=False).mean().iloc[-1]
-                
-                logger.info(f"   📊 Price: ${current_price:.2f} | EMA9: ${ema_9_ltf:.2f} | EMA20: ${ema_20_ltf:.2f}")
-                logger.info(f"   🎯 Bias: {bias} | Impulse High: ${self.impulse_high:.2f} | Low: ${self.impulse_low:.2f}")
-                
-                self._last_ltf_state = f'rejected_{ltf_reason}'
-            return
-        
-        # 🔥 FIX #154 (Feb 10, 2026): LTF confirmations < 2 = HARD BLOCK
-        # BEFORE: ltf_passed=True with 1/3 confirmations was allowed
-        # NOW: Require at least 2/3 confirmations
-        # Example: Trade 14:17:43 entered with LTF(1/3), MFE=0.00R, lost -0.44R
-        # =====================================================================
-        # LTF CONFIRMATION GATE
-        # Default: 2/3 confirmaciones (BOS, EMA reclaim, EMA slope)
-        # Bypass: Solo EXPANSION o DISPLACEMENT — movimientos reales del mercado
-        # donde LTF lagging no puede confirmar a tiempo.
-        # =====================================================================
-        ltf_confs = ltf_info.get('confirmations', 0) if ltf_info else 0
-        min_ltf_required = 2  # Default: 2/3 confirmaciones
+                    # Refresh if same-direction edge already active
+                    if (self._edge_manager.state == EdgeState.EDGE_ACTIVE
+                            and self._edge_manager.direction == direction):
+                        self._edge_manager.refresh_edge_origin(current_price, market_time)
 
-        is_expansion = self._trend_expansion_active or self._expansion_mode
-        is_displacement_edge = False
-        is_breakout_edge = False
-        if self._edge_manager.state in (EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE):
-            bos = self._edge_manager.current_bos
-            if bos:
-                if bos.trend_path and 'DISPLACEMENT' in str(bos.trend_path):
-                    is_displacement_edge = True
-                if hasattr(bos, 'edge_type') and bos.edge_type:
-                    et = bos.edge_type.value if hasattr(bos.edge_type, 'value') else str(bos.edge_type)
-                    if et == 'BREAKOUT':
-                        is_breakout_edge = True
+        # --- 8. Clear forbidden direction if displacement overrides ---
+        if self._forbidden_direction == direction and not is_stale:
+            logger.info(
+                f"🔥 DISPLACEMENT OVERRIDE: ${move_amount:.0f} clears FORBIDDEN={direction}"
+            )
+            self._forbidden_direction = None
+            self._current_trade_tags['displacement_override_bias_flip'] = True
 
-        # 🔥 FIX #154b (Feb 20, 2026): BREAKOUT bypass for LTF gate
-        # Data: 3/4 entries blocked by LTF 1/3 in log_20260220. BREAKOUT edges
-        # fire from ANTICIPATION (compression) where LTF EMA/BOS lag behind.
-        # BREAKOUT already has reduced sizing (0.50-0.71x), so 1/3 LTF is acceptable.
-        if is_expansion:
-            min_ltf_required = 1
-            logger.debug(f"📊 LTF bypass: 1/3 suficiente (EXPANSION mode)")
-        elif is_displacement_edge:
-            min_ltf_required = 1
-            logger.debug(f"📊 LTF bypass: 1/3 suficiente (DISPLACEMENT edge)")
-        elif is_breakout_edge:
-            min_ltf_required = 1
-            logger.debug(f"📊 LTF bypass: 1/3 suficiente (BREAKOUT edge)")
-        
-        if ltf_confs < min_ltf_required:
-            if self._last_ltf_state != 'weak_ltf':
-                logger.warning(f"⛔ LTF WEAK BLOCK: {ltf_confs}/3 confirmations < {min_ltf_required} minimum | Entry blocked")
-                self._last_ltf_state = 'weak_ltf'
-            return
-        
-        if self._last_ltf_state != 'passed':
-            logger.info(f"✅ LTF filter passed")
-            self._last_ltf_state = 'passed'
-        
-        # =====================================================================
-        # PUNTO 12: DELTA VOLUME CONFIRMATION (Jan 22, 2026)
-        # Check if buy/sell volume delta confirms the bias direction
-        # LONG: require positive delta (more buying than selling)
-        # SHORT: require negative delta (more selling than buying)
-        # This is a SCORE BONUS, not a hard gate
-        # =====================================================================
-        delta_score_bonus = 0
-        try:
-            if 'volume' in df_1m.columns and len(df_1m) >= 5:
-                # Calculate volume delta using candle direction
-                # Green candle = buy volume, Red candle = sell volume
-                df_1m_recent = df_1m.tail(5).copy()
-                df_1m_recent['is_green'] = df_1m_recent['close'] >= df_1m_recent['open']
-                df_1m_recent['signed_vol'] = np.where(
-                    df_1m_recent['is_green'],
-                    df_1m_recent['volume'],
-                    -df_1m_recent['volume']
-                )
-                delta = df_1m_recent['signed_vol'].sum()
-                avg_vol = df_1m['volume'].tail(20).mean()
-                
-                # Calculate delta as multiple of average volume
-                delta_ratio = delta / avg_vol if avg_vol > 0 else 0
-                
-                self._current_trade_tags['volume_delta'] = delta
-                self._current_trade_tags['volume_delta_ratio'] = delta_ratio
-                
-                # Score bonus for aligned delta
-                if bias == 'LONG' and delta_ratio > 0.5:
-                    # Positive delta = buying pressure confirms LONG
-                    delta_score_bonus = 0.5 if delta_ratio > 1.0 else 0.25
-                    logger.debug(f"📊 DELTA ALIGNED: +{delta_ratio:.2f}x avg vol supports LONG (+{delta_score_bonus} score)")
-                elif bias == 'SHORT' and delta_ratio < -0.5:
-                    # Negative delta = selling pressure confirms SHORT
-                    delta_score_bonus = 0.5 if delta_ratio < -1.0 else 0.25
-                    logger.debug(f"📊 DELTA ALIGNED: {delta_ratio:.2f}x avg vol supports SHORT (+{delta_score_bonus} score)")
-                elif bias == 'LONG' and delta_ratio < -0.5:
-                    # 🔥 DISABLED (Feb 04, 2026): Delta contradict penalties removed
-                    # Delta is lagging - was blocking valid entries and allowing bad ones
-                    self._current_trade_tags['delta_contradicts'] = True
-                    logger.debug(f"[INFO] Delta contradicts LONG (not penalized): {delta_ratio:.2f}x vol")
-                elif bias == 'SHORT' and delta_ratio > 0.5:
-                    # 🔥 DISABLED (Feb 04, 2026): Delta contradict penalties removed
-                    self._current_trade_tags['delta_contradicts'] = True
-                    logger.debug(f"[INFO] Delta contradicts SHORT (not penalized): +{delta_ratio:.2f}x vol")
-                
-                # 🔥 FIX #99 REMOVED (Feb 09, 2026): Delta NO invalida edge
-                # El usuario confirmó que el sistema hubiera ganado con LONG
-                # aunque el delta era negativo. El delta es indicativo, no determinante.
-                
-        except Exception as e:
-            logger.debug(f"Delta volume calculation error: {e}")
-        
-        self._current_trade_tags['delta_score_bonus'] = delta_score_bonus
-        
-        # =====================================================================
-        # 🔥 CRITICAL FIX (Jan 29, 2026): FINAL DIRECTION VALIDATION
-        # 
-        # ANTES DE EJECUTAR: Verificar que la dirección del trade coincide
-        # con la dirección del edge (si hay edge armado/activo).
-        # 
-        # Esto previene el bug donde ANTICIPATION detecta LONG pero el
-        # sistema ejecutaba SHORT basándose en otros filtros.
-        #
-        # NOTA (Feb 2, 2026): El orchestrator ahora maneja la prioridad del edge.
-        # Este bloque solo sincroniza variables locales para logging.
-        # =====================================================================
-        # 🔥 FIX (Jan 30): First check if edge_type already stored (e.g., from DISPLACEMENT detection)
-        # Only update from edge_manager if not already set
-        edge_direction_final = self._current_trade_tags.get('edge_direction')
-        edge_type_final = self._current_trade_tags.get('edge_type')
-        
-        # If not already set, try to get from edge_manager
-        if not edge_type_final:
-            if self._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]:
-                if self._edge_manager.current_bos:
-                    edge_direction_final = self._edge_manager.current_bos.direction
-                    edge_type_final = self._edge_manager.current_bos.edge_type
-                    if edge_type_final:
-                        # Store as string for consistency
-                        self._current_trade_tags['edge_type'] = edge_type_final.value if hasattr(edge_type_final, 'value') else edge_type_final
-                        self._current_trade_tags['edge_direction'] = edge_direction_final
-                        logger.debug(f"📊 Edge stored from manager: type={self._current_trade_tags['edge_type']}, dir={edge_direction_final}")
-        else:
-            logger.debug(f"📊 Edge already in tags: type={edge_type_final}, dir={edge_direction_final}")
-        
-        # Si hay BREAKOUT edge, sincronizar bias local para logging
-        # NOTE: _active_direction ya fue seteado por el orchestrator con EDGE_BREAKOUT priority 95
-        is_breakout = (
-            edge_type_final == EdgeType.BREAKOUT or 
-            edge_type_final == 'BREAKOUT' or
-            (hasattr(edge_type_final, 'value') and edge_type_final.value == 'BREAKOUT')
-        )
-        if is_breakout and edge_direction_final:
-            if bias != edge_direction_final:
-                # Solo sincronizar bias local, NO modificar _active_direction
-                # (ya fue seteado correctamente por el orchestrator)
-                # 🔥 FIX #122: Throttle 60 → 180 ticks
-                if self._idle_eval_count % 180 == 1:
-                    logger.debug(
-                        f"📊 Syncing local bias with edge: {bias} → {edge_direction_final}"
-                    )
-                bias = edge_direction_final
-                self.current_bias = bias
-                # NOTE: _active_direction override REMOVED - orchestrator handles this
-        
-        # ===== ALL FILTERS PASSED - PRE-CHECK EDGE CONTEXT =====
-        # Note: LTF is "score-based" not "gate-based" so we show actual confirmations
-        ltf_confs = self._current_trade_tags.get('ltf_confirmations', '?')
-        
-        # 🔥 FIX #151 (Feb 10, 2026): Rate-limit SETUP COMPLETE log to 60s
-        # This log was spamming when guards block after filter pass
-        now = market_time
-        last_setup_log = getattr(self, '_last_setup_complete_log', None)
-        should_log_setup = last_setup_log is None or (now - last_setup_log).total_seconds() >= 60
-        
-        # Quick edge context check BEFORE showing "SETUP COMPLETE"
-        # This prevents confusing logs where setup appears complete but is then blocked
-        if self._edge_context and not self._edge_context.is_valid():
-            if should_log_setup:
-                logger.info(f"🎯 FILTERS PASSED - {bias} | HTF✓ MTF✓ LTF({ltf_confs}/3) | ⚠️ Edge context pending validation")
-                self._last_setup_complete_log = now
-        else:
-            # 🔥 FIX: Log edge info if present
-            edge_info = ""
-            if edge_type_final and edge_direction_final:
-                # edge_type_final may be string or Enum
-                edge_type_str = edge_type_final.value if hasattr(edge_type_final, 'value') else edge_type_final
-                edge_info = f" | Edge: {edge_type_str} {edge_direction_final}"
-            if should_log_setup:
-                logger.info(f"🎯 SETUP COMPLETE - {bias} | HTF✓ MTF✓ LTF({ltf_confs}/3){edge_info}")
-                self._last_setup_complete_log = now
-        self._current_trade_type = TradeType.LONG_MAIN if bias == 'LONG' else TradeType.SHORT_STRUCTURAL
-        # FIX #303 REMOVED: Momentum drift check created a catch-22.
-        # Displacement needs $130+ to detect but drift blocked at $62 from BOS.
-        # The stale displacement check + edge invalidation already handle exhausted moves.
-        try:
-            await self._execute_entry(current_price, atr_1m, market_time)
-        except Exception as e:
-            logger.error(f"⛔ _execute_entry EXCEPTION: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-    
+        return is_stale
+
     async def _evaluate_pullback_short(
         self,
         current_price: float,

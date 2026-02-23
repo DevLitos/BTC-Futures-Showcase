@@ -52,8 +52,14 @@ from src.domain.trading.state.state_types import (
 )
 
 # 🎯 Edge State Manager (Jan 27, 2026)
+from src.domain.trading.edge_types import (
+    EdgeState, EdgeType, BOSEvent, EdgeStats,
+    EdgePriority, TrendEdgePath,
+    RangeEdgeCriteria, BreakoutEdgeCriteria, DisplacementEdgeCriteria,
+    EdgeTransition,
+)
 from src.domain.trading.edge_state_manager import (
-    EdgeStateManager, EdgeState, BOSEvent, EdgeStats,
+    EdgeStateManager,
     get_edge_manager, reset_edge_manager
 )
 
