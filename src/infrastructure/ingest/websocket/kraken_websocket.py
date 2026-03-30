@@ -245,7 +245,7 @@ class KrakenFuturesWebSocket:
                 # Procesar por tipo
                 await self._process_message(data)
                 
-                # 🔥 FIX (Jan 21, 2026): Rate limit message processing
+                # Rate limit message processing
                 # Yield after every message, plus small sleep every 100 messages
                 # to ensure other tasks get CPU time (WS can send 1000+ msgs/sec)
                 msg_count += 1

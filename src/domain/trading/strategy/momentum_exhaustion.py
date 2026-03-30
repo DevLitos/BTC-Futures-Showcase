@@ -84,7 +84,7 @@ class MomentumExhaustionDetector:
     VELOCITY_DECAY_PCT = 0.5      # Velocity < 50% of peak
     
     # Rate-limiting for logging (Fix #8 - Feb 2, 2026; Fix #289 - Feb 18, 2026)
-    # 🔥 FIX #289: Increased from 30s → 120s. In Trade 4, the same 3 signals
+    # Increased from 30s → 120s. In Trade 4, the same 3 signals
     # (vol climax, shooting star, velocity decay) logged every 30s for 6+ minutes.
     # State changes (level/action/count) still log immediately.
     LOG_INTERVAL_SECONDS = 120
@@ -265,7 +265,7 @@ class MomentumExhaustionDetector:
         
         # Find peak ATR in last 20 bars
         recent_atr = atr[-20:]
-        # 🔥 FIX (Jan 22, 2026): Filter NaN values before finding peak
+        # Filter NaN values before finding peak
         valid_atr = recent_atr[~np.isnan(recent_atr)]
         if len(valid_atr) == 0:
             return False, 0.0, "No valid ATR data"
@@ -273,7 +273,7 @@ class MomentumExhaustionDetector:
         peak_atr = np.max(valid_atr)
         current_atr = atr[-1]
         
-        # 🔥 FIX (Jan 22, 2026): Guard against NaN current ATR
+        # Guard against NaN current ATR
         if np.isnan(current_atr):
             return False, 0.0, "Current ATR is NaN"
         
@@ -320,7 +320,7 @@ class MomentumExhaustionDetector:
         if peak_vel > self._peak_velocity:
             self._peak_velocity = peak_vel
         
-        # 🔥 FIX (Jan 22, 2026): Safe division - guard against zero/negative peak velocity
+        # Safe division - guard against zero/negative peak velocity
         if self._peak_velocity <= 0:
             return False, "No positive velocity recorded"
         
@@ -455,7 +455,7 @@ class MomentumExhaustionDetector:
             exit_urgency=urgency
         )
         
-        # 🔥 FIX #8 (Feb 2, 2026): Rate-limited logging to reduce log spam
+        # Rate-limited logging to reduce log spam
         # Only log if: state changed OR 30 seconds elapsed since last log
         should_log = False
         now = datetime.now()

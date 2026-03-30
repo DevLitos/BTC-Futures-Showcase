@@ -119,7 +119,7 @@ class LocationContext:
     veto_short: bool = False
     veto_reasons: List[str] = field(default_factory=list)
     
-    # 🔥 FIX (Jan 22, 2026): Score penalties instead of hard vetoes
+    # Score penalties instead of hard vetoes
     location_penalty_long: float = 0.0    # Penalty for long at extremes
     location_penalty_short: float = 0.0   # Penalty for short at extremes
     
@@ -242,12 +242,12 @@ class LocationFilter:
             context.range_low_60d = float(np.min(lows_1h))
         
         # =============================================================
-        # 🔥 FIX (Feb 05, 2026): DYNAMIC RANGE EXPANSION
+        # DYNAMIC RANGE EXPANSION
         # =============================================================
         # PROBLEM: When price breaks 60d extremes, percentile becomes negative
         #          or very low (<5%), which blocks ALL trades via location_extreme.
         #          The system lost 100R+ potential on 2026-02-05 due to this bug.
-        #
+
         # SOLUTION: If current price is OUTSIDE the historical range, expand
         #           the range dynamically to include current price + buffer.
         #           This keeps percentile in valid 0-100% range.
@@ -404,7 +404,7 @@ class LocationFilter:
         """
         Apply location-based veto rules.
         
-        PHASE A FIX (Jan 18, 2026): Added TREND override with ADX parameter.
+        PHASE A Added TREND override with ADX parameter.
         In strong trends (ADX >= 25), allow trading at extremes.
         
         Args:
@@ -446,7 +446,7 @@ class LocationFilter:
         
         if is_range_regime:
             if context.in_extreme_high:
-                # 🔥 FIX (Jan 22, 2026): NO hard veto, use progressive penalties + size caps
+                # NO hard veto, use progressive penalties + size caps
                 # A trade at 95% percentile can still work if entry is good
                 if not context.is_breakout_up:
                     # Progressive penalty based on percentile
@@ -472,7 +472,7 @@ class LocationFilter:
                     )
             
             if context.in_extreme_low:
-                # 🔥 FIX (Jan 22, 2026): NO hard veto, use progressive penalties + size caps
+                # NO hard veto, use progressive penalties + size caps
                 if not context.is_breakout_down:
                     if context.percentile_60d <= 5:
                         context.location_penalty_short = -1.5

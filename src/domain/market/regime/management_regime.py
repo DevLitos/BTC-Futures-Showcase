@@ -130,7 +130,7 @@ class _TrendBasedRegimeClassifier:
     """
     Regime classifier that uses TrendIntelligence for real regime detection.
     
-    🔥 FIX (Feb 05, 2026): Sizing now REACTS to market regime!
+    Sizing now REACTS to market regime!
     - TREND_BIRTH/ACCELERATION → 1.25x risk (maximum edge)
     - TREND_MATURE/ACCUMULATION → 0.85x risk (normal)
     - TREND_EXHAUSTION/DEATH/RANGE → 0.3x risk (defensive)

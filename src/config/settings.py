@@ -745,7 +745,7 @@ async def validate_startup(settings: Settings) -> dict:
             config['timeout'] = 10000  # 10s internal CCXT timeout
             exchange = ExchangeClass(config)
             
-            # 🔥 FIX (Jan 21, 2026): Add timeout to prevent blocking
+            # Add timeout to prevent blocking
             await asyncio.wait_for(exchange.load_markets(), timeout=STARTUP_TIMEOUT)
             
             # Verify symbol exists
@@ -759,7 +759,7 @@ async def validate_startup(settings: Settings) -> dict:
             
             # Check time sync (some exchanges don't support fetch_time)
             try:
-                # 🔥 FIX (Jan 21, 2026): Add timeout to prevent blocking
+                # Add timeout to prevent blocking
                 server_time = await asyncio.wait_for(exchange.fetch_time(), timeout=10.0)
                 local_time = int(datetime.now(UTC).timestamp() * 1000)
                 drift_ms = abs(server_time - local_time)
@@ -776,7 +776,7 @@ async def validate_startup(settings: Settings) -> dict:
                 # Some exchanges (krakenfutures) don't support fetch_time
                 results["warnings"].append(f"Time sync check not available: {str(time_error)[:50]}")
             
-            # 🔥 FIX (Jan 21, 2026): Add timeout to prevent blocking
+            # Add timeout to prevent blocking
             try:
                 await asyncio.wait_for(exchange.close(), timeout=5.0)
             except asyncio.TimeoutError:
@@ -793,7 +793,7 @@ async def validate_startup(settings: Settings) -> dict:
             import telegram
             
             bot = telegram.Bot(token=settings.telegram_bot_token.get_secret_value())
-            # 🔥 FIX (Jan 21, 2026): Add timeout to Telegram validation
+            # Add timeout to Telegram validation
             try:
                 bot_info = await asyncio.wait_for(bot.get_me(), timeout=10.0)
                 results["checks"]["telegram_valid"] = True

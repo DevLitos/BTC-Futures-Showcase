@@ -42,7 +42,7 @@ class SignalPriority(Enum):
     ANTICIPATION = 100        # 🔥 RESTORED: 100% accuracy = CORE signal
     
     # TRANSITION LEVEL (75) - BIAS FLIP direction overrides structural bias
-    # 🔥 FIX #269: When BIAS FLIP sets transition_mode_direction, it MUST
+    # When BIAS FLIP sets transition_mode_direction, it MUST
     # override structural_bias. Otherwise the system reverts to LONG after
     # SHORT edge expires, causing infinite CONSENSUS BLOCKED spam.
     TRANSITION_MODE = 75
@@ -132,12 +132,12 @@ class DirectionOrchestrator:
                     strong_displacement: bool = False,
                     
                     # Anticipation signals (Priority 85)
-                    # 🔥 FIX #28 (Feb 04): Added confidence for high-confidence bypass
+                    # Added confidence for high-confidence bypass
                     anticipation_pending: bool = False,
                     anticipation_direction: Optional[str] = None,
                     anticipation_confidence: float = 0.0,
                     
-                    # 🔥 FIX #269: TRANSITION_MODE direction (Priority 75)
+                    # TRANSITION_MODE direction (Priority 75)
                     # When BIAS FLIP sets transition_mode, this direction MUST
                     # override structural_bias to prevent reverting to stale HTF bias
                     transition_mode_active: bool = False,
@@ -151,6 +151,12 @@ class DirectionOrchestrator:
                     
                     # 🔥 REFACTOR: Location context for extreme veto (moved from _get_effective_direction)
                     location_context: Optional[Any] = None,
+                    
+                    # ADX context for trend strength assessment
+                    htf_adx: float = 0.0,
+                    
+                    # Macro context for preventing dead-edge deadlocks
+                    macro_bias_strength: Optional[str] = None,
                     
                     # Context
                     tick_count: int = 0) -> OrchestrationResult:
@@ -202,7 +208,7 @@ class DirectionOrchestrator:
             ))
         
         # 4. ANTICIPATION - CORE signal (100) - 100% accuracy confirmed by user
-        # 🔥 FIX #28 (Feb 04): Use actual confidence and mark high-confidence for bypass
+        # Use actual confidence and mark high-confidence for bypass
         if anticipation_pending and anticipation_direction:
             actual_conf = anticipation_confidence if anticipation_confidence > 0 else 0.55
             is_high_confidence = actual_conf >= 0.70
@@ -216,7 +222,7 @@ class DirectionOrchestrator:
             ))
         
         # 5. TRANSITION_MODE - BIAS FLIP direction (Priority 75)
-        # 🔥 FIX #269: When BIAS FLIP activates transition_mode, this direction
+        # When BIAS FLIP activates transition_mode, this direction
         # MUST override structural_bias. Without this, after SHORT edge expires,
         # structural_bias=LONG takes over → arm_consensus_edge(LONG) → CONSENSUS
         # BLOCKED by macro=BEAR_STRONG → infinite spam, system paralyzed.
@@ -269,14 +275,36 @@ class DirectionOrchestrator:
         
         core_signals = [s for s in signals if s.priority.value >= 100]
         
+        # Pre-compute macro incoherence for deadlock prevention
+        # LOG EVIDENCE (Feb 23): EDGE_BREAKOUT=LONG (priority 100) bypassed
+        # forbidden_direction=SHORT, but REGIME FUSION blocked ALL LONG entries.
+        # Result: 12-min DEAD_EDGE deadlock per cycle, 7+ cycles = hours wasted.
+        _macro_would_block_long = macro_bias_strength == 'BEAR_STRONG'
+        _macro_would_block_short = macro_bias_strength == 'BULL_STRONG'
+        
         for signal in signals:
             # CORE signals (EXPANSION/EDGE/DISPLACEMENT/ANTICIPATION) bypass forbidden_direction
+            # UNLESS the direction contradicts strong macro (REGIME FUSION would block anyway)
             if signal.priority.value >= 100:
+                direction_blocked_by_macro = (
+                    (signal.direction == 'LONG' and _macro_would_block_long) or
+                    (signal.direction == 'SHORT' and _macro_would_block_short)
+                )
+                if direction_blocked_by_macro and forbidden_direction == signal.direction:
+                    # Don't bypass forbidden — REGIME FUSION would block this trade
+                    if not vetoed_by:
+                        vetoed_by = f"MACRO_{macro_bias_strength}"
+                        conflict_detected = True
+                        conflict_details = (
+                            f"{signal.source}={signal.direction} forbidden AND "
+                            f"macro={macro_bias_strength} contradicts — no bypass"
+                        )
+                    continue
                 winning_signal = signal
                 final_direction = signal.direction
                 break
             
-            # 🔥 FIX #28 (Feb 04): High-confidence ANTICIPATION bypasses forbidden_direction
+            # High-confidence ANTICIPATION bypasses forbidden_direction
             # Rationale: ANTICIPATION detected compression breakout BEFORE the move
             # The forbidden_direction is stale/lagging - ANTICIPATION has early info
             if signal.source == 'ANTICIPATION' and signal.metadata.get('can_bypass_forbidden'):
@@ -355,13 +383,28 @@ class DirectionOrchestrator:
                     winning_signal = None
         
         # =====================================================================
-        # HTF_BIAS STALENESS GUARD (from commit +$4, FIX #246)
+        # HTF_BIAS STALENESS GUARD
+
         # If STRUCTURAL_BIAS is the winning signal with no CORE/TRANSITION
-        # confirmation → veto. HTF bias alone is not actionable.
+        # confirmation → veto ONLY in RANGE markets (low ADX).
+
+        # ROOT CAUSE FIX
+        # PROBLEM: In TREND mode (ADX >= 25), structural bias IS the signal.
+        # The guard was designed for RANGE markets where HTF bias is noise.
+        # But it was applied unconditionally, causing Active=None for 20+ min
+        # while the market moved 0.89% in the structural direction.
+        # LOG EVIDENCE: ADX=31.1, -DI=34.8 → clear SHORT trend but
+        # Active=None because no CORE signal confirmed structural bias.
+
+        # FIX: When htf_adx >= 25 (STRONG_TREND), structural bias alone
+        # IS a valid actionable signal. Only veto in RANGE (ADX < 25).
         # Advisory signals (MICRO_MOMENTUM, FAST_REVERSAL) do NOT confirm.
         # =====================================================================
         if winning_signal and winning_signal.source == 'STRUCTURAL_BIAS':
-            has_real_confirmation = any(
+            # In strong trends, structural bias IS the signal — not stale
+            trend_confirms_bias = htf_adx >= 25
+            
+            has_real_confirmation = trend_confirms_bias or any(
                 s.source != 'STRUCTURAL_BIAS' and s.priority.value >= 50
                 for s in signals if not s.metadata.get('is_advisory')
             )
@@ -369,12 +412,17 @@ class DirectionOrchestrator:
             if not has_real_confirmation:
                 logger.debug(
                     f"📊 HTF_BIAS={final_direction} is ALONE | "
-                    f"No CORE/TRANSITION signal confirms | Returning None"
+                    f"ADX={htf_adx:.1f} < 25 (RANGE) | No confirmation | Returning None"
                 )
                 final_direction = None
                 winning_signal = None
                 if not vetoed_by:
                     vetoed_by = 'HTF_BIAS_ALONE'
+            elif trend_confirms_bias and tick_count % 60 == 1:
+                logger.info(
+                    f"📊 HTF_BIAS={final_direction} CONFIRMED by STRONG_TREND | "
+                    f"ADX={htf_adx:.1f} ≥ 25 | Actionable"
+                )
         
         # =====================================================================
         # CREATE RESULT

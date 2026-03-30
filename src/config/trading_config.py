@@ -213,15 +213,15 @@ class DailyRegimeDetector:
 # ============================================================================
 # El usuario dijo: "Ahora estás en el peor punto intermedio: no tienes wins 
 # pequeños, no tienes runners, y tus losses son variables."
-#
+
 # SOLUCIÓN: Elegimos UN CAMINO y lo aplicamos consistentemente.
-# 
+
 # CAMINO ELEGIDO: HIGH WINRATE + CONTROLLED LOSSES
 # - Target pequeño (1.0R) para maximizar winrate
 # - Pérdida máxima controlada (-0.35R absoluto máximo con TIME_INVALIDATION)
 # - NO chase runners en RANGE days
 # - SÍ chase runners SOLO en TREND days (daily regime = TREND_DAY)
-# 
+
 # REGLA DE ORO: Si un trade no va en profit en X minutos, EXIT.
 # No dejar que mediocre se convierta en pérdida.
 # ============================================================================
@@ -251,16 +251,16 @@ class AsymmetryConfig:
     MAX_STOP_R = 1.0                 # Stop máximo = 1.0R (igual que TP)
     
     # TIME_INVALIDATION: EXIT RÁPIDO SI NO FUNCIONA
-    # 🔥 FIX #121a (Feb 09, 2026): Give trades more room
+    # Give trades more room
     # OLD: -0.20R → Too aggressive, trades killed before developing
     # NEW: -0.35R → Standard pullback tolerance
     TIME_INVALIDATION_CANDLES = 15  # 15 velas 1m = 15 min
     TIME_INVALIDATION_EXIT_R = 0.0  # Target: salir en breakeven o mejor
-    TIME_INVALIDATION_MAX_LOSS_R = -0.35  # 🔥 FIX #121a: -0.35R (was -0.20R) - give room!
+    TIME_INVALIDATION_MAX_LOSS_R = -0.35  # -0.35R (was -0.20R) - give room!
     
     # === PÉRDIDA MÁXIMA ABSOLUTA ===
     # Si llegamos aquí, algo falló (slippage, gap, etc.)
-    ABSOLUTE_MAX_LOSS_R = -0.40     # 🔥 FIX #121a: NUNCA perder más de -0.40R (was -0.25R)
+    ABSOLUTE_MAX_LOSS_R = -0.40     # NUNCA perder más de -0.40R (was -0.25R)
     
     # === RUNNERS (SOLO EN TREND DAYS) ===
     ALLOW_RUNNERS = False           # Default OFF
@@ -304,7 +304,7 @@ class BiasStrength(str, Enum):
 
 class WorkingBias(str, Enum):
     """
-    🔥 FIX #76 (Feb 07, 2026): WORKING BIAS - Dirección Operativa
+    WORKING BIAS - Dirección Operativa
     
     Derived from macro_bias (BiasStrength), tells us what to PREFER trading.
     This is NOT a blocker, it's a PREFERENCE.
@@ -734,7 +734,7 @@ class OperatingMode:
     
     NEVER mix logic with loose ifs - everything depends on MODE
     
-    🔥 FIX (Feb 03, 2026): MODE is now DYNAMIC based on trade count
+    MODE is now DYNAMIC based on trade count
     - First 100 trades: DISCOVERY (learning, conservative)
     - After 100 trades: PRODUCTION (proven edge, full sizing)
     This is an INTRADAY system - we learn fast.
@@ -756,7 +756,7 @@ class OperatingMode:
             return "DISCOVERY"
     
     # Mode-specific thresholds
-    # 🔥 FIX #155 (Feb 10, 2026): Score threshold raised from 5 to 6
+    # Score threshold raised from 5 to 6
     # Analysis shows score 5.5 trades have MFE=0.00R (never go in favor)
     # Example: Trade 14:17:43 entered with score 5.5, lost -0.44R
     # Trades with score < 6 are lottery tickets, not trades.
@@ -797,7 +797,7 @@ class OperatingMode:
     
     # =========================================================================
     # CONSECUTIVE LOSSES SIZING - Reduce size after losses
-    # 🔥 FIX (Jan 25, 2026): Adjusted for micro accounts - faster reduction
+    # Adjusted for micro accounts - faster reduction
     # Progressive reduction: 1 loss = 70%, 2 losses = 50%, 3 losses = 30%
     # =========================================================================
     LOSS_SIZING_MULTIPLIERS = {
@@ -820,7 +820,7 @@ class OperatingMode:
     # =========================================================================
     # CAPA 4: MINIMUM ACTIVITY PER SESSION - Prevent "no trades" failures
     # If trades/session is below minimum, progressively relax filters
-    # FIX (Jan 24, 2026): More aggressive relaxation - bot was at 0 trades in 9h
+    # More aggressive relaxation - bot was at 0 trades in 9h
     # =========================================================================
     MIN_TRADES_PER_SESSION = 1        # Minimum trades expected per 4h session
     MIN_TRADES_PER_DAY = 2            # Minimum trades expected per day (was 3)
@@ -838,7 +838,7 @@ class OperatingMode:
         'LONDON': 0.90,             # Good
         'NY': 0.90,                 # Good
         'ASIA': 0.75,               # Lower quality
-        'DEAD_HOURS': 0.30,         # 🔥 FIX (Jan 25): Reduced to 30% (was 50%)
+        'DEAD_HOURS': 0.30,         # Reduced to 30% (was 50%)
         'WEEKEND': 0.50,            # Low liquidity
         'OTHER': 0.75,              # Default reduced
     }
@@ -846,7 +846,7 @@ class OperatingMode:
     # 🔥 NEW (Jan 25, 2026): Dead Hours Loss-Based Block
     # If 2+ losses occur during DEAD_HOURS, block trading until next session
     DEAD_HOURS_MAX_LOSSES = 2       # Block after 2 losses in dead hours
-    DEAD_HOURS_UTC = (0, 8)         # 🔥 FIX #293: Aligned with get_session_name()
+    DEAD_HOURS_UTC = (0, 8)         # Aligned with get_session_name()
     
     @classmethod
     def get_loss_sizing_multiplier(cls, consecutive_losses: int) -> float:
@@ -863,7 +863,7 @@ class OperatingMode:
     # =========================================================================
     # DAY OF WEEK SIZING - Reduce on riskier days
     # =========================================================================
-    # 🔥 FIX (Feb 01, 2026): Data-driven weekend reduction
+    # Data-driven weekend reduction
     # Data analysis: Weekend 29 trades, 37.9% win, -0.62R total (avg -0.021R/trade)
     #                Weekday 33 trades, 42.4% win, +0.42R total (avg +0.013R/trade)
     # TIME_INVALIDATION_MAX_LOSS on weekend: 11 trades, -3.98R (main loss driver)
@@ -884,11 +884,11 @@ class OperatingMode:
         return cls.DAY_OF_WEEK_MULTIPLIERS.get(day_of_week, 1.0)
     
     # SMART COOLDOWN - Based on exit reason and PnL size
-    # 🔥 FIX #149 (Feb 10, 2026): NO COOLDOWN TRAS PROFIT
-    # 
+    # NO COOLDOWN TRAS PROFIT
+
     # PROBLEMA: Cooldown tras profit pequeño = "miedo codificado"
     # Sales bien → 5min cooldown → pierdes continuación → frustración.
-    # 
+
     # SOLUCIÓN INSTITUCIONAL:
     # - Profit (pnl_r > 0) = 0 cooldown (el edge sigue, entra de nuevo)
     # - BE/scratch = 1 min (reset mental)
@@ -1091,12 +1091,12 @@ class EntryGateConfig:
 # HTF FILTERS (1H)
 # ============================================================================
 class HTFFilters:
-    # 🔥 FIX (Jan 23, 2026): Correct ADX classification thresholds
+    # Correct ADX classification thresholds
     # ADX is a CLASSIFIER, not a gate. It determines trading MODE:
     # - ADX < 18: RANGE/CHOP → smaller stops, faster exits, mean-reversion
     # - ADX 18-25: WEAK_TREND → cautious trend-following
     # - ADX > 25: TREND → full trend-following logic
-    #
+
     # Previous bug: ADX 15.3 was classified as "Mode: TREND" → wrong stops used
     
     # ADX Classification Thresholds (DO NOT lower these!)
@@ -1105,9 +1105,9 @@ class HTFFilters:
     ADX_TREND_MIN = 25              # ADX >= 25 → TREND mode
     
     # Legacy (kept for backwards compatibility, but use new thresholds above)
-    MIN_ADX = 20                    # 🔥 FIX (Jan 23): ADX must be >= 20 for ANY trend classification
+    MIN_ADX = 20                    # ADX must be >= 20 for ANY trend classification
     MIN_ADX_SLOPE = -999            # DEPRECATED: slope never blocks
-    MIN_ATR_VS_MA = 0.50  # 🔥 FIX (Jan 24): Relaxed from 0.70 to allow low-vol periods            # Allow contractions
+    MIN_ATR_VS_MA = 0.50  # Relaxed from 0.70 to allow low-vol periods            # Allow contractions
     
     # DEPRECATED: Slope filtering removed
     # ADX slope is now INFO/TAG only, never a veto
@@ -1224,7 +1224,7 @@ class DynamicRiskConfig:
 # ============================================================================
 class RiskManagement:
     # Leverage (configurable via LEVERAGE env var)
-    # FIX (Jan 3, 2026): Changed from 0 to 2 - 0x caused invalid position sizes
+    # Changed from 0 to 2 - 0x caused invalid position sizes
     DEFAULT_LEVERAGE = DynamicRiskConfig.DEFAULT_LEVERAGE  # Use dynamic config
     
     # Risk per session - RETUNED (Jan 4, 2026)
@@ -1242,7 +1242,7 @@ class RiskManagement:
     
     # Take profits - Minimum 1R to ensure positive expectancy after fees
     # With fees ~0.04% + slippage + funding, RR < 1 is negative EV
-    # FIX (Jan 22, 2026): Reduced to 1.0R to maximize winrate in Discovery
+    # Reduced to 1.0R to maximize winrate in Discovery
     # Many trades reach 1.0R but not 1.2R - capture more winners
     TP1_RISK_MULTIPLE = 1.0         # TP at 1.0R (maximize winrate, validate edge faster)
     TP1_CLOSE_PCT = 50              # Close 50% at TP1, leave 50% runner (was 60%)
@@ -1263,15 +1263,15 @@ class RiskManagement:
     # 🔥 EARLY PARTIAL - CALIBRADO PARA INTRADÍA BTC (Feb 2, 2026)
     # =========================================================================
     # FILOSOFÍA: Asegurar algo de profit sin cortar ganadores prematuramente
-    # 
+
     # PROBLEMA ORIGINAL: Trades llegan a +0.5R y luego pierden
     # PERO: +0.5R es MUY temprano - muchos trades buenos hacen pullback ahí
-    # 
+
     # SOLUCIÓN CALIBRADA:
     # - EARLY_PARTIAL_R = 0.7R (no 0.5R - dar más espacio)
     # - EARLY_PARTIAL_PCT = 30% (no 50% - dejar más para runners)
     # - EARLY_PARTIAL_MOVE_SL = False (no mover a BE aún - R_LOCK lo maneja)
-    # 
+
     # Con estos settings:
     # - A +0.7R, tomas 30% y aseguras +0.21R
     # - El R_LOCK ya habrá movido stop a -0.20R (desde 0.5R MFE)
@@ -1286,34 +1286,34 @@ class RiskManagement:
     # =========================================================================
     # These are based on Jan 20 - Feb 1 analysis but SHOULD BE RECALIBRATED
     # periodically as market conditions change. 
-    # 
+
     # ⚠️ IMPORTANT: These use small sample sizes (2-9 trades per bucket).
     # Monitor effectiveness and adjust as needed.
-    # 
+
     # To disable any filter, set ENABLED = False
     # =========================================================================
     
     # --- TOXIC HOURS (hours with historical negative edge) ---
-    # 🔥 FIX (Feb 04, 2026): RELAXED - original hours included prime trading times (9, 13)
+    # RELAXED - original hours included prime trading times (9, 13)
     # Only truly dead/low-liquidity hours should be penalized:
     # - 4-7 UTC: Dead zone between Asia close and London open
     # - 21-23 UTC: Dead zone after NY close, before Asia
-    #
+
     # Note: We use REDUCE (0.5x) not BLOCK - always allow trades
     TOXIC_HOURS_ENABLED = True      # Keep enabled but relaxed
     TOXIC_HOURS_SET = {4, 5, 6, 21, 22}  # 🔥 Only true dead hours
     TOXIC_HOURS_MULT = 0.5          # 🔥 Increased from 0.25 to 0.5 (less aggressive)
     
     # --- TOXIC COMBOS (session+direction with negative edge) ---
-    # 🔥 FIX (Feb 04, 2026): DISABLED - blocking based on 7-8 trades is statistically meaningless
+    # DISABLED - blocking based on 7-8 trades is statistically meaningless
     # The system was blocking 100% of trades during LONDON_NY_OVERLAP (5 hours/day!)
     # This is over-optimization on noise. Better to trade and collect more data.
-    # 
+
     # Original data (too small sample to draw conclusions):
     # - LONDON_NY_OVERLAP + SHORT: -1.72R in 7 trades
     # - LONDON_NY_OVERLAP + LONG: Unknown (added without data)
     # - WEEKEND + LONG: -0.72R in 7 trades, 29% WR
-    #
+
     # SOLUTION: Disable combo blocking entirely. Use REDUCE mode only if needed later.
     # 🔥🔥🔥 TOXIC COMBOS COMPLETELY DISABLED (Feb 04, 2026) 🔥🔥🔥
     # PROBLEM: Log showed "TOXIC COMBO BLOCK: LONDON_NY_OVERLAP + SHORT" blocking
@@ -1328,8 +1328,8 @@ class RiskManagement:
     # 🔥 NEW (Feb 04, 2026): System was entering trades on FIRST tick after startup
     # This is dangerous - no market context gathered yet
     WARMUP_ENABLED = True
-    WARMUP_MIN_TICKS = 60           # Minimum ticks before first trade (~60 seconds)
-    WARMUP_MIN_CANDLES = 3          # Minimum 1m candles to observe
+    WARMUP_MIN_TICKS = 120          # Minimum ticks before first trade (~2 minutes)
+    WARMUP_MIN_CANDLES = 5           # Minimum 1m candles to observe (~5 minutes)
     
     # --- DELTA CONTRADICT PENALTY ---
     # 🔥🔥🔥 DISABLED (Feb 04, 2026): Delta is a LAGGING indicator!
@@ -1400,13 +1400,13 @@ class RiskManagement:
     # Problem: System uses HH/HL/LL/LH scoring which requires 4+ candles to flip
     # direction. When 5 bearish candles are followed by 1 strong bullish reversal,
     # the system stays SHORT even though trend has reversed.
-    #
+
     # Solution: Detect single-candle reversals based on:
     # 1. Candle body size >= 1.5x ATR (strong conviction)
     # 2. Candle direction opposes current bias
     # 3. Engulfing pattern (covers previous candle)
     # 4. Momentum shift (volume spike)
-    #
+
     # When detected: Override micro_momentum to new direction
     # =========================================================================
     
@@ -1422,7 +1422,7 @@ class RiskManagement:
     # =========================================================================
     # When a strong displacement occurs AGAINST current bias, immediately
     # flip direction rather than waiting for EMA/structure to catch up.
-    #
+
     # Criteria:
     # - Price moves >= 0.5x ATR(5m) in opposite direction of current bias
     # - Movement happens within 3 candles
@@ -1446,7 +1446,7 @@ class OrderExecution:
     
     MIN_POSITION_SIZE_USD = 11     # Minimum position size
     
-    # FIX #2 (Jan 3, 2026): Market Orders in Momentum
+    # Market Orders in Momentum
     # Use market order when price velocity is high
     USE_MARKET_ON_MOMENTUM = True   # Enable market orders in momentum
     MOMENTUM_VELOCITY_MULTIPLIER = 2.0  # Market if velocity > 2x ATR (fast move)
@@ -1493,16 +1493,16 @@ class SmartExits:
     # =========================================================================
     # 1. SCALED PARTIAL EXITS - Take profits progressively
     # =========================================================================
-    # 🔥 FIX #150 (Feb 10, 2026): SALIDAS ESCALONADAS INSTITUCIONALES
-    # 
+    # SALIDAS ESCALONADAS INSTITUCIONALES
+
     # PROBLEMA ANTERIOR: Esperaba +1.0R para primer parcial → rara vez llegaba
     # RESULTADO: MFE=0.49R pero cerraba todo junto o muy tarde.
-    # 
+
     # SOLUCIÓN INSTITUCIONAL (3 tramos):
     # - 30% @ +0.30R → Paga el riesgo temprano
     # - 40% @ +0.80R → Captura el core del movimiento
     # - 30% runner → Deja correr con trailing (sin límite superior)
-    # 
+
     # BENEFICIOS:
     # 1. "Pagas el riesgo" rápido → psicología mejorada
     # 2. Core del movimiento capturado antes de reversión
@@ -1512,13 +1512,13 @@ class SmartExits:
     
     # Exit levels: (MFE in R, % of position to exit)
     SCALE_OUT_LEVELS = [
-        (0.30, 0.30),   # 🔥 FIX #150: Exit 30% @ +0.30R (paga el riesgo)
-        (0.80, 0.40),   # 🔥 FIX #150: Exit 40% @ +0.80R (core del movimiento)
+        (0.30, 0.30),   # Exit 30% @ +0.30R (paga el riesgo)
+        (0.80, 0.40),   # Exit 40% @ +0.80R (core del movimiento)
         # Remaining 30% runs with trailing stop → NO EXIT AUTOMÁTICO
     ]
     
     # Minimum position to keep for runner
-    MIN_RUNNER_PCT = 0.30  # 🔥 FIX #150: 30% como runner (era 10%)
+    MIN_RUNNER_PCT = 0.30  # 30% como runner (era 10%)
     
     # =========================================================================
     # 2. MOMENTUM EXIT - Exit when momentum dies BEFORE price falls
@@ -1538,17 +1538,17 @@ class SmartExits:
     
     # =========================================================================
     # 3. VPOC/RESISTANCE EXIT - Exit before hitting strong levels
-    # 🔥 FIX (Jan 25, 2026): CRITICAL - Was killing expectancy
+    # CRITICAL - Was killing expectancy
     # Data: Avg Win = 0.34R because VPOC exits at 0.3-0.5R MFE
     # Solution: Only exit near VPOC if we have REAL profit (0.85R+)
     # =========================================================================
     VPOC_EXIT_ENABLED = True
     
     # Distance to VPOC/resistance to trigger exit (as % of price)
-    VPOC_PROXIMITY_PCT = 0.0005  # 🔥 FIX (Jan 25): 0.05% = much tighter (only exit if VERY close)
+    VPOC_PROXIMITY_PCT = 0.0005  # 0.05% = much tighter (only exit if VERY close)
     
     # Minimum profit required before VPOC exit
-    VPOC_EXIT_MIN_MFE_R = 0.85  # 🔥 FIX (Jan 25): Need 0.85R profit minimum (was 0.6R)
+    VPOC_EXIT_MIN_MFE_R = 0.85  # Need 0.85R profit minimum (was 0.6R)
     
     # =========================================================================
     # 4. TIME-BASED PROFIT LOCK - Lock profits after time threshold
@@ -1566,12 +1566,12 @@ class SmartExits:
     VOLATILITY_SQUEEZE_EXIT_ENABLED = True
     
     # Bollinger Band width ratio to detect squeeze
-    # 🔥 FIX (Jan 27, 2026): Tightened from 0.5 to 0.4 to avoid premature exits
+    # Tightened from 0.5 to 0.4 to avoid premature exits
     # 49% width was triggering exit at +0.23R when trade still had room
     BB_SQUEEZE_RATIO = 0.4  # BB width < 40% of average = squeeze (was 50%)
     
     # Take profit if in squeeze with small profit
-    # 🔥 FIX (Jan 27, 2026): Raised min MFE from 0.2R to 0.3R
+    # Raised min MFE from 0.2R to 0.3R
     # Don't exit at +0.23R, wait until at least +0.3R in squeeze
     SQUEEZE_EXIT_MIN_MFE_R = 0.3  # Exit if profit between 0.3R and 0.5R in squeeze (was 0.2R)
     SQUEEZE_EXIT_MAX_MFE_R = 0.5  # Don't exit if already > 0.5R (let it run)
@@ -1591,13 +1591,13 @@ class SmartExits:
 
 
 # ============================================================================
-# FIX #6: FUNDING RATE CONTROL
+# FUNDING RATE CONTROL
 # ============================================================================
 class FundingRateControl:
     # AUDITORÍA (Jan 9, 2026): RE-ENABLED with relaxed thresholds
     # Critical for live trading - protects from funding spikes
-    # FIX (Jan 12, 2026): Raised thresholds - Kraken normal funding is ~0.10%
-    # 🔧 FIX #25 (Feb 02, 2026): Aumentar a 0.50% - funding de 0.12% bloqueaba casi todo
+    # Raised thresholds - Kraken normal funding is ~0.10%
+    # Aumentar a 0.50% - funding de 0.12% bloqueaba casi todo
     #    Kraken tiene funding rates más altos que Binance/Bybit
     #    0.79% ocurre en mercados bullish y no debería bloquear completamente
     ENABLED = True
@@ -1672,7 +1672,7 @@ class FundingRateControl:
 
 
 # ============================================================================
-# FIX #8: LIQUIDEZ BARRIDA (SWEEP) FILTER
+# LIQUIDEZ BARRIDA (SWEEP) FILTER
 # ============================================================================
 class SweepFilter:
     ENABLED = True
@@ -1681,7 +1681,7 @@ class SweepFilter:
 
 
 # ============================================================================
-# FIX #9: SESSION QUALITY FILTER
+# SESSION QUALITY FILTER
 # ============================================================================
 class SessionQuality:
     # AUDITORÍA (Jan 22, 2026): RE-ENABLED as SIZING modifier (not blocker)
@@ -1714,18 +1714,18 @@ class SessionQuality:
     # =========================================================================
     QUALITY_SIZE_MULT = {
         'good': 1.0,       # Full size - LONDON, NY_OVERLAP, NY
-        'moderate': 0.90,  # 🔥 FIX #121c: 0.80 → 0.90 - ASIA almost full size
+        'moderate': 0.90,  # ASIA almost full size
         'poor': 0.0,       # BLOCKED - Dead hours, extreme times
     }
     
     # =========================================================================
-    # 🔥 FIX #293 (Feb 18, 2026): SESSION NAME → QUALITY TIER MAPPING
-    #
+    # MAPPING
+
     # ROOT CAUSE: session_quality tag stored SESSION NAMES ("ASIA") instead of
     # quality tiers ("moderate"). QUALITY_SIZE_MULT.get("asia", 0.80) always
     # returned the 0.80 default, making 'poor':0.0 DEAD CODE.
     # The blocking path NEVER fired.
-    #
+
     # This is the SINGLE SOURCE OF TRUTH for session→quality mapping.
     # =========================================================================
     SESSION_TO_QUALITY = {
@@ -1781,7 +1781,7 @@ class SessionQuality:
 
 
 # ============================================================================
-# FIX #10: HTF DIVERGENCE CHECK
+# GENCE CHECK
 # ============================================================================
 class DivergenceFilters:
     ENABLED = True
@@ -1790,7 +1790,7 @@ class DivergenceFilters:
 
 
 # ============================================================================
-# FIX #11: VPOC (VOLUME POINT OF CONTROL)
+# UME POINT OF CONTROL)
 # ============================================================================
 class VPOCFilters:
     ENABLED = True
@@ -1799,7 +1799,7 @@ class VPOCFilters:
 
 
 # ============================================================================
-# FIX #12: BTC CORRELATION CHECK
+# LATION CHECK
 # ============================================================================
 class CorrelationFilters:
     # ENABLED: Now using BTCCorrelationFilter in filter_pipeline (Jan 15, 2026)
@@ -1811,7 +1811,7 @@ class CorrelationFilters:
 
 
 # ============================================================================
-# FIX #13: TIME-BASED EXIT - REDESIGNED (Jan 4, 2026)
+# D EXIT - REDESIGNED (Jan 4, 2026)
 # ============================================================================
 class TimeBasedExits:
     """TIME EXIT redesign: Exit on stagnation, NOT on clock.
@@ -1899,7 +1899,7 @@ def get_session_name(hour: int, minute: int, day_of_week: int | None = None) -> 
     if (hour == 13 and minute >= 30) or (14 <= hour < 21):
         return "NY"
     
-    # 🔥 FIX #293 (Feb 18, 2026): Dead hours = 0:00-7:59 UTC (real dead zone)
+    # real dead zone)
     # Root cause of overnight losses: "ASIA" covered 0-7 UTC with only 0.75x
     # multiplier. System took 3 losses between 02:00-06:00 UTC.
     # Split: 0-7 UTC = DEAD_HOURS (blocked), 21-23 UTC = ASIA (reduced)
@@ -1971,7 +1971,7 @@ class VolatilityRegime:
         "SPIKE": 2.0,
     }
     
-    # 🔥 FIX (Jan 22, 2026): Size multiplier by volatility regime
+    # Size multiplier by volatility regime
     SIZE_MULTIPLIER = {
         "LOW_VOL": 1.0,      # Normal size in low vol (tighter SL compensates)
         "NORMAL": 1.0,       # Standard
@@ -2049,22 +2049,22 @@ class DynamicScoreThreshold:
     This prevents low-quality trades from slipping through.
     """
     # Base threshold by regime
-    # FIX (Jan 24, 2026): Lowered all thresholds - bot was at 0 trades in 9h
-    # 🔥 FIX (Feb 04, 2026): Added TRANSITION explicitly with low threshold
-    # 🔥 FIX #211 (Feb 12, 2026): Lowered ALL thresholds to allow exploitation
+    # Lowered all thresholds - bot was at 0 trades in 9h
+    # Added TRANSITION explicitly with low threshold
+    # low exploitation
     # PROBLEMA: EDGE_FLOOR = 4.0 pero threshold >= 4.5 → nunca entra
     # SOLUCIÓN: Threshold = 4.0 base (momentum adjustments still apply)
     REGIME_THRESHOLD = {
-        "RANGE": 4.5,            # 🔥 FIX #211: Was 5.0 - can't reach with floor 4.0
-        "TREND": 4.0,            # 🔥 FIX #211: Was 4.5 - momentum should exploit
-        "TRANSITION": 4.0,       # 🔥 FIX #211: Was 4.5 - transition edge is validated
-        "TREND_EXPANSION": 4.0,  # 🔥 FIX #211: Was 5.0 - breakouts need FAST entry
-        "TREND_EXHAUSTION": 5.0, # 🔥 FIX #211: Was 5.5 - still be careful
-        "CONSOLIDATION": 4.5,    # 🔥 FIX #211: Was 5.0
+        "RANGE": 4.5,            # Was 5.0 - can't reach with floor 4.0
+        "TREND": 4.0,            # Was 4.5 - momentum should exploit
+        "TRANSITION": 4.0,       # Was 4.5 - transition edge is validated
+        "TREND_EXPANSION": 4.0,  # Was 5.0 - breakouts need FAST entry
+        "TREND_EXHAUSTION": 5.0, # Was 5.5 - still be careful
+        "CONSOLIDATION": 4.5,    #
     }
     
     # Session adjustment (added to base threshold)
-    # FIX (Jan 24, 2026): Reduced penalties, bot was paralyzed
+    # Reduced penalties, bot was paralyzed
     SESSION_ADJUSTMENT = {
         "ASIA": 0.25,          # Was 0.5
         "LONDON": 0.0,         # No adjustment
@@ -2077,7 +2077,7 @@ class DynamicScoreThreshold:
     }
     
     # Fallback for discovery mode
-    # FIX (Jan 24, 2026): Lowered from 5.0 - bot was at 0 trades in 9h
+    # Lowered from 5.0 - bot was at 0 trades in 9h
     DISCOVERY_BASE = 4.0
     
     @classmethod
@@ -2103,7 +2103,7 @@ class DynamicScoreThreshold:
         threshold = base + adjustment
         
         # Clamp to reasonable range
-        # 🔥 FIX #211 (Feb 12, 2026): Lowered minimum from 5.0 to 4.0
+        # 4.0
         # EDGE_FLOOR = 4.0, threshold must allow trading at floor
         return max(4.0, min(8.0, threshold))
 
@@ -2116,14 +2116,14 @@ class SessionTradeLimits:
     Limit trades per session to prevent overtrading.
     High-score setups can override.
     
-    🔥 FIX (Jan 22, 2026): Limits vary by regime_mode
+    Limits vary by regime_mode
     TREND: More trades allowed (4)
     RANGE: Fewer trades allowed (3)
     """
     ENABLED = True
     
     # Max trades per session (DEFAULT - adjusted by regime)
-    # 🔥 FIX #10: Increased base to 3 for Hot Hand system
+    # se to 3 for Hot Hand system
     MAX_TRADES_PER_SESSION = {
         "ASIA": 3,
         "LONDON": 3,
@@ -2136,10 +2136,10 @@ class SessionTradeLimits:
     }
     
     # 🔥 NEW: Mode-based multipliers
-    # 🔥 FIX #10: RANGE mode cap increased to 3 (was 2)
+    # ap increased to 3 (was 2)
     MODE_TRADE_LIMIT_CAP = {
         "TREND": 4,      # Max 4 trades per session in TREND
-        "RANGE": 3,      # 🔥 FIX #10: Max 3 trades base in RANGE (Hot Hand can extend)
+        "RANGE": 3,      #  base in RANGE (Hot Hand can extend)
         "BREAKOUT": 4,   # Max 4 trades per session in BREAKOUT
         "NO_TRADE": 0,   # No trades allowed
     }
@@ -2210,7 +2210,7 @@ class LossStreakConfig:
         "FUNDING_EXIT": 0.0,             # Funding-based exit (administrative)
         "DEFENSIVE_EXIT": 0.25,          # Defensive mode exit (small count)
         "STRUCTURE_BREAK_EXIT": 0.25,    # Structure changed (small count)
-        # 🔥 FIX (Feb 1, 2026): Administrative closes - NOT edge failures
+        # Administrative closes - NOT edge failures
         # Must match state_machine.py behavior ("NOT counted as loss")
         "EMERGENCY_ANOMALY": 0.0,        # System anomaly, not edge failure
         "PRICE_GAP_ANOMALY": 0.0,        # Flash crash protection
@@ -2315,7 +2315,7 @@ class MicroTrendADXConfig:
     Strong trends = penalty only (pullbacks are buying opportunities)
     Weak trends = hard block (micro trend is more meaningful)
     
-    FIX (Jan 22, 2026): Punto 10 - Penalización gradual en zona 20-30 ADX
+    Punto 10 - Penalización gradual en zona 20-30 ADX
     """
     ENABLED = True
     
@@ -2436,7 +2436,7 @@ class ExitHierarchy:
     # C) REGLA CRÍTICA: Max loss por TIME_INVALIDATION
     # Si timeout y PnL <= -0.25R → cerrar inmediatamente
     # Si timeout y PnL > -0.25R → evaluar tesis, no cerrar peor
-    # 🔥 FIX (Jan 24, 2026): Use AsymmetryConfig as single source of truth
+    # Use AsymmetryConfig as single source of truth
     TIME_INVALIDATION_MAX_LOSS_R = AsymmetryConfig.TIME_INVALIDATION_MAX_LOSS_R  # Nunca cerrar peor que esto
     
     # D) Comportamiento según estado de P&L en timeout
@@ -2519,7 +2519,7 @@ class ExitHierarchy:
     
     # Si llega a -0.35R ANTES de invalidar estructuralmente:
     # - El setup no era el correcto → salir
-    # 🔥 FIX (Jan 27, 2026): Raised from -0.25R to -0.35R
+    # Raised from -0.25R to -0.35R
     # Reason: -0.25R was too tight considering fees (~0.08R round trip)
     # This caused premature exits before trades had chance to work
     THESIS_INTACT_MAX_LOSS_R = -0.35  # Nunca perder más si tesis válida

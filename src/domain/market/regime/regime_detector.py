@@ -68,7 +68,7 @@ REGIME_CONFIGS: Dict[EntryRegime, RegimeConfig] = {
         score_threshold_adj=-1,          # Lower threshold (easier entry)
         size_multiplier=1.2,             # Larger size
         min_rr=0.9,
-        sl_atr_multiplier=3.5,           # FIX (Jan 20, 2026): Increased from 2.5 to 3.5 for fee survival
+        sl_atr_multiplier=3.5,           # Increased from 2.5 to 3.5 for fee survival
         description="Momentum expansion - allow aggression"
     ),
     EntryRegime.TREND_EXHAUSTION: RegimeConfig(
@@ -78,15 +78,15 @@ REGIME_CONFIGS: Dict[EntryRegime, RegimeConfig] = {
         score_threshold_adj=+1,          # Higher threshold (premium only)
         size_multiplier=0.7,             # Reduced size
         min_rr=1.5,
-        sl_atr_multiplier=3.5,           # FIX (Jan 20, 2026): Increased from 2.5 to 3.5 for fee survival
+        sl_atr_multiplier=3.5,           # Increased from 2.5 to 3.5 for fee survival
         description="Trend tired - premium setups only"
     ),
     # =========================================================================
     # 🔥 NEW (Jan 26, 2026): NORMAL MODE - Standard Trading
-    # 
+
     # WHEN: ADX between 18-25, neither strong trend nor weak range
     # PHILOSOPHY: "Market is tradeable, use standard risk management"
-    # 
+
     # This REPLACES the broken logic where ADX 18-25 fell into RANGE (NO_EDGE).
     # With ADX ~23, the market has SOME trend, not zero edge.
     # =========================================================================
@@ -102,15 +102,15 @@ REGIME_CONFIGS: Dict[EntryRegime, RegimeConfig] = {
     ),
     # =========================================================================
     # 🔥 NEW (Jan 26, 2026): PROBING MODE - Diagnostic Probe, Not Exploitation
-    # 
+
     # PHILOSOPHY: "Let the market SHOW you edge, don't guess"
-    # 
+
     # WHEN: No TREND_EXPANSION but location is promising (near VWAP/VPOC)
     # HOW: Graduated sizing via range_size_mult (0.25x-0.65x), limit only, tight stop
     # EXIT RULES:
     #   - If +0.2R in <60s → edge validated, can enable more trades
     #   - If MAE > 0.3R → abort without insisting
-    # 
+
     # NOTE: size_multiplier=1.0 here because actual sizing is controlled by
     # range_size_mult in trade tags (graduated: PROBE_MIN=0.25, MED=0.50, MAX=0.65)
     # =========================================================================
@@ -222,7 +222,7 @@ class RegimeDetector:
         elif adx < self.ADX_WEAK_THRESHOLD:
             regime = EntryRegime.RANGE
         
-        # 🔥 FIX (Jan 26, 2026): NORMAL for ADX between 18-25
+        # NORMAL for ADX between 18-25
         # Previously this fell into RANGE (NO_EDGE) which blocked ALL trades
         # ADX ~23 is normal tradeable market, not zero edge!
         else:
@@ -310,7 +310,7 @@ class RegimeDetector:
         # Base penalty calculation - GRADUAL, not step function
         # In DISCOVERY mode, we want information, not protection
         # Chase is expensive, but not wrong
-        # 🔥 FIX (Jan 27, 2026): Further reduced penalties
+        # Further reduced penalties
         # Chase penalty was blocking winners:
         # - LONG @ 88213 with 1.35 ATR chase → -0.6pts → missed +1.72R
         # BTC moves fast, chasing 1-2 ATR is NORMAL in intraday.
@@ -352,21 +352,21 @@ class RegimeDetector:
             return True, "CHAOS regime - no trading"
         
         # Extreme chase always blocks
-        # FIX (Jan 24, 2026): Raised from 3.0 to 4.0 - was too restrictive
+        # Raised from 3.0 to 4.0 - was too restrictive
         if chase_atr > 4.0:
             return True, f"Extreme chase ({chase_atr:.1f} ATR) - too risky"
         
         # =========================================================
-        # 🔥 FIX #84 (Feb 7, 2026): STRICTER CHASE IN TRANSITION/RANGE
-        # 
+        # STRICTER CHASE IN TRANSITION/RANGE
+
         # PROBLEMA: Con threshold 2.8 ATR, trades con 2.72 ATR pasaban
         # pero entraban en el TOPE del movimiento y perdían.
-        # 
+
         # SOLUCIÓN: En regímenes NORMAL/RANGE, usar 2.0 ATR como max.
         # El displacement detecta que el precio YA subió, pero si chase
         # es alto = el movimiento ya pasó = no entrar.
-        # 
-        # 🔧 FIX #85 (Feb 8, 2026): TRANSITION no existe en EntryRegime
+
+        # TRANSITION no existe en EntryRegime
         # Cambiado a NORMAL que es el equivalente (ADX 18-25)
         # =========================================================
         is_low_trend_regime = regime in [EntryRegime.NORMAL, EntryRegime.RANGE]

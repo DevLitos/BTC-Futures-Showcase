@@ -80,7 +80,7 @@ class PositionMismatchError(ExecutionError):
 
 # Timeouts para operaciones de exchange (segundos)
 # These can be overridden via Settings if needed
-# 🔥 FIX #167 (Feb 11, 2026): Reduced MEDIUM from 30s to 10s
+# Reduced MEDIUM from 30s to 10s
 # 30s was causing system hangs during API issues. 10s is enough for 
 # order operations and with existing retry+backoff, transient failures recover.
 EXCHANGE_TIMEOUT_SHORT = 5.0
@@ -217,7 +217,7 @@ class RESTExecutionEngine:
         self.credentials = credentials or {}
         self.exchange = None
         
-        # 🔥 FIX (Jan 21, 2026): Lock to serialize CCXT access
+        # Lock to serialize CCXT access
         # CCXT async can deadlock when multiple coroutines access the same exchange
         self._exchange_lock = asyncio.Lock()
         
@@ -267,7 +267,7 @@ class RESTExecutionEngine:
             ExchangeClass = getattr(ccxt, self.exchange_name)
             
             # Simple config - just pass credentials as-is
-            # 🔥 FIX (Jan 21, 2026): Add explicit timeout to CCXT
+            # Add explicit timeout to CCXT
             config = dict(self.credentials)
             config['timeout'] = 5000  # 5 second internal timeout
             self.exchange = ExchangeClass(config)
@@ -364,7 +364,7 @@ class RESTExecutionEngine:
             
             logger.info(f"Placing {side.upper()} order: {amount} {symbol} @ {price} (clientId={client_order_id})")
             
-            # 🔥 FIX (Jan 21, 2026): Use lock to prevent concurrent CCXT access
+            # Use lock to prevent concurrent CCXT access
             async with self._exchange_lock:
                 try:
                     order = await asyncio.wait_for(
@@ -585,7 +585,7 @@ class RESTExecutionEngine:
         """
         Cancelar orden con timeout.
         
-        🔥 FIX #172: Detecta ordenes que ya no existen (cancelled/filled externally)
+        Detecta ordenes que ya no existen (cancelled/filled externally)
         y las trata como éxito para evitar loops infinitos de reintento.
         
         Returns:
@@ -612,10 +612,10 @@ class RESTExecutionEngine:
         except Exception as e:
             error_str = str(e).lower()
             
-            # 🔥 FIX #172: Order doesn't exist = already cancelled/filled/expired
+            # Order doesn't exist = already cancelled/filled/expired
             # This is NOT an error - the order is gone, which is what we wanted
             if 'notfound' in error_str or 'not found' in error_str or 'unknown order' in error_str:
-                logger.warning(f"⚠️ FIX #172: Order {order_id[:12]}... not found - already gone (cancelled/filled/expired)")
+                logger.warning(f"⚠️ Order {order_id[:12]}... not found - already gone (cancelled/filled/expired)")
                 
                 # Clean up local tracking if exists
                 if order_id in self.open_orders:
@@ -656,6 +656,43 @@ class RESTExecutionEngine:
             self._handle_rest_error(e, "get_open_orders")
             return []
     
+    async def get_order_status(self, order_id: str, symbol: str) -> Optional[Dict]:
+        """
+        Fetch a single order by ID from the exchange.
+        
+        Called by poll_fill_status() to check order fill progress.
+        Uses ccxt fetch_order (REST).
+        
+        Returns:
+            Dict with order info if found, None otherwise.
+        """
+        if not self.exchange:
+            return None
+        
+        if self.is_circuit_breaker_open():
+            logger.debug("Circuit breaker open, skipping get_order_status")
+            return None
+        
+        try:
+            order = await asyncio.wait_for(
+                self.exchange.fetch_order(order_id, symbol),
+                timeout=EXCHANGE_TIMEOUT_SHORT
+            )
+            if not self.is_exchange_available:
+                self._reset_circuit_breaker()
+            return order
+        except asyncio.TimeoutError:
+            self._handle_rest_error(Exception(f"Timeout fetching order {order_id}"), "get_order_status")
+            return None
+        except Exception as e:
+            # Order not found is common for IOC fills — don't trigger circuit breaker
+            err_str = str(e).lower()
+            if 'not found' in err_str or 'unknown order' in err_str:
+                logger.debug(f"Order {order_id} not found on exchange: {e}")
+                return None
+            self._handle_rest_error(e, "get_order_status")
+            return None
+    
     async def poll_fill_status(self, order_id: str, symbol: str, 
                               timeout_seconds: int = 180) -> dict:
         """
@@ -676,7 +713,7 @@ class RESTExecutionEngine:
         max_consecutive_errors = 5  # Bail out after 5 consecutive errors
         
         while time.monotonic() < deadline:
-            # 🔒 FIX (Jan 22, 2026): Check deadline at start of loop body too
+            # 🔒 Check deadline at start of loop body too
             remaining_time = deadline - time.monotonic()
             if remaining_time <= 0:
                 break
@@ -919,7 +956,7 @@ class RESTExecutionEngine:
         3. Ambas órdenes DEBEN tener 'reduceOnly': True
         4. La cantidad (amount) DEBE coincidir EXACTAMENTE con la posición abierta
         
-        🔥 CRITICAL FIX (Jan 20, 2026): CHECK EXISTING ORDERS FIRST
+        🔥 CRITICAL CHECK EXISTING ORDERS FIRST
         Before placing new SL/TP, check if they already exist on exchange!
         This prevents duplicate orders that accumulate on every restart.
         
@@ -936,7 +973,7 @@ class RESTExecutionEngine:
         try:
             # ================================================================
             # 🔥 STEP 0: CHECK EXISTING ORDERS - PREVENT DUPLICATES
-            # 🔥 FIX #103: Correct price extraction + cleanup duplicates
+            # Correct price extraction + cleanup duplicates
             # ================================================================
             existing_orders = await self.get_open_orders(symbol)
             existing_sl = None
@@ -953,7 +990,7 @@ class RESTExecutionEngine:
                     
                     # Detect SL orders
                     if order_type in ('stop', 'stop-loss', 'stop_loss') or order_type_kraken in ('stp', 'stop'):
-                        # 🔥 FIX #103a: Priority to triggerPrice from order_info (Kraken Futures)
+                        # Priority to triggerPrice from order_info (Kraken Futures)
                         # order.get('price') returns 0 for stop orders, so check info first!
                         sl_price = 0.0
                         if order_info and order_info.get('triggerPrice'):
@@ -971,7 +1008,7 @@ class RESTExecutionEngine:
                                 existing_sl = order
                                 logger.info(f"✅ EXISTING SL found at {sl_price:.2f} - will NOT place duplicate")
                             else:
-                                # 🔥 FIX #103b: Track duplicate SL for cleanup
+                                # Track duplicate SL for cleanup
                                 duplicate_sl_ids.append(order_id)
                                 logger.warning(f"⚠️ DUPLICATE SL detected at {sl_price:.2f} (id={order_id}) - will cancel")
                         else:
@@ -987,13 +1024,13 @@ class RESTExecutionEngine:
                                     existing_tp = order
                                     logger.info(f"✅ EXISTING TP found at {tp_price:.2f} - will NOT place duplicate")
                                 else:
-                                    # 🔥 FIX #103b: Track duplicate TP for cleanup
+                                    # Track duplicate TP for cleanup
                                     duplicate_tp_ids.append(order_id)
                                     logger.warning(f"⚠️ DUPLICATE TP detected at {tp_price:.2f} (id={order_id}) - will cancel")
                             else:
                                 logger.warning(f"⚠️ Found TP order but price is INVALID ({tp_price}) - will place new TP")
             
-            # 🔥 FIX #103b: Cancel duplicate orders
+            # Cancel duplicate orders
             for dup_id in duplicate_sl_ids + duplicate_tp_ids:
                 try:
                     await self.exchange.cancel_order(dup_id, symbol)
@@ -1033,14 +1070,14 @@ class RESTExecutionEngine:
             if raw_side in ('long', 'short'):
                 position_side = raw_side
             else:
-                # 🔒 FIX (Jan 22, 2026): Don't fallback to contracts sign for Kraken
+                # 🔒 Don't fallback to contracts sign for Kraken
                 # Kraken always returns positive contracts, so sign is unreliable
                 logger.error(f"❌ Cannot determine position side (raw_side='{raw_side}') - aborting SL/TP placement")
                 logger.error(f"   Position data: contracts={contracts}, side={position.get('side')}")
                 return False
             position_size = abs(contracts)
             
-            # 🔒 FIX (Jan 14, 2026): Validate position size before setting SL/TP
+            # 🔒 Validate position size before setting SL/TP
             if position_size < KRAKEN_BTC_MIN_SIZE:
                 logger.error(f"Cannot set stops: position size {position_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}")
                 return False
@@ -1069,7 +1106,7 @@ class RESTExecutionEngine:
                     sl_side = 'sell' if position_side == 'long' else 'buy'
                     
                     # ATTEMPT 1: Standard 'stop-loss' type (Kraken Futures standard)
-                    # 🔥 FIX (Jan 20, 2026): Added timeout to all exchange calls
+                    # Added timeout to all exchange calls
                     logger.debug(f"[SL Attempt 1] Using 'stop-loss' type: {sl_side} {position_size:.8f} @ {stop_loss:.2f}")
                     try:
                         sl_order = await asyncio.wait_for(
@@ -1153,7 +1190,7 @@ class RESTExecutionEngine:
                     logger.error(f"❌ SL outer exception: {str(outer_e)[:150]}")
             
             # ===== TAKE PROFIT - Kraken Futures CRITICAL =====
-            # 🔥 FIX (Jan 20, 2026): Only place TP if it doesn't already exist
+            # Only place TP if it doesn't already exist
             if need_tp and take_profit:
                 try:
                     tp_side = 'sell' if position_side == 'long' else 'buy'
@@ -1272,7 +1309,7 @@ class RESTExecutionEngine:
         
         # =====================================================================
         # PLACE NEW SL FIRST, THEN CANCEL OLD ONE (Race-condition safe)
-        # 🔥 FIX (Jan 20, 2026): Reversed order - place new SL before canceling old
+        # Reversed order - place new SL before canceling old
         # This ensures position is ALWAYS protected, even if cancel/place fails
         # =====================================================================
         try:
@@ -1291,7 +1328,7 @@ class RESTExecutionEngine:
             position_size = abs(contracts)
             
             # 2. Place NEW SL first (position stays protected)
-            # 🔥 FIX (Feb 03, 2026): Added 3-attempt retry pattern matching place_initial_sl_tp
+            # Added 3-attempt retry pattern matching place_initial_sl_tp
             sl_side = 'sell' if position_side == 'long' else 'buy'
             
             sl_order = None
@@ -1416,7 +1453,7 @@ class RESTExecutionEngine:
             return {'has_sl': False, 'has_tp': False, 'orders': []}
         
         try:
-            # 🔥 FIX (Jan 21, 2026): Add timeout to prevent blocking
+            # Add timeout to prevent blocking
             open_orders = await asyncio.wait_for(
                 self.exchange.fetch_open_orders(symbol),
                 timeout=EXCHANGE_TIMEOUT_SHORT
@@ -1508,7 +1545,7 @@ class RESTExecutionEngine:
                     logger.warning("Position amount is 0, nothing to close")
                     return None
                 
-                # 🔒 FIX (Jan 14, 2026): Validate minimum order size
+                # 🔒 Validate minimum order size
                 if close_amount < KRAKEN_BTC_MIN_SIZE:
                     logger.warning(f"⚠️ Close amount {close_amount:.6f} < min {KRAKEN_BTC_MIN_SIZE}, cannot execute")
                     return None
@@ -1536,7 +1573,7 @@ class RESTExecutionEngine:
                 logger.critical(f"📤 {reason} MARKET CLOSE (attempt {attempt + 1}/{MAX_RETRIES}): {close_amount} {symbol} side={side}")
                 
                 # =====================================================================
-                # 🔒 FIX (Jan 13, 2026): ALWAYS USE reduceOnly=True FOR CLOSE ORDERS
+                # 🔒 ALWAYS USE reduceOnly=True FOR CLOSE ORDERS
                 # This prevents position flipping if local state is wrong.
                 # If we think we're closing but we're flat, order will be rejected
                 # instead of opening a new position in the wrong direction.
@@ -1554,7 +1591,7 @@ class RESTExecutionEngine:
                 logger.critical(f"Position closed (reduceOnly=True): {order}")
                 
                 # =====================================================================
-                # 🔥 FIX (Jan 14, 2026): IMMEDIATELY update position_store after close
+                # IMMEDIATELY update position_store after close
                 # This prevents phantom position discrepancies in the next sync.
                 # Previously, we waited for sync_from_exchange which caused warnings.
                 # =====================================================================
@@ -1661,7 +1698,7 @@ class RESTExecutionEngine:
             return 0.0
         
         try:
-            # 🔥 FIX (Jan 21, 2026): Use lock to prevent concurrent access + timeout
+            # Use lock to prevent concurrent access + timeout
             async with self._exchange_lock:
                 try:
                     balance = await asyncio.wait_for(
@@ -1777,7 +1814,7 @@ class RESTExecutionEngine:
             }
             
             # 1. Fetch real open orders
-            # 🔥 FIX (Jan 21, 2026): Add timeout to prevent blocking
+            # Add timeout to prevent blocking
             real_orders = await asyncio.wait_for(
                 self.exchange.fetch_open_orders(symbol),
                 timeout=EXCHANGE_TIMEOUT_SHORT
@@ -1826,7 +1863,7 @@ class RESTExecutionEngine:
         
         # Detect exchange outage (503, unavailable, timeout, etc.)
         # CRITICAL: Timeout is also an outage indicator!
-        # 🔥 FIX (Jan 29, 2026): Also detect DNS failures
+        # Also detect DNS failures
         is_outage = any(x in error_str.lower() for x in [
             '503', 'service unavailable', 'unavailable', 'try again later',
             'timeout', 'timed out', 'connection', 'dns', 'name resolution',
@@ -1855,6 +1892,13 @@ class RESTExecutionEngine:
         if self._circuit_breaker_until == 0:
             return False
         return asyncio.get_event_loop().time() < self._circuit_breaker_until
+    
+    def get_circuit_breaker_wait_time(self) -> float:
+        """Return seconds remaining in circuit breaker backoff."""
+        if self._circuit_breaker_until == 0:
+            return 0.0
+        remaining = self._circuit_breaker_until - asyncio.get_event_loop().time()
+        return max(0.0, remaining)
     
     def _reset_circuit_breaker(self):
         """Reset circuit breaker on successful call"""
@@ -1941,11 +1985,11 @@ class RESTExecutionEngine:
             logger.info(f"✅ Market order executed: {order['id']}")
             
             # =====================================================================
-            # 🔥 FIX (Jan 20, 2026): Update position_store after market order fill
+            # Update position_store after market order fill
             # This keeps position_store in sync with exchange reality.
             # Critical for ADD_POSITION scale-ins that were not being tracked.
-            #
-            # 🔥 FIX (Jan 23, 2026): Use position.entryPrice as source of truth
+
+            # Use position.entryPrice as source of truth
             # order.average can differ from position.entryPrice due to how Kraken
             # reports fills vs position entries. Position is the truth.
             # =====================================================================

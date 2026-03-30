@@ -212,7 +212,7 @@ class ProfessionalBacktester:
         self.kill_filter = KillConditionsFilter(self.state_machine, capital=initial_balance, backtest_mode=True)
         self.black_swan_filter = BlackSwanFilter()
         self.htf_filter = HTFFilter(backtest_mode=True)
-        # MTFStructureFilter removed - FIX #1 enables earlier entries
+        # MTFStructureFilter removed - enables earlier entries
         self.ltf_filter = LTFTriggerFilter(backtest_mode=True)
         
         # Edge Enforcement - INTEGRATED (was missing before)

@@ -18,7 +18,7 @@ from src.shared.indicators import calculate_atr, calculate_adx, calculate_ema
 from src.config.trading_config import DailyRegimeDetector
 from src.domain.trading.anticipation import AnticipationSignal, AnticipationState
 
-# FIX #116: Throttle for ANTICIPATION preserved log
+# Throttle for ANTICIPATION preserved log
 _last_anticipation_preserved_log: dict = {"direction": None, "time": None}
 _ANTICIPATION_PRESERVED_LOG_INTERVAL = 60  # seconds
 
@@ -45,17 +45,17 @@ def check_rejection_cooldown(engine: "SignalEngine") -> Tuple[bool, str]:
 # ==============================================================================
 # EVENT-BASED EVALUATION GATE (Jan 28, 2026)
 # ==============================================================================
-# 
+
 # PROBLEMA ANTERIOR:
 # - Sistema solo evaluaba una vez por vela de 1m (60+ segundos de latencia)
 # - Edges intraday viven en segundos, no en minutos
 # - "Timeframe fantasma": datos en ms pero razonamiento en minutos
-#
+
 # SOLUCIÓN:
 # - Event-based: evalúa cuando hay un EVENTO significativo
 # - Max ticks fallback: evalúa cada N ticks aunque no haya evento
 # - Candle close: siempre evalúa en cierre de vela (backward compatible)
-#
+
 # EVENTOS QUE DISPARAN EVALUACIÓN:
 # 1. Nueva vela de 1m cerrada
 # 2. Movimiento de precio >= 0.3 * ATR desde última evaluación
@@ -63,12 +63,12 @@ def check_rejection_cooldown(engine: "SignalEngine") -> Tuple[bool, str]:
 # ==============================================================================
 
 # Configuration for event-based evaluation
-# 🔧 FIX #129 (Feb 09, 2026): Increased PRICE_MOVE_ATR_THRESHOLD from 0.3 to 0.5
+# Increased PRICE_MOVE_ATR_THRESHOLD from 0.3 to 0.5
 # - 0.3 ATR was triggering too many evaluations on minor price wiggles
 # - 0.5 ATR = ~$38 on typical $76 ATR = meaningful moves only
 EVENT_GATE_CONFIG = {
     "MAX_TICKS_WITHOUT_EVAL": 30,        # Evaluate every 30 ticks max
-    "PRICE_MOVE_ATR_THRESHOLD": 0.5,     # 🔧 FIX #129: Was 0.3, now 0.5 ATR
+    "PRICE_MOVE_ATR_THRESHOLD": 0.5,     # Was 0.3, now 0.5 ATR
     "MIN_TICKS_BETWEEN_EVAL": 5,         # Minimum 5 ticks between evaluations
     "LOG_FREQUENCY": 30,                 # Log every N ticks
 }
@@ -111,7 +111,7 @@ def check_candle_gate(
         # 🔥 NEW (Feb 04, 2026): Track candles since startup for warmup
         engine._candles_since_start = getattr(engine, '_candles_since_start', 0) + 1
         
-        # FIX #84: Reducido a DEBUG para eliminar spam
+        # Reducido a DEBUG para eliminar spam
         logger.debug(f"🕯️ NEW CANDLE CLOSE → EVALUATING | Price: ${current_price:.2f} | ATR: {atr_1m:.2f}")
         return True, new_count
     
@@ -128,7 +128,7 @@ def check_candle_gate(
     # =========================================================================
     # 4. PRICE MOVEMENT EVENT: Evaluate if significant price move
     # =========================================================================
-    # 🔥 FIX #240 (Feb 15, 2026): ADAPTIVE THRESHOLD DURING ACTIVE EDGE
+    # ADAPTIVE THRESHOLD DURING ACTIVE EDGE
     # When an edge is active, lower the threshold to 0.2 ATR and max ticks to 10.
     # This gives 3× more evaluation opportunities during live setups.
     # Without active edge: 0.5 ATR threshold, 30 ticks max (normal).
@@ -174,7 +174,7 @@ def check_candle_gate(
     # =========================================================================
     # 6. NO EVENT: Skip evaluation (log rate-limited)
     # =========================================================================
-    # FIX #84: Eliminado log de IDLE: Waiting - no aporta nada
+    # Eliminado log de IDLE: Waiting - no aporta nada
     # Solo logear en DEBUG si realmente se necesita diagnóstico
     
     return False, new_count
@@ -315,9 +315,9 @@ def check_anticipation_signal(
             current_regime = engine.regime_classifier.current_regime.value
         
         # =========================================================================
-        # 🔥 FIX #58 (Feb 06, 2026): Usar evaluate_all() para detectar TODOS los
+        # Usar evaluate_all() para detectar TODOS los
         # patrones de anticipación, no solo COMPRESSION_BREAKOUT
-        # 
+
         # Patrones detectados:
         # 1. COMPRESSION_BREAKOUT - BB squeeze (original)
         # 2. TREND_PULLBACK - Pullback a EMA en tendencia
@@ -356,16 +356,16 @@ def check_anticipation_signal(
         engine._last_anticipation_state = anticipation
         
         # =========================================================================
-        # 🔥 FIX (Jan 28, 2026): VERIFICAR MOMENTUM EN TIEMPO REAL
-        # 🔥 FIX #25 (Feb 04): NO invalidar por ACTIVE_DIRECTION si edge EXPIRED
-        # 
+        # VERIFICAR MOMENTUM EN TIEMPO REAL
+        # NO invalidar por ACTIVE_DIRECTION si edge EXPIRED
+
         # PROBLEMA ORIGINAL (Jan 28): Anticipation detecta compresión pero precio
         # ya se movió contra la dirección sugerida → entrada en peor ubicación
-        #
+
         # PROBLEMA NUEVO (Feb 03): Anticipation (COMPRESSION_BREAKOUT) invalidada
         # por ACTIVE_DIRECTION=SHORT cuando edge está EXPIRED y no hay posición.
         # El ACTIVE_DIRECTION es "stale" (viejo) → crea dead zone.
-        #
+
         # SOLUCIÓN MEJORADA:
         # 1. Solo invalidar si displacement_bypass está ACTIVO (no stale)
         # 2. Si edge está EXPIRED o NO_EDGE y no hay posición, ACTIVE_DIRECTION stale
@@ -380,13 +380,13 @@ def check_anticipation_signal(
         if hasattr(engine, '_edge_manager'):
             from src.domain.trading.edge_state_manager import EdgeState
             edge_is_active = engine._edge_manager.state in [EdgeState.EDGE_ARMED, EdgeState.EDGE_ACTIVE]
-            # 🔥 FIX #59 (Feb 06, 2026): Use edge_manager's stale detection
+            # Use edge_manager's stale detection
             direction_is_stale = engine._edge_manager.is_direction_stale(stale_threshold_minutes=5)
         
         # Check if we have a position (if so, ACTIVE_DIRECTION matters)
         has_position = getattr(engine, '_position', None) is not None
         
-        # 🔥 FIX #25 + #59: Only invalidate if:
+        # Only invalidate if:
         # - Edge is actually active OR we have a position
         # - AND direction is NOT stale
         # If edge is EXPIRED/NO_EDGE and no position → ACTIVE_DIRECTION is stale, ignore it
@@ -404,7 +404,7 @@ def check_anticipation_signal(
         elif active_direction and (not direction_is_relevant or direction_is_stale):
             # Edge is stale o no hay edge - dirección es obsoleta, permitir anticipation
             if anticipation.direction and anticipation.direction != active_direction:
-                # 🔥 FIX #116 (Feb 09): Throttle log to 1 per minute per direction
+                # Throttle log to 1 per minute per direction
                 global _last_anticipation_preserved_log
                 now = datetime.now()
                 should_log = (
@@ -422,34 +422,34 @@ def check_anticipation_signal(
         
         # =========================================================================
         # 🔥 AJUSTE (Jan 27, 2026): ANTICIPATION = información, NO trigger
-        # 
+
         # Crítica institucional:
         # - ANTICIPATION no es un edge, es un early warning
         # - Solo debe servir para cambiar estado interno / alertas
         # - NUNCA como trigger directo de trades
-        #
-        # 🔥 FIX #97 (Feb 09): BAJAR umbral de 55% a 50% - anticipation acierta más de lo esperado
+
+        # BAJAR umbral de 55% a 50% - anticipation acierta más de lo esperado
         # =========================================================================
         
         # Check for valid anticipation signal (confidence >= 50% - bajado de 55%)
-        ANTICIPATION_MIN_CONFIDENCE = 0.50  # 🔥 FIX #97: Bajado de 0.55
+        ANTICIPATION_MIN_CONFIDENCE = 0.50  # Bajado de 0.55
         
         # =========================================================================
-        # 🔥 FIX #113 (Feb 09, 2026): ANTICIPATION QUALITY GATE
-        #
+        # ANTICIPATION QUALITY GATE
+
         # PROBLEMA (P1): ANTICIPATION spam con señales mediocres:
         # - conf=51%, ADX=0, phase=UNKNOWN → 40+ logs sin valor
         # - Estas señales NUNCA convierten porque faltan condiciones
-        #
+
         # SOLUCIÓN: Quality gate antes de procesar:
         # - Si conf < 60% AND (ADX < 5 OR phase = UNKNOWN) → skip
         # - Señales de baja confianza sin contexto son ruido puro
-        #
-        # 🔥 FIX #177 (Feb 11, 2026): EXCEPCIÓN para COMPRESSION_BREAKOUT
+
+        # EXCEPCIÓN para COMPRESSION_BREAKOUT
         # PROBLEMA: El quality gate filtraba señales de COMPRESSION_BREAKOUT
         # porque durante el squeeze el ADX es típicamente bajo (<5).
         # PERO eso es PRECISAMENTE cuando queremos anticipation!
-        #
+
         # SOLUCIÓN: Si signal == COMPRESSION_BREAKOUT, ignorar quality gate.
         # El squeeze confirmado (BB percentile bajo) ES la calidad.
         # =========================================================================
@@ -457,7 +457,7 @@ def check_anticipation_signal(
         trend_phase = getattr(engine, '_current_trend_phase', 'UNKNOWN')
         
         if anticipation.signal != AnticipationSignal.NONE:
-            # 🔥 FIX #177: NO filtrar COMPRESSION_BREAKOUT por low ADX
+            # NO filtrar COMPRESSION_BREAKOUT por low ADX
             # El squeeze implica ADX bajo - eso es esperado, no ruido
             is_compression_breakout = anticipation.signal == AnticipationSignal.COMPRESSION_BREAKOUT
             
@@ -468,7 +468,7 @@ def check_anticipation_signal(
             
             if is_low_quality and not is_compression_breakout:
                 logger.debug(
-                    f"⏭️ FIX #113: ANTICIPATION skipped (low quality): conf={anticipation.confidence:.0%}, "
+                    f"⏭️ ANTICIPATION skipped (low quality): conf={anticipation.confidence:.0%}, "
                     f"ADX={adx_5m:.1f}, phase={trend_phase}"
                 )
                 anticipation = AnticipationState()  # Reset to empty
@@ -479,12 +479,12 @@ def check_anticipation_signal(
             tags['anticipation_confidence'] = anticipation.confidence
             tags['anticipation_direction'] = anticipation.direction
             
-            # 🔥 FIX #29 (Feb 04): Store structure_level for breakout trigger
+            # Store structure_level for breakout trigger
             if anticipation.structure_level > 0:
                 tags['anticipation_structure_level'] = anticipation.structure_level
             
             # =====================================================================
-            # 🔥 FIX (Jan 28, 2026): Extraer BB percentile y volume ratio de reasons
+            # Extraer BB percentile y volume ratio de reasons
             # para que EdgeStateManager pueda usar estos valores para BREAKOUT edge
             # =====================================================================
             if anticipation.reasons:
@@ -503,11 +503,11 @@ def check_anticipation_signal(
                         if vol_match:
                             tags['anticipation_volume_ratio'] = float(vol_match.group(1))
             
-            # 🔥 FIX (Feb 02, 2026): Only log anticipation here (removed duplicate in anticipation.py)
+            # Only log anticipation here (removed duplicate in anticipation.py)
             # Also add ADX context for debugging ADX vs RANGE_BOUND conflict
-            # NOTE: adx_5m and trend_phase already defined in FIX #113 quality gate above
+            # NOTE: adx_5m and trend_phase already defined in quality gate above
             
-            # 🔥 FIX (Feb 05, 2026): Include current price to show context changes
+            # Include current price to show context changes
             # Also detect if structure is invalidated by current price
             structure_invalidated = False
             if anticipation.structure_level > 0 and anticipation.direction:
@@ -517,13 +517,13 @@ def check_anticipation_signal(
                     structure_invalidated = True
             
             # =================================================================
-            # 🔥 FIX #302 (Feb 19, 2026): STALE BREAKOUT CHECK
-            #
+            # STALE BREAKOUT CHECK
+
             # PROBLEMA: COMPRESSION_BREAKOUT detecta squeeze desde $66,117
             # pero precio ya está en $66,449 ($332 arriba). El breakout
             # ya ocurrió, la señal es stale. El bot entra en el TOPE del
             # bounce y se come el reversal completo (Trade 3: -0.32R).
-            #
+
             # SOLUCIÓN: Si el precio ya se movió > 2.5×ATR_5m desde el
             # structure_level en la dirección del entry, el breakout ya
             # se agotó. Invalidar la señal.
@@ -545,7 +545,7 @@ def check_anticipation_signal(
                 if distance_from_structure > STALE_BREAKOUT_ATR_MULT * atr_5m_for_stale:
                     stale_breakout = True
                     logger.warning(
-                        f"⛔ FIX #302 STALE BREAKOUT: {anticipation.direction} structure @ "
+                        f"⛔ STALE BREAKOUT: {anticipation.direction} structure @ "
                         f"${anticipation.structure_level:.0f} but price ${current_price:.0f} | "
                         f"Distance ${distance_from_structure:.0f} > "
                         f"{STALE_BREAKOUT_ATR_MULT:.1f}×ATR_5m (${atr_5m_for_stale * STALE_BREAKOUT_ATR_MULT:.0f}) | "
@@ -566,11 +566,11 @@ def check_anticipation_signal(
                 pass  # Already handled above
             else:
                 # =====================================================================
-                # 🔥 FIX #107 (Feb 09, 2026): THROTTLE ANTICIPATION LOGS
-                # 
+                # THROTTLE ANTICIPATION LOGS
+
                 # PROBLEMA: ~40 logs de "🔮 ANTICIPATION: COMPRESSION_BREAKOUT" en pocos
                 # minutos cuando detecta squeeze. Es spam que no aporta valor.
-                #
+
                 # SOLUCIÓN: Throttle a máximo 1 log por minuto por signal+direction.
                 # - Guarda last log time/signal/direction en engine
                 # - Solo loguea si cambió el signal o direction O pasó 1 minuto
@@ -599,17 +599,17 @@ def check_anticipation_signal(
                             logger.info(f"   → {reason}")
             
             # =========================================================================
-            # 🔥 FIX #58 (Feb 06, 2026): RE-HABILITAR ANTICIPATION COMO TRIGGER
-            # 
+            # RE-HABILITAR ANTICIPATION COMO TRIGGER
+
             # PROBLEMA: Sistema siempre detecta TARDE porque:
             # - Solo entra por BOS (ya movió 0.5-1.5%)
             # - ANTICIPATION detecta ANTES pero estaba deshabilitado
-            #
+
             # SOLUCIÓN: Habilitar ANTICIPATION como trigger con:
             # - Umbral de confianza 65% (era 75% - muy restrictivo)
             # - Probe size 0.35x (pequeño pero útil)
             # - Solo si tiene structure_level válido (no a ciegas)
-            #
+
             # Esto permite ENTRAR ANTES DEL MOVIMIENTO:
             # - Anticipation detecta compresión → entra pequeño
             # - Si breakout confirma → edge upgrades to ACTIVE → añade
@@ -619,8 +619,8 @@ def check_anticipation_signal(
             ANTICIPATION_PROBE_SIZE = 0.35          # Tamaño pequeño para probar
             
             # =========================================================================
-            # 🔥 FIX #59 (Feb 06, 2026): Evitar duplicación BREAKOUT edge vs ANTICIPATION
-            # 
+            # Evitar duplicación BREAKOUT edge vs ANTICIPATION
+
             # Si ya hay un BREAKOUT edge activo, COMPRESSION_BREAKOUT anticipation es
             # redundante - ambos detectan el mismo patrón (BB squeeze).
             # En ese caso, NO activar anticipation como trigger - el edge ya lo maneja.
@@ -628,11 +628,11 @@ def check_anticipation_signal(
             anticipation_redundant = False
             
             # =========================================================================
-            # 🔥 FIX #110 (Feb 09, 2026): ANTICIPATION FORBIDDEN CHECK
-            #
+            # ANTICIPATION FORBIDDEN CHECK
+
             # PROBLEMA: ANTICIPATION seguía detectando SHORT después de BIAS_FLIP
             # que prohibió SHORT. Esto causa esquizofrenia sistémica.
-            #
+
             # SOLUCIÓN: Verificar forbidden_direction ANTES de procesar anticipation.
             # Si la dirección está prohibida, resetear a estado vacío.
             # =========================================================================
@@ -661,7 +661,7 @@ def check_anticipation_signal(
             if (anticipation.confidence >= ANTICIPATION_TRIGGER_CONFIDENCE 
                 and anticipation.direction
                 and anticipation.structure_level > 0
-                and not anticipation_redundant):  # 🔥 FIX #59: No duplicar
+                and not anticipation_redundant):  # No duplicar
                 
                 tags['anticipation_entry'] = True
                 tags['anticipation_probe_size'] = ANTICIPATION_PROBE_SIZE
@@ -762,7 +762,7 @@ async def check_pre_trade_conditions(
     Returns:
         (can_trade, reason) tuple
     """
-    # 🔥 FIX #87 (Feb 09, 2026): STALE DATA KILL SWITCH
+    # STALE DATA KILL SWITCH
     # If market data is stale >60s, trading decisions are GARBAGE.
     # ADX, ATR, Volume, Bias - ALL WRONG. Don't trade with bad data.
     from datetime import timezone
@@ -786,7 +786,7 @@ async def check_pre_trade_conditions(
             # Reset counter when data is fresh
             engine._stale_data_tick_count = 0
     
-    # 🔥 FIX (Feb 1, 2026): LOSS STREAK COOLDOWN + KILL SWITCH CHECK
+    # LOSS STREAK COOLDOWN + KILL SWITCH CHECK
     # This was MISSING! _check_loss_cooldown was defined but never called
     if hasattr(engine, '_check_loss_cooldown'):
         can_enter, loss_reason = engine._check_loss_cooldown(market_time)
@@ -795,7 +795,7 @@ async def check_pre_trade_conditions(
             if "KILL SWITCH" in loss_reason:
                 logger.warning(f"[BLOCKED] {loss_reason}")
             else:
-                # 🔥 FIX #291: Throttle LOSS COOLDOWN log (was spamming every tick)
+                # Throttle LOSS COOLDOWN log (was spamming every tick)
                 # Only log once per 60s instead of every evaluation
                 _last_loss_cd_log = getattr(engine, '_last_loss_cooldown_log_time', None)
                 _now = datetime.now()

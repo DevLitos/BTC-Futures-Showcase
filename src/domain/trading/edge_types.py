@@ -175,7 +175,7 @@ class RangeEdgeCriteria:
     RANGE_SIZE_MAX = 0.30     # 30% size en rango (subido de 25%)
     
     # Timeouts
-    # 🔥 FIX #230 (Feb 12, 2026): EDGE TTL RADICAL
+    # EDGE TTL RADICAL
     # BTC intradía = edges mueren rápido. 20 min = eternidad.
     # Si no confirma en 10 min, el edge murió.
     RANGE_EDGE_TIMEOUT_MIN = 10  # 🔥 Was 20 → 10 min (TTL radical)
@@ -191,12 +191,12 @@ class BreakoutEdgeCriteria:
     2. Volume decline confirmado
     3. Ruptura del squeeze con volumen
     
-    🔥 FIX #97 (Feb 09): Relajar criterios - anticipation acierta más de lo esperado
+    Relajar criterios - anticipation acierta más de lo esperado
     """
     BB_WIDTH_PERCENTILE_MAX = 25  # 🔥 Subido de 10 a 25 - percentil 25 ya indica compresión relativa
     VOLUME_DECLINE_RATIO = 0.70   # 🔥 Subido de 0.50 a 0.70 - volumen ≤70% es suficiente
     BREAKOUT_CONFIRMATION_CANDLES = 2  # 2 velas para confirmar ruptura
-    # 🔥 FIX #230 (Feb 12, 2026): EDGE TTL RADICAL
+    # EDGE TTL RADICAL
     # Breakout que no rompe en 10 min = squeeze fallido = NO TRADE
     BREAKOUT_TIMEOUT_MIN = 10  # 🔥 Was 30 → 10 min (TTL radical)
     
@@ -211,12 +211,12 @@ class BreakoutEdgeCriteria:
 # =============================================================================
 # � DISPLACEMENT EDGE CRITERIA (Jan 30, 2026)
 # Edge de movimiento fuerte - EL MERCADO YA DECIDIÓ
-#
+
 # PROBLEMA RESUELTO:
 # - EXPANSION_MODE + DIRECTION_LOCK funcionaban pero NO generaban EDGE
 # - Sin EDGE → sistema no puede tradear aunque detecte displacement
 # - RESULTADO: 0 trades en caída de 2.3%
-#
+
 # SOLUCIÓN:
 # - DISPLACEMENT_EDGE se activa AUTOMÁTICAMENTE con EXPANSION_MODE
 # - No necesita BOS, sweep, ni compresión - el displacement ES el edge
@@ -248,7 +248,7 @@ class DisplacementEdgeCriteria:
     
     # =========================================================================
     # 🔥 ENTRY WINDOW (Jan 30, 2026) - CRÍTICO PARA CRASHES
-    # 
+
     # En displacement violento NO hay pullback limpio.
     # El sistema DEBE entrar temprano o no entrar.
     # "No perseguir" = regla de oro institucional
@@ -293,14 +293,14 @@ class DisplacementEdgeCriteria:
     CHASE_BLOCK_EXTENSION_MULT = 2.0  # Was 1.5 → allow more extension before chase block
     
     # Timeouts
-    # 🔥 FIX #230 (Feb 12, 2026): EDGE TTL RADICAL
+    # EDGE TTL RADICAL
     # CRÍTICO: El análisis brutal demostró que 90 min = LOCURA para BTC intradía.
     # Si no capturas displacement en 20 min, el movimiento ya se consumió.
     # "Confirmation-based" = LATE. Reducir TTL fuerza timing temprano.
     EDGE_TIMEOUT_MIN = 20             # 🔥 Was 90 → 20 min (TTL radical)
     CONFIRMATION_TIMEOUT_MIN = 10     # 🔥 Was 30 → 10 min (TTL radical)
     
-    # 🔥 KILL LATE EDGE - FIX #230 (Feb 12, 2026)
+    # KILL LATE EDGE
     # Displacement que no entró en 10 min = CHASE = NO TRADE.
     # El impulso ya se consumió, entrar ahora = vender al perdedor.
     KILL_EDGE_AFTER_BARS = 10         # 🔥 Was 20 → 10 bars
@@ -508,7 +508,7 @@ class EdgeTransition:
         """
         Log transition with unified format.
         
-        🔥 FIX (Feb 05, 2026): INTELLIGENT LOGGING
+        INTELLIGENT LOGGING
         - Only INFO for SIGNIFICANT transitions (direction/type changes, new edges)
         - DEBUG for redundant transitions (re-arming same edge repeatedly)
         """

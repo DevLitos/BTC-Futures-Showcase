@@ -1,0 +1,1 @@
+{"timestamp": "2026-02-23T19:36:25.968530+00:00", "event_type": "trade_closed", "entry": 64469.0, "exit": 64264.0, "size": 0.0037, "pnl": 0.7585000000000001, "reason": "EARLY_PARTIAL_FULL", "r": 0.31798228605996565, "mfe_r": 0.31798228605996565, "mae_r": 0.09617025236935546, "direction": "SHORT", "regime": "NORMAL"}

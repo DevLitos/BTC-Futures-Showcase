@@ -1,24 +1,16 @@
 """
-Filter Pipeline Integration - Centralizes all entry filters for signal_engine
+Filter Pipeline — REFACTORED from 7 filters to 3.
 
-This module provides a single entry point for running all filters and
-aggregating their decisions using the FilterDecision interface.
+DELETED:
+- BB Width Filter — compression = opportunity, not threat. Blocked 239 times during a $1400 rally.
+- Macro Trend Filter — redundant with direction_orchestrator + mode_handlers + edge_state_manager.
+- Post-Sweep Filter — 74 false blocks per session in trending markets. ADX override was a patch.
+- BTC Correlation Filter — we ARE BTC. This filter is for altcoins.
 
-Filters included:
-1. BB Width Filter - Bollinger Band compression detection
-2. Volatility Shock Filter - TrueRange > k*ATR with cooldown
-3. Macro Trend Filter - EMA200 on 15m + 1h with slope veto
-4. Post-Sweep Confirmation - Break+retest after sweep
-5. Cost Filter - Spread vs risk, fee-adjusted R
-6. Overtrade Filter - Same-zone prevention, HH/HL reset
-
-PHASE A FIX (Jan 18, 2026): 
-- Use merge_dedup() consistently for regime-based filters to avoid double penalties
-- Added regime_source to all decisions for proper deduplication
-- Categorized filters into CONTEXT vs EXECUTION for hierarchy
-
-Created: January 15, 2026
-Updated: January 18, 2026 - Phase A sobreprotección fix
+KEPT:
+1. Volatility Shock Filter — TrueRange > k*ATR with cooldown (safety)
+2. Cost Filter — Spread vs risk, fee-adjusted R (essential RR validation)
+3. Overtrade Filter — Same-zone prevention, HH/HL reset (safety)
 """
 
 import numpy as np
@@ -29,82 +21,34 @@ import logging
 
 from src.domain.market.filters.filter_interface import FilterDecision, FilterPipeline, BaseFilter
 
-# FIX #41: Rate limiting for filter log spam
 _last_filter_log: dict[str, datetime] = {}
 _filter_log_interval = timedelta(minutes=2)
-from src.domain.market.filters.bb_width_filter import BBWidthFilter, get_bb_width_filter
 from src.domain.market.filters.volatility_shock_filter import VolatilityShockFilter, get_volatility_shock_filter
-from src.domain.market.filters.macro_trend_filter import MacroTrendFilter, get_macro_trend_filter
-from src.domain.market.filters.post_sweep_filter import PostSweepConfirmationFilter, get_post_sweep_filter
 from src.domain.market.filters.cost_filter import CostFilter, get_cost_filter
 from src.domain.market.filters.overtrade_filter import OvertradeFilter, get_overtrade_filter
-from src.domain.market.filters.btc_correlation_filter import BTCCorrelationFilter, get_btc_correlation_filter
 
 logger = logging.getLogger(__name__)
 
 
 class EntryFilterPipeline:
     """
-    Manages all entry filters and provides a unified evaluation interface.
-    
-    Usage in signal_engine:
-        # During initialization:
-        self.filter_pipeline = EntryFilterPipeline()
-        
-        # During _handle_idle_state:
-        decision = self.filter_pipeline.evaluate(
-            df_5m=df_5m,
-            df_15m=df_15m,
-            df_1h=df_1h,
-            current_price=current_price,
-            atr=atr,
-            bias=bias,
-            ...
-        )
-        
-        if not decision.allow:
-            return  # Blocked
-        
-        score += decision.score_adjust
-        self._current_trade_tags.update(decision.tags)
+    Manages entry filters and provides a unified evaluation interface.
+    3 filters: volatility_shock, cost, overtrade.
     """
-    
+
     def __init__(self,
-                 bb_width_enabled: bool = True,
                  volatility_shock_enabled: bool = True,
-                 macro_trend_enabled: bool = True,
-                 post_sweep_enabled: bool = True,
                  cost_filter_enabled: bool = True,
-                 overtrade_enabled: bool = True,
-                 btc_correlation_enabled: bool = True,
-                 btc_correlation_mode: str = "PENALTY",
-                 is_btc_symbol: bool = True):
-        """
-        Initialize the filter pipeline.
-        
-        Args:
-            *_enabled: Enable/disable individual filters
-            btc_correlation_mode: STRICT, PENALTY, or CONTEXT_ONLY
-            is_btc_symbol: True if trading BTC itself
-        """
-        # Initialize filters
-        self.bb_width_filter = get_bb_width_filter(enabled=bb_width_enabled)
+                 overtrade_enabled: bool = True):
+        """Initialize the filter pipeline: volatility_shock, cost, overtrade."""
         self.volatility_shock_filter = get_volatility_shock_filter(enabled=volatility_shock_enabled)
-        self.macro_trend_filter = get_macro_trend_filter(enabled=macro_trend_enabled)
-        self.post_sweep_filter = get_post_sweep_filter(enabled=post_sweep_enabled)
         self.cost_filter = get_cost_filter(enabled=cost_filter_enabled)
         self.overtrade_filter = get_overtrade_filter(enabled=overtrade_enabled)
-        self.btc_correlation_filter = get_btc_correlation_filter(
-            enabled=btc_correlation_enabled,
-            mode=btc_correlation_mode,
-            is_btc_symbol=is_btc_symbol
-        )
-        
+
         # Track last decisions for debugging
         self._last_decisions: Dict[str, FilterDecision] = {}
         self._last_aggregate: Optional[FilterDecision] = None
-        self._last_bb_block_log_time: float = 0.0
-    
+
     def evaluate(self,
                  # Data inputs
                  df_1m: pd.DataFrame | None = None,
@@ -112,7 +56,7 @@ class EntryFilterPipeline:
                  df_15m: pd.DataFrame | None = None,
                  df_1h: pd.DataFrame | None = None,
                  current_price: float | None = None,
-                 
+
                  # Trade parameters
                  bias: str | None = None,
                  entry_price: float | None = None,
@@ -120,171 +64,46 @@ class EntryFilterPipeline:
                  target_price: float | None = None,
                  spread: float | None = None,
                  atr: float | None = None,
-                 
+
                  # Context
                  market_time: datetime | None = None,
-                 regime_mode: str = 'TREND',  # 🔥 FIX (Jan 22): Added regime_mode parameter
-                 displacement_bypass: bool = False,  # 🔥 FIX (Jan 29): Bypass sweep on displacement
-                 anticipation_bypass: bool = False,  # 🔥 FIX #46 (Feb 05): ANTICIPATION bypasses macro slope
-                 bias_flip_bypass: bool = False,  # 🔥 FIX #67 (Feb 06): Bypass sweep on BIAS FLIP
-                 
+                 regime_mode: str = 'TREND',
+                 adx_1h: float = 20.0,
+
                  # Control
                  early_exit: bool = True) -> FilterDecision:
         """
         Run all filters and return aggregated decision.
-        
-        Args:
-            df_*: OHLC DataFrames for various timeframes
-            current_price: Current market price
-            bias: 'LONG' or 'SHORT'
-            entry_price: Planned entry (defaults to current_price)
-            stop_loss: Planned stop loss
-            target_price: Planned take profit
-            spread: Current bid-ask spread
-            atr: Current ATR
-            market_time: Current timestamp
-            early_exit: Stop on first block
-        
-        Returns:
-            Aggregated FilterDecision
         """
         entry_price = entry_price or current_price
         market_time = market_time or datetime.utcnow()
-        
+
         self._last_decisions = {}
-        
-        # Start with allow
+
         aggregate = FilterDecision(
             allow=True,
             reasons=[],
             tags={}
         )
-        
-        # ===== 1. VOLATILITY SHOCK (check first - can pause everything) =====
+
+        # ===== 1. VOLATILITY SHOCK (safety — pauses everything) =====
         if self.volatility_shock_filter.enabled:
             decision = self.volatility_shock_filter.evaluate(
                 df=df_5m,
                 market_time=market_time,
-                timeframe='5m'  # 🔥 FIX (Jan 22): Pass timeframe for TF-specific thresholds
+                timeframe='5m'
             )
             decision.regime_source = 'volatility_shock'
             self._last_decisions['volatility_shock'] = decision
-            # Use merge_dedup to avoid double-penalizing for same regime
             aggregate = aggregate.merge_dedup(decision)
-            
+
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'volatility_shock'
                 self._last_aggregate = aggregate
                 logger.warning(f"[BLOCK] FILTER [volatility]: {decision.reasons[0] if decision.reasons else 'shock'}")
                 return aggregate
-        
-        # ===== 2. BB WIDTH (compression detection) =====
-        # 🔥 FIX #178 (Feb 11, 2026): ANTICIPATION BYPASS para BB WIDTH
-        # PROBLEMA CRÍTICO: ANTICIPATION detecta COMPRESSION_BREAKOUT (squeeze)
-        # pero BB WIDTH filter bloquea porque ve la misma compresión.
-        # Esto es CONTRADICTORIO: el squeeze ES lo que queremos anticipar!
-        #
-        # SOLUCIÓN: Si anticipation_bypass=True, convertir BB WIDTH BLOCK
-        # en penalty en lugar de bloqueo. Esto permite entrar con size reducido.
-        if self.bb_width_filter.enabled:
-            decision = self.bb_width_filter.evaluate(
-                df=df_5m
-            )
-            decision.regime_source = 'bb_width'
-            self._last_decisions['bb_width'] = decision
-            # Use merge_dedup - BB Width determines regime, avoid duplicate penalties
-            aggregate = aggregate.merge_dedup(decision)
-            
-            if not decision.allow and early_exit:
-                # 🔥 FIX #178 + #270: BYPASS BB WIDTH para ANTICIPATION y DISPLACEMENT
-                # Run 20260214: BB WIDTH bloqueó 239 veces durante rally de +$1,400
-                # porque las BB se contraen en tendencias limpias (baja desviación).
-                # DISPLACEMENT = el mercado YA se movió → compresión es consecuencia, no causa.
-                # ANTICIPATION = detecta squeeze → la compresión ES el setup.
-                if anticipation_bypass or displacement_bypass:
-                    bypass_reason = "ANTICIPATION" if anticipation_bypass else "DISPLACEMENT"
-                    logger.info(f"📊 FIX #270: BB WIDTH BLOCK bypassed by {bypass_reason} → penalty only")
-                    aggregate.allow = True
-                    aggregate.score_adjust -= 1.5  # Penalty por compresión (menos severo que antes)
-                    aggregate.size_factor = min(aggregate.size_factor, 0.6)
-                    aggregate.tags['bb_width_bypassed'] = True
-                    aggregate.tags['bb_width_bypass_reason'] = bypass_reason
-                else:
-                    aggregate.tags['blocked_by'] = 'bb_width'
-                    self._last_aggregate = aggregate
-                    import time as _time_mod
-                    _now = _time_mod.time()
-                    if _now - self._last_bb_block_log_time >= 60.0:
-                        self._last_bb_block_log_time = _now
-                        logger.warning(f"[BLOCK] FILTER [bb_width]: {decision.reasons[0] if decision.reasons else 'compression'}")
-                    return aggregate
-        
-        # ===== 3. MACRO TREND (15m + 1h EMA200 + slope) =====
-        # CONTEXT category - use merge_dedup to avoid double penalty with other context filters
-        if self.macro_trend_filter.enabled and bias:
-            # 🔥 FIX (Jan 22): Use regime_mode parameter directly
-            # In RANGE mode, macro slope never hard-blocks (only penalizes)
-            # 🔥 FIX (Feb 3): Pass displacement_bypass to skip hard veto during volatility shocks
-            # 🔥 FIX #46 (Feb 05): ANTICIPATION bypasses macro slope (reduces size instead of blocking)
-            decision = self.macro_trend_filter.evaluate(
-                df_15m=df_15m,
-                df_1h=df_1h,
-                current_price=current_price,
-                bias=bias,
-                regime_mode=regime_mode,
-                displacement_bypass=displacement_bypass,
-                anticipation_bypass=anticipation_bypass
-            )
-            decision.regime_source = 'macro_trend'  # Mark source for dedup
-            self._last_decisions['macro_trend'] = decision
-            # PHASE A FIX: Use merge_dedup for regime-based filter
-            aggregate = aggregate.merge_dedup(decision)
-            
-            if not decision.allow and early_exit:
-                aggregate.tags['blocked_by'] = 'macro_trend'
-                self._last_aggregate = aggregate
-                # 🔥 FIX #47 (Feb 05): Rate-limit macro block log to reduce spam
-                log_key = f'macro_{bias}'
-                now = datetime.utcnow()
-                last_log = _last_filter_log.get(log_key)
-                if last_log is None or (now - last_log) > _filter_log_interval:
-                    _last_filter_log[log_key] = now
-                    logger.warning(f"[BLOCK] FILTER [macro]: {decision.reasons[0] if decision.reasons else 'veto'}")
-                return aggregate
-        
-        # ===== 4. POST-SWEEP CONFIRMATION =====
-        # CONTEXT category - structural filter
-        if self.post_sweep_filter.enabled and bias:
-            # Use df_1m if available, otherwise df_5m (can't use 'or' with DataFrames)
-            df_short_tf = df_1m if df_1m is not None and not df_1m.empty else df_5m
-            # 🔥 FIX #67 (Feb 06): BIAS FLIP also bypasses sweep (market structure changed)
-            effective_bypass = displacement_bypass or bias_flip_bypass
-            decision = self.post_sweep_filter.evaluate(
-                df=df_short_tf,
-                current_price=current_price,
-                atr=atr,
-                bias=bias,
-                displacement_bypass=effective_bypass  # 🔥 FIX (Jan 29): Pass through
-            )
-            decision.regime_source = 'post_sweep'
-            self._last_decisions['post_sweep'] = decision
-            # PHASE A FIX: Use merge_dedup for consistency
-            aggregate = aggregate.merge_dedup(decision)
-            
-            if not decision.allow and early_exit:
-                aggregate.tags['blocked_by'] = 'post_sweep'
-                self._last_aggregate = aggregate
-                # FIX #41: Rate-limit log spam
-                log_key = f'sweep_{bias}'
-                now = datetime.utcnow()
-                last_log = _last_filter_log.get(log_key)
-                if last_log is None or (now - last_log) > _filter_log_interval:
-                    _last_filter_log[log_key] = now
-                    logger.warning(f"[BLOCK] FILTER [sweep]: {decision.reasons[0] if decision.reasons else 'blocked'}")
-                return aggregate
-        
-        # ===== 5. COST FILTER (if we have SL/TP) =====
-        # EXECUTION category - different from CONTEXT, use regular merge
+
+        # ===== 2. COST FILTER (RR validation) =====
         if self.cost_filter.enabled and entry_price and stop_loss:
             decision = self.cost_filter.evaluate(
                 entry_price=entry_price,
@@ -293,21 +112,18 @@ class EntryFilterPipeline:
                 spread=spread,
                 bias=bias
             )
-            decision.regime_source = 'cost'  # EXECUTION category
+            decision.regime_source = 'cost'
             self._last_decisions['cost'] = decision
-            # Cost is EXECUTION category - use regular merge (doesn't dedup with CONTEXT)
             aggregate = aggregate.merge(decision)
-            
+
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'cost'
                 self._last_aggregate = aggregate
                 logger.warning(f"[BLOCK] FILTER [cost]: {decision.reasons[0] if decision.reasons else 'rr'}")
                 return aggregate
-        
-        # ===== 6. OVERTRADE FILTER (same-zone + reset) =====
-        # EXECUTION category
+
+        # ===== 3. OVERTRADE FILTER (same-zone prevention) =====
         if self.overtrade_filter.enabled and bias:
-            # Use df_1m if available, otherwise df_5m (can't use 'or' with DataFrames)
             df_short_tf = df_1m if df_1m is not None and not df_1m.empty else df_5m
             decision = self.overtrade_filter.evaluate(
                 df=df_short_tf,
@@ -316,50 +132,28 @@ class EntryFilterPipeline:
                 bias=bias,
                 market_time=market_time
             )
-            decision.regime_source = 'overtrade'  # EXECUTION category
+            decision.regime_source = 'overtrade'
             self._last_decisions['overtrade'] = decision
-            # Overtrade is EXECUTION - use regular merge
             aggregate = aggregate.merge(decision)
-            
+
             if not decision.allow and early_exit:
                 aggregate.tags['blocked_by'] = 'overtrade'
                 self._last_aggregate = aggregate
                 logger.warning(f"[BLOCK] FILTER [overtrade]: {decision.reasons[0] if decision.reasons else 'limit'}")
                 return aggregate
-        
-        # ===== 7. BTC CORRELATION FILTER (macro context) =====
-        # CONTEXT category - use merge_dedup
-        if self.btc_correlation_filter.enabled and bias:
-            decision = self.btc_correlation_filter.evaluate(
-                bias=bias,
-                market_time=market_time
-            )
-            decision.regime_source = 'btc_correlation'  # CONTEXT category
-            self._last_decisions['btc_correlation'] = decision
-            # PHASE A FIX: Use merge_dedup for context filter
-            aggregate = aggregate.merge_dedup(decision)
-            
-            if not decision.allow and early_exit:
-                aggregate.tags['blocked_by'] = 'btc_correlation'
-                self._last_aggregate = aggregate
-                logger.warning(f"[BLOCK] FILTER [btc_corr]: {decision.reasons[0] if decision.reasons else 'blocked'}")
-                return aggregate
-        
+
         # ===== FINAL AGGREGATE =====
         self._last_aggregate = aggregate
-        
-        # 🔥 FIX (Feb 05, 2026): Only log significant adjustments
-        # +1.5 is common, only log >= 2.0 or blocks
+
         if aggregate.score_adjust != 0:
             adj_str = f"{aggregate.score_adjust:+.1f}"
             if not aggregate.allow:
                 logger.info(f"[DATA] FILTER: adj={adj_str}, {aggregate.reasons[0] if aggregate.reasons else 'ok'}")
             else:
                 logger.debug(f"[DATA] FILTER: adj={adj_str}, {aggregate.reasons[0] if aggregate.reasons else 'ok'}")
-            # Non-blocking adjustments are debug-level (too frequent for console)
-        
+
         return aggregate
-    
+
     def record_trade_result(self,
                            entry_price: float,
                            exit_price: float,
@@ -367,11 +161,7 @@ class EntryFilterPipeline:
                            exit_time: datetime,
                            direction: str,
                            pnl: float):
-        """
-        Record a trade result for filters that track history.
-        Called by signal_engine after trade closes.
-        """
-        # Overtrade filter needs trade history
+        """Record a trade result for filters that track history."""
         self.overtrade_filter.record_trade_from_params(
             entry_price=entry_price,
             exit_price=exit_price,
@@ -380,42 +170,31 @@ class EntryFilterPipeline:
             direction=direction,
             pnl=pnl
         )
-    
+
     def get_filter_decisions(self) -> Dict[str, FilterDecision]:
         """Get individual filter decisions from last evaluation"""
         return self._last_decisions
-    
+
     def get_last_decision(self) -> Optional[FilterDecision]:
         """Get last aggregated decision"""
         return self._last_aggregate
-    
+
     def get_filter_tags(self) -> Dict[str, Any]:
         """Get all tags from last evaluation (for trade logging)"""
         if self._last_aggregate:
             return self._last_aggregate.tags
         return {}
-    
+
     def reset_all(self):
         """Reset all filter states (for testing)"""
-        from src.domain.market.filters.bb_width_filter import reset_bb_width_filter
         from src.domain.market.filters.volatility_shock_filter import reset_volatility_shock_filter
-        from src.domain.market.filters.macro_trend_filter import reset_macro_trend_filter
-        from src.domain.market.filters.post_sweep_filter import reset_post_sweep_filter
         from src.domain.market.filters.cost_filter import reset_cost_filter
         from src.domain.market.filters.overtrade_filter import reset_overtrade_filter
-        from src.domain.market.filters.btc_correlation_filter import reset_btc_correlation_filter
-        from src.domain.market.structure.btc_context_feed import reset_btc_context_feed
-        
-        reset_bb_width_filter()
+
         reset_volatility_shock_filter()
-        reset_macro_trend_filter()
-        reset_post_sweep_filter()
         reset_cost_filter()
         reset_overtrade_filter()
-        reset_btc_correlation_filter()
-        reset_btc_context_feed()
-        
-        # Re-initialize
+
         self.__init__()
 
 

@@ -156,13 +156,13 @@ class StateMachine:
 
     def start_cooldown(self, duration_minutes: Optional[int] = None):
         """Start post-trade cooldown"""
-        # 🔥 FIX #170 (Feb 11, 2026): 0 is a valid duration, don't use 'or' which treats 0 as falsy
+        # 0 is a valid duration, don't use 'or' which treats 0 as falsy
         # BUG: "duration_minutes or default" → 0 becomes default (15 min)
         # FIX: Explicit None check
         duration = self.cooldown_duration_minutes if duration_minutes is None else duration_minutes
         
         if duration <= 0:
-            # 🔥 FIX #170: No cooldown = clear any existing cooldown
+            # No cooldown = clear any existing cooldown
             self.cooldown_until = None
             logger.info(f"Cooldown cleared (duration=0)")
             return
@@ -205,8 +205,7 @@ class StateMachine:
         """
         Record when a trade is closed.
         
-        CRITICAL FIX (Jan 12, 2026):
-        Consecutive losses are ONLY counted for REAL LOSSES:
+        CRITICAL Consecutive losses are ONLY counted for REAL LOSSES:
         - SL hit (stop-loss triggered)
         - Market adverse exit (manual close at loss)
         - R < 0 with confirmed position
@@ -224,16 +223,16 @@ class StateMachine:
             logger.info(f"Trade closed: {self.current_trade_id} | Reason: {exit_reason} | Duration: {duration:.1f}min | PnL: ${pnl:.2f}")
         
         # Determine if this is a REAL trade loss (not administrative)
-        # 🔥 FIX (Jan 20, 2026): Added EXCHANGE_STOP_LOSS and EXCHANGE_TAKE_PROFIT
+        # Added EXCHANGE_STOP_LOSS and EXCHANGE_TAKE_PROFIT
         # These are exchange-executed orders that should count as real trades
-        # 🔥 FIX #15 (Feb 02, 2026): TIME_INVALIDATION debe contar como LOSS
+        # TIME_INVALIDATION debe contar como LOSS
         #    TIME_INVALIDATION_MAX_LOSS es un trade que perdió dinero → LOSS
         REAL_LOSS_REASONS = {
             'SL_HIT', 'STOP_LOSS', 'MARKET_CLOSE', 'MANUAL_CLOSE',
             'EXCHANGE_STOP_LOSS',  # SL executed by exchange
             'TRAILING_STOP',       # Trailing stop hit
-            'TIME_INVALIDATION',   # 🔥 FIX #15: Trade stagnated at loss
-            'TIME_INVALIDATION_MAX_LOSS',  # 🔥 FIX #15: Trade timed out at loss
+            'TIME_INVALIDATION',   # Trade stagnated at loss
+            'TIME_INVALIDATION_MAX_LOSS',  # Trade timed out at loss
         }
         REAL_WIN_REASONS = {
             'EXCHANGE_TAKE_PROFIT', 'TP_HIT', 'TAKE_PROFIT', 'TP1', 'TP2'
@@ -257,7 +256,7 @@ class StateMachine:
             self.total_wins += 1
             logger.debug(f"WIN recorded - consecutive losses reset to 0")
         elif is_real_trade and not is_admin_event:
-            # 🔥 FIX (Jan 22, 2026): EXCHANGE_STOP_LOSS MUST count as loss
+            # EXCHANGE_STOP_LOSS MUST count as loss
             # The old logic required `pnl < 0`, but when exchange executes SL
             # we often don't have accurate PnL at detection time.
             # If exit_reason is SL/STOP type, it's a loss regardless of reported pnl.
@@ -307,7 +306,7 @@ class StateMachine:
             logger.warning(f"Expectancy {self.expectancy:.2f} is not positive")
             return True
         
-        # NUEVA LÓGICA: Demasiadas pérdidas consecutivas (FIX #8)
+        # NUEVA LÓGICA: Demasiadas pérdidas consecutivas
         # REDESIGNED (Jan 4, 2026): 3 losses = penalty, not hibernation
         if self.consecutive_losses >= 3:
             logger.warning(f"Consecutive losses {self.consecutive_losses} >= 3 - activating penalty mode")
@@ -343,24 +342,6 @@ class StateMachine:
         logger.warning(f"   - Will skip next {self.observation_setups_to_skip} setups")
         logger.warning(f"   - Then trade at {self.observation_size_multiplier*100:.0f}% size")
         logger.warning(f"   - NOT blocking for hours (penalty, not paralysis)")
-    
-    def should_skip_setup(self) -> tuple[bool, str]:
-        """
-        NEW (Jan 4, 2026): Check if current setup should be skipped.
-        
-        Called when a valid setup is detected.
-        Returns (should_skip, reason)
-        """
-        if self.state != BotState.OBSERVATION:
-            return False, ""
-        
-        if self.setups_skipped < self.observation_setups_to_skip:
-            self.setups_skipped += 1
-            remaining = self.observation_setups_to_skip - self.setups_skipped
-            return True, f"Penalty: skipping setup {self.setups_skipped}/{self.observation_setups_to_skip} ({remaining} left)"
-        
-        # All setups skipped - can trade but at reduced size
-        return False, ""
     
     def get_size_multiplier(self) -> float:
         """

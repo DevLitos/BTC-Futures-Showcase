@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 
 # Default path for health status file
 DEFAULT_HEALTH_FILE = Path("/app/storage/health_status.json")
-# Fallback for local development
-LOCAL_HEALTH_FILE = Path("storage/health_status.json")
+# Fallback for local development — use absolute path relative to this file's location
+LOCAL_HEALTH_FILE = Path(__file__).resolve().parent.parent.parent / "storage" / "health_status.json"
 
 
 @dataclass
@@ -213,13 +213,23 @@ class HealthBridge:
                         setattr(bridged, key, value)
             
             # Write atomically (write to temp, then rename)
+            # Fallback to direct write if rename fails (e.g. cross-device, race)
             data = bridged.to_dict()
             temp_path = self._file_path.with_suffix('.tmp')
             
             with self._lock:
                 with open(temp_path, 'w') as f:
                     json.dump(data, f, indent=2)
-                temp_path.rename(self._file_path)
+                try:
+                    temp_path.rename(self._file_path)
+                except OSError:
+                    # Atomic rename failed — fall back to direct write
+                    with open(self._file_path, 'w') as f:
+                        json.dump(data, f, indent=2)
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 self._last_write_time = datetime.now(UTC)
             
             return True

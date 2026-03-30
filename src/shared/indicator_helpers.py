@@ -229,7 +229,7 @@ def find_tp2_target(
 # NOTE: get_cached_indicators, get_indicator_cache, reset_indicator_cache
 # have been REMOVED. Use src/application/live/indicator_cache.py instead.
 # CachedIndicators class has also been removed from this file.
-#
+
 # For backward compatibility, import from shared/indicator_cache.py which
 # will issue a DeprecationWarning.
 

@@ -57,12 +57,12 @@ class TrailingState:
     
     # =========================================================================
     # 🔥 NEW (Jan 26, 2026): TIME TO +0.2R TRACKING
-    # 
+
     # RATIONALE: Winners reach +0.2R fast, losers never do.
     # This metric helps distinguish:
     # - Good entries: time_to_02r < 60s → edge confirmed
     # - Bad entries: time_to_02r > 300s or never → cut early next time
-    # 
+
     # Actionable: If time_to_02r is consistently >5min, entry quality is poor.
     # =========================================================================
     time_to_02r_sec: float = -1.0      # Seconds to reach +0.2R (-1 = not reached)
@@ -104,15 +104,15 @@ class HybridATRTrailing:
     """
     
     # R-Lock tiers by regime
-    # 🔥 FIX (Feb 20, 2026): AGGRESSIVE CAPTURE for RANGE
+    # AGGRESSIVE CAPTURE for RANGE
     # Data (Feb 11-20): 20 trades had MFE>=0.20R but captured NEGATIVE total (-1.25R)!
     # Old tiers captured 0-30% of MFE. New tiers target 33-60% capture.
     # In RANGE mode, moves REVERSE. Capture profit while it exists.
     # REFACTORED (Feb 20, 2026): Start protecting at 0.10R MFE
     # Data: 20 trades with MFE >= 0.20R captured -1.25R total! (negative!)
     # The trailing was letting price reverse ALL gains before locking anything.
-    #
-    # 🔥 FIX (Feb 20, 2026): tier=0 was at 0.10R MFE → locked at +0.01R (=breakeven).
+
+    # tier=0 was at 0.10R MFE → locked at +0.01R (=breakeven).
     # With TP at 0.30R, the trade NEVER had room to reach TP — trailing killed it at
     # 0.108R MFE with $0.00 PnL. Moved tier=0 to 0.20R MFE to give trades breathing room.
     # The early partial at 0.30R handles the RANGE full-close anyway.
@@ -143,10 +143,10 @@ class HybridATRTrailing:
     R_LOCK_TIERS = R_LOCK_TIERS_RANGE  # Default conservador
     
     # ATR K factors by regime
-    # 🔥 FIX (Feb 2, 2026): K FACTORS MÁS AGRESIVOS
+    # K FACTORS MÁS AGRESIVOS
     # PROBLEMA: Con K=2.0 ATR, se devuelve 60%+ del MFE
     # DATOS: 9 trades TRAILING_STOP solo capturaron 37% del MFE en promedio
-    # 
+
     # SOLUCIÓN: K factors más ajustados para capturar más profit
     # - TREND: 1.5 ATR (was 2.0 - pullbacks normales son ~1 ATR)
     # - RANGE: 1.3 ATR (needs some room even in range)
@@ -154,7 +154,7 @@ class HybridATRTrailing:
     # - CONSERVATIVE: 1.2 ATR (was 1.8 - conservative = protect profit)
     K_FACTORS = {
         TrailingRegime.TREND: 1.5,
-        TrailingRegime.RANGE: 0.7,       # 🔥 FIX (Feb 20): AGGRESSIVE capture in RANGE (was 1.0)
+        TrailingRegime.RANGE: 0.7,       # AGGRESSIVE capture in RANGE (was 1.0)
         TrailingRegime.VOLATILITY: 2.0,  # Data: captures only 7% of MFE at K=1.0, need tighter
         TrailingRegime.CONSERVATIVE: 1.0, # Tightened from 1.2 for consistency
     }
@@ -179,7 +179,7 @@ class HybridATRTrailing:
     # - BOS STRONG → trailing más suelto → más chance de capturar runner
     # - BOS NORMAL → trailing estándar
     # - BOS WEAK → trailing más apretado → proteger rápido
-    # 
+
     # ESTO NO ES SOBREPROTECCIÓN porque:
     # - NO rechaza trades (todos entran igual)
     # - Solo ajusta GESTIÓN post-entrada
@@ -253,7 +253,7 @@ class HybridATRTrailing:
         """
         Get the R-locked stop level based on MFE and regime.
         
-        🔥 FIX #64 (Feb 6, 2026): Use different tiers by regime
+        Use different tiers by regime
         - TREND: More lenient tiers (pullbacks of 0.3-0.5R are normal)
         - RANGE/SCALP: Tighter tiers (protect profits faster)
         
@@ -264,7 +264,7 @@ class HybridATRTrailing:
         locked_stop = self._initial_stop
         tier = 0
         
-        # 🔥 FIX #64: Select tiers based on regime
+        # Select tiers based on regime
         if regime == TrailingRegime.TREND:
             tiers = self.R_LOCK_TIERS_TREND
         else:
@@ -353,7 +353,7 @@ class HybridATRTrailing:
             self._state.time_to_02r_sec = (now - self._entry_time).total_seconds()
             logger.info(f"⏱️ TIME TO +0.2R: {self._state.time_to_02r_sec:.1f}s (MFE={mfe_r:.2f}R)")
         
-        # 1. Get R-locked stop (🔥 FIX #64: Use regime-specific tiers)
+        # 1. Get R-locked stop (Use regime-specific tiers)
         r_stop, r_tier = self.get_r_locked_stop(mfe_r, regime)
         
         # Only update if improved

@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, UTC
 
-# 🔥 FIX (Feb 05): Import TrendDirection from unified source
+# Import TrendDirection from unified source
 from src.config.unified_constants import TrendDirection
 
 logger = logging.getLogger(__name__)
@@ -128,7 +128,7 @@ class TrendIntelligence:
     MIN_DATA_FOR_CONFIDENCE = 20    # Minimum candles for high confidence
     
     # 🔥 NEW (Jan 24): Warmup requirements for reliable state detection
-    MIN_WARMUP_FOR_LOW_CONFIDENCE = 20  # 🔥 FIX (Jan 24): Increased from 6 for more reliable detection    # Minimum candles for 40%+ confidence
+    MIN_WARMUP_FOR_LOW_CONFIDENCE = 20  # Increased from 6 for more reliable detection    # Minimum candles for 40%+ confidence
     MIN_WARMUP_FOR_MED_CONFIDENCE = 12   # Minimum candles for 60%+ confidence
     MIN_WARMUP_FOR_HIGH_CONFIDENCE = 24  # Minimum candles for 80%+ confidence
     
@@ -214,7 +214,7 @@ class TrendIntelligence:
         # Now run proper analysis with full history
         self._warmup_candles = len(self._price_history)
         
-        # 🔥 FIX (Jan 25, 2026): Ensure ADX values are Python floats
+        # Ensure ADX values are Python floats
         # Calculate metrics with historical data
         _adx_for_warmup = float(adx_values[-1]) if adx_values is not None and len(adx_values) > 0 else 15.0
         self._update_adx_metrics(_adx_for_warmup)
@@ -283,7 +283,7 @@ class TrendIntelligence:
             return 1
         
         current_phase = self._state.current_phase
-        # 🔥 FIX (Jan 25, 2026): Ensure ADX is Python float
+        # Ensure ADX is Python float
         adx = float(adx_values[-1])
         
         # Count candles that match current phase criteria
@@ -553,7 +553,7 @@ class TrendIntelligence:
         # 🔥 FIX M1 (Feb 07, 2026): Less sensitive divergence detection
         # Previous: Any volume below average = diverges
         # Now: Need SIGNIFICANT divergence (>20% below average on meaningful move)
-        # 🔥 FIX #169 (Feb 11, 2026): Made divergence threshold stricter
+        # Made divergence threshold stricter
         # 0.7x was triggering in every low-liquidity session (night UTC)
         # Now: 0.5x (50% below average) is required for true divergence
         if len(self._price_history) >= 5:
@@ -675,7 +675,7 @@ class TrendIntelligence:
             if self._state.adx_slope > 0.3:
                 return TrendPhase.ACCUMULATION, 0.5, "New cycle accumulation"
         
-        # 🔥 FIX #61 (Feb 06): COLD START COHERENCE
+        # COLD START COHERENCE
         # When TrendPhase is stuck in RANGE_BOUND but ADX is very high,
         # this indicates a cold start problem - the system initialized
         # during an already-mature trend. Force transition to appropriate phase.
@@ -737,7 +737,7 @@ class TrendIntelligence:
             elif direction == TrendDirection.BEARISH:
                 self._state.trade_bias = "LONG_PREFERRED"
             else:
-                # 🔥 FIX (Feb 06, 2026): NEUTRAL direction in exhaustion = allow BOTH
+                # NEUTRAL direction in exhaustion = allow BOTH
                 # EdgeManager will decide direction based on price action
                 self._state.trade_bias = "BOTH"
         elif phase == TrendPhase.DISTRIBUTION:
@@ -761,7 +761,7 @@ class TrendIntelligence:
         elif phase in [TrendPhase.TREND_MATURE, TrendPhase.ACCUMULATION]:
             self._state.entry_mode = "CONSERVATIVE"
         elif phase == TrendPhase.TREND_EXHAUSTION:
-            # 🔥 FIX (Feb 06, 2026): EXHAUSTION = fade opportunity, NOT wait
+            # EXHAUSTION = fade opportunity, NOT wait
             # BULLISH exhaustion = SHORT opportunity
             # BEARISH exhaustion = LONG opportunity
             # Use CONSERVATIVE mode to fade with reduced size
@@ -832,7 +832,7 @@ class TrendIntelligence:
         elif phase == TrendPhase.TREND_MATURE:
             score_adj = 0.0
         elif phase == TrendPhase.TREND_EXHAUSTION:
-            # 🔥 FIX (Feb 06, 2026): EXHAUSTION fade trades need easier entry
+            # EXHAUSTION fade trades need easier entry
             # If trading preferred direction (fade), reduce threshold
             if (bias == "SHORT_PREFERRED" and desired_direction == "SHORT") or \
                (bias == "LONG_PREFERRED" and desired_direction == "LONG"):

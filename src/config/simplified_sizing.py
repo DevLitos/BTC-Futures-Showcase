@@ -91,8 +91,8 @@ class SimplifiedSizingResult:
     toxic_hour_mult: float = 1.0  # Toxic hour multiplier
     toxic_combo_mult: float = 1.0  # 🔥 NEW: Toxic combo multiplier (REDUCE mode)
     momentum_mult: float = 1.0  # Momentum predictor multiplier
-    regime_fusion_mult: float = 1.0  # 🔥 FIX #83: RegimeFusion macro/micro alignment
-    score_mult: float = 1.0  # 🔥 FIX #245: Score-to-sizing multiplier
+    regime_fusion_mult: float = 1.0  # RegimeFusion macro/micro alignment
+    score_mult: float = 1.0  # Score-to-sizing multiplier
     
     # Final
     combined_multiplier: float = 1.0
@@ -119,7 +119,7 @@ class RRBucket:
     """
     🔥 SCALPING INTELIGENTE - Calidad > Cantidad
     
-    FIX (Feb 05, 2026): Sistema de 5-15 trades/día
+    Sistema de 5-15 trades/día
     - NO queremos trades basura de bajo RR
     - Preferimos MENOS trades de MAYOR calidad
     - Bloquear trades < 0.6R, reducir < 0.9R
@@ -218,7 +218,7 @@ class SessionMultiplier:
          Only good/moderate trade
     """
     GOOD = 1.0      # LONDON, NY_OVERLAP, NY
-    MODERATE = 0.9  # 🔥 FIX #121c: 0.8 → 0.9 - ASIA almost full size
+    MODERATE = 0.9  # 0.8 → 0.9 - ASIA almost full size
     # POOR = HARD BLOCK (not a multiplier)
     
     @classmethod
@@ -275,9 +275,9 @@ class SimplifiedSizer:
         last_trade_time: Optional[datetime] = None,  # For loss streak cooldown
         # 🔥 NEW (Feb 2, 2026): Momentum predictor
         momentum_score: float = 1.0,  # 0-2 score from entry_scorer
-        # 🔥 FIX #83 (Feb 7, 2026): RegimeFusion macro/micro alignment
+        # RegimeFusion macro/micro alignment
         regime_fusion_mult: float = 1.0,  # 0.3 for fades, 1.0 for aligned
-        # 🔥 FIX #245 (Feb 16, 2026): Score-to-sizing multiplier
+        # Score-to-sizing multiplier
         entry_score: float = 5.0,  # Entry score for sizing graduation
     ) -> SimplifiedSizingResult:
         """
@@ -314,43 +314,25 @@ class SimplifiedSizer:
         result = SimplifiedSizingResult()
         
         # =====================================================================
-        # 🔥 NEW (Feb 2, 2026): LOSS STREAK COOLDOWN
-        # Enforce waiting period after 3+ consecutive losses
+        # LOSS STREAK COOLDOWN — basic inline implementation
+        # After 3+ consecutive losses, enforce proportional cooldown.
+        # Classes LossStreakCooldown and ToxicCombinationBlock were removed in
+        # a prior cleanup. The logic is inlined here as a simple guard.
         # =====================================================================
-        if consecutive_losses >= 3 and market_time is not None:
-            in_cooldown, remaining = LossStreakCooldown.is_in_cooldown(
-                consecutive_losses, last_trade_time, market_time
-            )
-            if in_cooldown:
+        if consecutive_losses >= 3 and market_time is not None and last_trade_time is not None:
+            cooldown_minutes = min(consecutive_losses * 5, 30)  # 3→15min, 4→20min, max 30min
+            elapsed = (market_time - last_trade_time).total_seconds()
+            required = cooldown_minutes * 60
+            if elapsed < required:
+                remaining = required - elapsed
                 result.should_trade = False
                 result.block_reason = (
                     f"⏳ LOSS STREAK COOLDOWN: {consecutive_losses} losses → "
-                    f"wait {remaining}s more"
+                    f"wait {remaining:.0f}s more"
                 )
                 result.tags['loss_streak_cooldown'] = True
                 result.tags['cooldown_remaining_s'] = remaining
                 return result
-        
-        # =====================================================================
-        # 🔥 NEW (Feb 2, 2026): TOXIC COMBINATION HANDLER
-        # In BLOCK mode: blocks trade entirely
-        # In REDUCE mode: applies sizing multiplier (more adaptive)
-        # =====================================================================
-        if session_name and direction:
-            is_toxic, toxic_reason = ToxicCombinationBlock.is_blocked(session_name, direction)
-            if is_toxic:
-                result.should_trade = False
-                result.block_reason = toxic_reason
-                result.tags['toxic_combo_blocked'] = True
-                result.tags['toxic_combo'] = f"{session_name}_{direction}"
-                return result
-            
-            # Apply REDUCE multiplier if in REDUCE mode
-            result.toxic_combo_mult = ToxicCombinationBlock.get_multiplier(session_name, direction)
-            if result.toxic_combo_mult < 1.0:
-                result.tags['toxic_combo_reduced'] = True
-                result.tags['toxic_combo'] = f"{session_name}_{direction}"
-                result.tags['toxic_combo_mult'] = result.toxic_combo_mult
         
         # Toxic hour, momentum, regime_fusion, score_mult REMOVED — Opción A (5 multipliers only)
         
@@ -359,7 +341,7 @@ class SimplifiedSizer:
         # =====================================================================
         # 🔥 INTRADAY vs INSTITUTIONAL: Filtros diferentes
         # INTRADAY tiene sus propios blocks para no asfixiarse
-        # 
+
         # INTRADAY THRESHOLDS (hardcoded to avoid circular import):
         # - RR_BLOCK_THRESHOLD = 0.25R (vs 0.70R institutional)
         # - RR_REDUCED_THRESHOLD = 0.40R
@@ -376,10 +358,10 @@ class SimplifiedSizer:
         
         # =====================================================================
         # 🔥 CAMBIO CLAVE #3 (Jan 28): R < 0.30 NO BLOQUEA, DEGRADA A PROVISIONAL
-        # 
+
         # ANTES: R < 0.30 sin liquidity → NO TRADE
         # AHORA: R < 0.30 sin liquidity → PROVISIONAL (size 0.10x)
-        # 
+
         # ❗ IMPORTANTE:
         # - R < 0.25 sigue bloqueado (mínimo absoluto)
         # - Liquidity sigue siendo obligatoria para size grande
@@ -534,14 +516,14 @@ class SimplifiedSizer:
         )
         
         # =====================================================================
-        # 🔥 FIX #100 (Feb 09, 2026): SIZING FLOOR - PREVENT EXTREME REDUCTION
-        # 
+        # SIZING FLOOR - PREVENT EXTREME REDUCTION
+
         # PROBLEMA: Múltiples multiplicadores compuestos reducen sizing a 8%
         # EJEMPLO: 0.83 × 0.7 × 0.6 × 0.8 × 0.54 × 0.5 × 0.6 = 0.08
-        # 
+
         # Con balance de $254, esto da posiciones de $20, beneficio ~$0.20
         # $0.20 < threshold de $0.30 = HARD BLOCK infinito
-        # 
+
         # SOLUCIÓN: Floor del 25% para garantizar operabilidad
         # =====================================================================
         MIN_SIZING_FLOOR = 0.25
@@ -552,7 +534,7 @@ class SimplifiedSizer:
             result.tags['sizing_floor_applied'] = True
             result.tags['sizing_floor_original'] = old_mult
             logger.info(
-                f"🔥 FIX #100: Sizing floor applied. Original={old_mult:.2%} → Floor={MIN_SIZING_FLOOR:.0%}"
+                f"Sizing floor applied. Original={old_mult:.2%} → Floor={MIN_SIZING_FLOOR:.0%}"
             )
         
         # Calculate base size from risk
@@ -620,7 +602,7 @@ class SimplifiedExitConfig:
     # 🔥 SCALPING INTELIGENTE (Feb 05, 2026)
     # NO es scalping de alto volumen (100 trades/día)
     # ES scalping de CALIDAD (5-15 trades/día con edge real)
-    # 
+
     # Filosofía: Menos oportunidades, más calidad
     # - TP moderados (1.0-1.5R) para dar tiempo al trade
     # - Filtros estrictos para solo trades de alta probabilidad
@@ -630,7 +612,7 @@ class SimplifiedExitConfig:
     # Data (Feb 11-20): TP 1.0R = 2% hit rate, TP 0.5R = 20% hit rate
     # In RANGE: moves rarely exceed 0.7R, set TP to minimum viable
     TP_R_TREND = 1.2    # 1.2R en tendencia (equilibrio calidad/frecuencia)
-    TP_R_RANGE = 0.30   # 0.30R — data-validated: 38% hit rate, +$0.83 avg win
+    TP_R_RANGE = 0.75   # 0.75R — requiere 57% WR para breakeven (alcanzable en MR)
     
     # 🔥 NEW FEB 11: TP ADAPTATIVO basado en volatilidad
     # - Baja volatilidad (atr_ratio < 0.8): TP conservador
@@ -640,7 +622,7 @@ class SimplifiedExitConfig:
     TP_LOW_VOL_MULT = 0.8    # Reduce TP 20% en baja vol
     TP_HIGH_VOL_MULT = 1.25  # Aumenta TP 25% en alta vol
     
-    # 🔥 FIX #261: TP floor to prevent HARD BLOCK deadlock
+    # TP floor to prevent HARD BLOCK deadlock
     # When low-vol adjustment reduces TP to 0.80R, net_R = 0.80 - 0.225(fees) = 0.575 < 0.60
     # This causes 16+ HARD BLOCK rejections until SL drifts enough to barely pass.
     # Floor ensures TP after adjustment always passes MIN_EXPECTED_NET_R with margin.
@@ -673,7 +655,7 @@ class SimplifiedExitConfig:
     # Time Invalidation - Simplified
     TIME_INVALIDATION_MINUTES = 60  # 60 min flat (INSTITUTIONAL)
     TIME_INVALIDATION_INTRADAY_MIN = 15  # 🔥 FIX Feb 05: 15 min for INTRADAY (was 5)
-    TIME_INVALIDATION_MAX_LOSS_R = -0.35  # 🔥 FIX #121a: -0.35R (was -0.20R) - give trades room to breathe
+    TIME_INVALIDATION_MAX_LOSS_R = -0.35  # -0.35R (was -0.20R) - give trades room to breathe
     
     # Stop Loss - No change (structural)
     SL_STRUCTURAL = True  # Use structural SL always
@@ -683,7 +665,7 @@ class SimplifiedExitConfig:
         """
         Get TP target in R based on regime, edge type, edge mode, and volatility.
         
-        🔥 FIX (Jan 28, 2026): TP basado PRINCIPALMENTE en régimen de mercado
+        TP basado PRINCIPALMENTE en régimen de mercado
         - El edge_type es informativo pero no debe cambiar el TP
         - Evita inconsistencia donde mismo contexto da diferente TP
         
@@ -733,7 +715,7 @@ class SimplifiedExitConfig:
     def _apply_volatility_adjustment(cls, base_tp: float, atr_expansion_ratio: Optional[float]) -> float:
         """
         🔥 NEW (Feb 11, 2026): Apply volatility-based TP adjustment.
-        🔥 FIX #261 (Feb 18, 2026): Added TP_MIN_FLOOR to prevent HARD BLOCK deadlock.
+        Added TP_MIN_FLOOR to prevent HARD BLOCK deadlock.
         
         - Low volatility (atr_ratio < 0.8): Conservative targets (×0.8), floored at 0.88R
         - High volatility (atr_ratio > 1.3): Extended targets (×1.25)
@@ -748,7 +730,7 @@ class SimplifiedExitConfig:
             floored = max(adjusted, cls.TP_MIN_FLOOR)
             if floored > adjusted:
                 logger.info(
-                    f"🔥 FIX #261: TP floor applied {adjusted:.2f}R → {floored:.2f}R "
+                    f"TP floor applied {adjusted:.2f}R → {floored:.2f}R "
                     f"(prevents HARD BLOCK deadlock)"
                 )
             return floored

@@ -94,22 +94,16 @@ class RiskEngine:
         UPDATED (Feb 03, 2026): Added bos_quality for dynamic trailing adjustment
         UPDATED (Feb 04, 2026): Added displacement_origin for reclaim exit
         """
-        # =====================================================================
-        # 🔥 FIX #183b (Feb 11, 2026): IDEMPOTENT GUARD
-        # If position already exists with same direction/entry, return it
-        # This prevents duplicate position creation during timeout recovery
-        # =====================================================================
+        # IDEMPOTENT GUARD — prevents duplicate position creation during timeout recovery
         if self.position is not None:
             existing = self.position
-            # Check if this is the same position (same direction, similar price)
-            price_match = abs(existing.entry_price - entry_price) < 1.0  # $1 tolerance
+            price_match = abs(existing.entry_price - entry_price) < 1.0
             direction_match = existing.direction == direction
             if price_match and direction_match:
-                logger.warning(f"🔄 FIX #183b: Position already exists - returning existing ({existing.direction} @ {existing.entry_price:.2f})")
+                logger.warning(f"🔄 Position already exists - returning existing ({existing.direction} @ {existing.entry_price:.2f})")
                 return existing
             else:
-                logger.warning(f"⚠️ FIX #183b: Position exists but different! Existing: {existing.direction} @ {existing.entry_price:.2f}, New: {direction} @ {entry_price:.2f}")
-                # Return existing to prevent overwrite
+                logger.warning(f"⚠️ Position exists but different! Existing: {existing.direction} @ {existing.entry_price:.2f}, New: {direction} @ {entry_price:.2f}")
                 return existing
         
         self.position = Position(
@@ -121,12 +115,12 @@ class RiskEngine:
             atr_1m=atr_1m,
             market_time=market_time,
             trade_type=trade_type,
-            regime_mode=regime_mode,  # 🔥 Pass regime for trailing
-            edge_type=edge_type,  # 🔥 FIX (Jan 30): Pass edge_type for TIME_INVALIDATION
-            entry_score=entry_score,  # 🔥 FIX (Feb 01): Pass entry_score for stricter TIME_INVALIDATION
-            is_weekend=is_weekend,  # 🔥 FIX (Feb 01): Pass is_weekend for stricter exits
-            bos_quality=bos_quality,  # 🔥 NEW (Feb 03): Pass bos_quality for dynamic trailing
-            displacement_origin=displacement_origin  # 🔥 NEW (Feb 04): Pass origin for reclaim exit
+            regime_mode=regime_mode,
+            edge_type=edge_type,
+            entry_score=entry_score,
+            is_weekend=is_weekend,
+            bos_quality=bos_quality,
+            displacement_origin=displacement_origin
         )
         
         return self.position
@@ -215,7 +209,7 @@ class RiskEngine:
                     self.capital = total
                     
                     # =====================================================================
-                    # 🔒 FIX (Jan 13, 2026): SYNC EQUITY FROM EXCHANGE IN LIVE MODE
+                    # SYNC EQUITY FROM EXCHANGE IN LIVE MODE
                     # Initial equity must be set from real exchange balance, not default 10k
                     # This ensures DD calculations and PnL tracking use real values
                     # =====================================================================
@@ -226,7 +220,6 @@ class RiskEngine:
                         self.equity = total
                         self.max_equity = total
                     
-                    # FIX #84: Reducido a DEBUG para eliminar spam
                     logger.debug(f"💰 Capital actualizado: ${self.capital:.2f} {currency} (Libre: ${free:.2f}, En uso: ${used:.2f})")
                     return True
             
@@ -299,11 +292,9 @@ class RiskEngine:
         EDGE FIX: Use minimum 1.2 ATR distance to avoid noise stops
         The SL is the FURTHER of: structure level OR ATR minimum
         
-        🔥 FIX #188 (Feb 11, 2026): SL is CAPPED at 3.0 ATR (reduced from 4.0)
-        - SL cannot exceed 3.0 ATR from entry (prevents absurd 1R distances)
-        - Trade that lost: swing_high at 3.4× ATR → 1R=$1,200 → MFE 0.26R → TIME_INVALIDATION
+        SL is CAPPED at 3.0 ATR (prevents absurd 1R distances)
         
-        REGIME-AWARE SL (Jan 12, 2026):
+        REGIME-AWARE SL:
         - RANGE: tighter SL (1.5 ATR) - quick scalps to value
         - TREND: wider SL (2.5 ATR) - let winners run
         - Volatility adjustment still applies ON TOP of regime base
@@ -332,14 +323,9 @@ class RiskEngine:
         else:
             atr_multiplier = base_atr_multiplier
         
-        # 🔥 FIX #188 (Feb 11, 2026): CAP SL DISTANCE MORE AGGRESSIVELY
-        # PROBLEMA: SL cap de 4× ATR era demasiado laxo.
-        # - Con ATR=$354, max SL = $1,416 → 1R muy grande
-        # - Si swing_high está a $1,200, 1R = $1,200
-        # - MFE de $300 = solo 0.25R → TIME_INVALIDATION a -0.40R
-        # SOLUCIÓN: Reducir cap a 3× ATR (en lugar de 4×)
-        # - Con ATR=$354, max SL = $1,062 → trailing se activa más rápido
-        max_atr_multiple = 3.0  # 🔥 FIX #188: Reduced from 4.0 to 3.0
+        # CAP SL DISTANCE: max 3× ATR to prevent absurd 1R distances
+        # With ATR=$354, max SL = $1,062. Tighter cap → trailing activates faster.
+        max_atr_multiple = 3.0
         max_sl_distance = max_atr_multiple * atr_1m
         
         # Minimum SL distance = dynamic ATR (survive noise in BTC)
@@ -347,25 +333,21 @@ class RiskEngine:
         
         if direction == 'LONG':
             structure_stop = support_resistance - buffer
-            # SL must be at least min_sl_distance below entry
             atr_stop = entry_price - min_sl_distance
-            stop = min(structure_stop, atr_stop)  # Use the LOWER (further) one
+            stop = min(structure_stop, atr_stop)
             
-            # 🔥 FIX #188: Apply max cap (3× ATR instead of 4×)
             max_stop = entry_price - max_sl_distance
             if stop < max_stop:
-                logger.warning(f"⚠️ FIX #188 SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple}× ATR)")
+                logger.warning(f"⚠️ SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple}× ATR)")
                 stop = max_stop
         else:  # SHORT
             structure_stop = support_resistance + buffer
-            # SL must be at least min_sl_distance above entry  
             atr_stop = entry_price + min_sl_distance
-            stop = max(structure_stop, atr_stop)  # Use the HIGHER (further) one
+            stop = max(structure_stop, atr_stop)
             
-            # 🔥 FIX #188: Apply max cap (3× ATR instead of 4×)
             max_stop = entry_price + max_sl_distance
             if stop > max_stop:
-                logger.warning(f"⚠️ FIX #188 SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple}× ATR)")
+                logger.warning(f"⚠️ SL capped: {stop:.2f} → {max_stop:.2f} (max {max_atr_multiple}× ATR)")
                 stop = max_stop
         
         logger.debug(f"Stop loss calculated: {stop:.2f} (Structure: {support_resistance:.2f}±{buffer:.2f}, ATR min: {min_sl_distance:.2f} [{atr_multiplier}x])")
@@ -436,7 +418,7 @@ class RiskEngine:
             pos = self.position
             pos.update_unrealized_pnl(current_price)
             
-            # 🔥 FIX #150: Log periódico del R actual (cada ~30s)
+            # Periodic R logging (every ~30s)
             current_r_log = pos.current_r_multiple if hasattr(pos, 'current_r_multiple') else 0
             mfe_r_log = pos.calculate_mfe_r() if hasattr(pos, 'calculate_mfe_r') else 0
             import time
@@ -453,41 +435,26 @@ class RiskEngine:
             trade_tags = getattr(pos, 'trade_tags', {}) or {}
             
             # ================================================================
-            # 🔥 ANOMALY-BASED EMERGENCY EXIT (Jan 24, 2026)
-            # Instead of fixed -0.25R limit that kills valid trades,
-            # detect OPERATIONAL ANOMALIES that indicate system/market issues
-            # where SL might fail to execute properly.
-            # 
-            # ANOMALY TRIGGERS:
-            # 1. Spread explosion (> 5x normal) = liquidity gone
-            # 2. Price gap (> 0.3% in 1 tick) = flash crash/spike
-            # 3. Feed stale (> 10s without tick) = connection issue
-            # 4. ATR explosion (> 4x normal) = extreme volatility
-            # 
-            # BACKSTOP: -1.0R hard limit as final safety net
+            # ANOMALY-BASED EMERGENCY EXIT
+            # Detects operational anomalies where exchange SL might fail:
+            # 1. Spread > 5x normal = liquidity evaporated
+            # 2. Price gap > 0.8% = flash crash/spike (pre-filtered upstream)
+            # 3. Feed stale > 10s = connection issue
+            # 4. ATR > 4x normal = extreme volatility
             # ================================================================
             current_r = pos.current_r_multiple
             
-            # --- ANOMALY DETECTION ---
             anomaly_detected = False
             anomaly_reason = ""
             
-            # 1. Spread anomaly (liquidity evaporated)
+            # 1. Spread anomaly
             if spread_bps is not None and spread_normal_bps > 0:
                 spread_ratio = spread_bps / spread_normal_bps
-                if spread_ratio > 5.0:  # > 5x normal spread
+                if spread_ratio > 5.0:
                     anomaly_detected = True
                     anomaly_reason = f"SPREAD_ANOMALY (spread={spread_bps:.1f}bps, {spread_ratio:.1f}x normal)"
             
-            # 2. Price gap anomaly (flash crash/spike)
-            # 🔥 FIX (Feb 01, 2026): INTELLIGENT MULTI-TICK DETECTION
-            # The price_gap_pct passed here is now pre-filtered by trading_app.py:
-            # - Single tick: Only passed if > 1.5% (massive gap)
-            # - Multi-tick: Passed if 2+ of last 3 ticks > 0.8% (confirmed trend)
-            # This eliminates false positives from isolated tick spikes
-            # 
-            # The 0.8% threshold here is a SAFETY NET (should rarely trigger
-            # since filtering is done upstream)
+            # 2. Price gap anomaly (upstream pre-filters: single tick >1.5%, multi-tick >0.8%)
             if price_gap_pct is not None and abs(price_gap_pct) > 0.8:
                 anomaly_detected = True
                 anomaly_reason = f"PRICE_GAP_ANOMALY (gap={price_gap_pct:.2f}%)"
@@ -511,33 +478,16 @@ class RiskEngine:
                 return await self._close_position(current_price, f'EMERGENCY_ANOMALY ({anomaly_reason})')
             
             # HARD BACKSTOP: -0.50R absolute limit (catastrophic protection)
-            # FIX (Feb 20): Tightened from -1.0R. With $230 capital, -1.0R = $1.50 loss = death.
+            # Only safety net if exchange SL fails. Does NOT fire if exchange SL is active.
             HARD_BACKSTOP_R = -0.50
             if current_r < HARD_BACKSTOP_R:
                 logger.error(
                     f"🚨🚨 HARD BACKSTOP EXIT: current_r={current_r:.3f}R < limit={HARD_BACKSTOP_R}R | "
-                    f"CRITICAL: Trade exceeded {HARD_BACKSTOP_R}R, closing IMMEDIATELY"
+                    f"exchange_sl_active={pos.exchange_sl_active} | CLOSING IMMEDIATELY"
                 )
                 return await self._close_position(current_price, f'HARD_BACKSTOP (R={current_r:.3f})')
             
-            # ================================================================
-            # 🚨 FIX (Feb 20, 2026): EMERGENCY MAX LOSS — defense in depth
-            # Fires during management cooldown, for adopted positions, always.
-            # This is the SECOND layer (first is in trading_app.py).
-            # ================================================================
-            EMERGENCY_MAX_LOSS_R = -0.20
-            if current_r < EMERGENCY_MAX_LOSS_R:
-                logger.warning(
-                    f"🚨 EMERGENCY MAX LOSS (risk_engine): R={current_r:.3f} < {EMERGENCY_MAX_LOSS_R} | "
-                    f"Bypassing cooldown/adopted/regime checks"
-                )
-                return await self._close_position(current_price, 'TIME_INVALIDATION_MAX_LOSS')
-            
-            # ================================================================
-            # 🔥 FIX (Jan 23, 2026): MANAGEMENT COOLDOWN - Prevent action spam
-            # After executing a management action, skip checks for N seconds
-            # This prevents cascading partial closes and race conditions
-            # ================================================================
+            # MANAGEMENT COOLDOWN — prevents cascading partial closes and race conditions
             if pos.last_management_action_time is not None:
                 cooldown_elapsed = (datetime.now(UTC) - pos.last_management_action_time).total_seconds()
                 if cooldown_elapsed < pos.MANAGEMENT_COOLDOWN_SEC:
@@ -595,7 +545,7 @@ class RiskEngine:
                             close_size = pos.size * exit_pct
                             remaining_size = pos.size - close_size
                             
-                            # 🔒 FIX (Jan 14, 2026): Validate minimum order sizes
+                            # Validate minimum order sizes
                             if close_size < KRAKEN_BTC_MIN_SIZE:
                                 logger.info(f"🔄 SMART PARTIAL skipped: close_size {close_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}")
                                 # Don't return, let normal exit logic continue below
@@ -614,7 +564,7 @@ class RiskEngine:
                                 }
                     
                     # Handle full exit triggers (momentum, VPOC, squeeze)
-                    # 🔥 FIX (Jan 23, 2026): Handle VPOC_PARTIAL_EXIT
+                    # Handle VPOC_PARTIAL_EXIT
                     elif action_type == 'VPOC_PARTIAL_EXIT':
                         is_partial = smart_exit.get('is_partial', False)
                         if is_partial:
@@ -647,7 +597,7 @@ class RiskEngine:
                         logger.info(f"🚀 SMART EXIT: {action_type} - {reason}")
                         return await self._close_position(current_price, action_type)
                 
-                # 🔥🔥🔥 FIX #101 (Feb 09, 2026): CONTEXTUAL EARLY EXIT
+                # CONTEXTUAL EARLY EXIT — uses regime, BB compression, volume, delta, session, ATR
                 # Now uses: regime, BB compression, volume, delta, session, ATR
                 # Instead of just "MFE < 0.25R in 6 candles = exit"
                 
@@ -678,7 +628,6 @@ class RiskEngine:
                 trade_tags = getattr(pos, 'trade_tags', {}) or {}
                 delta_ratio = trade_tags.get('volume_delta_ratio', None)
                 
-                # 🔥 FIX #144b: Get micro_trend from position tags
                 micro_trend = trade_tags.get('micro_trend', None)
                 
                 # ATR average (use atr_1m as proxy for avg if not available)
@@ -755,7 +704,6 @@ class RiskEngine:
                         remaining_size = pos.size - close_size
                         
                         if close_size >= KRAKEN_BTC_MIN_SIZE and remaining_size >= KRAKEN_BTC_MIN_SIZE:
-                            # 🔥 FIX (Jan 23, 2026): Mark partial as DONE to prevent cascading
                             pos.time_checkpoint_profit_partial_done = True
                             pos.last_management_action_time = datetime.now(UTC)
                             logger.info(f"⏱️ TIME IN PROFIT: Closing {partial_pct:.0%}, keeping runner (MARKED DONE)")
@@ -794,15 +742,6 @@ class RiskEngine:
                         # No action needed, continue
                 
                 # ============================================================
-                # 0.6. ANTI-ROUNDTRIP PROTECTION - REMOVED (Feb 4, 2026)
-                # ============================================================
-                # 🔥 FIX: Removed because R-LOCK tiers now use initial_entry_price
-                # If MFE >= 0.5R, Tier 2 locks stop at -0.2R from ORIGINAL entry
-                # This makes anti-roundtrip redundant - the SL protects us
-                # The bug was: after ADD, entry_price changed so R-LOCK calculated wrong
-                # Now R-LOCK uses initial_entry_price → consistent protection
-                # ============================================================
-                
                 # ============================================================
                 # 0.65. DISPLACEMENT ORIGIN RECLAIM (Feb 4, 2026)
                 # If price reclaims the displacement origin, thesis invalidated
@@ -891,10 +830,8 @@ class RiskEngine:
         """
         Handle early partial close — REGIME-AWARE.
         
-        🔥 FIX (Feb 20, 2026): RANGE FULL CLOSE
-        - RANGE: Close 100% at +0.30R (full position, no runner in range)
-          Data: scaled partial (30%) left 70% to reverse → destroyed +$3.59 in 5 days
-        - Other: Close 30% at configured level, move SL to +0.05R
+        RANGE: Close 100% at +0.30R (no runner — data showed 30% runners reversed)
+        Other: Close 30% at configured level, move SL to +0.05R
         """
         if pos.early_partial_done:
             return None
@@ -979,7 +916,7 @@ class RiskEngine:
         close_size = pos.size * (tp1_pct / 100.0)
         remaining_size = pos.size - close_size
         
-        # 🔒 FIX (Jan 14, 2026): Validate minimum order sizes
+        # Validate minimum order sizes
         # If partial close would leave remaining below minimum, close ALL
         if remaining_size < KRAKEN_BTC_MIN_SIZE:
             logger.info(f"🔄 TP1: Remaining {remaining_size:.6f} < min {KRAKEN_BTC_MIN_SIZE}, closing FULL position")
@@ -1093,7 +1030,7 @@ class RiskEngine:
         - 'contracts': can be signed (+ long, - short) or unsigned depending on exchange
         - 'info': raw exchange response
         
-        🔥 FIX (Feb 4, 2026): Also syncs PositionStore to prevent desync warnings
+        Also syncs PositionStore to prevent desync warnings.
         """
         # Minimum position size to consider valid (prevents float precision issues)
         MIN_POSITION_SIZE = 0.00001
@@ -1103,7 +1040,7 @@ class RiskEngine:
                 symbol = position_data.get('symbol', 'UNKNOWN')
                 contracts = float(position_data.get('contracts', 0))
                 
-                # 🔒 FIX: Use tolerance-based comparison instead of exact == 0
+                # Tolerance-based comparison instead of exact == 0
                 if abs(contracts) < MIN_POSITION_SIZE:
                     self.position = None
                     return
@@ -1153,9 +1090,8 @@ class RiskEngine:
                 
                 logger.warning(f"RECOVERED POSITION from exchange: {direction} {size} @ {entry_price} | SL: {estimated_stop:.2f}")
                 
-                # 🔥 FIX (Feb 4, 2026): Sync PositionStore to prevent desync warnings
-                # When RiskEngine recovers a position, PositionStore must also know about it
-                # Otherwise sync_from_exchange will report mismatch (local=0, exchange=X)
+                # Sync PositionStore — RiskEngine recovery must propagate to PositionStore
+                # or sync_from_exchange reports mismatch (local=0, exchange=X)
                 try:
                     from src.infrastructure.storage import get_position_store
                     import uuid as uuid_mod

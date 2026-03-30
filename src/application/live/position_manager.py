@@ -77,12 +77,12 @@ def check_bos_against_position(
     df_5m: pd.DataFrame,
     direction: str,
     lookback: int = 20,
-    min_bos_atr_mult: float = 0.3  # 🔧 FIX #126: Reduced from 0.5 to 0.3 for faster detection
+    min_bos_atr_mult: float = 0.3  # Reduced from 0.5 to 0.3 for faster detection
 ) -> Tuple[bool, float]:
     """
     Check if there's a Break of Structure against the position direction.
     
-    🔧 FIX #126 (Feb 09, 2026): Unified BOS detection with ATR filter
+    Unified BOS detection with ATR filter
     - Merged logic from filter_checks.py (ATR-filtered) with position_manager.py (returns level)
     - BOS must exceed min_bos_atr_mult × ATR to avoid noise
     
@@ -300,14 +300,14 @@ class BOSInvalidationChecker:
     - Close if near BE or small loss (|R| < threshold)
     - Tighten stop by 50% if in profit
     
-    🔧 FIX #124 (Feb 09, 2026): Increased tolerance
+    Increased tolerance
     - Grace period 5→7 min: Give trade more time to develop
     - Close threshold 0.3→0.5R: Only close if losing significantly
     - Problem: BOS appearing 1 min after entry was closing trades prematurely
     """
     
-    GRACE_PERIOD_MINUTES = 7.0  # FIX #124: 5→7 min
-    CLOSE_THRESHOLD_R = 0.4  # FIX #124: 0.3→0.4R (only close if |R| < this)
+    GRACE_PERIOD_MINUTES = 7.0  # 5→7 min
+    CLOSE_THRESHOLD_R = 0.4  # 0.3→0.4R (only close if |R| < this)
     TIGHTEN_PCT = 0.5  # Tighten by 50%
     
     @staticmethod
@@ -330,7 +330,7 @@ class BOSInvalidationChecker:
             return result
         
         # Check grace period
-        # 🔧 FIX (Jan 30, 2026): Position uses 'open_time', not 'entry_time'
+        # Position uses 'open_time', not 'entry_time'
         # Note: BOS GRACE PERIOD log suppressed to avoid spam (logs only at debug level)
         if hasattr(position, 'open_time') and position.open_time:
             trade_age_min = (market_time - position.open_time).total_seconds() / 60.0

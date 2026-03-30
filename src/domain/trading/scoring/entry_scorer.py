@@ -149,7 +149,7 @@ class EntryScorer:
         """
         # Reset state
         self._breakdown = ScoreBreakdown()
-        self._trade_tags = TradeTags(mode=OperatingMode.MODE)
+        self._trade_tags = TradeTags(mode=OperatingMode.get_mode())
 
         # 1️⃣ STRUCTURE (0-2) — THE ONLY GATE
         structure_score, structure_blocks, htf_clean = self._score_structure(
@@ -426,12 +426,20 @@ class EntryScorer:
             self._trade_tags.bos_volume_ratio = volume_ratio
 
         # Scoring with BOS quality
+        # clean_close = candle closed in top/bottom 60% of range (directional conviction)
+        # WEAK BOS (0/3 quality signals) still gets timing=1 if clean_close,
+        # because in low-vol markets body_atr and volume are naturally low.
+        # Without clean_close, WEAK BOS is genuine noise → timing=0.
         if bos_confirmed and clean_close:
-            if bos_quality == 'WEAK':
+            if bos_quality == 'STRONG':
+                return 2, True
+            else:  # NORMAL or WEAK with clean close
                 return 1, True
-            return 2, True
         elif bos_confirmed:
-            return 1, True
+            # BOS without clean close — only count if quality is NORMAL+
+            if bos_quality in ('STRONG', 'NORMAL'):
+                return 1, True
+            return 0, True  # WEAK BOS without clean close = noise
 
         # Check intra-candle BOS
         current = df_1m.iloc[-1]

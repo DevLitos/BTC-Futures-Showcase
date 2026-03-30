@@ -25,7 +25,7 @@ class FilterDecision:
         score += decision.score_adjust
         tags.update(decision.tags)
         
-    🔥 FIX (Jan 22, 2026): Added size_factor for position size caps
+    Added size_factor for position size caps
     """
     allow: bool                                    # True = pass, False = hard block
     score_adjust: float = 0.0                      # Score adjustment (+/-)

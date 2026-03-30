@@ -288,7 +288,7 @@ def calculate_adx_with_di(
     """
     Calculate ADX with directional indicators (+DI/-DI).
     
-    🔥 FIX #77 (Feb 07, 2026): Expose +DI/-DI for directional decisions.
+    Expose +DI/-DI for directional decisions.
     
     Returns:
         Tuple of (adx, adx_slope, plus_di, minus_di)

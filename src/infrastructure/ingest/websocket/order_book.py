@@ -11,7 +11,7 @@ from typing import Dict, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
-# 🔥 FIX (Jan 21, 2026): Throttle debug logs to prevent event loop blocking
+# Throttle debug logs to prevent event loop blocking
 _last_imbalance_log = 0.0
 _IMBALANCE_LOG_INTERVAL = 5.0  # Log imbalance only every 5 seconds
 
@@ -100,7 +100,7 @@ class OrderBookManager:
         self.last_imbalance = (bid_volume / total) * 100.0
         self.imbalance_history.append(self.last_imbalance)
         
-        # 🔥 FIX (Jan 21, 2026): Throttle debug logs to prevent event loop blocking
+        # Throttle debug logs to prevent event loop blocking
         now = time.time()
         if now - _last_imbalance_log >= _IMBALANCE_LOG_INTERVAL:
             logger.debug(f"Order Book Imbalance: {self.last_imbalance:.1f}% (Bid: {bid_volume:.4f} Ask: {ask_volume:.4f})")

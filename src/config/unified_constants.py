@@ -44,7 +44,7 @@ class TrendDirection(Enum):
     """
     Unified trend direction enum.
     
-    🔥 FIX (Feb 05): Previously defined in:
+    Previously defined in:
     - trend_intelligence.py:46
     - trading_regime.py:43
     
@@ -389,7 +389,7 @@ class UnifiedRegimeConfig:
     """
     Unified regime configuration.
     
-    🔥 FIX (Feb 05): Previously defined in 3 places:
+    Previously defined in 3 places:
     - regime_detector.py:40 (entry behavior)
     - regime_classifier.py:34 (trading restrictions)
     - market_regime.py:41 (ADX thresholds)

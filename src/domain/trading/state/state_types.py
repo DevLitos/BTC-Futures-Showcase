@@ -125,27 +125,27 @@ def can_trade_in_state(state: StrategyState) -> bool:
 # ============================================================================
 # SIZING PRIORITY DOCUMENTATION
 # ============================================================================
-#
+
 # There are TWO sources of position size adjustment:
-#
+
 # 1. StrategyState (via StrategyStateMachine):
 #    - Based on degradation signals and recovery
 #    - Multipliers: 1.0 (ACTIVE), 0.5 (DEGRADED/OBS), 0.0 (DEAD)
 #    - This is the PRIMARY control - it can BLOCK trading entirely
-#
+
 # 2. EdgeScore (via ActivityRegimeAnalyzer):
 #    - Based on current market activity/edge quality
 #    - Multipliers: 0.0, 0.5, 0.75, 1.0 based on edge score
 #    - This is SECONDARY - only applies when state allows trading
-#
+
 # COMBINED SIZING (using min for safety):
 #    final_multiplier = min(state_multiplier, edge_multiplier)
-#    
+
 #    Examples:
 #    - ACTIVE + edge_score 0.7 = min(1.0, 0.75) = 0.75
 #    - DEGRADED + edge_score 0.7 = min(0.5, 0.75) = 0.5
 #    - ACTIVE + edge_score 0.3 = min(1.0, 0.5) = 0.5
-#
+
 # ============================================================================
 
 
@@ -174,5 +174,5 @@ def compute_final_position_multiplier(state_multiplier: float, edge_multiplier: 
     # Use min() - the more conservative value wins
     return min(state_multiplier, edge_multiplier)
 #    - DEAD + any edge = 0.0 * any = 0.0
-#
+
 # ============================================================================

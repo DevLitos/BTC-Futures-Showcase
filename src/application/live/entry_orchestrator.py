@@ -37,17 +37,7 @@ from src.domain.market.regime import TrendPhase
 from src.domain.trading.state.state_machine import BotState
 from src.domain.market.regime import EntryRegime
 
-# =========================================================================
-# 🔥 FIX #180 (Feb 11, 2026): LOG RATE LIMITING
-# 
-# PROBLEMA: Logs repetitivos ensucian los archivos:
-#   - "FIX #171 STALE SIGNAL" cada tick (50+ veces)
-#   - "FIX #147 Delta SEVERE" cada tick cuando delta es alto
-#   - "FIX #176 Cross-block expired" cada tick después de timeout
-#   - "PENALTY SUMMARY" cada tick con cualquier penalty
-# 
-# SOLUCIÓN: Rate limiter que sólo logea una vez por minuto para cada tipo.
-# =========================================================================
+# Rate limiter: throttle repetitive per-tick logs to once per minute
 _rate_limiter: dict[str, datetime] = {}  # log_key -> last_log_time
 _RATE_LIMIT_SECONDS = 60  # Solo logear cada 60 segundos
 
@@ -95,22 +85,80 @@ class EntryContext:
 
 @dataclass
 class GuardResult:
-    """Result of all guard checks.
-    
-    🔥 FIX #81 (Feb 07, 2026): Now uses RiskPenaltyAccumulator
-    - Guards add penalties instead of hard blocking
-    - Block decision made at end based on accumulated penalties
-    - passed=False only for catastrophic events or size < 15% base
-    """
+    """Result of all guard checks."""
     passed: bool = True
     reason: str = ""
-    edge_size_mult: float = 1.0
     tags: Dict[str, Any] = field(default_factory=dict)
-    
-    # 🔥 FIX #81: Accumulated penalties
-    final_size_mult: float = 1.0  # Product of all size penalties
-    total_score_adj: float = 0.0  # Sum of all score adjustments
-    penalty_sources: list = field(default_factory=list)  # Which guards penalized
+
+
+@dataclass
+class CostValidationResult:
+    """Result of cost/fee validation for an entry."""
+    is_valid: bool = True
+    block_reason: str = ""
+    expected_net_r: float = 0.0      # RR after fees
+    fee_r_estimate: float = 0.0      # Total fees as fraction of risk
+    expected_profit_usd_net: float = 0.0  # Net profit in USD
+
+
+def _validate_costs(
+    engine: 'SignalEngine',
+    position_size: float,
+    current_price: float,
+    stop_loss: float,
+    take_profit: float,
+    bias: str,
+    is_maker_entry: bool = True,
+    is_maker_exit: bool = True,
+) -> CostValidationResult:
+    """
+    Calculate net R and profit after fees using the engine's SlippageModel.
+
+    Replaces the missing ``engine._cost_validator.validate_costs()`` calls
+    that never had an implementation.
+    """
+    result = CostValidationResult()
+
+    # Calculate risk and gross reward
+    if bias == 'LONG':
+        risk = current_price - stop_loss
+        reward = take_profit - current_price
+    else:
+        risk = stop_loss - current_price
+        reward = current_price - take_profit
+
+    if risk <= 0:
+        result.is_valid = False
+        result.block_reason = f"Invalid risk: {risk:.2f}"
+        return result
+
+    gross_rr = reward / risk if risk > 0 else 0.0
+
+    # Fee calculation (bps → fraction)
+    entry_fee_bps = 2.0 if is_maker_entry else 5.0   # Kraken maker=0.02%, taker=0.05%
+    exit_fee_bps = 2.0 if is_maker_exit else 5.0
+
+    entry_fee_pct = entry_fee_bps / 10_000
+    exit_fee_pct = exit_fee_bps / 10_000
+
+    notional = position_size * current_price
+    total_fee_usd = notional * (entry_fee_pct + exit_fee_pct)
+    risk_usd = position_size * risk
+    reward_usd = position_size * reward
+
+    fee_as_r = total_fee_usd / risk_usd if risk_usd > 0 else 999.0
+
+    result.fee_r_estimate = fee_as_r
+    result.expected_net_r = gross_rr - fee_as_r
+    result.expected_profit_usd_net = reward_usd - total_fee_usd
+
+    if result.expected_net_r < 0:
+        result.is_valid = False
+        result.block_reason = (
+            f"Negative net R: gross={gross_rr:.2f} - fees={fee_as_r:.2f} = {result.expected_net_r:.2f}"
+        )
+
+    return result
 
 
 @dataclass 
@@ -155,7 +203,7 @@ class EntryResult:
 
 class GuardOrchestrator:
     """
-    Essential pre-execution guards only — Opción A radical simplification.
+    Essential pre-execution guards only.
     
     KEEP: Infrastructure guards + delta severe + session limits
     REMOVED: Location, ADX coherence, trend phase, funding, spread, obstinacy,
@@ -197,7 +245,6 @@ class GuardOrchestrator:
             result.passed = False
             result.reason = block_reason
             return result
-        result.edge_size_mult = edge_mult
         
         # =====================================================================
         # GUARD 3: POST_ONLY rejection tracking — HARD BLOCK (infrastructure)
@@ -209,51 +256,9 @@ class GuardOrchestrator:
             engine.state_machine.start_cooldown(5)
             return result
         
-        # =====================================================================
-        # GUARD 4: MACRO COHERENCE — Only block EXTREME macro mismatch
-        # Only BEAR_STRONG / BULL_STRONG are vetoed (not BEAR / BULL).
-        # Momentum override (displacement/expansion) bypasses this guard
-        # because price action has proven the macro is breaking.
-        # =====================================================================
-        macro_strength = getattr(engine, '_current_bias_strength', None)
-        macro_str = macro_strength.value if macro_strength else None
-        has_momentum = getattr(engine, 'has_momentum_override', False)
-        if macro_str and not has_momentum:
-            is_macro_incoherent = (
-                (macro_str == 'BEAR_STRONG' and ctx.bias == 'LONG') or
-                (macro_str == 'BULL_STRONG' and ctx.bias == 'SHORT')
-            )
-            if is_macro_incoherent:
-                result.passed = False
-                result.reason = f"MACRO VETO: {ctx.bias} blocked by macro={macro_str}"
-                # Also expire the stale edge that shouldn't exist
-                if hasattr(engine, '_edge_manager'):
-                    edge_mgr = engine._edge_manager
-                    if edge_mgr.state.name in ('EDGE_ACTIVE', 'EDGE_ARMED'):
-                        from src.domain.trading.edge_state_manager import EdgeState
-                        edge_mgr._transition_to(
-                            EdgeState.EDGE_EXPIRED,
-                            f"MACRO VETO: {ctx.bias} vs macro={macro_str}",
-                            ctx.market_time
-                        )
-                        logger.warning(
-                            f"🚫 MACRO VETO: Expired stale {ctx.bias} edge | macro={macro_str}"
-                        )
-                return result
-
-        # =====================================================================
-        # GUARD 5: Delta SEVERE contradict — HARD BLOCK
-        # Only block on extreme delta (>5x) against direction
-        # =====================================================================
-        delta_ratio = engine._current_trade_tags.get('volume_delta_ratio', 0)
-        delta_severe = (
-            (ctx.bias == 'LONG' and delta_ratio < -5.0) or
-            (ctx.bias == 'SHORT' and delta_ratio > 5.0)
-        )
-        if delta_severe:
-            result.passed = False
-            result.reason = f"Delta SEVERE: {delta_ratio:+.2f}x vs {ctx.bias}"
-            return result
+        # GUARD 4-5: REMOVED — Macro coherence and delta severe are already
+        # checked upstream in arm_consensus_edge() and evaluation_pipeline.
+        # Checking them again here was redundant and caused double-blocks.
         
         # =====================================================================
         # CONTEXT: Calculate ADX for scorer and sizing
@@ -353,12 +358,9 @@ class ScoreOrchestrator:
         # Handle None df_1m
         df_1m_safe = ctx.df_1m if ctx.df_1m is not None else pd.DataFrame()
         
-        # 🔥 FIX (Jan 30) + FIX #62 (Feb 06): Check if DISPLACEMENT is active for structure bypass
-        # FIX #62: The edge_type check alone misses cases where:
-        # 1. Displacement was detected → edge becomes TREND with CONSENSUS_DIRECT
-        # 2. The _displacement_bypass flag is still True
-        # 3. But EdgeType is TREND, not DISPLACEMENT
-        # Solution: Also check _displacement_bypass from trading_app state
+        # Check if DISPLACEMENT is active for structure bypass
+        # edge_type alone misses cases where displacement morphed into TREND/CONSENSUS
+        # so also check _displacement_bypass flag from trading_app state
         displacement_edge_active = False
         edge_mgr = getattr(engine, '_edge_manager', None)
         if edge_mgr is not None:
@@ -369,30 +371,27 @@ class ScoreOrchestrator:
                 edge_mgr.current_bos.edge_type == EdgeType.DISPLACEMENT
             )
         
-        # 🔥 FIX #62: Also check trading_app's displacement_bypass flag
-        # This catches cases where DISPLACEMENT was detected but edge_type is TREND
         if not displacement_edge_active:
             displacement_bypass_flag = engine._current_trade_tags.get('displacement_bypass', False)
             trend_displacement = engine._current_trade_tags.get('trend_displacement', False)
             if displacement_bypass_flag or trend_displacement:
                 displacement_edge_active = True
                 logger.debug(
-                    f"🔥 FIX #62: DISPLACEMENT detected via trading_app flags | "
+                    f"DISPLACEMENT detected via trading_app flags | "
                     f"displacement_bypass={displacement_bypass_flag} trend_displacement={trend_displacement}"
                 )
         
         expansion_mode_active = engine._current_trade_tags.get('expansion_mode_activated', False)
         effective_adx = engine._current_trade_tags.get('effective_adx', 0) or engine._current_trade_tags.get('htf_adx', 0)
         
-        # 🔥 FIX #260c: Suppress ADX bypass during post-BIAS-FLIP stabilization
+        # Suppress ADX bypass during post-BIAS-FLIP stabilization
         # After BIAS FLIP, high ADX reflects the OLD trend direction, not the new one.
-        # ADX=72 after SHORT→LONG flip means SHORT was strong, not that LONG will be.
         if hasattr(engine, '_post_bias_flip_cooldown_until') and engine._post_bias_flip_cooldown_until:
             from datetime import datetime as _dt
             if _dt.now() < engine._post_bias_flip_cooldown_until:
                 effective_adx = 0
         
-        # Base score from 4-block scorer — no mutations (Opción A)
+        # Base score from 4-block scorer — no mutations
         score, breakdown, structure_blocks = engine._entry_scorer.calculate_entry_score(
             df_1h=ctx.df_1h,
             df_5m=ctx.df_5m,
@@ -423,17 +422,10 @@ class SizingOrchestrator:
     """
     Calculates final position size with all multipliers.
     
-    SIMPLIFIED MODE (Jan 27, 2026):
-    Only 5 multipliers: RR, REGIME, LOSS_STREAK, SESSION + base_risk
-    Everything else becomes HARD BLOCK or 1.0
+    5-multiplier sizing system: RR, REGIME, LOSS_STREAK, SESSION + base_risk.
     
-    LEGACY MODE (for comparison):
-    All 13+ multipliers active
-    
-    🔥 FIX #60.3 (Feb 06): SIZING ORDER DOCUMENTATION
-    =================================================
-    Size caps are applied as MULTIPLIERS, meaning they are multiplicative
-    with other factors, not absolute caps. The order is:
+    Size caps are applied as MULTIPLIERS (multiplicative with other factors,
+    not absolute caps). The order is:
     
     1. Base size = capital * risk_pct / price_risk
     2. Edge multiplier (1.0-1.5x for institutional, 0.15-0.30x for intraday)
@@ -481,7 +473,7 @@ class SizingOrchestrator:
         
         # =====================================================================
         # 🔥 REFACTORED (Feb 05, 2026): Simplified Edge Sizing
-        # 
+
         # Uses EdgeType-based sizing from get_edge_size_multiplier()
         # Replaces old INSTITUTIONAL/INTRADAY mode logic
         # =====================================================================
@@ -517,7 +509,7 @@ class SizingOrchestrator:
         from src.domain.trading.activity_tracker import get_last_loss_time
         last_loss_time = get_last_loss_time()
         
-        # Calculate using simplified 5-multiplier system — Opción A
+        # Calculate using 5-multiplier system
         sizing_result = SimplifiedSizer.calculate(
             capital=capital,
             entry_price=ctx.current_price,
@@ -549,7 +541,7 @@ class SizingOrchestrator:
         result.size_usd = result.size * ctx.current_price
         result.min_size_ok = result.size >= KRAKEN_BTC_MIN_SIZE
         
-        # Store multipliers for logging — Opción A: 5 only
+        # Store multipliers for logging
         result.multipliers = {
             'rr': sizing_result.rr_mult,
             'regime': sizing_result.regime_mult,
@@ -596,15 +588,14 @@ class OrderExecutor:
         size: float,
         stop_loss: float,
         take_profit: float,
-        use_market: bool = False,
-        entry_data: Optional[Dict[str, Any]] = None,  # 🔥 FIX: Use Optional
-        aggressive_execution: bool = False,  # 🔥 FIX (Jan 30): Allow IOC for displacement
+        entry_data: Optional[Dict[str, Any]] = None,
+        aggressive_execution: bool = False,
     ) -> EntryResult:
         """Place order and handle result."""
         result = EntryResult()
         
         try:
-            # 🔥 FIX (Jan 30): DISPLACEMENT AGGRESSIVE EXECUTION
+            # DISPLACEMENT AGGRESSIVE EXECUTION
             # During DIRECT ENTRY WINDOW, post-only is counterproductive
             # The market is moving fast - either fill NOW or miss the trade
             if aggressive_execution:
@@ -617,43 +608,6 @@ class OrderExecutor:
                     stop_loss=stop_loss,
                     take_profit=take_profit
                 )
-            elif use_market:
-                logger.warning("🚫 MAKER-ONLY ENFORCED: ignoring use_market=True → limit post-only first")
-                logger.info(f"📊 Placing LIMIT post-only | {ctx.bias} {size:.6f} @ {ctx.current_price:.2f}")
-                order_result = await engine.execution.place_limit_order(
-                    symbol=engine.symbol,
-                    side='buy' if ctx.bias == 'LONG' else 'sell',
-                    amount=size,
-                    price=ctx.current_price,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit
-                )
-                # If POST-ONLY rejected and system wanted market anyway → IOC fallback
-                if order_result is None:
-                    # 🔥 Re-validate costs with TAKER fees before IOC fallback
-                    MIN_NET_R_IOC = 0.10
-                    taker_cost = engine._cost_validator.validate_costs(
-                        position_size=size, current_price=ctx.current_price,
-                        stop_loss=stop_loss, take_profit=take_profit,
-                        bias=ctx.bias, is_maker_entry=False, is_maker_exit=True,
-                    )
-                    if taker_cost.expected_net_r < MIN_NET_R_IOC:
-                        logger.warning(
-                            f"🚫 IOC BLOCKED: taker fees net_R={taker_cost.expected_net_r:.2f} < {MIN_NET_R_IOC} | "
-                            f"Post-only rejected but IOC not viable (use_market path)"
-                        )
-                    else:
-                        logger.warning(f"🔄 POST-ONLY REJECTED (use_market path) → IOC FALLBACK")
-                        order_result = await engine.execution.place_aggressive_order(
-                            symbol=engine.symbol,
-                            side='buy' if ctx.bias == 'LONG' else 'sell',
-                            amount=size,
-                            price=ctx.current_price,
-                            stop_loss=stop_loss,
-                            take_profit=take_profit
-                        )
-                        if order_result:
-                            logger.info(f"✅ IOC FALLBACK SUCCESS (use_market path): Filled as taker | net_R={taker_cost.expected_net_r:.2f}")
             else:
                 logger.info(f"📊 Placing LIMIT post-only | {ctx.bias} {size:.6f} @ {ctx.current_price:.2f}")
                 order_result = await engine.execution.place_limit_order(
@@ -665,15 +619,11 @@ class OrderExecutor:
                     take_profit=take_profit
                 )
                 
-                # 🔥 FIX #65+: ALWAYS FALLBACK TO IOC IF POST-ONLY REJECTED
-                # Taker fee diff ~0.05% ($0.03 on $60 position) vs losing the trade entirely
-                # Score 8.0 trade was lost to POST-ONLY reject with no retry — unacceptable
+                # IOC fallback if POST-ONLY rejected — taker fee ~0.05% is acceptable
                 if order_result is None:
-                    # 🔥 Re-validate costs with TAKER fees before IOC fallback
-                    # TP floor (0.88R) gives net=0.655R with maker, but with taker: net=0.587R < 0.60
-                    MIN_NET_R_IOC = 0.10
-                    taker_cost = engine._cost_validator.validate_costs(
-                        position_size=size, current_price=ctx.current_price,
+                    MIN_NET_R_IOC = 0.25
+                    taker_cost = _validate_costs(
+                        engine, position_size=size, current_price=ctx.current_price,
                         stop_loss=stop_loss, take_profit=take_profit,
                         bias=ctx.bias, is_maker_entry=False, is_maker_exit=True,
                     )
@@ -730,10 +680,9 @@ class OrderExecutor:
                     result.transition_to = "WAIT_FILL"
                 
             else:
-                # 🔥 FIX #79 (Feb 07): POST-ONLY reject is NOT a real failure
-                # It just means price moved - try again in 1 minute, not 5
+                # POST-ONLY reject: price moved — retry in 1 min, not 5
                 result.reason = "Order placement returned None (likely POST-ONLY reject)"
-                engine.state_machine.start_cooldown(1)  # Reduced from 5 to 1 minute
+                engine.state_machine.start_cooldown(1)
                 
         except Exception as e:
             result.reason = str(e)
@@ -950,32 +899,16 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         result.reason = "No bias set"
         return result
     
-    # =====================================================================
-    # 🔥 DIRECTION MEMORY: Block same-direction normal entry for 30 minutes
-    # Prevents chasing the same move after a trade already captured it.
-    # =====================================================================
-    _SAME_DIR_BLOCK_NORMAL = 1800  # 30 minutes
-    _last_dir_n = getattr(engine, '_last_trade_direction', None)
-    _last_exit_n = getattr(engine, '_last_trade_exit_time', None)
-    if _last_dir_n and _last_exit_n and _last_dir_n == bias:
-        from datetime import datetime as _dt_n
-        _elapsed_n = (_dt_n.now() - _last_exit_n).total_seconds()
-        if _elapsed_n < _SAME_DIR_BLOCK_NORMAL:
-            _remaining_n = _SAME_DIR_BLOCK_NORMAL - _elapsed_n
-            if _should_log_rate_limited("direction_memory_normal", 120):
-                logger.info(
-                    f"🚫 DIRECTION MEMORY: {bias} blocked — last trade was {_last_dir_n} "
-                    f"{_elapsed_n:.0f}s ago | Wait {_remaining_n:.0f}s"
-                )
-            result.reason = f"DIRECTION MEMORY: {bias} blocked for {_remaining_n:.0f}s after last {_last_dir_n}"
-            return result
+    # DIRECTION MEMORY: REMOVED — 30 min same-direction block was too aggressive.
+    # Prevented legitimate re-entries after TP in ongoing trends.
+    # Anti-overtrading is handled by daily limit + session limits (Guard 0, 6).
     
     # =====================================================================
-    # 🔥 LOCATION GATE (Feb 20, 2026) — THE #1 FIX
+    # LOCATION GATE — Only for price INSIDE the range (0-100%)
     # Data: System was buying at the TOP and selling at the BOTTOM.
     # Example: LONG @ $68868 when SwingH=$68448 (116% of range!) = instant loss
     # Example: SHORT @ $65962 when SwingL=$65826 (5% of range!) = instant loss
-    #
+
     # RULE: In RANGE market, only trade at favorable locations:
     #   - LONG only when price < 70% of swing range
     #   - SHORT only when price > 30% of swing range
@@ -984,14 +917,32 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     swing_high = getattr(engine, '_last_swing_high', 0)
     swing_low = getattr(engine, '_last_swing_low', 0)
     current_edge_type_for_location = engine._current_trade_tags.get('edge_type', None)
+    # Also bypass location gate when displacement_bypass is active
+    # (CONSENSUS edges armed during displacement get edge_type='CONSENSUS', not 'DISPLACEMENT')
+    has_displacement_bypass = getattr(engine, '_displacement_bypass', False)
+    
+    # Strong trend bypass: In BEAR_STRONG/BULL_STRONG, price naturally sits at range
+    # extremes — that IS the correct trade location for trend-following.
+    # The LOCATION GATE was designed for RANGE markets to prevent buying tops / selling bottoms.
+    # LOG EVIDENCE (Feb 23): 12.5h, 28765 ticks, 0 trades. 50+ SETUP COMPLETE SHORT signals
+    # blocked because range_position was 0-15% during entire BEAR_STRONG session.
+    macro_strength_for_location = getattr(engine, '_current_bias_strength', None)
+    is_strong_trend = (macro_strength_for_location is not None and
+                       macro_strength_for_location.value in ('BEAR_STRONG', 'BULL_STRONG'))
     
     if swing_high > 0 and swing_low > 0 and swing_high > swing_low:
         swing_range = swing_high - swing_low
         range_position = (current_price - swing_low) / swing_range  # 0.0 = bottom, 1.0 = top
         engine._current_trade_tags['range_position_pct'] = round(range_position * 100, 1)
         
-        # Only apply location gate for NON-displacement entries
-        if current_edge_type_for_location != 'DISPLACEMENT':
+        # Only apply location gate when price is INSIDE the range (0-100%).
+        # When range_position < 0 or > 1, price has BROKEN the range = breakout.
+        # Blocking a SHORT at -107% of range is absurd — price broke down!
+        price_inside_range = 0.0 <= range_position <= 1.0
+        
+        if (price_inside_range and
+                current_edge_type_for_location != 'DISPLACEMENT' and
+                not has_displacement_bypass and not is_strong_trend):
             if bias == 'LONG' and range_position > 0.70:
                 result.reason = (
                     f"LOCATION GATE: LONG blocked at {range_position:.0%} of range "
@@ -1010,27 +961,6 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
                     logger.warning(f"🚫 {result.reason}")
                 return result
     
-    # Parallel DI eval removed — Opción A
-    
-    # =========================================================================
-    # 🔥🔥🔥 PRICE DIRECTION VALIDATION - BACKUP CHECK (Feb 04, 2026) 🔥🔥🔥
-    # =========================================================================
-    # NOTE: La validación PRINCIPAL está ahora en trading_app.py _price_confirms_direction()
-    # que bloquea CONSENSUS entries cuando el precio contradice la dirección.
-    #
-    # =========================================================================
-    # 🔥 FIX #90 (Feb 09, 2026): ELIMINADO PRICE_DIRECTION_BLOCK
-    # 
-    # PROBLEMA: Este bloqueo era CONTRAPRODUCENTE porque:
-    # 1. Detecta displacement SHORT (precio cayó $500)
-    # 2. Pero bloquea porque "price DOWN 0.5%" → ¡Exactamente lo que queremos!
-    # 3. Resultado: Nunca entra, siempre llega tarde
-    #
-    # El displacement YA valida la dirección correcta. Este bloqueo duplicado
-    # solo servía para crear ciclos donde siempre llegamos tarde.
-    # =========================================================================
-    # REMOVED: price_direction_block logic - was killing valid entries
-    
     # Get market data
     candles_5m = engine.market_data.get_candles('5m')
     candles_1m = engine.market_data.get_candles('1m')
@@ -1046,7 +976,7 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     
     # Build context
     df_5m = pd.DataFrame(candles_5m)
-    # 🔧 FIX (Feb 03): Reducido de 200 a 30 velas - el scorer solo necesita ~20-30
+    # Reducido de 200 a 30 velas - el scorer solo necesita ~20-30
     # PROBLEMA: df_1m=None causaba Score=0 en FAST PATH → sizing mínimo en buenos trades
     df_1m = pd.DataFrame(candles_1m) if candles_1m and len(candles_1m) >= 30 else None
     df_1h = pd.DataFrame(candles_1h)
@@ -1077,12 +1007,12 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     # =========================================================================
     # PROBLEMA: El sistema trata DISPLACEMENT como "setup a evaluar"
     # REALIDAD: DISPLACEMENT es un EVENTO URGENTE - o entras ahora o no entras
-    #
+
     # FAST PATH bypasea TODA la ceremonia cuando:
     # 1. Edge DISPLACEMENT está ACTIVE
     # 2. bars_since_displacement <= 1 (VENTANA DURA: 0-1 velas, NO MÁS)
     # 3. Volume no colapsó
-    #
+
     # El objetivo NO es el mejor precio
     # El objetivo es NO PERDER EL MOVIMIENTO
     # =========================================================================
@@ -1096,8 +1026,6 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     if not guard_result.passed:
         result.reason = guard_result.reason
         return result
-    
-    # Guard penalty propagation removed — Opción A (no penalty system)
     
     # ========== PHASE 2: SCORING ==========
     score_result = ScoreOrchestrator.calculate_score(engine, ctx, guard_result)
@@ -1131,17 +1059,9 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         result.reason = f"Score {score_result.score:.1f} below floor"
         return result
     
-    # =====================================================================
-    # 🔥 TREND EDGE BLOCK (Feb 20, 2026)
-    # Data (Feb 11-20): TREND edge = 28/41 trades, 18% WR, -$10.60 (83% of ALL losses)
-    # 18/28 TREND trades die in TIME_INVALIDATION with avg MFE 0.11R (never moved)
-    # The edge detection for TREND finds BOS in ranging market = noise.
-    # ONLY allow DISPLACEMENT and RANGE edges which have actual signal.
-    # =====================================================================
+    # TREND EDGE BLOCK removed — stale data from pre-refactoring pipeline.
+    # EXPANSION_MODE at 100% confidence was being killed here.
     current_edge_type = engine._current_trade_tags.get('edge_type', None)
-    if current_edge_type == 'TREND':
-        result.reason = f"TREND edge BLOCKED (Score={score_result.score:.1f}) — 83% of losses, 18% WR in data"
-        return result
 
     # =====================================================================
     # 🔥 DISPLACEMENT CONSUMED GUARD — NORMAL PIPELINE (Feb 20, 2026)
@@ -1160,11 +1080,6 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
             return result
 
     # Session limit check (with override for high scores)
-    # 🔥 FIX #10: Handle Hot Hand stopped (loss occurred)
-    # 🔥 FIX #82: Improved message clarity
-    
-    # Fusion gate removed — Opción A
-
     if guard_result.tags.get('session_stopped', False):
         session_pnl = guard_result.tags.get('session_pnl_r', 0.0)
         result.reason = (
@@ -1186,14 +1101,7 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     engine._entry_score = score_result.score
     engine._score_breakdown = score_result.breakdown
     
-    # Quality gate removed — Opción A
-    
-    # ========== PHASE 4: CHASE VALIDATION ==========
-    # Chase validation removed — Opción A
     final_score = score_result.score
-    
-    # ========== PHASE 4.5: ML SCORE ADJUSTMENT (Feb 10, 2026) ==========
-    # ML adjustment removed — Opción A
     
     # ========== PHASE 5: SL/TP CALCULATION ==========
     # Find support/resistance
@@ -1203,8 +1111,7 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     regime_config = engine.regime_detector.get_config(ctx.regime) if hasattr(engine, 'regime_detector') else None
     regime_sl_mult = regime_config.sl_atr_multiplier if regime_config else 2.0
     
-    # 🔥 FIX #56: TIGHT STOPS in LOCATION EXTREME SOFT MODE
-    # When trading in extreme location, use tighter stops to limit risk
+    # Tight stops in location extreme: reduce SL multiplier by 30%
     location_tight_stops = engine._current_trade_tags.get('location_extreme_tight_stops', False)
     if location_tight_stops:
         # Reduce SL multiplier by 30% for tighter stops
@@ -1235,7 +1142,7 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         current_edge_type = engine._current_trade_tags.get('edge_type', None)
         atr_expansion_ratio = engine._current_trade_tags.get('atr_expansion_ratio', None)
         
-        # 🔥 FIX (Feb 20, 2026): Use trading_mode ('RANGE'/'TREND') as canonical regime
+        # Use trading_mode ('RANGE'/'TREND') as canonical regime
         # instead of engine._current_regime.value which returns raw classifier strings
         # like "low_participation_chop" that don't match get_tp_r()'s 'RANGE' check.
         # This ensures RANGE exchange TP = 0.30R (safety net if bot crashes).
@@ -1258,10 +1165,8 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     else:
         take_profit = current_price - (risk * tp_mult)
     
-    # TP capping by historical range removed — Opción A
-
-    # ========== PHASE 5.5: HARD ENTRY BLOCKS (Jan 27, 2026) ==========
-    # Simplified worst-case RR estimate — Opción A
+    # ========== PHASE 5.5: HARD ENTRY BLOCKS ==========
+    # Worst-case RR estimate (80% of ideal)
     ideal_rr = abs(take_profit - current_price) / risk if risk > 0 else 0
     worst_case_rr = ideal_rr * 0.8
     engine._current_trade_tags['rr_worst_case'] = worst_case_rr
@@ -1272,12 +1177,12 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         result.reason = f"RR too low: {worst_case_rr:.2f} < 0.20"
         return result
     
-    # 🔥 FIX (Feb 19, 2026): ENFORCE REGIME RR MINIMUM FOR FADES
+    # ENFORCE REGIME RR MINIMUM FOR FADES
     # ROOT CAUSE: RegimeFusion correctly sets rr_min=2.0 for counter-trend
     # entries, but nobody checked it. Result: LONG entries at the top of
     # bounces in BEAR macro with 1.2R TP → guaranteed SL hit.
     # Now: if is_fade AND ideal_rr < rr_min → BLOCK.
-    # 🔥 FIX (Feb 20, 2026): RANGE mean-reversion EXEMPT from fade RR check.
+    # RANGE mean-reversion EXEMPT from fade RR check.
     # RANGE buys at support / sells at resistance with 0.30R TP — this is NOT
     # a directional fade. rr_min=2.0 was designed for TREND entries going
     # against macro. RANGE trades profit from many small wins at extremes.
@@ -1335,9 +1240,8 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     # PASO 2 — MAKER ONLY REAL (SIN EXCEPCIONES)
     # Entrada: SOLO LIMIT + post-only
     # (No market entries, no chasing.)
-    use_market = False
-    
-    cost_result = engine._cost_validator.validate_costs(
+    cost_result = _validate_costs(
+        engine,
         position_size=sizing_result.size,
         current_price=current_price,
         stop_loss=stop_loss,
@@ -1368,19 +1272,7 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         return result
 
     # =====================================================================
-    # ✅ PASO 4 — TAMAÑO MÍNIMO DE POSICIÓN (FIX #102d - Feb 09)
-    # 🔥 REFACTORED: Eliminamos el "bypass por RR" que era autoengaño
-    # 
-    # PROBLEMA IDENTIFICADO:
-    # - FIX #98 bypass permitía trades con profit $1.17 porque "RR >= 1.0"
-    # - Esto es AUTOENGAÑO: ganas poco, pero permitido porque "matemáticamente" rentable
-    # - Con slippage, fees reales, y ejecución imperfecta → break-even o pérdida
-    # 
-    # SOLUCIÓN FIX #102d:
-    # 1. Mantener umbrales mínimos para cuentas pequeñas
-    # 2. PERO exigir profit mínimo ABSOLUTO de $0.50 (cubre fees + buffer)
-    # 3. Si profit < $0.50, BLOQUEAR sin excepciones
-    # 4. Log para transparencia
+    # MINIMUM POSITION SIZE — absolute profit floor, no size exceptions
     # =====================================================================
     capital = engine.risk_engine.capital if hasattr(engine, 'risk_engine') else 500.0
     
@@ -1393,16 +1285,15 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     
     min_expected_profit = max(capital * MIN_PROFIT_PERCENT, MIN_PROFIT_FLOOR)
     
-    # 🔥 FIX #102d: NO HAY BYPASS - profit mínimo es sagrado
-    # Si no puedes ganar $0.50 neto, no deberías estar en el trade
+    # No bypass — minimum profit is non-negotiable
     if cost_result.expected_profit_usd_net < min_expected_profit:
         if _should_log_rate_limited("fix102d_block", 120):
             logger.warning(
-                f"🚫 FIX #102d BLOCK: profit_net=${cost_result.expected_profit_usd_net:.2f} < ${min_expected_profit:.2f} | "
+                f"🚫 MIN PROFIT BLOCK: profit_net=${cost_result.expected_profit_usd_net:.2f} < ${min_expected_profit:.2f} | "
                 f"net_R={cost_result.expected_net_r:.2f} | gross_R={ideal_rr:.2f} | size={sizing_result.size:.6f}"
             )
         result.reason = (
-            f"FIX #102d BLOCK: expected_profit=${cost_result.expected_profit_usd_net:.2f} < ${min_expected_profit:.2f} "
+            f"MIN PROFIT BLOCK: expected_profit=${cost_result.expected_profit_usd_net:.2f} < ${min_expected_profit:.2f} "
             f"(minimum viable profit)"
         )
         return result
@@ -1411,8 +1302,6 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
             f"✅ Profit check PASS: ${cost_result.expected_profit_usd_net:.2f} >= ${min_expected_profit:.2f} | "
             f"net_R={cost_result.expected_net_r:.2f} | gross_R={ideal_rr:.2f}"
         )
-    
-    # Probe validation removed — Opción A
     
     # ========== PHASE 9: EXECUTE ==========
     logger.info(f"📊 ENTRY: {bias} | Score={final_score:.1f} | Size={sizing_result.size:.6f} | SL={stop_loss:.2f} | TP={take_profit:.2f}")
@@ -1430,7 +1319,7 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
         'score_breakdown': score_result.breakdown.copy(),
     }
     
-    # Aggressive execution for displacement only — Opción A
+    # Aggressive execution for displacement only
     aggressive_execution = False
     edge_mgr = getattr(engine, '_edge_manager', None)
     if edge_mgr is not None:
@@ -1448,9 +1337,8 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
     
     order_result = await OrderExecutor.place_order(
         engine, ctx, sizing_result.size, stop_loss, take_profit,
-        use_market=False,
         entry_data=entry_data,
-        aggressive_execution=aggressive_execution,  # 🔥 FIX: IOC for displacement
+        aggressive_execution=aggressive_execution,
     )
     
     if order_result.success:
@@ -1462,12 +1350,7 @@ async def orchestrate_entry(engine: 'SignalEngine', current_price: float, atr_1m
             engine.state_machine.start_entry_timer()
             engine.state_machine.transition_to(BotState.WAIT_FILL, "Order placed")
         
-        # 🔥 FIX #196 (Feb 12, 2026): REMOVED DUPLICATE session_trade_counts increment
-        # The counter is already incremented in trading_app.py line ~6926 when fill is confirmed.
-        # Having it here too caused DOUBLE COUNTING: 2 real trades → 4 counted → session_limit blocked
-        # See: "Session STOPPED (4 trades done)" but Health said "trades_today=2"
-        
-        # 🔥 FIX (Jan 27, 2026): Use CENTRALIZED activity tracker
+        # Trade counter incremented at fill-confirmation in trading_app.py (not here)
         from src.domain.trading.activity_tracker import record_trade_executed
         record_trade_executed(market_time)
         engine._last_trade_time = market_time  # Keep local copy for backwards compat

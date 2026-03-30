@@ -33,7 +33,7 @@ class DegradationMonitor:
     Tracks leading indicators that precede visible PnL degradation.
     Maintains rolling window of recent trades for continuous analysis.
     
-    PERFORMANCE FIX (Jan 17, 2026): Added metrics caching to avoid O(n) 
+    PERFORMANCE Added metrics caching to avoid O(n) 
     recalculation on every query. Metrics are recalculated only when 
     trades are added, not on every has_active_degradation() call.
     """
@@ -239,7 +239,7 @@ class DegradationMonitor:
         """
         Returns current metrics from rolling window.
         
-        🔥 PERFORMANCE FIX (Jan 17, 2026): Uses caching to avoid O(n) 
+        🔥 PERFORMANCE Uses caching to avoid O(n) 
         recalculation on every call. Cache is invalidated when trades are added.
         
         Returns:

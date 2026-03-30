@@ -6,7 +6,6 @@ RegimeConfig defined here is a DUPLICATE.
 Prefer using UnifiedRegimeConfig from src/config/unified_constants.py
 This file's RegimeConfig is kept for backward compatibility but should be migrated.
 
-🔥 FIX (Jan 22, 2026):
 ADX should NOT be a binary filter. It's a REGIME CLASSIFIER.
 
 MODES:
@@ -64,7 +63,7 @@ class RegimeConfig:
 
 
 # Regime configurations
-# 🔥 FIX (Jan 22, 2026): Adjusted for $250 capital - more selective, structured limits
+# Adjusted for $250 capital - more selective, structured limits
 REGIME_CONFIGS: Dict[str, RegimeConfig] = {
     'TREND': RegimeConfig(
         mode='TREND',
@@ -114,7 +113,7 @@ class RegimeClassifier:
     2. Adapts trading style to the regime
     3. Allows profitable range trading with appropriate restrictions
     
-    🔥 FIX (Jan 22, 2026): Lowered thresholds for more participation
+    Lowered thresholds for more participation
     With more capital, want to catch moderate trends, not just perfect ones.
     """
     

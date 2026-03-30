@@ -28,7 +28,7 @@ class SpreadFilterConfig:
     MIN_SAMPLES: int = 10                    # Minimum samples before filtering
     
     # Spread thresholds (relative to rolling stats)
-    # 🔥 FIX (Jan 27, 2026): Spread filter was TOO AGGRESSIVE
+    # Spread filter was TOO AGGRESSIVE
     # Blocked LONG @ 88185 that went to +4.50R because spread was 0.6 vs 0.4 bps avg
     # That's insane - 0.6 bps is NOTHING for BTC. Relaxed significantly.
     BLOCK_MULT_AVG: float = 3.0              # 🔥 Was 2.0, now 3.0 - only block truly anomalous

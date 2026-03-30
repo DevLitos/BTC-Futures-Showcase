@@ -257,19 +257,19 @@ class PositionSizeCalculator:
         )
         
         # =====================================================================
-        # 🔥 FIX #100 (Feb 09, 2026): SIZING FLOOR - PREVENT EXTREME REDUCTION
-        # 
+        # SIZING FLOOR - PREVENT EXTREME REDUCTION
+
         # PROBLEMA DETECTADO:
         # - Múltiples multiplicadores se acumulan: RR × REG × LOSS × SESS × EDGE × TOXIC_HR × FUSION
         # - Resultado: 0.83 × 0.7 × 0.6 × 0.8 × 0.54 × 0.5 × 0.6 = 0.08 (8% sizing)
         # - Con balance de $254, esto da posiciones de $20, beneficio de $0.20
         # - $0.20 < threshold de $0.30 = HARD BLOCK infinito
-        # 
+
         # SOLUCIÓN:
         # - Aplicar floor del 25% mínimo al multiplicador combinado
         # - Esto garantiza que al menos 25% del sizing base se use
         # - Para balance $254: 25% sizing = ~$63 = profit ~$0.63 (>threshold)
-        # 
+
         # WHY 25%:
         # - Suficiente para superar thresholds de profitability
         # - Aún permite reducción significativa en condiciones adversas
@@ -283,7 +283,7 @@ class PositionSizeCalculator:
             result.multipliers_applied['floor_applied'] = True
             result.multipliers_applied['floor_original'] = old_mult
             logger.info(
-                f"🔥 FIX #100: Sizing floor applied. Original={old_mult:.2%} → Floor={MIN_SIZING_FLOOR:.0%}"
+                f"Sizing floor applied. Original={old_mult:.2%} → Floor={MIN_SIZING_FLOOR:.0%}"
             )
         
         # Apply multiplier
@@ -313,7 +313,7 @@ class LocationGuards:
     - Too close to range boundaries in RANGE regime
     """
     
-    # 🔧 FIX #130 (Feb 09, 2026): Reduced from 0.75 to allow more aggressive entries
+    # Reduced from 0.75 to allow more aggressive entries
     # Old: 0.75 ATR was too conservative, blocked valid trends
     # New: 0.3 ATR allows entries closer to levels while still protecting from exact level entries
     MIN_HEADROOM_ATR = 0.3
@@ -343,12 +343,12 @@ class LocationGuards:
             if hasattr(engine, '_location_context') and engine._location_context:
                 regime = engine._location_context.regime.upper()
             
-            # 🔧 FIX #130: Skip anchor check entirely in trending regimes
+            # Skip anchor check entirely in trending regimes
             # In TREND, we WANT to enter even near levels - the trend will break them
             if regime not in ['RANGE', 'CHOPPY_DEAD', 'MEAN_REVERSION']:
                 return True, ""
             
-            # 🔧 FIX #130: Also skip if TREND_EXPANSION is active
+            # Also skip if TREND_EXPANSION is active
             trend_expansion_active = getattr(engine, '_trend_expansion_active', False)
             if trend_expansion_active:
                 return True, ""

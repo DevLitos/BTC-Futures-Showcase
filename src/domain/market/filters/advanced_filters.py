@@ -1,5 +1,5 @@
 """
-Advanced Filters for Tier 2-3 Optimizations (FIX #6-13)
+Advanced Filters for Tier 2-3 Optimizations
 Includes: Funding rate, VPOC, divergence, BTC correlation, session quality
 """
 
@@ -19,12 +19,12 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# FIX #6: FUNDING RATE CONTROL
+# FUNDING RATE CONTROL
 # ============================================================================
 
 async def check_funding_rate_safe(external_data_manager, symbol: str | None, bias: str | None) -> Tuple[bool, str]:
     """
-    FIX #6: Check if funding rate is safe for entry
+    Check if funding rate is safe for entry
     
     Returns: (is_safe: bool, reason: str)
     """
@@ -57,7 +57,7 @@ async def should_exit_on_funding(
     time_to_funding_min: float | None = None  # Minutes until next funding settlement
 ) -> Tuple[bool, str]:
     """
-    FIX #6: Force exit if funding becomes EXTREMELY dangerous
+    Force exit if funding becomes EXTREMELY dangerous
     
     IMPROVED (Jan 12, 2026):
     - Uses REAL TIME until next funding settlement (not arbitrary position age)
@@ -113,7 +113,7 @@ async def should_exit_on_funding(
 
 
 # ============================================================================
-# FIX #9: SESSION QUALITY FILTER
+# SESSION QUALITY FILTER
 # ============================================================================
 
 def get_session_name_utc(hour_utc: int) -> str:
@@ -145,7 +145,7 @@ def is_weekend(hour_utc: int, day_of_week: int) -> bool:
 
 def check_session_quality(adx: float, volatility_bps: float, market_time: datetime | None = None) -> Tuple[bool, str]:
     """
-    FIX #9: Check if current session has adequate quality
+    Check if current session has adequate quality
     
     Args:
         adx: ADX value (1H)
@@ -190,12 +190,12 @@ def check_session_quality(adx: float, volatility_bps: float, market_time: dateti
 
 
 # ============================================================================
-# FIX #10: HTF DIVERGENCE DETECTION
+# HTF DIVERGENCE DETECTION
 # ============================================================================
 
 def check_htf_divergence(df_1h: pd.DataFrame, bias: str | None) -> Tuple[bool, str]:
     """
-    FIX #10: Detect bearish (for LONG) or bullish (for SHORT) divergence
+    Detect bearish (for LONG) or bullish (for SHORT) divergence
     
     Divergence = New high/low in price but RSI doesn't confirm
     This is HIGH RISK for reversals
@@ -243,12 +243,12 @@ def check_htf_divergence(df_1h: pd.DataFrame, bias: str | None) -> Tuple[bool, s
 
 
 # ============================================================================
-# FIX #11: VPOC (VOLUME POINT OF CONTROL)
+# VPOC (VOLUME POINT OF CONTROL)
 # ============================================================================
 
 def calculate_vpoc(df_1h: pd.DataFrame) -> Optional[float]:
     """
-    FIX #11: Calculate VPOC (Volume Point of Control)
+    Calculate VPOC (Volume Point of Control)
     
     VPOC = Price level where most volume was traded
     
@@ -285,7 +285,7 @@ def calculate_vpoc(df_1h: pd.DataFrame) -> Optional[float]:
 
 def check_vpoc_validity(current_price: float, vpoc: float | None, bias: str | None) -> Tuple[bool, str]:
     """
-    FIX #11: Check if entry price is valid relative to VPOC
+    Check if entry price is valid relative to VPOC
     
     Returns: (is_valid: bool, reason: str)
     """
@@ -310,12 +310,12 @@ def check_vpoc_validity(current_price: float, vpoc: float | None, bias: str | No
 
 
 # ============================================================================
-# FIX #12: BTC CORRELATION CHECK
+# BTC CORRELATION CHECK
 # ============================================================================
 
 async def check_btc_trend(external_data_manager, bias: str | None) -> Tuple[bool, str]:
     """
-    FIX #12: Check BTC trend - don't trade LONG if BTC is DOWN
+    Check BTC trend - don't trade LONG if BTC is DOWN
     
     BTC and altcoin correlation is 0.95+ (very correlated)
     
@@ -370,13 +370,13 @@ async def check_btc_trend(external_data_manager, bias: str | None) -> Tuple[bool
 
 
 # ============================================================================
-# FIX #7: TRAIN-TEST VALIDATION HELPERS
+# TRAIN-TEST VALIDATION HELPERS
 # ============================================================================
 
 def validate_train_test_split(train_results: dict, test_results: dict, 
                              max_overfitting_pct: float = 10.0) -> Tuple[bool, str]:
     """
-    FIX #7: Validate that backtest doesn't have excessive overfitting
+    Validate that backtest doesn't have excessive overfitting
     
     Returns: (is_valid: bool, assessment: str)
     """

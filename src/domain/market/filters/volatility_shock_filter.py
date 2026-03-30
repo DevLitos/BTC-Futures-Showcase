@@ -6,7 +6,7 @@ Detects when TrueRange > k*ATR (individual candle spike) and:
 2. Penalizes score for MODERATE/ELEVATED but allows trading
 3. Enforces cooldown ONLY for SEVERE/EXTREME (actual chaos)
 
-🔥 FIX (Jan 22, 2026): Complete rewrite with:
+Complete rewrite with:
    - Timeframe-specific thresholds (1m vs 5m vs 15m)
    - Uses CLOSED candle only (not live candle)
    - No ATR estimation fallback (requires real data)
@@ -92,12 +92,12 @@ class VolatilityShockFilter(BaseFilter):
     ATR_PERIOD = 14
     
     # Score adjustments (when allowed but penalized)
-    # 🔥 FIX (Jan 22, 2026): Lighter penalties - volatility can be opportunity
+    # Lighter penalties - volatility can be opportunity
     MODERATE_PENALTY = -0.5  # Was -1.0
     ELEVATED_PENALTY = -1.0  # Was -2.0
     
     # Base cooldown durations (minutes) - only for SEVERE/EXTREME
-    # 🔥 FIX (Jan 22, 2026): Reduced cooldowns - post-spike often best entries
+    # Reduced cooldowns - post-spike often best entries
     # 🔥 FIX v2: Further reduced - volatility = opportunity, not danger
     SEVERE_BASE_COOLDOWN = 3    # 3-5 min based on ratio (was 6-10)
     EXTREME_BASE_COOLDOWN = 6   # 6-10 min based on ratio (was 12-20)

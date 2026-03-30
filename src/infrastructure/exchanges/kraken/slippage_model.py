@@ -42,7 +42,7 @@ class SlippageConfig:
     Slippage configuration by order type.
     Values in basis points (1 bps = 0.01%).
     
-    FIX (Jan 22, 2026): Punto 13 - Calibrated with realistic Kraken values
+    Punto 13 - Calibrated with realistic Kraken values
     Based on actual fills from small orders ($100-$500 notional):
     - Limit orders: <0.3 bps average slippage
     - Market orders: ~0.8 bps average slippage
@@ -65,7 +65,7 @@ class SlippageConfig:
     
     # =========================================================================
     # OPERATIONAL MODE: P90-P95 caps for DECISION making
-    # FIX (Jan 25, 2026): Reduced caps - were causing ~0.65R degradation
+    # Reduced caps - were causing ~0.65R degradation
     # With liquid BTC and small orders, real slippage is much lower
     # =========================================================================
     P95_ENTRY_SLIP_BPS: float = 0.5       # 🔥 FIX: was 1.5 → too conservative

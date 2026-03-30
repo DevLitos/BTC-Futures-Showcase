@@ -22,7 +22,6 @@ Regime Context - SINGLE SOURCE OF TRUTH for market regime
 
 OLD DESCRIPTION:
 ----------------
-🔥 FIX (Jan 22, 2026):
 "Tu bot ya sabe cuándo una entrada es mediocre,
 pero todavía no alinea todos los módulos para tratarla como tal de forma consistente."
 
@@ -224,7 +223,7 @@ def _build_range_context(adx: float, confidence: float, adx_slope: float) -> Reg
         size_multiplier=0.7,          # Smaller size in range
         
         # SL/TP
-        # 🔥 FIX (Jan 22, 2026): RANGE needs TIGHT stops, NOT 3.0x
+        # RANGE needs TIGHT stops, NOT 3.0x
         # RANGE = scalps, quick in/out. 3.0x converts scalp into "fade con stop enorme"
         # FULL entry: max 2.0x ATR | PROBE: max 1.6x ATR (applied in signal_engine)
         sl_atr_multiplier=2.0,        # 🔥 REDUCED from 3.0 to 2.0 for RANGE scalps

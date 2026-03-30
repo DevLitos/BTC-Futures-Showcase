@@ -18,7 +18,7 @@ from src.shared.indicators import (
     calculate_ema, calculate_adx, calculate_atr,
     calculate_relative_volume, calculate_orderbook_imbalance,
     check_hl_lh_structure, calculate_fibonacci_levels,
-    calculate_adx_with_di  # 🔥 FIX #77: Add +DI/-DI for direction
+    calculate_adx_with_di  # Add +DI/-DI for direction
 )
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ class KillConditionsFilter:
         
         Returns: (should_kill: bool, reason: str)
         
-        MEJORADO (FIX #8):
+        MEJORADO:
         - 3 pérdidas consecutivas → OBSERVATION MODE (no apagar)
         - Drawdown diario → OBSERVATION MODE (no apagar)
         - Solo causas CRÍTICAS → APAGAR TODO (WebSocket, funding extremo, etc)
@@ -131,10 +131,10 @@ class BlackSwanFilter:
         self.cooldown_until: Optional[datetime] = None
         self.defensive_mode: bool = False
         self.defensive_until: Optional[datetime] = None
-        # 🔥 FIX (Jan 29, 2026): Throttle defensive mode reactivation logs
+        # Throttle defensive mode reactivation logs
         self._last_defensive_activation: Optional[datetime] = None
         self._defensive_activation_min_interval = 120  # Seconds between log messages
-        # 🔥 FIX (Feb 05, 2026): Track suppression state
+        # Track suppression state
         self._defensive_suppressed: bool = False
         self._defensive_suppression_reason: str = ""
     
@@ -195,7 +195,7 @@ class BlackSwanFilter:
         defensive_threshold = KillConditions.DEFENSIVE_MODE_MULTIPLIER * atr
         
         if abs_change >= defensive_threshold:
-            # 🔥 FIX #28 (Feb 05, 2026): Suppress defensive mode if regime already blocking
+            # Suppress defensive mode if regime already blocking
             # This avoids redundant logs like "DEFENSIVE MODE" when HARD BLOCK is active
             if regime_blocked:
                 self._defensive_suppressed = True
@@ -281,12 +281,11 @@ class BlackSwanFilter:
 class HTFFilter:
     """BLOQUE 1 - High Timeframe Filter (1H)
     
-    BACKTEST MODE FIX (Jan 4, 2026):
-    - Simplified to work with limited data
+    BACKTEST MODE - Simplified to work with limited data
     - Uses EMA50 only (not EMA200) when data < 200 candles
     - Logs all decisions for debugging
     
-    FIX (Jan 23, 2026): ADX Classification
+    ADX Classification
     - ADX < 18: RANGE mode (scalp stops, mean-reversion)
     - ADX 18-25: WEAK_TREND mode (cautious trend-following)
     - ADX >= 25: TREND mode (full trend-following)
@@ -294,7 +293,7 @@ class HTFFilter:
     
     def __init__(self, backtest_mode: bool = False):
         self.backtest_mode = backtest_mode
-        # 🔥 FIX (Jan 23, 2026): Store last regime mode for downstream use
+        # Store last regime mode for downstream use
         self.last_htf_regime_mode: str = 'UNKNOWN'
         self.last_htf_adx: float = 0.0
     
@@ -335,21 +334,21 @@ class HTFFilter:
             return False, None, "EMA50 calculation failed (NaN)"
         
         adx_values, adx_slope = calculate_adx(highs, lows, closes, 14)
-        # 🔥 FIX (Jan 25, 2026): Ensure ADX is a Python float, not numpy array
+        # Ensure ADX is a Python float, not numpy array
         adx = float(adx_values[-1]) if len(adx_values) > 0 else 0.0
         slope = float(adx_slope[-1]) if len(adx_slope) > 0 else 0.0
         
         # =====================================================================
-        # 🔥 FIX #77 (Feb 07, 2026): USE +DI/-DI FOR DIRECTION
-        # 
+        # USE +DI/-DI FOR DIRECTION
+
         # PROBLEM: Bias determined by EMA50 position is LAGGING.
         # - During fast moves, price can be "wrong side" of EMA50 temporarily
         # - EMA50 doesn't measure MOMENTUM DIRECTION, only price position
-        # 
+
         # SOLUTION: Use +DI/-DI which measures ACTUAL directional momentum:
         # - +DI > -DI + threshold → BULLISH momentum (buy pressure > sell)
         # - -DI > +DI + threshold → BEARISH momentum (sell pressure > buy)
-        # 
+
         # When ADX >= 25 (trending), use +DI/-DI as PRIMARY direction source.
         # EMA50 becomes SECONDARY (for zones/confirmation only).
         # =====================================================================
@@ -388,13 +387,13 @@ class HTFFilter:
             atr_ma = atr
         
         # =========================================================
-        # 🔥 FIX #77 BIAS DETERMINATION WITH +DI/-DI
+        # BIAS DETERMINATION WITH +DI/-DI
         # =========================================================
         # PRIORITY ORDER:
         # 1. +DI/-DI when ADX >= 25 (trending market, DI is reliable)
         # 2. EMA50/EMA200 macro trend (when ADX < 25 or DI indecisive)
         # 3. Price vs EMA50 with hysteresis (fallback)
-        #
+
         # RATIONALE:
         # - +DI/-DI measures CURRENT directional momentum (ANTICIPATORY)
         # - EMA50 position measures where price WAS (LAGGING)
@@ -416,7 +415,7 @@ class HTFFilter:
         
         # =====================================================================
         # PRIORITY 1: +DI/-DI in trending markets (ADX >= 25)
-        # This is the KEY FIX #77 - use directional indicators for direction!
+        # Use directional indicators for direction!
         # =====================================================================
         ADX_TREND_THRESHOLD = 25.0
         
@@ -426,7 +425,7 @@ class HTFFilter:
             bias_source = f"+DI/-DI (ADX={adx:.1f}, +DI={plus_di_last:.1f}, -DI={minus_di_last:.1f})"
             
             logger.info(
-                f"📊 FIX #77: Bias from +DI/-DI | ADX={adx:.1f} | "
+                f"📊 Bias from +DI/-DI | ADX={adx:.1f} | "
                 f"+DI={plus_di_last:.1f} vs -DI={minus_di_last:.1f} (diff={di_strength:.1f}) → {bias}"
             )
         
@@ -499,7 +498,7 @@ class HTFFilter:
         # Log bias decision (DEBUG level to reduce noise)
         macro_label = "BEAR" if is_macro_bear else ("BULL" if is_macro_bull else "NEUTRAL")
         logger.debug(
-            f"[DATA] FIX #77 HTF bias: Price={current_price:.2f} | EMA50={ema_50:.2f} | "
+            f"[DATA] HTF bias: Price={current_price:.2f} | EMA50={ema_50:.2f} | "
             f"ADX={adx:.2f} | +DI={plus_di_last:.1f} | -DI={minus_di_last:.1f} | "
             f"Macro={macro_label} | Source={bias_source} → bias={bias}"
         )
@@ -519,11 +518,11 @@ class HTFFilter:
         # FULL VALIDATION FOR LIVE TRADING
         # =========================================================
         
-        # 🔥 FIX (Jan 23, 2026): ADX is a CLASSIFIER with CORRECT thresholds
+        # ADX is a CLASSIFIER with CORRECT thresholds
         # ADX < 18: RANGE → scalp logic, 2.0x ATR stops, mean-reversion
         # ADX 18-25: WEAK_TREND → cautious trend-following
         # ADX >= 25: TREND → full trend logic, 3.0x ATR stops
-        #
+
         # Previous bug: ADX 15.3 was classified as TREND → wrong!
         
         # Determine regime based on ADX with CORRECT thresholds
@@ -548,11 +547,11 @@ class HTFFilter:
         
         # =========================================================
         # ADX SLOPE - INFORMATION ONLY, NEVER BLOCKS
-        # 
+
         # ADX slope negativo ≠ tendencia colapsando
         # ADX mide fuerza PASADA, no reversión
         # Cae durante pullbacks normales
-        # 
+
         # Colapso real = estructura (price < EMA50), no indicador
         # =========================================================
         # slope is logged and returned for tagging, but NEVER blocks entry
@@ -589,7 +588,7 @@ class LTFTriggerFilter:
     
     # Umbrales de volumen por régimen
     VOLUME_BLOCK_THRESHOLD_EXPANSION = 0.5  # En expansión, bloquear si < 50% del promedio
-    # FIX (Jan 3, 2026): Reduced volume threshold from 0.25 to 0.05 for diagnosis
+    # Reduced volume threshold from 0.25 to 0.05 for diagnosis
     # Kraken Futures has very low volume on weekends
     VOLUME_BLOCK_THRESHOLD_DEFAULT = 0.05   # Fallback muy bajo - solo trades muertos
     
@@ -685,7 +684,7 @@ class LTFTriggerFilter:
             'current_price': current_price
         }
         
-        # 🔥 FIX (Feb 05, 2026): LTF log is redundant - use DEBUG always
+        # LTF log is redundant - use DEBUG always
         # Only log at INFO when confirmations CHANGE or reach 3/3
         logger.debug(f"LTF confirmations: {confirmations}/3 | BOS={bos_confirmed} | EMAReclaim={ema_reclaim} | Slope={slope_positive}")
         

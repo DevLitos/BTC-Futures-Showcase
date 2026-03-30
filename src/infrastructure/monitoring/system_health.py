@@ -87,7 +87,7 @@ class SystemHealthMonitor:
         self._fill_latencies: List[float] = []  # ONLY pure MARKET orders
         self._conversion_times: List[float] = []  # LIMIT→MARKET (separate, informational)
         
-        # 🔥 FIX (Jan 23, 2026): Auto-heal by TIME, not by fills
+        # Auto-heal by TIME, not by fills
         # Kill switch was a deadlock: required fills to heal but couldn't fill while dead
         self._last_latency_problem: Optional[datetime] = None
         self.LATENCY_HEAL_MINUTES = 5  # Auto-heal after 5 minutes without NEW problems
@@ -262,9 +262,9 @@ class SystemHealthMonitor:
             is_healthy = False
         
         # Check latency - TIME-BASED auto-heal
-        # 🔥 FIX (Jan 23, 2026): Auto-heal by TIME, not by fills
+        # Auto-heal by TIME, not by fills
         # Old design was a deadlock: needed fills to heal but couldn't fill while dead
-        #
+
         # New design:
         # - Problem detected → record timestamp
         # - If no NEW problems for LATENCY_HEAL_MINUTES → auto-healed

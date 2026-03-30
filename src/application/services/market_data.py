@@ -7,7 +7,7 @@ Includes candle validation to prevent invalid data from corrupting calculations.
 
 import numpy as np
 import pandas as pd
-import time  # 🔧 FIX (Jan 25, 2026): For feed staleness tracking
+import time  # For feed staleness tracking
 from collections import deque
 from datetime import datetime, UTC
 from typing import Dict, Optional, List
@@ -79,7 +79,7 @@ class SynchronizedMultiTimeframeBuffer:
         # Real-time tracking
         self.last_price = 0.0
         
-        # 🔧 FIX (Jan 25, 2026): Track last data received timestamp
+        # Track last data received timestamp
         # Used for feed staleness detection (feed_age_sec)
         # Updated on every tick, trade, and candle received
         self._last_data_received_at: float = time.time()
@@ -128,7 +128,7 @@ class SynchronizedMultiTimeframeBuffer:
         """Procesar tick (price update)"""
         self.ticks.append(tick)
         
-        # 🔧 FIX (Jan 25, 2026): Track when data was received for feed staleness
+        # Track when data was received for feed staleness
         self._last_data_received_at = time.time()
         
         # Update last price
@@ -145,7 +145,7 @@ class SynchronizedMultiTimeframeBuffer:
         """Procesar trade (para CVD real)"""
         self.trades.append(trade)
         
-        # 🔧 FIX (Jan 25, 2026): Track when data was received for feed staleness
+        # Track when data was received for feed staleness
         self._last_data_received_at = time.time()
         
         # Update last price from trade as well (Robustness)
@@ -167,7 +167,7 @@ class SynchronizedMultiTimeframeBuffer:
         - El callback viene de WebSocket cuando arma la siguiente vela
         - Candles se validan antes de agregar
         """
-        # 🔧 FIX (Jan 25, 2026): Track when data was received for feed staleness
+        # Track when data was received for feed staleness
         self._last_data_received_at = time.time()
         
         timeframe = candle.get('timeframe')
@@ -222,11 +222,11 @@ class SynchronizedMultiTimeframeBuffer:
                        f"L={candle['low']:.2f} C={candle['close']:.2f} V={candle['volume']:.0f}")
         elif timeframe == '5m':
             status = "✓" if current_counts['5m'] >= 50 else "⏳"
-            # FIX #84: Reducido a DEBUG
+            # Reducido a DEBUG
             logger.debug(f"{status} [5m] O={candle['open']:.0f} C={candle['close']:.0f} ({current_counts['5m']}/50)")
         elif timeframe == '1h':
             status = "✓" if current_counts['1h'] >= 50 else "⏳"
-            # FIX #84: Reducido a DEBUG
+            # Reducido a DEBUG
             logger.debug(f"{status} [1h] O={candle['open']:.0f} C={candle['close']:.0f} ({current_counts['1h']}/50)")
         
         # Recalcular indicadores SOLO si hay suficientes velas
@@ -368,7 +368,7 @@ class SynchronizedMultiTimeframeBuffer:
         atr = calculate_atr(highs, lows, closes, 14)[-1]
         self.indicators['1h']['atr'] = atr
         
-        # FIX #84: Reducido a DEBUG
+        # Reducido a DEBUG
         logger.debug(f"1h indicators: EMA50={ema50:.2f} EMA200={ema200:.2f} ADX={self.indicators['1h']['adx']:.2f} "
                    f"Slope={self.indicators['1h']['adx_slope']:.4f}")
     
@@ -455,7 +455,7 @@ class SynchronizedMultiTimeframeBuffer:
         - Position duration
         - Any time comparison
         
-        🔥 FIX (Feb 1, 2026): In live mode, if current_time is too stale (>2 min),
+        In live mode, if current_time is too stale (>2 min),
         fallback to real time to avoid cooldowns being calculated in the past.
         """
         if not self.backtest_mode:
@@ -489,7 +489,7 @@ class SynchronizedMultiTimeframeBuffer:
     
     def get_feed_age_sec(self) -> float:
         """
-        🔧 FIX (Jan 25, 2026): Get actual feed staleness in seconds.
+        Get actual feed staleness in seconds.
         
         This measures time since last data was received from the exchange,
         NOT time between tick processing (which was buggy and caused false blocks).

@@ -61,8 +61,8 @@ async def handle_partial_close(
     exchange_pos = await engine.execution.get_position(engine.symbol)
     if not exchange_pos:
         # =============================================================
-        # 🔒 FIX #268: REGISTER PnL WHEN EXCHANGE CLOSED DURING PARTIAL
-        #
+        # 🔒 REGISTER PnL WHEN EXCHANGE CLOSED DURING PARTIAL
+
         # ROOT CAUSE: Exchange closes position (TP/SL hit) between MFE
         # detection and partial execution. Position gone → silent reset
         # without recording PnL, trade logging, or daily PnL update.
@@ -96,7 +96,7 @@ async def handle_partial_close(
             engine.state_machine.update_daily_pnl(pnl_estimate)
             
             logger.warning(
-                f"🔒 FIX #268: Exchange closed during partial | "
+                f"🔒 Exchange closed during partial | "
                 f"{exit_type} | PnL: ${pnl_estimate:.2f} ({r_realized:.2f}R) | "
                 f"Entry: {position.entry_price:.2f} → Exit: {exit_price:.2f}"
             )
@@ -108,10 +108,10 @@ async def handle_partial_close(
                     'exit_price': exit_price,
                     'pnl': pnl_estimate,
                     'r_realized': r_realized,
-                    'note': 'FIX #268: Exchange closed during partial attempt'
+                    'note': 'Exchange closed during partial attempt'
                 })
         except Exception as pnl_e:
-            logger.error(f"FIX #268: Could not estimate PnL: {pnl_e}")
+            logger.error(f"Could not estimate PnL: {pnl_e}")
         
         engine.reconciler.notify_exit_completed()
         engine._reset_trade_state("Position closed externally before partial")
@@ -144,7 +144,7 @@ async def handle_partial_close(
         reason="PARTIAL"
     )
     
-    # 🔥 FIX (Feb 1, 2026): Robust size sync after partial close
+    # Robust size sync after partial close
     # Wait for exchange to settle, then force local state to match
     await asyncio.sleep(0.8)  # Increased from 0.5s for better settlement
     try:
@@ -167,17 +167,17 @@ async def handle_partial_close(
                         })
                 
                 # =============================================================
-                # 🔒 FIX #266/282: POST-PARTIAL SL PROTECTION
-                #
+                # POST-PARTIAL SL PROTECTION
+
                 # ROOT CAUSE: After 30% partial at +0.3R, the remaining 70%
                 # has NO protection (R-LOCK requires 0.5R MFE, TIME_LOCK too).
                 # Trades with MFE 0.30-0.49R devuelven TODA la ganancia.
-                #
-                # 🔥 FIX #282 (Feb 17, 2026): Tighten from -0.30R to -0.10R
+
+                # Tighten from -0.30R to -0.10R
                 # LOG EVIDENCE: Trade 2 had MFE=0.49R, partial at 0.33R, but 
                 # post-partial SL at -0.30R let price retrace entire move.
                 # Net result: -$0.34 despite having been +$1.45 at peak.
-                # 
+
                 # With -0.10R post-partial SL:
                 # - Partial captures: +0.33R * 30% = +0.10R
                 # - Worst case remaining: -0.10R * 70% = -0.07R
@@ -193,7 +193,7 @@ async def handle_partial_close(
                             position.trailing_stop = new_sl
                             position.stop_loss = new_sl
                             logger.warning(
-                                f"🔒 FIX #266: POST-PARTIAL SL PROTECTION | "
+                                f"🔒 POST-PARTIAL SL PROTECTION | "
                                 f"SL moved: {current_sl:.2f} → {new_sl:.2f} | "
                                 f"Max loss now {post_partial_max_loss_r}R (was -1.0R)"
                             )
@@ -204,7 +204,7 @@ async def handle_partial_close(
                             position.trailing_stop = new_sl
                             position.stop_loss = new_sl
                             logger.warning(
-                                f"🔒 FIX #266: POST-PARTIAL SL PROTECTION | "
+                                f"🔒 POST-PARTIAL SL PROTECTION | "
                                 f"SL moved: {current_sl:.2f} → {new_sl:.2f} | "
                                 f"Max loss now {post_partial_max_loss_r}R (was -1.0R)"
                             )
@@ -302,7 +302,7 @@ async def handle_add_position(
             price=current_price,
         )
 
-        # 🔥 FIX (Feb 02, 2026): If POST-ONLY REJECTED, try IOC limit as fallback
+        # If POST-ONLY REJECTED, try IOC limit as fallback
         # This prevents missed add-to-winner on fast-moving winners
         if add_order is None:
             logger.warning("🔄 ADD_POSITION POST-ONLY rejected, retrying with IOC limit...")
@@ -371,7 +371,7 @@ async def handle_add_position(
                     position.entry_price = new_entry_price
                     position.size = new_exchange_size
                     
-                    # 🔥 FIX (Feb 1, 2026): Force position_store sync to avoid mismatch warning
+                    # Force position_store sync to avoid mismatch warning
                     try:
                         if hasattr(engine, 'position_store') and engine.position_store:
                             engine.position_store._update_position_record(engine.symbol, position)
@@ -487,13 +487,13 @@ async def handle_full_close(
         engine._is_be_stop = True
     
     # =========================================================================
-    # 🔥 FIX (Feb 03, 2026): Record trade close for Hot Hand system
+    # Record trade close for Hot Hand system
     # =========================================================================
     # PROBLEM: handle_full_close was NOT calling record_trade_closed, so the
     # Activity Tracker never knew if the last trade was a WIN or LOSS.
     # This broke the Hot Hand system - session_stopped was always triggered
     # because _last_trade_was_win remained False.
-    # 
+
     # SOLUTION: Calculate PnL and call record_trade_closed here.
     # =========================================================================
     try:

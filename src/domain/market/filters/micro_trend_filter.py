@@ -333,13 +333,13 @@ class MicroTrendFilter:
     # SIGNAL WEIGHTS - Importancia de cada señal (total normalizado a 1.0)
     # =========================================================================
     # 🔥 REFACTOR (Feb 05, 2026): REDUCED ALL WEIGHTS BY 50%
-    # 
+
     # PROBLEM: MicroTrend was a "dictator" - its 16+ points of lagging indicators
     # dominated everything. In violent reversals:
     #   - Displacement detected SHORT (real, fast)
     #   - MicroTrend still showed BULLISH (EMA lagging)
     #   - System entered conflict or blocked valid entries
-    #
+
     # SOLUTION: Cut all weights in half. MicroTrend becomes ADVISORY, not VETO.
     # Structure (swings) gets relatively more weight than lagging EMAs.
     # =========================================================================
@@ -386,7 +386,7 @@ class MicroTrendFilter:
     HYSTERESIS_BARS_TO_CLEAR = 2   # Bars in BULLISH before clearing block
     
     # Score adjustments
-    # 🔥 FIX (Jan 26, 2026): Reduced penalties - were too aggressive
+    # Reduced penalties - were too aggressive
     # -3.0 was destroying any reasonable score (5 base - 3 = 2)
     # 🔥 REFACTOR (Feb 05, 2026): Further reduced - MicroTrend should ADVISE, not VETO
     SCORE_HARD_PENALTY = -1.0      # Was -1.5 → still too aggressive
@@ -444,7 +444,7 @@ class MicroTrendFilter:
         """
         Check micro-trend filter with all improvements.
         
-        🔥 FIX (Jan 22, 2026): Added conditional hard block for RANGE mode.
+        Added conditional hard block for RANGE mode.
         In RANGE + high strength + low ADX → hard block
         In TREND or high ADX → only penalty
         
@@ -658,7 +658,7 @@ class MicroTrendFilter:
         # 5.5 CONFLUENCE BOOST (Jan 15, 2026)
         # When multiple HIGH-WEIGHT signals align, apply a multiplier to strength.
         # This catches clear trends faster without waiting for hysteresis.
-        # 
+
         # BEARISH confluence: EMA cross + swing LL + (1m confirm OR negative slope)
         # BULLISH confluence: EMA cross + swing HL + (1m confirm OR positive slope)
         # =================================================================
@@ -787,7 +787,7 @@ class MicroTrendFilter:
         allowed = True
         reason = ""
         
-        # 🔥 FIX (Jan 22, 2026): Conditional hard block based on regime_mode
+        # Conditional hard block based on regime_mode
         # Hard block only if:
         # 1. Opposing with high strength
         # 2. State confirmed by hysteresis

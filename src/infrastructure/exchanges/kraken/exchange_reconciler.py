@@ -104,7 +104,7 @@ class ExchangeReconciler:
     
     # Configuration
     POLL_INTERVAL_MS = 500  # Poll exchange every 500ms in live
-    # 🔥 FIX (Jan 21, 2026): Increased from 1.5s to 15s to give exchange time to respond
+    # Increased from 1.5s to 15s to give exchange time to respond
     # The 1.5s timeout was too short and caused premature lock releases
     HARD_LOCK_DURATION_MS = 15000  # 15 seconds of protection (was 1.5s)
     BACKTEST_POLL_INTERVAL_MS = 0  # Instant in backtest
@@ -152,7 +152,7 @@ class ExchangeReconciler:
         self._state_changes = 0
         self._hard_locks_triggered = 0
         
-        # 🔥 FIX #3: Exchange availability tracking
+        # Exchange availability tracking
         self._consecutive_failures = 0
         self._last_successful_poll: Optional[datetime] = None
         self._exchange_available = True
@@ -223,7 +223,7 @@ class ExchangeReconciler:
         
         PRIORITY: Timeout is checked FIRST to ensure we never get stuck.
         
-        🔥 FIX (Jan 20, 2026): This property now ONLY checks state without side effects.
+        This property now ONLY checks state without side effects.
         The actual release happens in _check_and_release_hard_lock() which should
         be called once per reconcile cycle, not on every property access.
         """
@@ -247,7 +247,7 @@ class ExchangeReconciler:
         """
         Check if HARD_LOCK should be released and release it if so.
         
-        🔥 FIX (Jan 20, 2026): This method has side effects and should be called
+        This method has side effects and should be called
         ONCE per reconcile cycle, not from property accessors.
         
         Returns: True if lock was released, False otherwise
@@ -305,7 +305,7 @@ class ExchangeReconciler:
             return has_stop_orders
         
         # =====================================================================
-        # 🔒 FIX (Jan 13, 2026): EXIT_PENDING should release when position is flat
+        # 🔒 EXIT_PENDING should release when position is flat
         # This ensures we don't wait for timeout when exit already succeeded
         # =====================================================================
         if self._hard_lock_event == HardLockEvent.EXIT_PENDING:
@@ -313,7 +313,7 @@ class ExchangeReconciler:
             return not snapshot.has_position
         
         # =====================================================================
-        # 🔒 FIX (Jan 14, 2026): PARTIAL_CLOSE should release when size changes
+        # 🔒 PARTIAL_CLOSE should release when size changes
         # For partial closes, position won't be 0, so we release when size differs
         # =====================================================================
         if self._hard_lock_event == HardLockEvent.PARTIAL_CLOSE:
@@ -363,7 +363,7 @@ class ExchangeReconciler:
         1. Not in HARD_LOCK
         2. State is POSITION_OPEN (confirmed by exchange)
         """
-        # 🔥 FIX #3: Block ALL actions when exchange is unavailable
+        # Block ALL actions when exchange is unavailable
         if self._degraded_mode:
             return False, "DEGRADED_MODE: Exchange connection unstable - all trading blocked"
         
@@ -380,7 +380,7 @@ class ExchangeReconciler:
     
     def is_exchange_available(self) -> bool:
         """
-        🔥 FIX #3: Check if exchange data is reliable enough for trading decisions.
+        Check if exchange data is reliable enough for trading decisions.
         
         Returns False if:
         - Too many consecutive poll failures
@@ -451,7 +451,7 @@ class ExchangeReconciler:
         self._order_placed_time = datetime.now(UTC)
         
         # Event-based HARD_LOCK - released when position confirms
-        # 🔥 FIX (Jan 20, 2026): Increased timeout from 5s to 15s
+        # Increased timeout from 5s to 15s
         # Kraken API has significant lag (~60s sometimes) between order fill and position appearing
         # The 15s timeout allows for normal API delays while not blocking indefinitely
         self.enter_hard_lock(
@@ -491,7 +491,7 @@ class ExchangeReconciler:
         
         Released ONLY when position_size = 0 confirmed by exchange.
         """
-        # 🔥 FIX (Jan 20, 2026): Increased from 5s to 10s for exit operations
+        # Increased from 5s to 10s for exit operations
         self.enter_hard_lock(
             reason=reason,
             event=HardLockEvent.EXIT_PENDING,
@@ -541,20 +541,20 @@ class ExchangeReconciler:
             position_data = await self.execution.get_position(self._symbol)
             
             # =================================================================
-            # 🔒 FIX #264: API timeout/error must NOT be treated as "no position"
-            # 
+            # 🔒 API timeout/error must NOT be treated as "no position"
+
             # ROOT CAUSE: get_position() returns {'_timeout': True} or {'_error': ...}
             # on failure. This dict is truthy but has contracts=0, so the reconciler
             # interprets it as "position closed" → false POSITION_OPEN→IDLE transition
             # → records phantom PnL → state corruption.
-            #
+
             # FIX: If position_data contains error/timeout sentinels, skip this
             # reconcile cycle entirely and return last known good snapshot.
             # =================================================================
             if isinstance(position_data, dict) and ('_error' in position_data or '_timeout' in position_data):
                 error_type = 'timeout' if position_data.get('_timeout') else position_data.get('_error', 'unknown')
                 logger.warning(
-                    f"🔒 FIX #264: API returned error/timeout ({error_type}) - "
+                    f"🔒 API returned error/timeout ({error_type}) - "
                     f"SKIPPING reconcile to prevent false position close. "
                     f"Current state: {self._state.name}"
                 )
@@ -606,7 +606,7 @@ class ExchangeReconciler:
             
             # ============================================================
             # STEP 1.5: Check and release HARD_LOCK if conditions met
-            # 🔥 FIX (Jan 20, 2026): Call this once per reconcile, not in property
+            # Call this once per reconcile, not in property
             # ============================================================
             self._check_and_release_hard_lock()
             
@@ -636,7 +636,7 @@ class ExchangeReconciler:
                 self._confirmed_position_size = 0.0
                 self._confirmed_entry_price = 0.0
             
-            # 🔥 FIX #3: Mark exchange as available on successful poll
+            # Mark exchange as available on successful poll
             self._consecutive_failures = 0
             self._last_successful_poll = now
             if self._degraded_mode:
@@ -647,7 +647,7 @@ class ExchangeReconciler:
             return snapshot
             
         except Exception as e:
-            # 🔥 FIX #3: Track consecutive failures for degradation
+            # Track consecutive failures for degradation
             self._consecutive_failures += 1
             logger.error(f"Reconciler error ({self._consecutive_failures}/{self.MAX_CONSECUTIVE_FAILURES}): {e}")
             

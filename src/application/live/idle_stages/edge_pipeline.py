@@ -17,6 +17,7 @@ import pandas as pd
 
 from src.config.trading_config import HTFFilters, ADXThresholds
 from src.domain.trading.edge_state_manager import EdgeState, EdgeType, RangeEdgeCriteria
+from src.domain.trading.edge_types import TrendEdgePath
 from src.shared.indicators import (
     calculate_atr, calculate_adx, detect_swing_high, detect_swing_low,
     calculate_bollinger_bands,
@@ -220,13 +221,25 @@ def stage_edge_detection(engine: 'SignalEngine', ctx: IdleCtx) -> bool:
                     )
                     engine._current_trade_tags['edge_invalidated_by'] = 'direction_flip'
 
-    # ── Detect new edges (NO_EDGE state) ──
-    if engine._edge_manager.state == EdgeState.NO_EDGE:
+    # ── Detect new edges (NO_EDGE or EXPIRED state) ──
+    # Also detect in EXPIRED state.
+    # EXPIRED is transient and auto-resets to NO_EDGE via check_expiration(),
+    # but as safety net, allow detection here too to prevent deadlock.
+    if engine._edge_manager.state in [EdgeState.NO_EDGE, EdgeState.EDGE_EXPIRED]:
         _detect_new_edges(engine, ctx, has_anticipation_breakout, anticipation_direction)
 
-    # ── Pullback / breakout / displacement confirmation (EDGE_ARMED) ──
+    # ── Pullback / breakout / displacement / consensus confirmation (EDGE_ARMED) ──
     if engine._edge_manager.state == EdgeState.EDGE_ARMED:
-        _confirm_armed_edge(engine, ctx)
+        # First try consensus-specific confirmation (price must move in direction)
+        candles_1m_for_confirm = engine.market_data.get_candles('1m')
+        promoted = engine._edge_manager.confirm_consensus_armed(
+            current_price=ctx.price,
+            candles_1m=candles_1m_for_confirm,
+            market_time=ctx.time,
+        )
+        if not promoted:
+            # Fall back to standard confirmation (pullback, displacement, breakout)
+            _confirm_armed_edge(engine, ctx)
 
     # ── Store edge status in tags ──
     edge_status = engine._edge_manager.get_status()
@@ -477,9 +490,17 @@ def _try_range_edge(engine: 'SignalEngine', ctx: IdleCtx) -> bool:
 
 
 def _confirm_armed_edge(engine: 'SignalEngine', ctx: IdleCtx) -> None:
-    """Confirm an armed edge via pullback, displacement, or breakout."""
+    """Confirm an armed edge via pullback, displacement, or breakout.
+    
+    CONSENSUS edges are NOT handled here — they have their own promotion
+    path via confirm_consensus_armed() which requires strict price confirmation.
+    """
     current_bos = engine._edge_manager.current_bos
     if not current_bos:
+        return
+    
+    # CONSENSUS edges must only be promoted via confirm_consensus_armed()
+    if current_bos.trend_path == TrendEdgePath.CONSENSUS_DIRECT:
         return
 
     if current_bos.edge_type == EdgeType.DISPLACEMENT:

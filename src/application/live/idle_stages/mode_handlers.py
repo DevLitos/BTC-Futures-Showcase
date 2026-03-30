@@ -231,6 +231,12 @@ def _handle_range_mid(
 
         bypass_direction = engine._active_direction or engine._expansion_direction
         if bypass_direction:
+            # Even BYPASS must confirm price is moving in direction
+            price_confirms, _, confirm_reason = engine._price_confirms_direction(bypass_direction)
+            if not price_confirms:
+                if engine._idle_eval_count % 120 == 1:
+                    logger.warning(f"⚠️ RANGE BYPASS: {bypass_direction} BLOCKED BY PRICE | {confirm_reason}")
+                return True
             if engine._is_post_bias_flip_blocked(ctx.price, ctx.atr_1m):
                 return True
             macro_str = engine._current_bias_strength.value if engine._current_bias_strength else None
@@ -310,29 +316,10 @@ def _handle_range_mid(
     engine._current_trade_tags['range_mid_source'] = source
     engine._current_trade_tags['range_mid_confidence'] = confidence
 
-    # Structural range fallback
-    if direction is None and engine._structural_bias:
-        bias_aligns = (
-            (engine._structural_bias == 'SHORT' and pct_60d > 40.0) or
-            (engine._structural_bias == 'LONG' and pct_60d < 60.0)
-        )
-        if bias_aligns:
-            direction = engine._structural_bias
-            source = 'STRUCTURAL_RANGE_FALLBACK'
-            confidence = 0.50
-            engine._active_direction = direction
-            engine._active_direction_source = source
-            engine._active_direction_confidence = confidence
-            engine._current_trade_tags['range_mid_direction'] = direction
-            engine._current_trade_tags['range_mid_source'] = source
-            engine._current_trade_tags['range_size_mult'] = 0.30
-            if engine._idle_eval_count % 120 == 1:
-                logger.info(
-                    f"🔄 RANGE STRUCTURAL FALLBACK: {direction} at pct={pct_60d:.0f}% | "
-                    f"Structural={engine._structural_bias} aligns with range position | Size=30%"
-                )
+    # NO STRUCTURAL_RANGE_FALLBACK — coin flip signals eliminados.
+    # Si no hay dirección real, el bot ESPERA.
 
-    if direction and (source in ctx.core_sources or confidence >= 0.5):
+    if direction and (source in ctx.core_sources or confidence >= 0.60):
         # Range coherence guard
         if direction == 'SHORT' and pct_60d < 20.0:
             if engine._idle_eval_count % 120 == 1:
@@ -349,13 +336,18 @@ def _handle_range_mid(
                 )
             return True
 
-        price_confirms = True
-        confirm_reason = f"RANGE: {direction} at pct={pct_60d:.0f}% (extremes trusted)"
+        # Price MUST confirm direction before arming edge — no blind entries
+        price_confirms, price_change, confirm_reason = engine._price_confirms_direction(direction)
+        if not price_confirms:
+            if engine._idle_eval_count % 120 == 1:
+                logger.warning(f"⚠️ RANGE MID: {source} {direction} BLOCKED BY PRICE | {confirm_reason}")
+            engine._current_trade_tags['range_mid_reason'] = 'PRICE_CONTRADICTED'
+            return True
 
         if engine._idle_eval_count % 300 == 1:
             logger.info(
                 f"✅ RANGE MID: {source} | direction={direction} | conf={confidence:.0%} | "
-                f"price: {confirm_reason} | pct={pct_60d:.0f}% | Size=40% | TRADING"
+                f"{confirm_reason} | pct={pct_60d:.0f}% | Size=40% | TRADING"
             )
         engine._current_trade_tags['range_size_mult'] = 0.40
         engine._current_trade_tags['range_mid_reason'] = source
@@ -571,7 +563,8 @@ def stage_trend_mode(engine: 'SignalEngine', ctx: IdleCtx) -> bool:
             engine._edge_manager.current_bos.direction == direction
         )
 
-        if source not in ('DISPLACEMENT', 'EXPANSION_LOCK', 'DIRECTION_LOCK') and not edge_already_active:
+        # Price MUST confirm direction — NO bypasses except existing active edge
+        if not edge_already_active:
             price_confirms, price_change, confirm_reason = engine._price_confirms_direction(direction)
             if not price_confirms:
                 if engine._idle_eval_count % 120 == 1:

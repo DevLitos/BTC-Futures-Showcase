@@ -103,7 +103,7 @@ class ImportantLevelsProvider:
     """
     
     # Configuration
-    # 🔥 FIX (Jan 26, 2026): Reduced blocking thresholds
+    # Reduced blocking thresholds
     # Previous values (0.3 ATR / 15 bps) were causing too many rejections
     # The system was blocking trades when price was $100 away from a level
     # For intraday, this is too restrictive - levels are context, not gospel

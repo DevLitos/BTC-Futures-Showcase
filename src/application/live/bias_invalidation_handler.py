@@ -41,8 +41,8 @@ class BiasInvalidationConfig:
     max_threshold: float = 350.0  # Maximum $350 (lowered from $500)
     expansion_mult: float = 2.0  # Harder to invalidate during expansion
     direction_lock_mult: float = 1.5  # Harder during direction lock
-    hysteresis_ticks: int = 180  # Min ticks before clearing forbidden (FIX #89: was 120)
-    flip_cooldown_ticks: int = 300  # 🔥 FIX #168: Min ticks between same-direction flips (~5 min)
+    hysteresis_ticks: int = 180  # Min ticks before clearing forbidden (was 120)
+    flip_cooldown_ticks: int = 300  # Min ticks between same-direction flips (~5 min)
 
 
 @dataclass
@@ -99,7 +99,7 @@ class BiasInvalidationHandler:
     3. Protection during EXPANSION_MODE or DIRECTION_LOCK
     4. Structural confirmation required (price must break swing)
     5. Hysteresis prevents rapid oscillation
-    6. FIX #168: Cooldown between same-direction flips (prevents spam)
+    6. Cooldown between same-direction flips (prevents spam)
     """
     
     def __init__(self, config: Optional[BiasInvalidationConfig] = None):
@@ -107,7 +107,7 @@ class BiasInvalidationHandler:
         self.config = config or BiasInvalidationConfig()
         self._forbidden_set_at_tick: int = 0
         self._previous_forbidden: Optional[str] = None
-        # 🔥 FIX #168 (Feb 11, 2026): Track last flip per direction for cooldown
+        # Track last flip per direction for cooldown
         self._last_flip_tick_long: int = 0  # Last tick we flipped to FORBID LONG
         self._last_flip_tick_short: int = 0  # Last tick we flipped to FORBID SHORT
     
@@ -115,7 +115,8 @@ class BiasInvalidationHandler:
         self,
         atr_1m: float,
         expansion_mode: bool = False,
-        direction_lock: Optional[str] = None
+        direction_lock: Optional[str] = None,
+        macro_strength: Optional[str] = None
     ) -> tuple[float, str]:
         """
         Calculate invalidation threshold based on context.
@@ -133,6 +134,14 @@ class BiasInvalidationHandler:
         else:
             mult = 1.0
             reason = 'NORMAL'
+        
+        # In strong macro trends, require much larger bounce to flip bias.
+        # LOG EVIDENCE (Feb 23): 7+ BIAS FLIPs on $140-$277 bounces during
+        # BEAR_STRONG (ADX 35-49) in a $1,647 downtrend. Each flip cost 15-25 min.
+        # With 2.5x multiplier: threshold $300-$450 → prevents noise flips.
+        if macro_strength in ('BEAR_STRONG', 'BULL_STRONG'):
+            mult *= 2.5
+            reason = f'{reason}+STRONG_MACRO'
         
         threshold = atr_1m * self.config.base_atr_mult * mult
         threshold = max(self.config.min_threshold, 
@@ -158,7 +167,8 @@ class BiasInvalidationHandler:
         direction_lock_initial_move: float = 0.0,
         tick_count: int = 0,
         can_clear_forbidden: bool = False,
-        current_forbidden: Optional[str] = None
+        current_forbidden: Optional[str] = None,
+        macro_strength: Optional[str] = None
     ) -> BiasInvalidationResult:
         """
         Check if bias should be invalidated based on price movement.
@@ -197,7 +207,7 @@ class BiasInvalidationHandler:
         
         # Calculate threshold
         threshold, reason = self.calculate_threshold(
-            atr_1m, expansion_mode, direction_lock
+            atr_1m, expansion_mode, direction_lock, macro_strength
         )
         result.threshold_used = threshold
         
@@ -226,7 +236,7 @@ class BiasInvalidationHandler:
         else:
             if current_forbidden and can_clear_forbidden:
                 ticks_since = tick_count - self._forbidden_set_at_tick
-                # 🔥 FIX (Feb 05, 2026): Only log ONCE when actually clearing
+                # Only log ONCE when actually clearing
                 # The previous code logged every tick which spammed logs
                 if self._previous_forbidden and result.forbidden_direction is None:
                     # Actually clearing - log this
@@ -253,7 +263,7 @@ class BiasInvalidationHandler:
     ) -> BiasInvalidationResult:
         """Handle LONG bias invalidation."""
         
-        # 🔥 FIX (Feb 04, 2026): Use micro_swing if available for faster detection
+        # Use micro_swing if available for faster detection
         micro_swing_low = getattr(self, '_micro_swing_low', None)
         
         # Check structural confirmation
@@ -302,7 +312,7 @@ class BiasInvalidationHandler:
                 )
             return result
         
-        # 🔥 FIX #168 (Feb 11, 2026): Check cooldown before flipping
+        # Check cooldown before flipping
         ticks_since_last_flip = tick_count - self._last_flip_tick_long
         if self._last_flip_tick_long > 0 and ticks_since_last_flip < self.config.flip_cooldown_ticks:
             # Still in cooldown from recent flip to FORBID LONG
@@ -323,7 +333,7 @@ class BiasInvalidationHandler:
             f"and below {structure_type} ${structure_level:.0f}"
         )
         self._forbidden_set_at_tick = tick_count
-        self._last_flip_tick_long = tick_count  # 🔥 FIX #168: Track this flip
+        self._last_flip_tick_long = tick_count  # Track this flip
         
         # Save displacement memory (SHORT displacement caused the drop)
         if expansion_initial_displacement > 0 or direction_lock_initial_move > 0:
@@ -359,7 +369,7 @@ class BiasInvalidationHandler:
     ) -> BiasInvalidationResult:
         """Handle SHORT bias invalidation."""
         
-        # 🔥 FIX (Feb 04, 2026): Use micro_swing if available for faster detection
+        # Use micro_swing if available for faster detection
         # MICRO structure break: check 1m swing first (more responsive)
         # If micro structure is broken, consider overall structure broken
         micro_swing_high = getattr(self, '_micro_swing_high', None)
@@ -411,7 +421,7 @@ class BiasInvalidationHandler:
                 )
             return result
         
-        # 🔥 FIX #168 (Feb 11, 2026): Check cooldown before flipping
+        # Check cooldown before flipping
         ticks_since_last_flip = tick_count - self._last_flip_tick_short
         if self._last_flip_tick_short > 0 and ticks_since_last_flip < self.config.flip_cooldown_ticks:
             # Still in cooldown from recent flip to FORBID SHORT
@@ -432,7 +442,7 @@ class BiasInvalidationHandler:
             f"and above {structure_type} ${structure_level:.0f}"
         )
         self._forbidden_set_at_tick = tick_count
-        self._last_flip_tick_short = tick_count  # 🔥 FIX #168: Track this flip
+        self._last_flip_tick_short = tick_count  # Track this flip
         
         # Save displacement memory (LONG displacement caused the rise)
         if expansion_initial_displacement > 0 or direction_lock_initial_move > 0:

@@ -267,7 +267,7 @@ def log_regime_score_if_discrepancy(
     eval_count: int
 ) -> None:
     """Log when regime score differs from ADX-only mode."""
-    # 🔥 FIX #122: Throttle de 60 → 180 ticks para reducir spam
+    # Throttle de 60 → 180 ticks para reducir spam
     if regime_result.trading_mode != regime_result.adx_suggested_mode and eval_count % 180 == 1:
         logger.info(
             f"📊 REGIME SCORE: {regime_result.score:.2f} → {regime_result.trading_mode} | "

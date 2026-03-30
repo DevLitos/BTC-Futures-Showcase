@@ -39,11 +39,7 @@ from src.domain.market.filters.micro_trend_filter import MicroTrendFilter, get_m
 from src.domain.market.filters.spread_filter import SpreadFilter, get_spread_filter, check_spread_for_entry, SpreadCheckResult
 from src.domain.market.filters.cost_filter import CostFilter, get_cost_filter
 from src.domain.market.filters.overtrade_filter import OvertradeFilter, get_overtrade_filter
-from src.domain.market.filters.bb_width_filter import BBWidthFilter, get_bb_width_filter
 from src.domain.market.filters.volatility_shock_filter import VolatilityShockFilter, get_volatility_shock_filter
-from src.domain.market.filters.macro_trend_filter import MacroTrendFilter, get_macro_trend_filter
-from src.domain.market.filters.post_sweep_filter import PostSweepConfirmationFilter, get_post_sweep_filter
-from src.domain.market.filters.btc_correlation_filter import BTCCorrelationFilter, get_btc_correlation_filter
 
 __all__ = [
     # Core
@@ -79,14 +75,6 @@ __all__ = [
     'get_cost_filter',
     'OvertradeFilter',
     'get_overtrade_filter',
-    'BBWidthFilter',
-    'get_bb_width_filter',
     'VolatilityShockFilter',
     'get_volatility_shock_filter',
-    'MacroTrendFilter',
-    'get_macro_trend_filter',
-    'PostSweepConfirmationFilter',
-    'get_post_sweep_filter',
-    'BTCCorrelationFilter',
-    'get_btc_correlation_filter',
 ]

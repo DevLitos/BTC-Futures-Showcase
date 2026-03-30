@@ -32,7 +32,7 @@ class FundingRateMonitor:
         # Track last funding bucket to avoid log spam
         self._last_logged_bucket = None
         
-        # 🔒 FIX (Jan 13, 2026): Reusable HTTP session to prevent resource leaks
+        # Reusable HTTP session to prevent resource leaks
         self._session: Optional[aiohttp.ClientSession] = None
         
         # Check if exchange is supported

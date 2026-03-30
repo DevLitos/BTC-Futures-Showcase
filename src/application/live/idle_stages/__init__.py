@@ -11,9 +11,6 @@ from .mode_handlers import stage_range_mode, stage_transition_mode, stage_trend_
 from .edge_pipeline import stage_counter_trend_htf, stage_edge_detection
 from .evaluation_pipeline import (
     stage_location_filter,
-    stage_decision_center,
-    stage_regime_fusion,
-    stage_micro_trend,
     stage_filters_and_ltf,
     stage_finalize_entry,
 )
@@ -26,9 +23,6 @@ __all__ = [
     'stage_counter_trend_htf',
     'stage_edge_detection',
     'stage_location_filter',
-    'stage_decision_center',
-    'stage_regime_fusion',
-    'stage_micro_trend',
     'stage_filters_and_ltf',
     'stage_finalize_entry',
 ]

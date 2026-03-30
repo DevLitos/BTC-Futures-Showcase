@@ -72,13 +72,13 @@ class ActivityTracker:
     # We still track WTP exits for observability but don't block on them.
     
     # =========================================================================
-    # 🔥 FIX #10: HOT HAND SESSION LIMIT (Feb 02, 2026)
+    # HOT HAND SESSION LIMIT (Feb 02, 2026)
     # =========================================================================
     # Base limit = 3 trades per session (ALWAYS guaranteed)
     # After base is consumed:
     #   - If last trade was WIN: +1 trade allowed
     #   - If last trade was LOSS: session STOPPED
-    # 
+
     # Example:
     #   Trade 1: LOSS → OK (within base)
     #   Trade 2: LOSS → OK (within base)
@@ -101,20 +101,20 @@ class ActivityTracker:
         self._last_loss_time: Optional[datetime] = None
         self._pnl_today_r: float = 0.0
         
-        # 🔥 FIX #195: Idempotencia para record_trade_executed
+        # Idempotencia para record_trade_executed
         # Previene que timeouts en el loop causen conteo duplicado
         self._last_execution_recorded_time: Optional[datetime] = None
         self._execution_idempotency_window_seconds: int = 30  # Ignora llamadas duplicadas en 30s
         
-        # 🔥 FIX #10: Hot Hand - track last trade result
+        # Hot Hand - track last trade result
         self._last_trade_was_win: bool = False
         self._current_session: Optional[str] = None  # Track session for reset
         
-        # 🔥 FIX #82: Track session P&L for smarter session limits
+        # Track session P&L for smarter session limits
         self._session_pnl_r: float = 0.0  # P&L in R-multiples for current session
         self._session_pnl_usd: float = 0.0  # P&L in USD for current session
         
-        # 🔥 FIX #83: Track last trade details for session limit override
+        # Track last trade details for session limit override
         self._last_exit_reason: Optional[str] = None
         self._last_trade_pnl_r: Optional[float] = None
         
@@ -144,11 +144,11 @@ class ActivityTracker:
         Args:
             market_time: The time the trade was executed
             
-        🔥 FIX #195: IDEMPOTENCY GUARD
+        IDEMPOTENCY GUARD
         Si se llama múltiples veces en el mismo window (30s), ignora llamadas duplicadas.
         Esto previene el bug donde timeouts en el loop causan 8+ conteos para 1 trade.
         """
-        # 🔥 FIX #195: Idempotencia - ignorar llamadas duplicadas en ventana de 30s
+        # Idempotencia - ignorar llamadas duplicadas en ventana de 30s
         if self._last_execution_recorded_time is not None:
             seconds_since_last = (market_time - self._last_execution_recorded_time).total_seconds()
             if seconds_since_last < self._execution_idempotency_window_seconds:
@@ -213,10 +213,10 @@ class ActivityTracker:
         
         self._pnl_today_r += pnl_r
         
-        # 🔥 FIX #82: Track session P&L
+        # Track session P&L
         self._session_pnl_r += pnl_r
         
-        # 🔥 FIX #83: Track last trade details for session limit override
+        # Track last trade details for session limit override
         self._last_exit_reason = exit_reason
         self._last_trade_pnl_r = pnl_r
         
@@ -238,7 +238,7 @@ class ActivityTracker:
             self._losses_today += 1
             self._last_loss_time = market_time
             
-            # 🔥 FIX #10: Track last trade result
+            # Track last trade result
             self._last_trade_was_win = False
             
             if is_wtp:
@@ -263,7 +263,7 @@ class ActivityTracker:
             self._consecutive_losses = 0
             self._wins_today += 1
             
-            # 🔥 FIX #10: Track last trade result - enables Hot Hand bonus
+            # Track last trade result - enables Hot Hand bonus
             self._last_trade_was_win = True
             logger.info(
                 f"🔥 HOT HAND: Last trade was WIN | "
@@ -284,7 +284,7 @@ class ActivityTracker:
     
     def last_trade_was_win(self) -> bool:
         """
-        🔥 FIX #10: Check if last trade was a win.
+        Check if last trade was a win.
         
         Used by Hot Hand system to determine if bonus trade is allowed
         after base limit is consumed.
@@ -296,7 +296,7 @@ class ActivityTracker:
     
     def get_session_pnl_r(self) -> float:
         """
-        🔥 FIX #82: Get session P&L in R-multiples.
+        Get session P&L in R-multiples.
         
         Used to override Hot Hand stop when session is profitable.
         
@@ -307,7 +307,7 @@ class ActivityTracker:
     
     def get_last_exit_reason(self) -> Optional[str]:
         """
-        🔥 FIX #83: Get last trade exit reason.
+        Get last trade exit reason.
         
         Used to allow trades after administrative exits (EARLY_MFE, WTP).
         
@@ -318,7 +318,7 @@ class ActivityTracker:
     
     def get_last_trade_pnl_r(self) -> Optional[float]:
         """
-        🔥 FIX #83: Get last trade P&L in R-multiples.
+        Get last trade P&L in R-multiples.
         
         Used to allow trades after small losses.
         
@@ -329,7 +329,7 @@ class ActivityTracker:
     
     def set_session_pnl_usd(self, pnl_usd: float) -> None:
         """
-        🔥 FIX #82: Set session P&L in USD (from external source).
+        Set session P&L in USD (from external source).
         
         Args:
             pnl_usd: Session P&L in USD
@@ -338,7 +338,7 @@ class ActivityTracker:
     
     def get_session_pnl_usd(self) -> float:
         """
-        🔥 FIX #82: Get session P&L in USD.
+        Get session P&L in USD.
         
         Returns:
             Session P&L in USD
@@ -347,7 +347,7 @@ class ActivityTracker:
     
     def session_is_profitable(self, min_r: float = 0.5) -> bool:
         """
-        🔥 FIX #82: Check if session has minimum profit to override Hot Hand stop.
+        Check if session has minimum profit to override Hot Hand stop.
         
         Args:
             min_r: Minimum R-multiple profit required (default 0.5R)
@@ -438,7 +438,7 @@ class ActivityTracker:
     
     def reset_session_state(self, session_name: str) -> None:
         """
-        🔥 FIX #10: Reset session state when session changes.
+        Reset session state when session changes.
         
         Called when trading session changes (e.g., ASIA → LONDON)
         to reset the Hot Hand state.
@@ -451,7 +451,7 @@ class ActivityTracker:
             # 🔥 PASO 1: Reconciliar antes de resetear
             self.reconcile_session_pnl()
             
-            # 🔥 FIX #82: Reset session P&L on session change
+            # Reset session P&L on session change
             old_pnl = self._session_pnl_r
             self._session_pnl_r = 0.0
             self._session_pnl_usd = 0.0

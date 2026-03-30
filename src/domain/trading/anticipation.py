@@ -56,7 +56,7 @@ class AnticipationState:
     expected_target: float = 0.0
     time_valid_until: Optional[datetime] = None
     reasons: List[str] | None = None
-    # 🔥 FIX #29 (Feb 04): Store structure level for breakout trigger
+    # Store structure level for breakout trigger
     structure_level: float = 0.0  # The level from "Building X from Y"
     
     def __post_init__(self):
@@ -82,7 +82,7 @@ class AnticipationEngine:
     """
     
     # Thresholds
-    # 🔥 FIX #60 (Feb 06): Use centralized ADXThresholds
+    # Use centralized ADXThresholds
     from src.config.trading_config import ADXThresholds
     
     BB_SQUEEZE_PERCENTILE = 20  # Width below this = squeezed
@@ -135,13 +135,13 @@ class AnticipationEngine:
         else:
             # Not enough history, use simple comparison
             avg_width = np.mean(width_pct[-50:])
-            # 🔥 FIX (Jan 22, 2026): Safe division with guard
+            # Safe division with guard
             if avg_width > 0 and not np.isnan(avg_width):
                 percentile = (current_width / avg_width) * 50
             else:
                 percentile = 50  # Neutral if no valid average
         
-        # 🔥 FIX (Jan 22, 2026): Guard against NaN current_width
+        # Guard against NaN current_width
         if np.isnan(current_width):
             return False, 0.0, "Invalid BB width (NaN)"
         
@@ -172,7 +172,7 @@ class AnticipationEngine:
         current_adx = adx[-1]
         adx_5_ago = adx[-5]
         
-        # 🔥 FIX (Jan 22, 2026): Guard against NaN ADX values
+        # Guard against NaN ADX values
         if np.isnan(current_adx) or np.isnan(adx_5_ago):
             return False, 0.0, "ADX values contain NaN"
         
@@ -386,7 +386,7 @@ class AnticipationEngine:
             direction = 'LONG' if closes[-1] > closes[0] else 'SHORT'
         
         # Calculate entry/SL/target
-        # 🔥 FIX (Jan 22, 2026): Tight SL for anticipation - if no structure, use 0.6*ATR
+        # Tight SL for anticipation - if no structure, use 0.6*ATR
         # This enforces "if no breakout soon, exit quickly" thesis
         closes = df_5m['close'].to_numpy()
         ema20 = pd.Series(closes).ewm(span=20, adjust=False).mean().iloc[-1]
@@ -460,10 +460,10 @@ class AnticipationEngine:
             expected_target=target,
             time_valid_until=valid_until,
             reasons=reasons,
-            structure_level=base_level if has_structure else 0.0  # 🔥 FIX #29: Store for trigger
+            structure_level=base_level if has_structure else 0.0  # Store for trigger
         )
         
-        # 🔥 FIX (Feb 02, 2026): REMOVED duplicate log here - already logged in idle_state_handlers
+        # REMOVED duplicate log here - already logged in idle_state_handlers
         # The previous log caused duplicate "ANTICIPATION" messages in logs
         # if signal_type != AnticipationSignal.NONE:
         #     logger.info(f"🔮 ANTICIPATION: {signal_type.value} {direction} | conf={confidence:.0%}")
@@ -477,11 +477,11 @@ class AnticipationEngine:
         return self._last_state
 
     # =========================================================================
-    # 🔥 FIX #58 (Feb 06, 2026): MÉTODOS ADICIONALES DE ANTICIPACIÓN
-    # 
+    # MÉTODOS ADICIONALES DE ANTICIPACIÓN
+
     # El método evaluate() original detecta COMPRESSION_BREAKOUT.
     # Estos métodos complementarios detectan otros patrones PRE-MOVE:
-    # 
+
     # 1. TREND_PULLBACK - Pullback a EMA en tendencia fuerte
     # 2. FAILED_TEST - Rechazo de nivel clave → reversión
     # 3. DIVERGENCE - RSI divergence → agotamiento

@@ -213,7 +213,7 @@ class TrendExpansionDetector:
     
     def __init__(self, config: TrendExpansionConfig | None = None):
         self.config = config or TrendExpansionConfig()
-        # 🔥 FIX #41: Track last log time to prevent spam
+        # Track last log time to prevent spam
         self._last_expansion_log: datetime | None = None
         self._log_interval = timedelta(minutes=2)
     
@@ -253,7 +253,7 @@ class TrendExpansionDetector:
             criteria_count = sum(criteria_met.values())
             is_expanding = criteria_count >= self.config.MIN_CRITERIA_FOR_EXPANSION
             
-            # 🔥 FIX #41: Rate limit expansion log to prevent spam
+            # Rate limit expansion log to prevent spam
             if is_expanding:
                 now = datetime.utcnow()
                 should_log = (

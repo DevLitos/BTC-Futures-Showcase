@@ -426,7 +426,7 @@ def record_error_sync(source: str, message: str,
     import asyncio
     try:
         loop = asyncio.get_running_loop()
-        # 🔥 FIX (Jan 21, 2026): Track task properly to prevent GC and enable exception handling
+        # Track task properly to prevent GC and enable exception handling
         # If we're in an async context, create task but return False immediately
         # The error will be recorded asynchronously
         task = asyncio.create_task(

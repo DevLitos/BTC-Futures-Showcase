@@ -1173,17 +1173,20 @@ class TradingSystemOrchestrator:
                     self.health_bridge_writer.update_extra_data(extra_health_data)
                 logger.debug("📊 [MON] health_bridge_writer done")
                 
-                # 🔥 NEW (Jan 28, 2026): Balance info in 5min report
+                # 🔥 FIX #306 (Feb 23, 2026): Session PnL from SignalEngine's startup balance
+                # ROOT CAUSE: main.py lazily set its own _session_start_capital 15min after
+                # startup, by which time trades may have already changed the balance.
+                # FIX: Use SignalEngine._session_start_capital which is set at boot from
+                # the exchange balance BEFORE any trades happen.
                 try:
                     if self.signal_engine and self.signal_engine.risk_engine:
                         current_capital = self.signal_engine.risk_engine.capital
                         
-                        # Track session start capital (first report sets baseline)
-                        if not hasattr(self, '_session_start_capital'):
-                            self._session_start_capital = current_capital
+                        # Use SignalEngine's startup balance (set at boot, before trades)
+                        session_start = getattr(self.signal_engine, '_session_start_capital', None) or current_capital
                         
-                        session_pnl = current_capital - self._session_start_capital
-                        session_pnl_pct = (session_pnl / self._session_start_capital * 100) if self._session_start_capital > 0 else 0
+                        session_pnl = current_capital - session_start
+                        session_pnl_pct = (session_pnl / session_start * 100) if session_start > 0 else 0
                         
                         pnl_emoji = "📈" if session_pnl >= 0 else "📉"
                         logger.info(

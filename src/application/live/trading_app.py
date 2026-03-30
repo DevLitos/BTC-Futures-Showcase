@@ -31,14 +31,14 @@ from src.shared.indicators import (
     calculate_adx_with_di
 )
 from src.config.trading_config import HTFFilters, OperatingMode
-from src.config.trading_config import DailyRegimeDetector  # 🔥 FIX (Jan 23): Daily regime classification
-from src.domain.market.regime import EdgeRegimeClassifier, RegimeDetector, EntryRegime  # 🔥 REMOVED Feb 04: calculate_chase_atr - unused
+from src.config.trading_config import DailyRegimeDetector  # Daily regime classification
+from src.domain.market.regime import EdgeRegimeClassifier, RegimeDetector, EntryRegime  # REMOVED Feb 04: calculate_chase_atr - unused
 from src.domain.market.regime import TrendPhase, get_trend_intelligence
 from src.domain.trading.edge.edge_enforcement import EdgeEnforcement
 from src.domain.trading.edge.edge_validator import ContextValidity
 from src.infrastructure.monitoring.error_tracker import get_error_tracker, ErrorSeverity
 from src.infrastructure.monitoring.system_health import SystemHealthMonitor
-from src.infrastructure.exchanges.kraken.exchange_reconciler import ExchangeReconciler  # 🔥 REMOVED Feb 04: ReconcilerState - unused
+from src.infrastructure.exchanges.kraken.exchange_reconciler import ExchangeReconciler  # REMOVED Feb 04: ReconcilerState - unused
 from src.domain.market.structure.important_levels import (
     ImportantLevelsProvider, get_important_levels_provider,
     LevelContext
@@ -51,13 +51,13 @@ from src.domain.trading.strategy.pullback_short import (
 from src.config.trading_config import PullbackShortConfig
 
 # NEW: Bias Strength & Trend Expansion configs (Jan 22, 2026)
-# 🔥 FIX #76 (Feb 07, 2026): Added WorkingBias for preference-based trading
+# WorkingBias for preference-based trading
 from src.config.trading_config import (
     BiasStrength, BiasStrengthConfig, TrendExpansionConfig, WorkingBias
     # 🔥 REMOVED Feb 04: ShortObstinacyConfig - unused
 )
 
-# 🔥 FIX #83 (Feb 07, 2026): 3-Layer Regime Fusion Architecture
+# 3-Layer Regime Fusion Architecture
 from src.domain.market.regime.regime_fusion import RegimeFusion, TradeDecision
 
 # NEW: Anticipation & Exhaustion engines (Jan 22, 2026)
@@ -91,7 +91,7 @@ from src.domain.trading.scoring import get_entry_scorer
 # Extracted helper modules (Jan 20, 2026 - Phase 4 refactoring)
 # 🔥 CLEANED Feb 04: Removed 4 unused imports (_check_trend_pure, _check_volatility_expansion_pure, 
 #                    _check_anti_reversal_pure, _check_volume_delta_pure)
-# 🔥 FIX #127 (Feb 09, 2026): Unified BOS detection - use position_manager version
+# Unified BOS detection - use position_manager version
 from src.application.live.position_manager import (
     check_bos_against_position as _check_bos_unified,
 )
@@ -331,7 +331,7 @@ class SignalEngine:
         self.kill_filter = KillConditionsFilter(self.state_machine, capital=0.0, risk_engine=self.risk_engine, backtest_mode=self._is_backtest)
         self.black_swan_filter = BlackSwanFilter()
         self.htf_filter = HTFFilter(backtest_mode=self._is_backtest)
-        # self.mtf_filter = MTFStructureFilter()  # REMOVED (FIX #1: Enable earlier entries)
+        # self.mtf_filter = MTFStructureFilter()  # REMOVED (arlier entries)
         self.ltf_filter = LTFTriggerFilter(backtest_mode=self._is_backtest)
         
         # Location filter - macro context veto (prevents buying tops in RANGE)
@@ -342,7 +342,7 @@ class SignalEngine:
         # MICRO TREND FILTER - Prevents LONGs during micro-bearish trends
         # Detects when 5m structure is bearish even if 1h is bullish
         # =====================================================================
-        # 🔥 FIX (Jan 22, 2026): Disable hard_block - only penalize score
+        # Disable hard_block — only penalize score
         # Hard blocking on micro structure kills too many good trades
         # BTC does LL/LH constantly during trends, doesn't mean reversal
         self.micro_trend_filter = get_micro_trend_filter(hard_block_enabled=False)
@@ -374,14 +374,10 @@ class SignalEngine:
         self.cooldown_manager = get_cooldown_manager()
 
         # =====================================================================
-        # ENTRY FILTER PIPELINE (Jan 15, 2026) - Unified filter evaluation
-        # Combines: BB Width, Volatility Shock, Macro Trend, Post-Sweep, Cost, Overtrade
+        # ENTRY FILTER PIPELINE — 3 active filters: volatility_shock, cost, overtrade
         # =====================================================================
         self.filter_pipeline = get_entry_filter_pipeline(
-            bb_width_enabled=True,
             volatility_shock_enabled=True,
-            macro_trend_enabled=True,
-            post_sweep_enabled=True,
             cost_filter_enabled=True,
             overtrade_enabled=True
         )
@@ -392,7 +388,7 @@ class SignalEngine:
         # =====================================================================
         self.pullback_short_engine = get_pullback_short_engine()
         self._current_trade_type: TradeType = TradeType.LONG_MAIN  # Default
-        self._current_trade_regime: str = 'RANGE'  # 🔥 FIX (Jan 22): Track regime for trailing stop
+        self._current_trade_regime: str = 'RANGE'  # Track regime for trailing stop
         
         # =====================================================================
         # 🔥 DAILY REGIME DETECTOR (Jan 23, 2026) - IMPRESCINDIBLE
@@ -410,7 +406,7 @@ class SignalEngine:
         # =====================================================================
         self._trend_intelligence = get_trend_intelligence()
         self._trend_phase: TrendPhase = TrendPhase.RANGE_BOUND
-        self._trend_direction_from_ti: str | None = None  # 🔥 FIX #222: Track trend direction
+        self._trend_direction_from_ti: str | None = None  # Track trend direction
         self._trend_last_update: datetime | None = None
         
         # Regime classifier for volume-aware filtering
@@ -456,16 +452,16 @@ class SignalEngine:
         
         # =====================================================================
         # 🎯 EDGE STATE MANAGER (Jan 27, 2026) - Edge como EVENTO DISCRETO
-        # 
+
         # Filosofía: El sistema NO busca entradas continuamente.
         # Solo opera cuando hay un EDGE ACTIVO.
-        # 
+
         # Estados:
         #   NO_EDGE: Sin oportunidad - NO SE EVALUA NADA
         #   EDGE_ARMED: BOS detectado, esperando pullback
         #   EDGE_ACTIVE: Pullback válido, ventana de entrada abierta
         #   EDGE_EXPIRED: Oportunidad consumida o expirada
-        # 
+
         # Reglas:
         #   - Máximo 2 trades por edge event
         #   - Edge expira después de X minutos sin ejecución
@@ -500,7 +496,7 @@ class SignalEngine:
         self.entry_order_time: datetime | None = None
         
         # STATE MACHINE para evitar busy loops
-        # 🔥 FIX: Type annotation to allow str values
+        # Type annotation to allow str values
         self.setup_state: str | None = None  # IDLE, WAIT_LTF, EXECUTING
         self.setup_start_time: datetime | None = None  # Cuándo entró en WAIT_LTF
         self.ltf_wait_timeout = 5 * 60  # 5 minutos (300s) = ~5 candles 1m
@@ -512,7 +508,7 @@ class SignalEngine:
         self._stops_set = False  # Flag para evitar intentar establecer SL/TP múltiples veces
         self._sync_lock = asyncio.Lock()  # 🔥 AUDIT FIX: Proper async lock for sync operations
         self._syncing_position = False  # Track if sync is in progress
-        # 🔥 FIX (Jan 23, 2026): Force BOS check after orphan recovery
+        # Force BOS check after orphan recovery
         self._force_bos_check_on_orphan = False  # Check BOS immediately after orphan sync
         
         # =====================================================================
@@ -520,7 +516,7 @@ class SignalEngine:
         # These were previously initialized via hasattr() checks - now explicit
         # =====================================================================
         self._last_entry_data = None  # Entry data for current trade
-        # 🔥 FIX: Add type annotations for datetime | None attributes
+        # Add type annotations for datetime | None attributes
         self._last_exchange_sync: datetime | None = None  # Last time we synced with exchange
         self._consecutive_post_only_rejects = 0  # Track post-only rejections
         self._recent_trade_prices = []  # Recent trade prices for analysis
@@ -540,13 +536,13 @@ class SignalEngine:
         self._last_pullback_block_log: datetime | None = None  # Rate limit pullback block logs
         self._loss_exit_types = {}  # Track loss exit types for analysis (dict not list!)
         
-        # 🔥 FIX #41: Rate limiting for repetitive state logs
+        # Rate limiting for repetitive state logs
         self._last_countertrend_log: datetime | None = None  # Rate limit countertrend logs
         self._last_antifade_log: datetime | None = None  # Rate limit anti-fade logs
         self._last_edge_state_log: str | None = None  # Last edge state string (only log on change)
         self._log_rate_limit_interval = timedelta(minutes=2)  # Default rate limit interval
         
-        # 🔧 FIX #129 (Feb 09, 2026): Throttle repetitive evaluation logs
+        # Throttle repetitive evaluation logs
         self._last_vol_divergence_log: datetime | None = None  # Rate limit VOLUME DIVERGENCE logs
         
         # =====================================================================
@@ -571,16 +567,16 @@ class SignalEngine:
         
         # =====================================================================
         # LOSS STREAK COOLDOWN - Protection against chop regimes
-        # 
-        # FIX (Jan 22, 2026): Punto 3 - Loss cooldown was too aggressive
+
+        # Punto 3 - Loss cooldown was too aggressive
         # PROBLEM: 2 losses triggered 30min cooldown - this is normal variance
         # SOLUTION: Tiered cooldown with higher thresholds:
         #   - 3 consecutive losses → 15 min cooldown (tier 1)
         #   - 4 consecutive losses → 60 min cooldown (tier 2)
         #   - 5 consecutive losses → 180 min cooldown (tier 3)
         #   - 6 consecutive losses → KILL SWITCH (daily)
-        # 
-        # 🔥 FIX (Jan 25, 2026): Enhanced auto kill-switch + dead hours tracking
+
+        # Enhanced auto kill-switch + dead hours tracking
         # =====================================================================
         self._consecutive_losses = 0  # Tracks consecutive SL hits
         self._cooldown_until = None  # Timestamp when cooldown ends
@@ -679,26 +675,26 @@ class SignalEngine:
         self._htf_cache_passed: bool = False  # Resultado cacheado
         self._htf_cache_bias: str | None = None  # 'LONG', 'SHORT', None
         self._htf_cache_reason: str = ""  # Razón del resultado
-        # 🔥 FIX (Jan 23, 2026): Cache HTF regime mode based on ADX
+        # Cache HTF regime mode based on ADX
         self._htf_cache_regime_mode: str = 'UNKNOWN'  # 'RANGE', 'WEAK_TREND', 'TREND', 'LOW_ADX'
         self._htf_cache_adx: float = 0.0  # ADX value for logging
         
         # =====================================================================
-        # 🔥 BIAS ARCHITECTURE FIX (Jan 28, 2026) - Separar conceptos
-        #
+        # BIAS ARCHITECTURE - Separar conceptos
+
         # STRUCTURAL_BIAS: Derivado de HTF (1h, daily)
         #   - Sirve para sizing y evitar contra-tendencia fuerte
         #   - NO bloquea trades
         #   - Valores: 'LONG' / 'SHORT' / None
-        #
+
         # ACTIVE_DIRECTION: Derivado de momentum/displacement
         #   - Sirve para decidir qué buscar AHORA
         #   - Valores: 'LONG' / 'SHORT' (NUNCA None/NEUTRAL)
         #   - Si no hay edge → NO_EDGE pero no NEUTRAL
-        #
+
         # FORBIDDEN_DIRECTION: Dirección bloqueada por invalidación
         #   - Si LONG invalidado → forbidden='LONG', pero SHORT aún permitido
-        #
+
         # 🔄 DEPRECATED Feb 04: Use DirectionStateManager.state instead
         # These variables are kept for backward compatibility but should be
         # accessed via self.direction_manager.state.* for consistency.
@@ -706,7 +702,7 @@ class SignalEngine:
         # =====================================================================
         self._structural_bias: str | None = None  # HTF bias (doesn't block trades)
         self._active_direction: str | None = None  # Current momentum direction
-        self._active_direction_source: str = 'NONE'  # 🔥 FIX #275: Track winning signal source
+        self._active_direction_source: str = 'NONE'  # Track winning signal source
         self._active_direction_confidence: float = 0.0  # 🔥 REFACTOR: Track orchestrator confidence
         self._forbidden_direction: str | None = None  # Direction blocked by invalidation
         self._displacement_bypass: bool = False  # Bypass filters due to strong displacement
@@ -718,12 +714,12 @@ class SignalEngine:
         
         # =====================================================================
         # 🔥 EXPANSION MODE (Jan 29, 2026) - Estado explícito para mercado en expansión
-        #
+
         # Cuando el mercado está en EXPANSION:
         # - forbidden_direction SUSPENDIDO (no ignorado permanentemente)
         # - BIAS FLIP threshold ALTO (3x normal)
         # - Solo se invalida por: displacement opuesto, estructura HTF, o timeout
-        #
+
         # Esto evita que pequeños rebotes invaliden trades durante tendencias fuertes
         # =====================================================================
         self._expansion_mode: bool = False  # Estado de mercado en expansión
@@ -733,7 +729,7 @@ class SignalEngine:
         self._last_trade_exit_time: datetime | None = None  # FIX: Displacement consumed after exit
         self._last_trade_direction: str | None = None  # Track direction of last closed trade
         # 🌊 BE WATER: Timeout ADAPTATIVO basado en volatilidad
-        # 🔥 FIX #19 (Feb 02, 2026): Reducido de 45 a 20 min base
+        # Reduced from 45 to 20 min base
         # El sistema quedaba bloqueado demasiado tiempo cuando el mercado revertía
         self._expansion_timeout_base: int = 20  # Base timeout (was 45)
         self._expansion_timeout_minutes: int = 20  # Actual (recalculado dinámicamente)
@@ -741,7 +737,7 @@ class SignalEngine:
         
         # =====================================================================
         # 🔥 REGIME BLOCK TRACKING (Feb 05, 2026) - Coordinación con DEFENSIVE MODE
-        #
+
         # Cuando hay un regime block activo (RANGE sin extremo, etc.), el sistema
         # NO debe activar DEFENSIVE MODE ya que sería redundante.
         # Estos atributos trackean el estado del bloqueo de régimen.
@@ -751,17 +747,17 @@ class SignalEngine:
         
         # =====================================================================
         # 🔥 DIRECTION LOCK (Jan 29, 2026) - Lock direccional post-DISPLACEMENT
-        # 
+
         # Separación OBLIGATORIA: MarketBias ≠ TradePermission
         # - MarketBias: puede cambiar libremente (SHORT/LONG/NEUTRAL)
         # - TradePermission: solo cambia con reglas duras (ALLOW/BLOCK)
         # - DirectionLock: bloquea cambios de dirección tras displacement
-        #
+
         # Durante LOCK:
         # ❌ No bias flip
         # ❌ No forbid por retrocesos pequeños
         # ✅ Solo invalidación MAYOR (3x displacement inicial)
-        #
+
         # 🔄 DEPRECATED Feb 04: Use DirectionStateManager.state.direction_lock*
         # These variables are kept for backward compatibility.
         # =====================================================================
@@ -770,12 +766,12 @@ class SignalEngine:
         self._direction_lock_expires_at: datetime | None = None  # Cuando expira el lock
         self._direction_lock_initial_move: float = 0.0  # Movimiento que causó el lock
         # 🌊 BE WATER: Lock timeout ADAPTATIVO
-        # 🔥 FIX #19 (Feb 02, 2026): Reducido de 30 a 15 min base
+        # Reduced from 30 to 15 min base
         self._direction_lock_timeout_base: int = 15  # Base timeout (was 30)
         self._direction_lock_timeout_minutes: int = 15  # Actual (recalculado)
         
         # 🌊 BE WATER: Invalidación asimétrica ADAPTATIVA por régimen
-        # 🔥 FIX #19 (Feb 02, 2026): Reducido de 3.0x a 2.0x base
+        # Reduced from 3.0x to 2.0x base
         # RANGE: 1.5x (más fácil invalidar - micro moves importan)
         # TREND: 2.0x (normal)
         # EXPANSION: 2.5x (más difícil - pero no imposible)
@@ -788,13 +784,13 @@ class SignalEngine:
         
         # =====================================================================
         # 🧠 DISPLACEMENT MEMORY (Fix #20 - Feb 03, 2026)
-        # 
+
         # PROBLEMA DETECTADO:
         # - Displacement SHORT detectado @ 04:22:02 ($292 move)
         # - Precio sube $197 → BIAS FLIP invalida displacement @ 04:24:02
         # - SHORT OBSTINACY bloquea 14 señales → MISSED +11R
         # - Pero los indicadores (VWAP, EMA) son LAGGING - tardan en actualizar
-        #
+
         # SOLUCIÓN: "Displacement Memory"
         # - Cuando displacement se invalida, guardar memoria de que HUBO uno reciente
         # - Durante X minutos, el OBSTINACY pasa a modo SOFT (no HARD BLOCK)
@@ -879,7 +875,7 @@ class SignalEngine:
         
         # =====================================================================
         # LAST SENT SL TRACKING for exchange updates (Jan 16, 2026)
-        # 🔥 FIX #294 (Feb 18, 2026): Added trailing sync failure tracking
+        # Added trailing sync failure tracking
         # =====================================================================
         self._last_sent_sl: float = 0.0
         self._trailing_sync_failures: int = 0
@@ -887,17 +883,17 @@ class SignalEngine:
         
         # =====================================================================
         # NEW: BIAS STRENGTH & TREND EXPANSION SYSTEM (Jan 22, 2026)
-        # 🔥 FIX #76 (Feb 07, 2026): Added working_bias for preference-based trading
-        # 🔥 FIX #83 (Feb 07, 2026): 3-Layer Regime Fusion Architecture
+        # Working bias for preference-based trading
+        # 3-Layer Regime Fusion Architecture
         # =====================================================================
         self._current_bias_strength: 'BiasStrength | None' = None  # MACRO: BULL_STRONG, BEAR_STRONG, NEUTRAL
-        self._working_bias: 'WorkingBias' = WorkingBias.BOTH  # 🔥 FIX #76: WORKING: LONG_PREF, SHORT_PREF, BOTH
+        self._working_bias: 'WorkingBias' = WorkingBias.BOTH  # WORKING: LONG_PREF, SHORT_PREF, BOTH
         
-        # 🔥 FIX #83: 3-Layer Regime Fusion (MACRO + MICRO = TradeDecision)
+        # 3-Layer Regime Fusion (MACRO + MICRO = TradeDecision)
         self._regime_fusion = RegimeFusion()
         self._last_regime_decision: TradeDecision | None = None
         self._last_logged_macro_regime = None  # For change detection logging
-        self._is_bullish_structure: bool | None = None  # 🔥 FIX #70d: True if price > EMA50_1h
+        self._is_bullish_structure: bool | None = None  # True if price > EMA50_1h
         self._trend_expansion_active: bool = False
         self._trend_expansion_start_time: datetime | None = None
         self._anti_fade_until: datetime | None = None  # No counter-trend until this time
@@ -912,18 +908,18 @@ class SignalEngine:
         self._df_1m_micro: pd.DataFrame | None = None
         
         # =========================================================================
-        # 🔥 FIX #37 (Feb 05, 2026): OBSTINACY BLOCK COUNTER
+        # OBSTINACY BLOCK COUNTER
         # When SHORT_OBSTINACY blocks 3+ times consecutively, invalidate edge
         # to allow direction change. Prevents stuck SHORT edge in bullish market.
         # =========================================================================
         self._obstinacy_block_count: int = 0
         
         # =========================================================================
-        # 🔥 FIX #109 (Feb 09, 2026): TRANSITION_MODE
-        # 
+        # TRANSITION_MODE
+
         # PROBLEMA: Después de BIAS_FLIP o DISPLACEMENT, el sistema aplica
         # demasiados penalties (volume, correlation, fade) que matan el edge.
-        # 
+
         # SOLUCIÓN: Activar TRANSITION_MODE por 15 min post-transición:
         # - Durante este modo, el floor de penalties sube de 50% a 70%
         # - Permite capturar el edge de la transición sin sobre-filtrar
@@ -934,30 +930,30 @@ class SignalEngine:
         self._transition_mode_duration_minutes: int = 15
         
         # =========================================================================
-        # 🔥 FIX #260: POST-BIAS-FLIP STABILIZATION COOLDOWN
+        # POST-BIAS-FLIP STABILIZATION COOLDOWN
         # After BIAS FLIP, block edge creation for 2.5 minutes or until price
         # pulls back 2.0×ATR. Prevents entering at extremes right after flip.
         # =========================================================================
         self._post_bias_flip_cooldown_until: datetime | None = None
         self._post_bias_flip_price: float = 0.0
         
-        # 🔥 FIX #299: BIAS_RECOVERY window after BIAS RESTORED
+        # BIAS_RECOVERY window after BIAS RESTORED
         # HTF_BIAS_ALONE veto makes direction=None when only STRUCTURAL_BIAS exists.
         # After BIAS RESTORED, the bias is FRESH (just confirmed by price), not stale.
         # Keep recovery active for 10min to override the veto.
         self._bias_recovery_until: datetime | None = None
         
-        # 🔥 FIX #284: Track whether edge was cleared on OBSERVATION entry
+        # Track whether edge was cleared on OBSERVATION entry
         self._observation_edge_cleared: bool = False
         
         # =========================================================================
         # 🔥 NEW (Jan 26, 2026): FALSE EXPANSION TRACKING
-        # 
+
         # A "false expansion" is when:
         # - Expansion was detected (4/4 criteria)
         # - Trade entered
         # - MFE < 0.3R AND stop hit
-        # 
+
         # This tracks detector quality, NOT entry quality.
         # High false expansion rate = detector needs recalibration.
         # =========================================================================
@@ -994,14 +990,14 @@ class SignalEngine:
         """
         Callback when ExchangeReconciler detects a state change.
         
-        🔥 FIX (Jan 14, 2026): React immediately to position closes detected by reconciler.
+        React immediately to position closes detected by reconciler.
         This handles TP/SL fills on exchange that the bot didn't initiate.
         """
-        # 🔥 FIX (Jan 20, 2026): Import PublicState, not ReconcilerState
+        # Import PublicState, not ReconcilerState
         # The callback receives PublicState enum values
         from src.infrastructure.exchanges.kraken.exchange_reconciler import PublicState
         
-        # 🔒 CRITICAL FIX (Jan 21, 2026): Don't interfere if we're in HARD_LOCK
+        # 🔒 CRITICAL Don't interfere if we're in HARD_LOCK
         # HARD_LOCK means we're actively executing an operation and will handle state ourselves
         if self.reconciler.is_hard_locked:
             logger.debug(f"Reconciler callback skipped: HARD_LOCK active (state={public_state})")
@@ -1018,7 +1014,7 @@ class SignalEngine:
                     return
                 
                 # =========================================================================
-                # 🔥 FIX (Jan 27, 2026): Estimate fill price from known TP/SL levels
+                # Estimate fill price from known TP/SL levels
                 # This is a SYNC callback so we can't call async exchange methods.
                 # Use the TP or SL price that was set on the position as the estimate.
                 # =========================================================================
@@ -1054,7 +1050,7 @@ class SignalEngine:
                     logger.info(f"📊 Using TP/SL level as exit price: {exit_price:.2f}")
                 
                 # =========================================================================
-                # 🔥 FIX (Jan 27, 2026): Use CORRECT position size for PnL calculation
+                # Use CORRECT position size for PnL calculation
                 # After partials/ADD TO WINNER, position.size tracks remaining size
                 # =========================================================================
                 actual_closed_size = position.size  # Use current tracked size
@@ -1077,12 +1073,12 @@ class SignalEngine:
                 
                 logger.info(f"✅ Trade closed by exchange TP/SL | Entry: {position.entry_price:.2f} → Exit: {exit_price:.2f} | Size: {actual_closed_size:.6f} | PnL: ${pnl_estimate:.2f} ({r_realized:.2f}R)")
                 
-                # Log trade close - 🔥 FIX: Use proper exit_type so losses are counted correctly
+                # Log trade close — use proper exit_type so losses are counted correctly
                 self.state_machine.record_trade_close(pnl_estimate, pnl_estimate > 0, exit_reason=exit_type)
                 self.state_machine.update_daily_pnl(pnl_estimate)
                 
                 # ═══════════════════════════════════════════════════════════════
-                # 🔥 FIX (Jan 25, 2026): Record trade result for KILL-SWITCH tracking
+                # Record trade result for KILL-SWITCH tracking
                 # Exchange TP/SL closes MUST be counted for consecutive loss tracking
                 # Without this, kill-switch and tiered cooldowns don't trigger!
                 # ═══════════════════════════════════════════════════════════════
@@ -1092,11 +1088,11 @@ class SignalEngine:
                 logger.info(f"📊 Exchange TP/SL result recorded for loss tracking: {exit_type} ${pnl_estimate:.2f}")
                 
                 # =========================================================================
-                # 🔥 FIX (Jan 27, 2026): LOG TRADE TO TRADE_LOGS FOR EXCHANGE TP/SL CLOSES
+                # LOG TRADE TO TRADE_LOGS FOR EXCHANGE TP/SL CLOSES
                 # Previously, trades closed by exchange were NOT logged, causing PnL mismatches
                 # =========================================================================
                 try:
-                    # 🔥 FIX: Use calculate_mfe_r() method instead of non-existent attribute
+                    # Use calculate_mfe_r() method instead of non-existent attribute
                     mfe_r = position.calculate_mfe_r() if hasattr(position, 'calculate_mfe_r') else 0
                     mae_r = abs(r_realized) if r_realized < 0 else 0
                     
@@ -1119,8 +1115,8 @@ class SignalEngine:
                 except Exception as log_err:
                     logger.error(f"Failed to log exchange TP/SL trade: {log_err}")
                 
-                # 🔥 FIX (Jan 14, 2026): Send Telegram notification for exchange TP/SL closes
-                # 🔥 FIX (Jan 27, 2026): Include initial_stop and size for fee calculation
+                # Send Telegram notification for exchange TP/SL closes
+                # Include initial_stop and size for fee calculation
                 if self.output_manager is not None:
                     try:
                         _create_safe_task(self.output_manager.send_exit_notification({
@@ -1128,11 +1124,11 @@ class SignalEngine:
                             'reason': exit_type,  # Already has EXCHANGE_ prefix
                             'pnl': pnl_estimate,
                             'r_realized': r_realized,
-                            'exit_price': exit_price,  # 🔥 FIX: Use actual fill price, not current market
+                            'exit_price': exit_price,  # Use actual fill price, not current market
                             'entry_price': position.entry_price,
                             'direction': position.direction,
-                            'size': actual_closed_size,  # 🔥 FIX: For fee calculation
-                            'initial_stop': position.initial_stop_loss,  # 🔥 FIX: For R net calculation
+                            'size': actual_closed_size,  # For fee calculation
+                            'initial_stop': position.initial_stop_loss,  # For R net calculation
                             'timestamp': market_time.strftime('%Y-%m-%d %H:%M:%S UTC')
                         }), "send_exit_notification_exchange_tpsl")
                         logger.info("📱 Telegram notification sent for exchange TP/SL close")
@@ -1146,12 +1142,12 @@ class SignalEngine:
             self.risk_engine.clear_position_sync("Exchange TP/SL hit - reconciler detected")
             self._reset_trade_state("Exchange TP/SL hit - reconciler detected")
             
-            # 🔥 FIX #262b: Smart cooldown after exchange TP/SL close (reconciler path)
+            # Smart cooldown after exchange TP/SL close (reconciler path)
             # ANTES: Sin cooldown → edge armed inmediatamente → trade desesperado
             # AHORA: Mismo cooldown que un trade normal
             recon_cooldown = OperatingMode.get_smart_cooldown(exit_type, r_realized)
             logger.info(
-                f"⏱️ FIX #262b: Reconciler close cooldown: {recon_cooldown}min "
+                f"⏱️ Reconciler close cooldown: {recon_cooldown}min "
                 f"(exit={exit_type}, r={r_realized:.2f})"
             )
             self.state_machine.start_cooldown(recon_cooldown)
@@ -1184,7 +1180,7 @@ class SignalEngine:
         """Limpia COMPLETAMENTE el estado de trading - CRITICAL para prevenir órdenes múltiples"""
         logger.info(f"🔄 Resetting trade state: {reason}")
         
-        # 🔥 FIX (Jan 20, 2026): Clear position_store on state reset
+        # Clear position_store on state reset
         # This ensures position tracking is always in sync after exits
         try:
             if hasattr(self, '_position_store') and self._position_store and self.symbol is not None:
@@ -1224,7 +1220,7 @@ class SignalEngine:
         self._last_bos_level = None
         self._last_bos_direction = None
         
-        # 🔥 FIX (Jan 22, 2026): Reset exhaustion detector on trade close
+        # Reset exhaustion detector on trade close
         # Prevents stale peak_atr/peak_velocity from affecting next trade
         if hasattr(self, 'exhaustion_detector') and self.exhaustion_detector:
             self.exhaustion_detector.reset()
@@ -1235,11 +1231,11 @@ class SignalEngine:
         # 🔥 FEB 11: Reset exhaustion partial flag
         self._exhaustion_partial_taken = False
         
-        # 🔥 FIX (Feb 19, 2026): Mark displacement as "consumed" for 3 minutes
+        # Mark displacement as "consumed" for 3 minutes
         # Prevents re-entry using the SAME displacement that made the previous trade
         self._last_trade_exit_time = datetime.now()
         
-        # 🔥 FIX (Jan 29, 2026 - AUDIT BUG 4): Reset EXPANSION_MODE and DIRECTION_LOCK
+        # Reset EXPANSION_MODE and DIRECTION_LOCK on trade close
         # Prevents state leakage between trades
         self._expansion_mode = False
         self._expansion_direction = None
@@ -1344,7 +1340,7 @@ class SignalEngine:
         Llamar después de reconexiones de WebSocket o timeouts
         """
         try:
-            # 🔥 FIX (Jan 20, 2026): Add timeout to prevent hanging
+            # Add timeout to prevent hanging
             try:
                 real_orders = await asyncio.wait_for(
                     self.execution.get_open_orders(self.symbol),
@@ -1386,7 +1382,7 @@ class SignalEngine:
         # =====================================================================
         self.reconciler.set_symbol(symbol)
         
-        # 🔥 FIX (Jan 14, 2026): Register as listener to react to position closes
+        # Register as listener to react to position closes
         self.reconciler.register_listener(self._on_reconciler_state_change)
         
         # 1. Set leverage on exchange
@@ -1404,7 +1400,7 @@ class SignalEngine:
         
         if capital > 0:
             self.risk_engine.capital = capital
-            # 🔒 FIX (Jan 22, 2026): Also sync equity values from real exchange balance
+            # Also sync equity values from real exchange balance
             # Without this, equity stays at default 10k causing incorrect DD calculations
             if self.risk_engine.initial_equity == 10000.0 or self.risk_engine.equity == 10000.0 or not self.risk_engine.equity_synced:
                 logger.info(f"[$] LIVE: Syncing equity from exchange (was default 10k)")
@@ -1562,9 +1558,9 @@ class SignalEngine:
                 # ═══════════════════════════════════════════════════════════════
                 # 🔒 NEW: Position Store Sync (LIVE mode - every 30s)
                 # This ensures we always have accurate position state from exchange
-                # FIX #4 (Jan 13, 2026): Enhanced with auto-correction
-                # FIX #5 (Jan 21, 2026): Added timeout to prevent blocking
-                # FIX #6 (Jan 22, 2026): Skip if circuit breaker is open
+                # Enhanced with auto-correction
+                # Added timeout to prevent blocking
+                # Skip if circuit breaker is open
                 # ═══════════════════════════════════════════════════════════════
                 if self._runtime_config and self._runtime_config.mode == RuntimeMode.LIVE:
                     time_since_sync = (datetime.now(UTC) - last_position_sync_time).total_seconds()
@@ -1606,7 +1602,7 @@ class SignalEngine:
                     pos = self.risk_engine.position
                     pos_status = "FLAT" if pos is None else f"{pos.direction} {pos.size:.6f}"
                     
-                    # 🔥 FIX #105: Heartbeat mejorado con info de evaluación
+                    # Heartbeat mejorado con info de evaluación
                     edge_state = "N/A"
                     if hasattr(self, '_edge_manager') and self._edge_manager:
                         edge_state = self._edge_manager.state.value
@@ -1621,7 +1617,7 @@ class SignalEngine:
                     eval_count = getattr(self, '_idle_eval_count', 0)
                     logger.info(f"[BEAT] HEARTBEAT: tick #{tick_count}, state={self.state_machine.state.name}, pos={pos_status} | edge={edge_state} | evals={eval_count}{cooldown_info}")
                     
-                    # 🔧 FIX #128 (Feb 09, 2026): Agregar info de precio y niveles clave cada 2 heartbeats
+                    # eles clave cada 2 heartbeats
                     if tick_count % 80 == 0:  # Cada ~80 segundos
                         try:
                             candles = self.market_data.get_candles('1m')
@@ -1673,10 +1669,10 @@ class SignalEngine:
                     
                     last_heartbeat_time = tick_start
                 
-                # 🔒 FIX (Jan 21, 2026): Add global timeout to _process_tick
+                # Add global timeout to _process_tick
                 # Prevents infinite blocking if any async call hangs
-                # 🔒 FIX (Jan 22, 2026): Use shield + wait to properly cancel subtasks
-                # 🔥 FIX #167 (Feb 11, 2026): Reduced from 30s to 15s
+                # Use shield + wait to properly cancel subtasks
+                # Reduced from 30s to 15s
                 # With API timeout now 10s, tick should complete faster
                 tick_task = None
                 try:
@@ -1698,7 +1694,7 @@ class SignalEngine:
                     except Exception as reset_err:
                         logger.warning(f"Could not reset exchange session: {reset_err}")
                     
-                    # 🔥 FIX (Feb 1, 2026): Force position sync after timeout
+                    # Force position sync after timeout
                     # Timeout can leave local state inconsistent with exchange
                     try:
                         if self.reconciler:
@@ -1821,7 +1817,7 @@ class SignalEngine:
             return
         
         # Check black swan (IMPROVED: pass full candle data for wick detection)
-        # 🔥 FIX #28 (Feb 05, 2026): Pass regime_blocked to suppress redundant defensive mode
+        # Pass regime_blocked to suppress redundant defensive mode
         price_change = abs(closes[-1] - closes[-2]) if len(closes) > 1 else 0
         last_candle = candles_1m[-1] if candles_1m else {}
         is_black_swan, bs_reason = self.black_swan_filter.check(
@@ -1887,7 +1883,7 @@ class SignalEngine:
         Intenta recuperarse cuando las métricas mejoran
         """
         # =====================================================================
-        # 🔥 FIX #284 (Feb 17, 2026): EXPIRE EDGE ON OBSERVATION ENTRY
+        # EXPIRE EDGE ON OBSERVATION ENTRY
         # LOG EVIDENCE: Edge stayed EDGE_ACTIVE for 2+ HOURS during OBSERVATION
         # with evals frozen at 3727. When OBSERVATION expired, DEAD_EDGE caught
         # the 135.9min age. But this means the system held a stale edge the
@@ -1897,12 +1893,12 @@ class SignalEngine:
         if not getattr(self, '_observation_edge_cleared', False):
             if self._edge_manager.is_edge_active():
                 self._edge_manager._expire_edge(
-                    "🔥 FIX #284: Edge expired on OBSERVATION entry (stale prevention)",
+                    "Edge expired on OBSERVATION entry (stale prevention)",
                     set_context_cooldown=False,
                     current_price=current_price
                 )
                 logger.warning(
-                    f"🔥 FIX #284: Cleared stale edge on OBSERVATION entry | "
+                    f"🔄 Cleared stale edge on OBSERVATION entry | "
                     f"Price={current_price:.2f}"
                 )
             self._observation_edge_cleared = True
@@ -1942,7 +1938,7 @@ class SignalEngine:
         in_cooldown, cooldown_reason = check_rejection_cooldown(self)
         if in_cooldown:
             self._idle_eval_count += 1
-            # 🔥 FIX #105: Pasado a INFO cada 60 ticks (era DEBUG 30) para visibilidad
+            # Pasado a INFO cada 60 ticks (era DEBUG 30) para visibilidad
             if self._idle_eval_count % 60 == 0:
                 logger.info(f"⏳ COOLDOWN: {cooldown_reason}")
             return
@@ -1959,32 +1955,32 @@ class SignalEngine:
             return
         
         # Log activity
-        # 🔥 FIX #105: Log cada 60 ticks (era 120) para mejor observabilidad
+        # Log cada 60 ticks (era 120) para mejor observabilidad
         if self._idle_eval_count % 60 == 0:
             logger.info(f"📊 IDLE: Evaluated {self._idle_eval_count} ticks | Price: ${current_price:.2f} | ATR: {atr_1m:.2f}")
         
         # Reset trade tags for new evaluation
         self._current_trade_tags = {}
         
-        # 🔥 FIX #28: Reset regime block state at start of each evaluation
+        # Reset regime block state at start of each evaluation
         self._regime_blocked = False
         self._regime_block_reason = ""
         
         # =====================================================================
-        # 🔥 FIX #32 (Feb 05, 2026): EDGE INVALIDATION - UNCONDITIONAL CHECK
-        # 
+        # EDGE INVALIDATION - UNCONDITIONAL CHECK
+
         # CRITICAL: Edge expiration/invalidation MUST run on EVERY tick,
         # regardless of any filters. Previously this check was buried deep
         # in the evaluation chain, so if ANY filter returned early, the edge
         # would never be invalidated - causing stale edges to persist for
         # 10+ minutes while price moved against the thesis.
-        #
+
         # Example from log: BOS SHORT at $72,869, price rose to $73,053 (+$184)
         # but edge remained ACTIVE because HTF filter returned before check.
         # =====================================================================
         if hasattr(self, '_edge_manager') and self._edge_manager:
             # Get ATR for invalidation buffer (use 1m as proxy, scale appropriately)
-            # 🔥 FIX #77b: Pass swing_range for adaptive buffer
+            # Pass swing_range for adaptive buffer
             swing_range = 0.0
             if hasattr(self, '_last_swing_high') and hasattr(self, '_last_swing_low'):
                 if self._last_swing_high > 0 and self._last_swing_low > 0:
@@ -2010,7 +2006,7 @@ class SignalEngine:
         # ===== 6. PRE-TRADE CHECKS =====
         can_trade, trade_reason = await check_pre_trade_conditions(self, market_time)
         if not can_trade:
-            # 🔥 FIX #105: Log cada 30 ticks (era 100) para mejor observabilidad
+            # Log cada 30 ticks (era 100) para mejor observabilidad
             if self._idle_eval_count % 30 == 0:
                 logger.info(f"⏸️ BLOCKED: {trade_reason}")
             return
@@ -2037,7 +2033,7 @@ class SignalEngine:
         last_1h_ts = _ts_to_int(candles_1h[-1].get('timestamp', 0))
         if last_1h_ts != self._htf_cache_ts:
             # Nueva vela 1h cerrada → recalcular
-            # 🔥 FIX (Jan 29, 2026 - AUDIT): Store OLD bias BEFORE updating
+            # Store OLD bias BEFORE updating
             old_bias = self._htf_cache_bias  # MUST be before .check() updates
             
             htf_passed, bias, htf_reason = self.htf_filter.check(
@@ -2049,14 +2045,14 @@ class SignalEngine:
             self._htf_cache_passed = htf_passed
             self._htf_cache_bias = bias
             self._htf_cache_reason = htf_reason
-            # 🔥 FIX (Jan 23, 2026): Cache HTF regime mode based on ADX
+            # Cache HTF regime mode based on ADX
             self._htf_cache_regime_mode = self.htf_filter.last_htf_regime_mode
-            # 🔥 FIX (Jan 25, 2026): Ensure ADX cache is always a Python float
+            # Ensure ADX cache is always a Python float
             _raw_adx = self.htf_filter.last_htf_adx
             self._htf_cache_adx = float(_raw_adx) if hasattr(_raw_adx, '__float__') else float(_raw_adx) if _raw_adx else 0.0
             logger.debug(f"HTF cache updated: ts={last_1h_ts}, passed={htf_passed}, bias={bias}, regime_mode={self._htf_cache_regime_mode}, adx={self._htf_cache_adx:.1f}")
             
-            # 🔥 FIX (Jan 29, 2026 - AUDIT): Reset ONLY when bias ACTUALLY changes
+            # Reset ONLY when bias ACTUALLY changes
             # Also reset expansion/direction lock state on bias change
             if old_bias != bias and old_bias is not None:
                 logger.info(f"📊 BIAS CHANGED: {old_bias}→{bias} - resetting displacement and expansion state")
@@ -2109,13 +2105,13 @@ class SignalEngine:
                 old_phase = self._trend_phase
                 self._trend_phase = trend_state.current_phase
                 
-                # 🔥 FIX #222: Also store trend direction for displacement checks
+                # Also store trend direction for displacement checks
                 self._trend_direction_from_ti = trend_state.direction.value  # 'BULLISH', 'BEARISH', 'NEUTRAL'
                 
-                # 🔥 FIX #223: Share trend_phase with edge_manager for TREND_BIRTH bypass
+                # Share trend_phase with edge_manager for TREND_BIRTH bypass
                 self._edge_manager._trend_phase_from_engine = self._trend_phase
                 
-                # 🔥 FIX #269: Share transition_mode with edge_manager for DEAD_EDGE timeout extension
+                # Share transition_mode with edge_manager for DEAD_EDGE timeout extension
                 self._edge_manager._transition_mode_from_engine = bool(self._transition_mode_active)
                 
                 if old_phase != self._trend_phase:
@@ -2138,12 +2134,12 @@ class SignalEngine:
             htf_reason = self._htf_cache_reason
         
         # =====================================================================
-        # 🔥 FIX (Jan 28, 2026): BIAS ARCHITECTURE REWRITE
-        # 
+        # BIAS ARCHITECTURE REWRITE
+
         # PROBLEMA ORIGINAL: BIAS INVALIDATION = BLOQUEO TOTAL (deadlock)
         # - LONG invalidado → NEUTRAL → no LONG ni SHORT
         # - Eso es INCORRECTO. Invalidar LONG debe PERMITIR buscar SHORT.
-        #
+
         # SOLUCIÓN: Separar conceptos:
         # 1. STRUCTURAL_BIAS: HTF bias (no bloquea, solo informa)
         # 2. ACTIVE_DIRECTION: Qué buscar AHORA (basado en momentum)
@@ -2156,12 +2152,12 @@ class SignalEngine:
         self._current_trade_tags['structural_bias'] = self._structural_bias
         
         # =====================================================================
-        # 🔥 FIX #93 (Feb 09, 2026): VENTANA MÓVIL PARA EXTREMOS
+        # VENTANA MÓVIL PARA EXTREMOS
         # =====================================================================
         # PROBLEMA ANTERIOR: _bias_high_since y _bias_low_since solo se 
         # reseteaban cada HORA. Esto causaba que el displacement se detectara
         # DESPUÉS del movimiento porque los extremos seguían creciendo.
-        #
+
         # SOLUCIÓN: Usar ventana móvil de 10 velas de 1m (~10 min) para
         # calcular los extremos, en lugar de acumular desde el inicio de la hora.
         # =====================================================================
@@ -2179,17 +2175,17 @@ class SignalEngine:
                 self._bias_low_since = rolling_low
             else:
                 # =========================================================
-                # 🔥 FIX #244 (Feb 16, 2026): CRITICAL DIRECTION FIX
-                # 
+                # CRITICAL DIRECTION FIX
+
                 # PROBLEMA: max(rolling_high, current_price) hacía que 
                 # _bias_high_since SIEMPRE = current_price en un uptrend.
                 # Entonces distance_from_high = high - price = 0 → STALE.
                 # LONG displacement NUNCA se armaba → 13/13 SHORT en Feb 10.
-                #
+
                 # ROOT CAUSE: En uptrend, current_price >= rolling_high,
                 # así que max() = current_price. distance_from_high = 0.
                 # El stale check (< 0.5 ATR) SIEMPRE disparaba para LONG.
-                #
+
                 # SOLUCIÓN: Usar SOLO rolling_high/rolling_low del window
                 # de 10 velas cerradas. NO incluir current_price (tick vivo).
                 # Esto permite que:
@@ -2230,7 +2226,7 @@ class SignalEngine:
                 if len(atr_vals) > 0:
                     atr_1m = float(atr_vals[-1])
             except Exception as e:
-                # 🔥 FIX (Jan 29, 2026 - AUDIT BUG 13): Log exception instead of silencing
+                # Log exception instead of silencing
                 logger.debug(f"ATR 1m calculation failed, using default: {e}")
         
         # Get ATR 5m for stronger displacement signal
@@ -2273,13 +2269,13 @@ class SignalEngine:
         self._current_trade_tags.update(self.direction_state_mgr.trade_tags)
         
         # =====================================================================
-        # 🔥 FIX 2: BIAS INVALIDATION → ALLOW OPPOSITE DIRECTION
-        # 
+        # BIAS INVALIDATION → ALLOW OPPOSITE DIRECTION
+
         # ANTES: invalidate_bias() → BIAS = NEUTRAL (deadlock)
         # AHORA: invalidate_bias(LONG) → forbid LONG, ALLOW SHORT detection
         # =====================================================================
         
-        # 🔥 FIX (Jan 29, 2026): Initialize tracking variables BEFORE calculating displacement
+        # Initialize tracking variables BEFORE calculating displacement
         # This prevents negative displacement values on system startup
         if self._bias_high_since == 0.0:
             self._bias_high_since = current_price
@@ -2291,7 +2287,7 @@ class SignalEngine:
         
         # =====================================================================
         # 🔥 DIRECTION_LOCK + EXPANSION_MODE State Management (Refactored Feb 04)
-        # 
+
         # Delegado a DirectionStateManager para:
         # - Check timeouts
         # - Check asymmetric invalidation
@@ -2369,7 +2365,7 @@ class SignalEngine:
         self._current_trade_tags['atr_1m_for_bias'] = atr_1m_val
         
         # Get recent structure levels for confirmation
-        # 🔥 FIX (Feb 04, 2026): Reduced lookback from 20 to 12 velas (1h instead of 100min)
+        # Reduced lookback from 20 to 12 velas (1h instead of 100min)
         # This makes structure detection more responsive to recent price action
         SWING_LOOKBACK_5M = 12  # 12 velas de 5m = 1 hora
         MICRO_SWING_LOOKBACK_1M = 15  # 15 velas de 1m = 15 minutos
@@ -2419,7 +2415,7 @@ class SignalEngine:
         can_clear_forbidden = ticks_since_forbidden >= FORBIDDEN_MIN_DURATION_TICKS
         
         # Check bias invalidation using handler
-        # 🔥 FIX (Feb 04, 2026): Pass micro_swings for faster structure detection
+        # Pass micro_swings for faster structure detection
         invalidation_result = self.bias_invalidation_handler.check_invalidation(
             bias=bias,
             current_price=current_price,
@@ -2437,7 +2433,9 @@ class SignalEngine:
             direction_lock_initial_move=self._direction_lock_initial_move,
             tick_count=self._idle_eval_count,
             can_clear_forbidden=can_clear_forbidden,
-            current_forbidden=self._forbidden_direction
+            current_forbidden=self._forbidden_direction,
+            macro_strength=(self._current_bias_strength.value
+                            if self._current_bias_strength else None)
         )
         
         # Apply invalidation result
@@ -2453,13 +2451,13 @@ class SignalEngine:
             self._current_trade_tags['reclaim_level'] = self._bias_invalidation_level
             
             # =====================================================================
-            # 🔥 FIX #190 (Feb 11, 2026): BIAS FLIP EXPIRA EL EDGE EN DIRECCIÓN OPUESTA
-            #
+            # BIAS FLIP EXPIRA EL EDGE EN DIRECCIÓN OPUESTA
+
             # PROBLEMA: El log mostró BIAS FLIP "LONG detection ENABLED" pero:
             # 1. El edge SHORT siguió activo 57+ minutos (con penalty -99)
             # 2. Cuando expiró por precio, se generó OTRO SHORT
             # 3. Nunca se generó el edge LONG que el mercado pedía
-            #
+
             # SOLUCIÓN: Cuando hay BIAS FLIP, expirar INMEDIATAMENTE el edge
             # si es de la dirección que ahora está PROHIBIDA.
             # Esto permite que se cree un nuevo edge en la dirección correcta.
@@ -2473,17 +2471,17 @@ class SignalEngine:
                 if current_edge_dir and current_edge_dir == invalidation_result.forbidden_direction:
                     new_direction = 'LONG' if invalidation_result.forbidden_direction == 'SHORT' else 'SHORT'
                     self._edge_manager.force_expire(
-                        f"🔥 FIX #190 BIAS_FLIP: {invalidation_result.forbidden_direction} edge expired | "
+                        f"BIAS_FLIP: {invalidation_result.forbidden_direction} edge expired | "
                         f"{new_direction} detection now ENABLED"
                     )
                     logger.warning(
-                        f"🔥 FIX #190: BIAS FLIP expired {current_edge_dir} edge | "
+                        f"🔄 BIAS FLIP expired {current_edge_dir} edge | "
                         f"Reason: {invalidation_result.forbid_reason} | "
                         f"{new_direction} edge can now be created"
                     )
                     
                     # =====================================================================
-                    # 🔥 FIX #206 (Feb 12, 2026): CLEAR COOLDOWN FOR NEW DIRECTION
+                    # CLEAR COOLDOWN FOR NEW DIRECTION
                     # PROBLEMA: Después de BIAS_FLIP, la nueva dirección puede estar
                     # en cooldown por un DEAD_EDGE anterior, bloqueando el edge nuevo:
                     #   - SHORT muere por DEAD_EDGE → cooldown SHORT
@@ -2495,38 +2493,38 @@ class SignalEngine:
                     if hasattr(self._edge_manager, '_direction_cooldown') and new_direction in self._edge_manager._direction_cooldown:
                         del self._edge_manager._direction_cooldown[new_direction]
                         logger.info(
-                            f"🔥 FIX #206: Cleared DEAD_EDGE cooldown for {new_direction} after BIAS_FLIP | "
+                            f"� Cleared DEAD_EDGE cooldown for {new_direction} after BIAS_FLIP | "
                             f"New edge can be created immediately"
                         )
             
             # =====================================================================
-            # 🔥 FIX #192 (Feb 11, 2026): BIAS FLIP ACTUALIZA ACTIVE_DIRECTION
-            #
+            # BIAS FLIP ACTUALIZA ACTIVE_DIRECTION
+
             # PROBLEMA: Cuando hay BIAS FLIP (ej: "FORBID SHORT, LONG detection ENABLED"):
-            # 1. FIX #190 expira el edge SHORT ✓
-            # 2. FIX #191 bloquea nuevos edges SHORT ✓
+            # 1. Expira el edge SHORT ✓
+            # 2. Bevos edges SHORT ✓
             # 3. PERO _active_direction sigue siendo SHORT
             # 4. Orchestrator no correrá hasta próximo tick → direction queda stale
             # 5. RESULTADO: No se genera ningún edge → pérdida de oportunidad LONG
-            #
+
             # SOLUCIÓN: Al detectar BIAS FLIP, actualizar _active_direction 
             # a la dirección OPUESTA (la que ahora está permitida).
             # El orchestrator la confirmará en el siguiente tick.
             # =====================================================================
             new_direction_for_active = 'LONG' if invalidation_result.forbidden_direction == 'SHORT' else 'SHORT'
             old_active = self._active_direction
-            # 🔥 FIX #299: New BIAS FLIP invalidates any prior bias recovery
+            # New BIAS FLIP invalidates any prior bias recovery
             self._bias_recovery_until = None
             
             # =====================================================================
             # MACRO COHERENCE CHECK FOR BIAS FLIP
-            #
+
             # A small bounce ($320) in a BEAR market should NOT flip the system
             # to LONG. The bounce is noise; the macro trend is the signal.
             # If macro=BEAR and flip wants LONG → only forbid the old direction,
             # but DON'T set active_direction or transition_mode to the new one.
             # Let the system wait for real CORE signals (displacement, breakout).
-            #
+
             # Same for macro=BULL and flip wants SHORT.
             # =====================================================================
             macro_str = self._current_bias_strength.value if self._current_bias_strength else None
@@ -2563,8 +2561,8 @@ class SignalEngine:
             # TRANSITION_MODE + COOLDOWN CLEAR solo si el flip es coherente con macro
             # Si contradice macro, solo forbidimos la dirección vieja pero NO
             # activamos TRANSITION_MODE ni limpiamos cooldowns.
-            #
-            # 🔥 FIX #279 (Feb 17, 2026): NO TRANSITION_MODE IN RANGE_BOUND
+
+            # NO TRANSITION_MODE IN RANGE_BOUND
             # LOG EVIDENCE: 3 consecutive losses all originated from:
             #   BIAS FLIP → TRANSITION_MODE LONG → CONSENSUS → EDGE → ENTRY
             # In RANGE_BOUND (ADX 18.4, pct 29-37%), tiny $150-200 rises trigger
@@ -2572,11 +2570,11 @@ class SignalEngine:
             # creating an artificial LONG edge machine that ignores range context.
             # FIX: In RANGE_BOUND without expansion, skip TRANSITION_MODE entirely.
             # The system will wait for real CORE signals (displacement, breakout).
-            #
-            # 🔥 FIX #288 (Feb 18, 2026): ADX GUARD FOR TRANSITION_MODE
+
+            # ADX GUARD FOR TRANSITION_MODE
             # LOG EVIDENCE: Trade 5 entered TRANSITION_MODE LONG with ADX=17.1,
             # phase=ACCUMULATION (not yet RANGE_BOUND). MFE only 0.17R → -0.37R loss.
-            # FIX #279 only catches RANGE_BOUND, but ADX<20 already signals no trend.
+            # Only catches RANGE_BOUND, but ADX<20 already signals no trend.
             # Adding ADX floor: if effective_adx < 20, TRANSITION_MODE is noise.
             # =====================================================================
             is_range_bound = getattr(self, '_trend_phase', None) == TrendPhase.RANGE_BOUND
@@ -2643,7 +2641,7 @@ class SignalEngine:
                         else "RANGE_BOUND + no expansion"
                     )
                     logger.warning(
-                        f"🚫 FIX #279/#288 TRANSITION_MODE SKIPPED: {skip_reason} | "
+                        f"🚫 TRANSITION_MODE SKIPPED: {skip_reason} | "
                         f"BIAS FLIP to {new_direction_for_active} is noise | "
                         f"Waiting for CORE signal (displacement/breakout)"
                     )
@@ -2660,17 +2658,17 @@ class SignalEngine:
             self._forbidden_direction = None
         
         # =====================================================================
-        # 🔥 FIX #250 (Feb 16, 2026): CLEAR FORBIDDEN ON TRANSITION EXPIRY
-        #
+        # CLEAR FORBIDDEN ON TRANSITION EXPIRY
+
         # PROBLEMA: BIAS FLIP establece _forbidden_direction + transition_mode (15min).
         # Cuando transition expira, forbidden_direction NO se limpiaba.
         # Además, el handler puede RE-SET forbidden en cada tick si rise_from_low > threshold,
         # así que forbidden quedaba activa INDEFINIDAMENTE.
-        #
+
         # CRITICAL: Esta lógica DEBE estar en el main loop, NO en entry_orchestrator.
         # Si forbidden bloquea arm_consensus_edge → no hay edge → no hay entry eval
         # → run_all_guards nunca ejecuta → forbidden nunca se limpia = DEADLOCK.
-        #
+
         # SOLUCIÓN: Al expirar transition mode, limpiar forbidden Y poner
         # forbidden_immunity para que el handler no la re-establezca inmediatamente.
         # =====================================================================
@@ -2686,7 +2684,7 @@ class SignalEngine:
                     # (can_clear_forbidden) passes immediately if handler tries to clear
                     self._forbidden_set_at_tick = max(0, self._idle_eval_count - FORBIDDEN_MIN_DURATION_TICKS - 1)
                     logger.warning(
-                        f"🔥 FIX #250: TRANSITION expired → FORBIDDEN {old_forbidden} CLEARED | "
+                        f"� TRANSITION expired → FORBIDDEN {old_forbidden} CLEARED | "
                         f"Direction free - market structure will guide"
                     )
                 else:
@@ -2698,7 +2696,7 @@ class SignalEngine:
         
         # =====================================================================
         # 🔥 BIAS RESTORATION (reversible invalidation)
-        # 🔥 FIX #207 (Feb 12, 2026): FAST RECOVERY for mini-pullbacks
+        # FAST RECOVERY for mini-pullbacks
         # IMPROVED: Added "strong momentum" fast path - if current candle body 
         # is >0.3% in reclaim direction, don't wait for 2-candle confirmation.
         # This allows immediate recovery from false flips.
@@ -2706,7 +2704,7 @@ class SignalEngine:
         if self._bias_before_invalidation and self._bias_invalidation_level > 0:
             momentum_ok = False
             reclaim_ok = False
-            strong_momentum_ok = False  # 🔥 FIX #207: Fast path
+            strong_momentum_ok = False  # Fast path
             
             # Check if price reclaimed the level
             if self._bias_before_invalidation == 'LONG':
@@ -2722,7 +2720,7 @@ class SignalEngine:
                         last_3_closes = [c['close'] for c in candles_1m_check[-3:]]
                         last_3_opens = [c['open'] for c in candles_1m_check[-3:]]
                         
-                        # 🔥 FIX #207: Check for STRONG single candle (>0.3% body)
+                        # Check for STRONG single candle (>0.3% body)
                         current_candle = candles_1m_check[-1]
                         candle_body = current_candle['close'] - current_candle['open']
                         body_pct = abs(candle_body) / current_candle['open'] * 100 if current_candle['open'] > 0 else 0
@@ -2762,7 +2760,7 @@ class SignalEngine:
                 self._current_trade_tags['bias_recovery_mode'] = recovery_mode
                 
                 # =====================================================================
-                # 🔥 FIX #207 (Feb 12, 2026): FAST RECOVERY AFTER MINI-PULLBACK
+                # FAST RECOVERY AFTER MINI-PULLBACK
                 # PROBLEMA: Después de BIAS_FLIP por mini-pullback, si el precio reclaim
                 # rápidamente, el sistema queda bloqueado por:
                 #   1. TRANSITION_MODE activo en dirección opuesta
@@ -2777,7 +2775,7 @@ class SignalEngine:
                 # 1. Cancel TRANSITION_MODE if it was for the opposite direction
                 if self._transition_mode_active and self._transition_mode_direction != restored_bias:
                     logger.info(
-                        f"🔥 FIX #207: Canceling TRANSITION_MODE {self._transition_mode_direction} "
+                        f"� Canceling TRANSITION_MODE {self._transition_mode_direction} "
                         f"due to BIAS RECOVERY to {restored_bias}"
                     )
                     self._transition_mode_active = False
@@ -2788,7 +2786,7 @@ class SignalEngine:
                 if hasattr(self._edge_manager, '_direction_cooldown') and restored_bias in self._edge_manager._direction_cooldown:
                     del self._edge_manager._direction_cooldown[restored_bias]
                     logger.info(
-                        f"🔥 FIX #207: Cleared cooldown for {restored_bias} after BIAS RECOVERY"
+                        f"� Cleared cooldown for {restored_bias} after BIAS RECOVERY"
                     )
                 
                 # 3. Restore _active_direction to the recovered bias
@@ -2798,20 +2796,20 @@ class SignalEngine:
                     self._active_direction_source = 'BIAS_RECOVERY'
                     self._active_direction_confidence = 0.65
                     logger.info(
-                        f"🔥 FIX #207: Restored _active_direction {old_active} → {restored_bias}"
+                        f"� Restored _active_direction {old_active} → {restored_bias}"
                     )
                 
                 self._current_trade_tags['bias_fast_recovery'] = True
-                # 🔥 FIX #299: Keep bias recovery active 10min to override HTF_BIAS_ALONE
+                # Keep bias recovery active 10min to override HTF_BIAS_ALONE
                 self._bias_recovery_until = datetime.now() + timedelta(minutes=10)
                 
                 # =====================================================================
-                # 🔥 FIX #260b: BIAS RESTORED → RE-INIT STABILIZATION COOLDOWN
-                #
-                # ANTES: BIAS RESTORED borraba el cooldown de FIX #260, permitiendo
+                # BIAS RESTORED → RE-INIT STABILIZATION COOLDOWN
+
+                # ANTES: BIAS RESTORED borraba el cooldown, permitiendo
                 # entrar LONG instantáneamente en el tope de un bounce. 
                 # Run 20260214: 4 LONGs entraron así → 3 pérdidas, -$2.60.
-                #
+
                 # AHORA: BIAS RESTORED re-inicia un cooldown de 1min con pullback
                 # requerido para la NUEVA dirección restaurada. Esto fuerza que
                 # el precio retroceda antes de entrar, evitando comprar en máximos.
@@ -2821,19 +2819,19 @@ class SignalEngine:
                 self._post_bias_flip_cooldown_until = datetime.now() + _td(seconds=60)
                 self._post_bias_flip_price = current_price
                 logger.warning(
-                    f"🔥 FIX #260b: Post-BIAS-RESTORED 1min stabilization | "
+                    f"⏳ Post-BIAS-RESTORED 1min stabilization | "
                     f"Price={current_price:.2f} | Need pullback before {restored_bias} entry"
                 )
 
         
         # =====================================================================
-        # 🔥 FIX 3: FLIP AUTOMÁTICO POR DISPLACEMENT
-        # 
+        # FLIP AUTOMÁTICO POR DISPLACEMENT
+
         # Si el precio se mueve ≥1.2×ATR_5m en una dirección:
         # → ACTIVE_DIRECTION = dirección del movimiento
         # → El mercado YA DECIDIÓ, no esperar HTF
-        #
-        # 🔥 FIX (Jan 29, 2026): DISPLACEMENT OVERRIDES BIAS FLIP
+
+        # DISPLACEMENT OVERRIDES BIAS FLIP
         # Cuando hay displacement fuerte (≥1.5x threshold), el mercado está
         # en movimiento direccional claro. En este caso:
         # - IGNORAR _forbidden_direction completamente
@@ -2842,7 +2840,7 @@ class SignalEngine:
         # =====================================================================
         
         # 🌊 BE WATER: ADAPTIVE DISPLACEMENT THRESHOLDS
-        # 🔥 ROOT FIX (Feb 19, 2026): APPLIED FIX #278 — threshold 2.8 → 1.8 ATR
+        # Threshold 2.8 → 1.8 ATR (detect 35% earlier)
         # BEFORE (2.8): Needed $202 move to detect → entered at END of momentum
         #   BTC dropped 3% ($2100) and system entered SHORT at the minimum.
         # ORIGINAL (1.2): Too many false positives in micro-movements.
@@ -2850,7 +2848,7 @@ class SignalEngine:
         #   without waiting for the entire move to complete.
         #   With ATR_5m=$72: threshold=$130 (0.19% of price) — detectable in 2-3 candles
         #   With ATR_5m=$200: threshold=$360 (0.52% of price) — detectable in 3-5 candles
-        BASE_DISPLACEMENT_ATR_MULT = 1.8  # ~0.7% del precio con ATR típico (FIX #278 applied: detect 35% earlier)
+        BASE_DISPLACEMENT_ATR_MULT = 1.8  # ~0.7% del precio con ATR típico (detect 35% earlier)
         vol_displacement_adj = 1.0 + (self._current_volatility_ratio - 1.0) * 0.3  # +/- 30% por volatilidad
         vol_displacement_adj = max(0.7, min(1.5, vol_displacement_adj))  # Floor 0.7, cap 1.5
         
@@ -2922,11 +2920,11 @@ class SignalEngine:
         
         # =====================================================================
         # 🎭 UNIFIED DIRECTION ORCHESTRATION (Feb 2, 2026 - REFACTORED)
-        # 
+
         # ALL direction signals pass through the orchestrator with clear priority:
         # EXPANSION(100) > EDGE(95) > DISPLACEMENT(90) > ANTICIPATION(85) > 
         # FAST_REVERSAL(80) > MICRO(70) > STRUCTURAL(60)
-        #
+
         # This eliminates the 8+ scattered _active_direction assignments!
         # =====================================================================
         
@@ -2981,6 +2979,11 @@ class SignalEngine:
             
             location_context=self._location_context if hasattr(self, '_location_context') else None,
             
+            htf_adx=self._htf_cache_adx,
+            
+            macro_bias_strength=(self._current_bias_strength.value
+                                 if self._current_bias_strength else None),
+            
             tick_count=self._idle_eval_count
         )
         
@@ -3006,8 +3009,8 @@ class SignalEngine:
             )
         
         # =====================================================================
-        # 🔥 FIX #299: BIAS_RECOVERY overrides HTF_BIAS_ALONE veto
-        #
+        # BIAS_RECOVERY overrides HTF_BIAS_ALONE veto
+
         # After BIAS RESTORED, the structural bias is FRESHLY confirmed by
         # price reclaiming the invalidation level. The HTF_BIAS_ALONE guard
         # exists to prevent stale-bias trades, but a just-restored bias is
@@ -3025,7 +3028,7 @@ class SignalEngine:
             if self._idle_eval_count % 60 == 1:
                 remaining = (self._bias_recovery_until - datetime.now()).total_seconds()
                 logger.info(
-                    f"🔥 FIX #299: BIAS_RECOVERY override HTF_BIAS_ALONE | "
+                    f"🔥 BIAS_RECOVERY override HTF_BIAS_ALONE | "
                     f"Direction={self._structural_bias} | {remaining:.0f}s remaining"
                 )
         
@@ -3044,16 +3047,16 @@ class SignalEngine:
         # =====================================================================
         
         # =====================================================================
-        # 🔥 FIX (Jan 23, 2026): RANGE MODE - NOT BLOCK, USE DIFFERENT RULES
+        # RANGE MODE - NOT BLOCK, USE DIFFERENT RULES
         # When ADX < 18, we are in RANGE/CHOP - NOT trending
-        # 
+
         # CORRECCIÓN CRÍTICA: No bloquear, usar MODO RANGE con reglas:
         #   - Trades SÍ permitidos en EXTREMOS (VAH/VAL/VWAP bands)
         #   - Size reducido (50%)
         #   - Stop más tight (2x ATR vs 3x)
         #   - TP corto + salida rápida
         #   - Score threshold más alto (7.0 vs 6.0)
-        # 
+
         # El rango es donde BTC pasa el 60-70% del tiempo - no podemos
         # ignorarlo, hay que explotarlo correctamente.
         # =====================================================================
@@ -3061,10 +3064,10 @@ class SignalEngine:
         htf_adx = self._htf_cache_adx
         
         # =====================================================================
-        # 🔥 FIX (Jan 23, 2026): FAST REGIME DETECTION using 5m ADX
+        # FAST REGIME DETECTION using 5m ADX
         # Problem: Using only 1h ADX meant we could be 1 HOUR late detecting
         # regime changes. An intraday bot needs faster detection.
-        # 
+
         # Solution: Use 5m ADX for FAST detection, 1h ADX for CONFIRMATION
         #   - If 5m ADX drops < 15 → IMMEDIATE RANGE MODE (don't wait for 1h)
         #   - If 5m ADX > 25 AND 1h ADX > 18 → STRONG TREND
@@ -3088,14 +3091,14 @@ class SignalEngine:
                 logger.debug(f"Fast ADX calc error: {e}")
         
         # =====================================================================
-        # 🔥 FIX #263 (Feb 13, 2026): CORREGIDO — 5m ADX NO debe crear TREND en RANGE real
-        # 
+        # CORREGIDO — 5m ADX NO debe crear TREND en RANGE real
+
         # PROBLEMA ORIGINAL (FIX 4): effective_adx = min() mataba trends reales
         # NUEVO PROBLEMA: ADX 5m=65 con ADX 1h=13 → "TREND" falso en RANGE puro
         #   - La caída que activó el SL infla el 5m ADX temporalmente
         #   - Sistema interpreta su propia pérdida como "señal de tendencia"
         #   - Resultado: SHORT inmediato tras perder LONG → comportamiento desesperado
-        #
+
         # SOLUCIÓN: 5m ADX solo puede overridear si 1h ADX muestra ALGO de tendencia
         # - Si ADX 1h < 18 → RANGE PURO, 5m no puede overridear (blend conservador)
         # - Si ADX 1h >= 18 → 5m puede dominar (el 1h al menos muestra dirección)
@@ -3111,12 +3114,12 @@ class SignalEngine:
                     f"⚡ FAST TREND: ADX 5m={fast_adx:.1f} ≥ {ADXThresholds.VERY_STRONG_TREND}, 1h={htf_adx:.1f} ≥ {ADXThresholds.RANGE} → Using 5m"
                 )
         elif fast_adx >= ADXThresholds.VERY_STRONG_TREND and htf_adx < ADXThresholds.RANGE:
-            # 🔥 FIX #263: 5m is hot BUT 1h says RANGE → blend conservatively
+            # 5m is hot BUT 1h says RANGE → blend conservatively
             # Don't let 5m noise create a fake trend in a ranging market
             effective_adx = fast_adx * 0.35 + htf_adx * 0.65
             if self._idle_eval_count % 180 == 1:
                 logger.info(
-                    f"⚡ FIX #263: ADX 5m={fast_adx:.1f} hot but 1h={htf_adx:.1f} RANGE → "
+                    f"⚡ ADX 5m={fast_adx:.1f} hot but 1h={htf_adx:.1f} RANGE → "
                     f"blend={effective_adx:.1f} (conservative)"
                 )
         elif htf_adx >= ADXThresholds.STRONG_TREND:
@@ -3166,13 +3169,13 @@ class SignalEngine:
         calculate_intraday_edge_data(candles_1m, self._current_trade_tags)
         
         # =========================================================================
-        # 🔥 FIX #292 (Feb 18, 2026): BIAS STRENGTH & REGIME FUSION - EARLY COMPUTATION
-        #
+        # BIAS STRENGTH & REGIME FUSION - EARLY COMPUTATION
+
         # ROOT CAUSE: _current_bias_strength was computed AFTER mode handlers
         # and the can_evaluate_entry() guard. Mode handlers read macro_str=None →
         # consensus BLOCKED → no edge armed → early return → bias NEVER computed.
         # CIRCULAR DEADLOCK that blocked ALL trading for 3.5 hours on startup.
-        #
+
         # FIX: Move bias computation BEFORE mode handlers so they get real data.
         # All dependencies (df_1h, candles_5m, candles_1m, current_price) are
         # already available at this point in the pipeline.
@@ -3195,7 +3198,7 @@ class SignalEngine:
             self._current_bias_strength = BiasStrength.NEUTRAL
         self._current_trade_tags['bias_strength'] = self._current_bias_strength.value
         
-        # Calculate WORKING BIAS from MACRO BIAS (FIX #76)
+        # Calculate WORKING BIAS from MACRO BIAS
         self._working_bias = BiasStrengthConfig.get_working_bias(self._current_bias_strength)
         self._current_trade_tags['working_bias'] = self._working_bias.value
         
@@ -3204,7 +3207,7 @@ class SignalEngine:
             f"is_bullish_structure={self._is_bullish_structure}"
         )
         
-        # 3-LAYER REGIME FUSION (FIX #83): Compute MACRO layer
+        # 3-LAYER REGIME FUSION: Compute MACRO layer
         ema50_1h = float(df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1])
         ema200_1h = float(df_1h['close'].ewm(span=200, adjust=False).mean().iloc[-1])
         
@@ -3252,8 +3255,7 @@ class SignalEngine:
         trend_phase_str = regime_result.trend_phase_str
         adx_suggested_mode = regime_result.adx_suggested_mode
         
-        # Log mode changes with full context (rate limited)
-        # 🔥 FIX #122: Throttle 30 → 120 ticks
+        # Log mode changes with full context (rate limited, every 120 ticks)
         if self._idle_eval_count % 120 == 1:
             override_note = ""
             if adx_suggested_mode != trading_mode:
@@ -3283,8 +3285,7 @@ class SignalEngine:
         # Matches the commit +$4 proven list + TRANSITION_MODE (with macro guard)
         _core_sources = ('EXPANSION_MODE', 'EDGE_BREAKOUT', 'DISPLACEMENT', 
                          'ANTICIPATION', 'TRANSITION_MODE', 'RANGE_MR_LOW', 
-                         'RANGE_MR_HIGH', 'BIAS_FLIP', 'BIAS_RECOVERY',
-                         'STRUCTURAL_RANGE_FALLBACK')
+                         'RANGE_MR_HIGH', 'BIAS_FLIP', 'BIAS_RECOVERY')
         
         # ===================================================================
         # IDLE PIPELINE — stages extracted to idle_stages/
@@ -3293,8 +3294,7 @@ class SignalEngine:
             IdleCtx,
             stage_range_mode, stage_transition_mode, stage_trend_mode,
             stage_counter_trend_htf, stage_edge_detection,
-            stage_location_filter, stage_decision_center,
-            stage_regime_fusion, stage_micro_trend,
+            stage_location_filter,
             stage_filters_and_ltf, stage_finalize_entry,
         )
 
@@ -3342,19 +3342,7 @@ class SignalEngine:
                 )
             return
 
-        # Stage 5: Decision center (TrendIntelligence)
-        if stage_decision_center(self, ctx):
-            return
-
-        # Stage 6: Regime fusion + expansion / anti-fade
-        if stage_regime_fusion(self, ctx):
-            return
-
-        # Stage 7: Micro trend filter
-        if stage_micro_trend(self, ctx):
-            return
-
-        # Stage 8: Filter pipeline + LTF trigger
+        # Stage 5: Filter pipeline + trend expansion + LTF trigger
         if stage_filters_and_ltf(self, ctx):
             return
 
@@ -3377,7 +3365,7 @@ class SignalEngine:
         """Process displacement in one direction. Returns True if stale/blocked.
 
         Handles: stale check, active-move override, range extreme check,
-        bad phase check (FIX #222), RANGE_BOUND block, direction memory,
+        bad phase check, RANGE_BOUND block, direction memory,
         expansion/lock activation, displacement edge arming, forbidden
         direction override.  Symmetric for SHORT and LONG.
         """
@@ -3437,7 +3425,7 @@ class SignalEngine:
                         f"from extreme ${extreme_price:.0f} (< {range_threshold:.0f} = 1.5 ATR)"
                     )
 
-        # --- 3. Bad phase check (FIX #222) ---
+        # --- 3. Bad phase check ---
         bad_phases = (TrendPhase.TREND_EXHAUSTION, TrendPhase.DISTRIBUTION, TrendPhase.TREND_DEATH)
         if trend_phase in bad_phases:
             trend_dir = getattr(self, '_trend_direction_from_ti', None)
@@ -3847,14 +3835,14 @@ class SignalEngine:
                     logger.debug(f"Prometheus metric update error: {e}")
             else:
                 if result.reason:
-                    logger.debug(f"📊 Entry not executed: {result.reason}")
+                    logger.warning(f"📊 Entry not executed: {result.reason}")
                 
                 # =========================================================================
-                # 🔥 FIX #111 (Feb 09, 2026): EXECUTION SLA VIOLATION DETECTION
-                #
+                # EXECUTION SLA VIOLATION DETECTION
+
                 # PROBLEMA: El sistema ve trades (EDGE_ACTIVE + SETUP_COMPLETE) pero
                 # no los toma por penalties acumulativos. Esto viola el SLA de ejecución.
-                #
+
                 # SOLUCIÓN: Si hay EDGE_ACTIVE y conf >= 70% pero no entramos,
                 # loguear ERROR para análisis posterior. Esto ayuda a detectar
                 # sobre-filtraje sistémico.
@@ -3874,7 +3862,7 @@ class SignalEngine:
                         )
                     
         except Exception as e:
-            # 🔥 FIX #86 (Feb 09, 2026): NEVER cooldown for CODE ERRORS
+            # NEVER cooldown for CODE ERRORS
             # Code errors ≠ trading errors. Cooldown only for market-related issues.
             # Log critically and continue - don't punish for bugs.
             logger.critical(f"Entry orchestration error (NO COOLDOWN): {e}", exc_info=True)
@@ -3906,23 +3894,22 @@ class SignalEngine:
         """WAIT_FILL state: monitor pending order"""
         
         # =====================================================================
-        # 🔥 FIX #183 (Feb 11, 2026): IDEMPOTENT FILL GUARD
+        # IDEMPOTENT FILL GUARD
         # CRITICAL: If position already exists, fill was already processed!
         # The timeout interrupted before transition to MANAGE completed.
         # This prevents the infinite loop: WAIT_FILL → detect fill → timeout → repeat
         # =====================================================================
         if self.risk_engine.position is not None:
-            logger.warning(f"🔄 FIX #183: WAIT_FILL with existing position detected - fast transition to MANAGE")
-            logger.info(f"🔄 FIX #183: Position: {self.risk_engine.position.direction} {self.risk_engine.position.size:.6f} @ {self.risk_engine.position.entry_price:.2f}")
-            
-            # Clear pending order tracking
+            logger.warning(f"🔄 WAIT_FILL with existing position detected - fast transition to MANAGE")
+            logger.info(f"🔄 Position: {self.risk_engine.position.direction} {self.risk_engine.position.size:.6f} @ {self.risk_engine.position.entry_price:.2f}")
+            # Clear pending  Position: {self.risk_engine.position.direction} {self.risk_engine.position.size:.6f} @ {self.risk_engine.position.entry_price:.2f}")order tracking
             if self.pending_order_id and self.pending_order_id in self.execution.open_orders:
                 self.execution.open_orders.pop(self.pending_order_id, None)
             self.pending_order_id = None
             self.entry_order_time = None
             
             # Transition immediately to MANAGE
-            self.state_machine.transition_to(BotState.MANAGE, "FIX #183: Position already exists")
+            self.state_machine.transition_to(BotState.MANAGE, "Position already exists")
             return
         
         if not self.pending_order_id:
@@ -3932,7 +3919,7 @@ class SignalEngine:
             return
         
         # =====================================================================
-        # 🔒 FIX (Jan 13, 2026): BACKTEST-ONLY instant fill from fills list
+        # BACKTEST-ONLY instant fill from fills list
         # This path should ONLY be used in backtest mode.
         # In LIVE, we verify fills through the proper poll_fill_status flow below.
         # =====================================================================
@@ -3946,7 +3933,7 @@ class SignalEngine:
                         fill_size = fill.get('amount', entry_data['position_size'])
                         fill_price = fill.get('price', entry_data['entry_price'])
                         
-                        # 🔥 FIX (Jan 21, 2026): Update position_store in backtest WAIT_FILL
+                        # Update position_store in backtest WAIT_FILL
                         try:
                             fill_side = 'buy' if entry_data['bias'].upper() == 'LONG' else 'sell'
                             await self._position_store.record_fill(
@@ -3971,18 +3958,18 @@ class SignalEngine:
                             atr_1m=entry_data['atr_1m'],
                             market_time=market_time,
                             trade_type=entry_data.get('trade_type', TradeType.LONG_MAIN if entry_data['bias'] == 'LONG' else TradeType.SHORT_STRUCTURAL),
-                            regime_mode=self._current_trade_regime,  # 🔥 FIX (Jan 22): Pass regime to trailing
-                            edge_type=self._current_trade_tags.get('edge_type'),  # 🔥 FIX (Jan 29): Pass edge_type for TIME_INVALIDATION
-                            entry_score=self._current_trade_tags.get('entry_score'),  # 🔥 FIX (Feb 01): Pass entry_score for stricter TIME_INVALIDATION
-                            is_weekend=market_time.weekday() >= 5 if market_time else False  # 🔥 FIX (Feb 01): Weekend stricter exits
+                            regime_mode=self._current_trade_regime,  # Pass regime to trailing
+                            edge_type=self._current_trade_tags.get('edge_type'),  # Pass edge_type for TIME_INVALIDATION
+                            entry_score=self._current_trade_tags.get('entry_score'),  # Pass entry_score for stricter TIME_INVALIDATION
+                            is_weekend=market_time.weekday() >= 5 if market_time else False  # Weekend stricter exits
                         )
                         
                         # 🔥 NEW: Start exhaustion tracking for this trade
                         self.exhaustion_detector.start_tracking(market_time)
                         self._exhaustion_tightened = False
                         
-                        # 🔥 FIX (Feb 01): Reset gap history for new trade
-                        self._gap_history = []
+
+                        #= []
                         
                         # Record trade price for duplicate zone filter
                         self._record_trade_price(fill_price)
@@ -4000,14 +3987,13 @@ class SignalEngine:
             # No LIMIT→MARKET fallback. If it doesn't fill, we cancel on timeout.
             
             # ================================================================
-            # 🔥 FIX #172b (Feb 11, 2026): HARD ESCAPE after 10 minutes
+            # HARD ESCAPE after 10 minutes
             # If stuck in WAIT_FILL for > 10 min, force exit unconditionally
             # This prevents the 3.5-hour zombie loop bug
             # ================================================================
             if elapsed > 600:  # 10 minutes = absolute max WAIT_FILL time
-                logger.critical(f"🚨 FIX #172b: HARD ESCAPE - stuck in WAIT_FILL for {elapsed:.0f}s (>10min)!")
-                logger.critical(f"🚨 FIX #172b: Forcing state cleanup and transition to IDLE")
-                
+                logger.critical(f"🚨 HARD ESCAPE - stuck in WAIT_FILL for {elapsed:.0f}s (>10min)!")
+                logger.critical(f"🚨 Forcing state cleanup and transition to IDLE")
                 # Force cleanup
                 try:
                     # Try to cancel if possible
@@ -4019,14 +4005,13 @@ class SignalEngine:
                 if self.pending_order_id and self.pending_order_id in self.execution.open_orders:
                     self.execution.open_orders.pop(self.pending_order_id, None)
                 
-                self._reset_trade_state("FIX #172b: HARD ESCAPE from WAIT_FILL")
-                self.state_machine.transition_to(BotState.IDLE, "FIX #172b: Hard escape timeout")
-                
+                self._reset_trade_state("HARD ESCAPE from WAIT_FILL")
+                self.state_machine.transition_to(BotState.IDLE, "Hard escape timeout")
                 # Notify
                 if self.output_manager:
                     _create_safe_task(
                         self.output_manager.send_critical_alert(
-                            f"🚨 FIX #172b: HARD ESCAPE from WAIT_FILL after {elapsed/60:.1f}min"
+                            f"🚨 HARD ESCAPE from WAIT_FILL after {elapsed/60:.1f}min"
                         ),
                         "hard_escape_alert"
                     )
@@ -4036,16 +4021,16 @@ class SignalEngine:
                 logger.warning(f"Entry timeout after {elapsed:.0f}s - attempting cancel")
                 
                 # ================================================================
-                # FIX #3 (Jan 13, 2026): Enhanced timeout cleanup with late fill detection
-                # 🔥 FIX #184 (Feb 11, 2026): Use SHORT timeout for pre-cancel check
-                # The original code used default 180s which blocked the tick!
+                # Enhanced timeout cleanup with late fill detection
+                #th late fill detection
+                #ult 180s which blocked the tick!
                 # ================================================================
                 
                 # Step 1: Check if order was ALREADY filled before we cancel (SHORT check)
                 pre_cancel_filled = False
                 try:
-                    # 🔥 FIX #184: Use 5s timeout, not the default 180s!
-                    # This is just a quick check, not a full poll
+                    # Use 5s timeout, not the default 180s!
+                    # a quick check, not a full poll
                     fill_status = await asyncio.wait_for(
                         self.execution.poll_fill_status(
                             self.pending_order_id, self.symbol, timeout_seconds=5
@@ -4124,8 +4109,8 @@ class SignalEngine:
                     return
         
         # Check if order was filled
-        # 🔥 FIX #184b (Feb 11, 2026): Use 10s timeout per tick instead of 180s default
-        # This prevents blocking the tick for too long
+        # Use 10s timeout per tick instead of 180s default
+        # ck for too long
         try:
             fill_status = await asyncio.wait_for(
                 self.execution.poll_fill_status(
@@ -4148,11 +4133,11 @@ class SignalEngine:
                 if not hasattr(self, '_consecutive_post_only_rejects'):
                     self._consecutive_post_only_rejects = 0
                 self._consecutive_post_only_rejects += 1
-                logger.info(f"📊 FIX #78: POST_ONLY rejection count: {self._consecutive_post_only_rejects}/3")
+                logger.info(f"📊 POST_ONLY rejection count: {self._consecutive_post_only_rejects}/3")
                 
                 # =============================================================
-                # 🔥 FIX #78 (Feb 06, 2026): POST-ONLY RETRY MECHANISM
-                # Instead of immediately giving up:
+                # POST-ONLY RETRY MECHANISM
+                # ng up:
                 # 1. Retry 3 times with price adjustment (+/- tick to win spread)
                 # 2. After 3 failures, fallback to MARKET order at 0.5× size
                 # =============================================================
@@ -4180,7 +4165,7 @@ class SignalEngine:
                         else:
                             adjusted_price = original_price + adjustment
                         
-                        logger.info(f"🔄 FIX #78: RETRY {self._consecutive_post_only_rejects}/{MAX_RETRIES} - "
+                        logger.info(f"🔄 RETRY {self._consecutive_post_only_rejects}/{MAX_RETRIES} - "
                                    f"{bias} @ {adjusted_price:.2f} (adjusted from {original_price:.2f})")
                         
                         try:
@@ -4194,7 +4179,7 @@ class SignalEngine:
                             )
                             
                             if order_result and order_result.get('id'):
-                                logger.info(f"✅ FIX #78: RETRY ORDER PLACED: {order_result['id']}")
+                                logger.info(f"✅ RETRY ORDER PLACED: {order_result['id']}")
                                 
                                 # Update pending order - stay in WAIT_FILL
                                 self.pending_order_id = order_result['id']
@@ -4212,7 +4197,7 @@ class SignalEngine:
                                 return  # Stay in WAIT_FILL with new order
                                 
                         except Exception as retry_err:
-                            logger.error(f"❌ FIX #78: Retry order failed: {retry_err}")
+                            logger.error(f"❌ Retry order failed: {retry_err}")
                     
                     # ==========================================
                     # MAX RETRIES REACHED → MARKET ORDER FALLBACK
@@ -4220,7 +4205,7 @@ class SignalEngine:
                     if self._consecutive_post_only_rejects >= MAX_RETRIES:
                         reduced_size = original_size * FALLBACK_SIZE_MULTIPLIER
                         
-                        logger.warning(f"🚨 FIX #78: MAX RETRIES ({MAX_RETRIES}) REACHED - "
+                        logger.warning(f"🚨 MAX RETRIES ({MAX_RETRIES}) REACHED - "
                                       f"FALLBACK to MARKET @ {reduced_size:.6f} (0.5× original)")
                         
                         try:
@@ -4234,7 +4219,7 @@ class SignalEngine:
                             )
                             
                             if order_result and order_result.get('id'):
-                                logger.info(f"✅ FIX #78: MARKET FALLBACK PLACED: {order_result['id']} @ {reduced_size:.6f}")
+                                logger.info(f"✅ MARKET FALLBACK PLACED: {order_result['id']} @ {reduced_size:.6f}")
                                 
                                 # Reset counter - we got an order placed
                                 self._consecutive_post_only_rejects = 0
@@ -4256,10 +4241,10 @@ class SignalEngine:
                                 return  # Stay in WAIT_FILL with market order
                                 
                         except Exception as fallback_err:
-                            logger.error(f"❌ FIX #78: Market fallback error: {fallback_err}")
+                            logger.error(f"❌ Market fallback error: {fallback_err}")
                 
                 # ALL RETRIES FAILED OR NO ENTRY DATA - RESET TO IDLE
-                logger.error(f"❌ FIX #78: All retry attempts exhausted - resetting to IDLE")
+                logger.error(f"❌ All retry attempts exhausted - resetting to IDLE")
                 self._consecutive_post_only_rejects = 0
                 self._reset_trade_state("Order rejected after all retries")
                 self.state_machine.transition_to(BotState.IDLE, "Order rejected - max retries")
@@ -4292,7 +4277,7 @@ class SignalEngine:
                             logger.info(f"🏷️ TAG: Order→fill latency: {fill_latency_ms}ms ({order_type}, converted={was_converted})")
                 
                 # =====================================================================
-                # 🔥 FIX (Jan 23, 2026): Setup TTL - si fill_latency > 20s el contexto LTF
+                # Setup TTL - si fill_latency > 20s el contexto LTF
                 # ya no es fiable. Cancelar y esperar otro setup.
                 # Aplica SOLO a market orders puros, no a conversiones (damage control)
                 # =====================================================================
@@ -4319,7 +4304,7 @@ class SignalEngine:
                         # Continue anyway - better to have tracking than phantom position
                 
                 # 📊 CAPA 5: Record fill in health monitor
-                # 🔥 FIX (Jan 23, 2026): Pass order type to distinguish LIMIT wait time vs MARKET latency
+                # Pass order type to distinguish LIMIT wait time vs MARKET latency
                 if self.health_monitor:
                     self.health_monitor.record_order_filled(
                         latency_ms=fill_latency_ms, 
@@ -4361,7 +4346,7 @@ class SignalEngine:
                     self.execution.open_orders.pop(self.pending_order_id, None)
                 
                 # Create Position object for risk management
-                # 🔥 FIX #4: Use ACTUAL fill price/size from exchange, not intended values
+                # Use ACTUAL fill price/size from exchange, not intended values
                 if hasattr(self, '_last_entry_data') and self._last_entry_data:
                     entry_data = self._last_entry_data
                     
@@ -4385,11 +4370,11 @@ class SignalEngine:
                             actual_size = exchange_qty
                     
                     # =========================================================================
-                    # 🔥 FIX (Jan 21, 2026): Update position_store when limit order fills
+                    # Update position_store when limit order fills
                     # This was missing, causing position_store vs risk_engine desync
                     # leading to phantom positions and "Position flipped" errors
-                    # 
-                    # 🔥 FIX (Jan 22, 2026): SKIP if market order already recorded fill!
+
+                    # SKIP if market order already recorded fill!
                     # When LIMIT→MARKET conversion happens, execution.py already calls
                     # record_fill, so we must NOT call it again here.
                     # Check if position_store already has this position to avoid double-count.
@@ -4425,17 +4410,17 @@ class SignalEngine:
                         atr_1m=entry_data['atr_1m'],
                         market_time=market_time,  # Use market time, not datetime.now()
                         trade_type=entry_data.get('trade_type', TradeType.LONG_MAIN if entry_data['bias'] == 'LONG' else TradeType.SHORT_STRUCTURAL),
-                        regime_mode=self._current_trade_regime,  # 🔥 FIX (Jan 22): Pass regime to trailing
-                        edge_type=self._current_trade_tags.get('edge_type'),  # 🔥 FIX (Jan 29): Pass edge_type for TIME_INVALIDATION
-                        entry_score=self._current_trade_tags.get('entry_score'),  # 🔥 FIX (Feb 01): Pass entry_score for stricter TIME_INVALIDATION
-                        is_weekend=market_time.weekday() >= 5 if market_time else False  # 🔥 FIX (Feb 01): Weekend stricter exits
+                        regime_mode=self._current_trade_regime,  # Pass regime to trailing
+                        edge_type=self._current_trade_tags.get('edge_type'),  # Pass edge_type for TIME_INVALIDATION
+                        entry_score=self._current_trade_tags.get('entry_score'),  # Pass entry_score for stricter TIME_INVALIDATION
+                        is_weekend=market_time.weekday() >= 5 if market_time else False  # Weekend stricter exits
                     )
                     
                     # 🔥 NEW: Start exhaustion tracking for this trade
                     self.exhaustion_detector.start_tracking(market_time)
                     self._exhaustion_tightened = False
                     
-                    # 🔥 FIX (Feb 01): Reset gap history for new trade
+                    # Reset gap history for new trade
                     self._gap_history = []
                     
                     trade_type_str = entry_data.get('trade_type', TradeType.LONG_MAIN)
@@ -4483,7 +4468,7 @@ class SignalEngine:
                             # 🔥 EDGE TYPE (Feb 05, 2026)
                             edge_type=edge_type_for_log
                         )
-                        # 🔥 FIX (Jan 27, 2026): Use CENTRALIZED activity tracker
+                        # Use CENTRALIZED activity tracker
                         # This is the SINGLE source of truth for trade activity
                         from src.domain.trading.activity_tracker import record_trade_executed
                         record_trade_executed(market_time)
@@ -4541,7 +4526,7 @@ class SignalEngine:
                                     )
                     
                     # =================================================================
-                    # 🔥 FIX #233 (Feb 15, 2026): TRANSITION TO MANAGE *BEFORE* SL/TP
+                    # TRANSITION TO MANAGE *BEFORE* SL/TP
                     # PROBLEM: SL/TP placement takes >15s (3 retries + backoff),
                     # exceeding the tick timeout. State stays WAIT_FILL, next tick
                     # re-detects the same fill → position created 8+ times.
@@ -4550,13 +4535,13 @@ class SignalEngine:
                     # =================================================================
                     self.pending_order_id = None
                     self.state_machine.transition_to(BotState.MANAGE, "Order filled")
-                    logger.info("🔥 FIX #233: State → MANAGE before SL/TP placement")
+                    logger.info("� State → MANAGE before SL/TP placement")
                     
                     # 🔥 ESTABLECER SL/TP EN LA POSICIÓN ABIERTA (UNA SOLA VEZ)
                     if not self._stops_set:
                         logger.info("📍 Setting SL/TP on open position...")
                         
-                        # 🔥 FIX #3: Retry SL placement with EXPONENTIAL BACKOFF
+                        # Retry SL placement with EXPONENTIAL BACKOFF
                         max_sl_retries = 3
                         stops_set = False
                         base_delay = 0.5  # Start at 500ms
@@ -4631,8 +4616,8 @@ class SignalEngine:
                 pass
         
         except asyncio.TimeoutError:
-            # 🔥 FIX #184b: Timeout is normal, will retry next tick
-            logger.debug(f"Poll fill status timeout (12s) - will retry next tick")
+            # Timeout is normal, will retry next tick
+            logger.debug(f"⏱️ Poll fill status timeout (12s) - will retry next tick")
         
         except Exception as e:
             logger.error(f"Error checking fill status: {e}")
@@ -4643,39 +4628,35 @@ class SignalEngine:
         """MANAGE state: run open position"""
         
         # =====================================================================
-        # � FIX (Feb 20, 2026): EMERGENCY MAX LOSS CAP — UNBLOCABLE
-        # 
-        # DATA (Feb 16-20): 14 losers averaged -0.42R despite -0.15R cap.
-        # ROOT CAUSE: Multiple gates (can_subsystems_act, _syncing_position,
-        # is_exchange_available, is_adopted) prevented manage_position from
-        # running. Trades drifted to -0.44R, -0.75R, -1.0R without any cap.
-        #
-        # This check fires BEFORE any gate. Nothing can bypass it.
-        # At $230 capital, one -0.50R loss = project death.
+        # UNPROTECTED POSITION EMERGENCY — ONLY fires if NO exchange SL exists
+        # If exchange SL is active and verified, we TRUST IT. The exchange SL
+        # is the real protection. Programmatic exits before SL only destroy
+        # edge by cutting trades that still have room to work.
+        # HARD_BACKSTOP (-0.50R) in risk_engine.py is the catastrophic safety net.
         # =====================================================================
-        EMERGENCY_MAX_LOSS_R = -0.20
         position = self.risk_engine.position
-        if position and current_price > 0:
+        if position and current_price > 0 and not position.exchange_sl_active:
             initial_risk = abs(position.entry_price - position.initial_stop_loss)
             if initial_risk > 0:
                 if position.direction == 'LONG':
                     emergency_r = (current_price - position.entry_price) / initial_risk
                 else:
                     emergency_r = (position.entry_price - current_price) / initial_risk
-                if emergency_r < EMERGENCY_MAX_LOSS_R:
+                UNPROTECTED_MAX_LOSS_R = -0.50
+                if emergency_r < UNPROTECTED_MAX_LOSS_R:
                     logger.critical(
-                        f"🚨 EMERGENCY MAX LOSS: R={emergency_r:.3f} < {EMERGENCY_MAX_LOSS_R} | "
-                        f"Entry={position.entry_price:.2f} Price={current_price:.2f} | "
-                        f"CLOSING NOW — no gate can block this"
+                        f"🚨 UNPROTECTED POSITION EMERGENCY: R={emergency_r:.3f} | "
+                        f"NO exchange SL active! Entry={position.entry_price:.2f} Price={current_price:.2f} | "
+                        f"CLOSING NOW"
                     )
                     try:
                         await self._close_position_with_full_flow(
-                            reason="TIME_INVALIDATION_MAX_LOSS",
+                            reason="UNPROTECTED_EMERGENCY",
                             current_price=current_price,
                             market_time=market_time,
                             position=position,
                             cooldown_minutes=10,
-                            extra_log_data={'emergency_r': emergency_r, 'cap': EMERGENCY_MAX_LOSS_R}
+                            extra_log_data={'emergency_r': emergency_r, 'cap': UNPROTECTED_MAX_LOSS_R}
                         )
                     except Exception as e:
                         logger.critical(f"🚨 EMERGENCY CLOSE FAILED: {e} — trying raw market close")
@@ -4683,7 +4664,7 @@ class SignalEngine:
                             close_side = 'sell' if position.direction == 'LONG' else 'buy'
                             await self.execution.close_position_market(
                                 symbol=self.symbol, side=close_side,
-                                amount=position.size, reason="EMERGENCY_MAX_LOSS_FALLBACK"
+                                amount=position.size, reason="UNPROTECTED_EMERGENCY_FALLBACK"
                             )
                         except Exception as e2:
                             logger.critical(f"🚨🚨 ALL CLOSE METHODS FAILED: {e2}")
@@ -4698,7 +4679,7 @@ class SignalEngine:
             logger.debug(f"🔒 Subsystems BLOCKED: {block_reason}")
             return
         
-        # 🔥 FIX #2: Skip if sync operation is in progress
+        # Skip if sync operation is in progress
         if getattr(self, '_syncing_position', False):
             logger.debug("Position sync in progress - skipping MANAGE operations")
             return
@@ -4722,7 +4703,7 @@ class SignalEngine:
                 
                 # Registrar cierre (SYNC event, NOT a real loss)
                 self.state_machine.record_trade_close(estimated_pnl, False, exit_reason='RECONCILE_CLOSE')
-                self.state_machine.update_daily_pnl(estimated_pnl)  # 🔥 FIX: Update daily PnL (even if 0)
+                self.state_machine.update_daily_pnl(estimated_pnl)  # Update daily PnL (even if 0)
                 
                 # Limpiar posición local (thread-safe)
                 await self.risk_engine.clear_position("reconcile close - no position on exchange")
@@ -4761,8 +4742,8 @@ class SignalEngine:
                         # 🔥 CRITICAL: Mark exchange SL as active
                         if self.risk_engine.position:
                             self.risk_engine.position.mark_exchange_sl_active()
-                        # 🔥 FIX #27: Initialize _last_sent_sl for trailing sync
-                        self._last_sent_sl = self._last_entry_data['stop_loss']
+                        # Initialize _last_sent_sl for trailing sync
+                    #nt_sl = self._last_entry_data['stop_loss']
                     else:
                         logger.critical("❌ SL/TP claimed success but NOT found on exchange - UNPROTECTED!")
                         # Mark SL as inactive - local check will handle closure
@@ -4791,18 +4772,18 @@ class SignalEngine:
         position = self.risk_engine.position
         if not position:
             # ============================================================
-            # 🔥 FIX #79 (Feb 07, 2026): CHECK EXCHANGE BEFORE IDLE
-            # 
+            # CHECK EXCHANGE BEFORE IDLE
+
             # PROBLEM: Si hay posición en exchange pero no local, volver
             # a IDLE causaba entradas duplicadas.
-            # 
+
             # SOLUTION: Verificar exchange primero. Si hay posición,
             # sincronizar en lugar de ir a IDLE.
             # ============================================================
             try:
                 exchange_has_position = await self.execution.has_open_position(self.symbol)
                 if exchange_has_position:
-                    logger.warning("🔒 FIX #79: No local position but EXCHANGE HAS POSITION - syncing instead of IDLE")
+                    logger.warning("🔒 No local position but EXCHANGE HAS POSITION - syncing instead of IDLE")
                     
                     # Get exchange position details
                     exchange_pos = await self.execution.get_position(self.symbol)
@@ -4813,12 +4794,12 @@ class SignalEngine:
                         
                         if size >= KRAKEN_BTC_MIN_SIZE:
                             # Create local position to match exchange
-                            logger.info(f"🔄 FIX #79: Creating local position from exchange: {side} {size} @ {entry_price}")
+                            logger.info(f"🔄 Creating local position from exchange: {side} {size} @ {entry_price}")
                             
                             direction = 'LONG' if side == 'long' else 'SHORT'
                             
-                            # 🔥 FIX #79b (Feb 20, 2026): Read actual SL from exchange orders
-                            # BEFORE: Used entry_price * 1.01 = $68,391 as SL (1% fallback)
+                            # Read actual SL from exchange orders
+                            # .01 = $68,391 as SL (1% fallback)
                             # ACTUAL: Real SL was $68,188 → trailing used 43% wider risk!
                             # This distorted ALL R-multiple calculations (MFE, tiers, etc.)
                             actual_sl = None
@@ -4838,14 +4819,14 @@ class SignalEngine:
                                             trigger = float(order.get('triggerPrice'))
                                         if trigger > 0:
                                             actual_sl = trigger
-                                            logger.info(f"🔄 FIX #79b: Exchange SL found at ${actual_sl:.2f}")
+                                            logger.info(f"🔄 Exchange SL found at ${actual_sl:.2f}")
                                             break
                             except Exception as e:
-                                logger.debug(f"FIX #79b: Could not read exchange orders: {e}")
+                                logger.debug(f"Could not read exchange orders: {e}")
                             
                             if actual_sl is None:
                                 actual_sl = entry_price * (0.99 if direction == 'LONG' else 1.01)
-                                logger.warning(f"⚠️ FIX #79b: No exchange SL found, using 1% fallback: ${actual_sl:.2f}")
+                                logger.warning(f"⚠️ No exchange SL found, using 1% fallback: ${actual_sl:.2f}")
                             
                             fallback_atr = abs(entry_price - actual_sl)
                             self.risk_engine.create_position(
@@ -4860,20 +4841,20 @@ class SignalEngine:
                                 regime_mode=self._current_trade_regime,
                             )
                             
-                            # 🔥 FIX #185a (Feb 11, 2026): Reset gap history y prev_tick_price
-                            # en sync forzado para evitar PRICE_GAP_ANOMALY falso positivo
+                            # Reset gap history y prev_tick_price
+                            # RICE_GAP_ANOMALY falso positivo
                             # El sync puede ocurrir segundos después del fill, acumulando "gap"
                             self._gap_history = []
                             self._prev_tick_price = current_price
-                            logger.info(f"🔥 FIX #185a: Gap history reset on forced sync to prevent false PRICE_GAP_ANOMALY")
+                            logger.info(f"🔥 Gap history reset on forced sync to prevent false PRICE_GAP_ANOMALY")
                             
                             # Start cooldown to prevent immediate re-entry
                             self.state_machine.start_cooldown(3)
-                            logger.info(f"✅ FIX #79: Position synced - staying in MANAGE with 3-candle cooldown")
+                            logger.info(f"✅ Position synced - staying in MANAGE with 3-candle cooldown")
                             return  # Stay in MANAGE
                             
             except Exception as sync_err:
-                logger.error(f"❌ FIX #79: Exchange sync failed: {sync_err}")
+                logger.error(f"❌ Exchange sync failed: {sync_err}")
             
             # 🔒 LIMPIEZA COMPLETA si no hay posición local NI en exchange
             logger.warning("MANAGE state but no local position AND no exchange position - transitioning to IDLE")
@@ -5034,13 +5015,13 @@ class SignalEngine:
             self._exhaustion_tightened = False
 
         # ==================================================================
-        # TIER 2 INTEGRATION (FIX #6): Funding-based forced exit
-        # TIER 2 INTEGRATION (FIX #13): Time-based forced exit
+        # TIER 2 INTEGRATION: Funding-based forced exit
+        # TIER 2 INTEGRATIONed forced exit
         # ==================================================================
 
         try:
-            # FIX #6: exit on extreme funding (LONG only)
-            # IMPROVED (Jan 12): Use REAL time until next funding settlement
+            # Extreme funding (LONG only)
+            # Use REAL time until next funding settlement
             time_to_funding_min = None
             try:
                 if hasattr(self.external_data, 'funding'):
@@ -5068,9 +5049,9 @@ class SignalEngine:
                 )
                 return
 
-            # FIX #13: time-based exit (stagnation-based, not clock-based)
+            # Time-based exit (stagnation-based, not clock-based)
             # REDESIGNED (Jan 4, 2026): Pass current ATR for stagnation check
-            # 🔧 FIX #23 (Feb 02, 2026): Use ACTUAL ATR from market data, not position's entry ATR
+            # Use ACTUAL ATR from market data, not position's entry ATR
             # The bug was: current_atr = position.atr_1m compares ATR with itself (ratio=1.0)
             # Now we calculate fresh ATR from current candles
             candles_1m_for_atr = self.market_data.get_candles('1m')
@@ -5144,7 +5125,7 @@ class SignalEngine:
         # Check for BOS against position
         has_bos_against = self._check_bos_against_position(position.direction, candles_5m)
         
-        # 🔥 FIX (Jan 23, 2026): Log if this is an orphan recovery BOS check
+        # Log if this is an orphan recovery BOS check
         if getattr(self, '_force_bos_check_on_orphan', False):
             logger.info(f"📊 ORPHAN BOS CHECK: {position.direction} | has_bos_against={has_bos_against}")
             self._force_bos_check_on_orphan = False  # Reset flag
@@ -5182,8 +5163,8 @@ class SignalEngine:
                 f"R: {bos_result.extra_data.get('current_r', 0):.2f} → Tightening SL 50%"
             )
         
-        # 🔥 FIX #3: Block logical exits when exchange is unavailable
-        # Only emergency close with confirmed position is allowed
+        # al exits when exchange is unavailable
+        # ncy close with confirmed position is allowed
         if not self.reconciler.is_exchange_available():
             if self.reconciler.is_degraded:
                 logger.warning("⚠️ DEGRADED MODE: Skipping logical exit checks - exchange unavailable")
@@ -5192,18 +5173,18 @@ class SignalEngine:
         # =====================================================================
         # 🔥 ANOMALY DETECTION DATA (Jan 24, 2026)
         # Calculate anomaly indicators for EMERGENCY system
-        # 🔧 FIX (Jan 25, 2026): Use real feed staleness from market_data
-        # 🔥 FIX (Feb 01, 2026): INTELLIGENT PRICE GAP DETECTION
+        # Use real feed staleness from market_data
+        # ETECTION
         #    - Problem: Single-tick gap (0.5%) triggered false EMERGENCY exits
         #    - Solution: Normalize gap by ATR + require 2 consecutive large gaps
         # =====================================================================
         price_gap_pct = None
         
-        # 🔧 FIX (Jan 25, 2026): Use REAL feed staleness from market_data
+        # Use REAL feed staleness from market_data
         # Previous implementation calculated time between tick processing (buggy)
         last_tick_age_sec = self.market_data.get_feed_age_sec()
         
-        # 🔥 FIX (Feb 01, 2026): INTELLIGENT PRICE GAP DETECTION
+        # ETECTION
         # Single tick gap is noisy - require confirmation
         # Gap normalized by ATR (1-min ATR ~ 0.05% for BTC)
         if self._prev_tick_price > 0 and current_price > 0:
@@ -5242,7 +5223,7 @@ class SignalEngine:
         self._prev_tick_time = market_time
         
         # =====================================================================
-        # �🔒 FIX (Jan 13, 2026): SYNC SIZE FROM RECONCILER SNAPSHOT
+        # �SYNC SIZE FROM RECONCILER SNAPSHOT
         # OPTIMIZED (Jan 20, 2026): Use cached snapshot instead of API call
         # The reconciler already polls exchange every 5 seconds
         # =====================================================================
@@ -5282,14 +5263,14 @@ class SignalEngine:
         )
         
         # =====================================================================
-        # 🔥 FIX #27 (Feb 02, 2026): SYNC TRAILING STOP WITH EXCHANGE
-        # PROBLEMA: trailing_stop se calculaba localmente pero NUNCA se enviaba
+        # HANGE
+        # calculaba localmente pero NUNCA se enviaba
         # al exchange. Si el bot se desconecta, el SL quedaba en valor inicial.
-        #
+
         # SOLUCIÓN: Después de cada manage_position, sincronizar el trailing
         # con el exchange si cambió significativamente.
-        # 🔥 FIX #294 (Feb 18, 2026): Track sync failures + periodic SL verification
-        # =====================================================================
+        # ic SL verification
+        # =========================================
         if position and not self._is_backtest:
             current_trailing = position.trailing_stop
             # Solo sincronizar si el trailing cambió significativamente (>0.3R o >0.5%)
@@ -5332,8 +5313,8 @@ class SignalEngine:
                     )
             
             # =================================================================
-            # 🔥 FIX #294: PERIODIC SL HEALTH CHECK
-            #
+            # EALTH CHECK
+
             # If trailing sync fails 5+ times OR every 120 seconds,
             # verify the exchange SL actually exists. If it disappeared
             # (cancelled externally, exchange error, etc.), either
@@ -5355,14 +5336,14 @@ class SignalEngine:
                         # SL exists on exchange — reset failure counter
                         if self._trailing_sync_failures >= 5:
                             logger.info(
-                                f"✅ FIX #294: SL verified on exchange despite {self._trailing_sync_failures} sync failures | "
+                                f"✅ SL verified on exchange despite {self._trailing_sync_failures} sync failures | "
                                 f"Exchange SL still protecting position"
                             )
                             self._trailing_sync_failures = 0
                     else:
                         # SL NOT found on exchange but exchange_sl_active=True — CRITICAL
                         logger.critical(
-                            f"🚨 FIX #294: EXCHANGE SL MISSING! exchange_sl_active=True but no SL found | "
+                            f"🚨 EXCHANGE SL MISSING! exchange_sl_active=True but no SL found | "
                             f"Attempting emergency SL placement at {current_trailing:.2f}"
                         )
                         # Attempt emergency SL placement
@@ -5374,15 +5355,15 @@ class SignalEngine:
                         if emergency_sl:
                             self._last_sent_sl = current_trailing
                             self._trailing_sync_failures = 0
-                            logger.info(f"✅ FIX #294: Emergency SL placed at {current_trailing:.2f}")
+                            logger.info(f"✅ Emergency SL placed at {current_trailing:.2f}")
                         else:
-                            position.mark_exchange_sl_inactive("FIX #294: SL missing + placement failed")
+                            position.mark_exchange_sl_inactive("SL missing + placement failed")
                             logger.critical(
-                                f"🚨 FIX #294: Emergency SL FAILED — local SL fallback active | "
+                                f"🚨 Emergency SL FAILED — local SL fallback active | "
                                 f"Position at risk if bot disconnects"
                             )
                 except Exception as e:
-                    logger.warning(f"⚠️ FIX #294: SL verification error: {e}")
+                    logger.warning(f"⚠️ SL verification error: {e}")
         
         if exit_action:
             action = exit_action.get('action')
@@ -5658,101 +5639,73 @@ class SignalEngine:
 
     def _price_confirms_direction(self, direction: str, lookback_candles: int = 5) -> tuple[bool, float, str]:
         """
-        🔥 FIX (Feb 04, 2026): Validate that PRICE MOVEMENT confirms the trade direction.
-        🔥 FIX #53 (Feb 05, 2026): Extended lookback to 5 min, added high/low range check
+        Anti-contradiction gate: block only when price is ACTIVELY moving against
+        the trade direction. Neutral / flat price = allowed through.
         
-        PROBLEMA: Sistema usaba CONSENSUS de indicadores lagging (structural == active)
-        para entrar trades. Pero si el precio estaba moviéndose en dirección OPUESTA,
-        entraba de todas formas. Ejemplo: SHORT cuando precio subió 0.5% en 3 min.
+        This is the FIRST gate (pre-arming). The SECOND gate is
+        confirm_consensus_armed() which requires positive confirmation.
         
-        SOLUCIÓN: Antes de cualquier entrada, verificar que el precio reciente
-        se mueve EN LA DIRECCIÓN del trade, o al menos NO en contra.
+        Blocks when:
+        - Price moved ≥ 0.15% AGAINST direction in last N candles
+        - Price is at the tip of a rally/dump (near extreme, still moving against)
         
-        🔥 FIX #53: Also check if price made significant HIGH/LOW in lookback period
-        - For SHORT: Block if recent high is significantly above current (price just rallied)
-        - For LONG: Block if recent low is significantly below current (price just dumped)
+        Allows when:
+        - Price is moving IN direction (confirmed)
+        - Price is flat / neutral (not contradicting)
+        - Price bounced from extreme (reversal setup)
         
-        Args:
-            direction: 'LONG' o 'SHORT'
-            lookback_candles: Cuántas velas 1m mirar hacia atrás (default 5 = 5 min)
-            
-        Returns:
-            (confirms: bool, price_change_pct: float, reason: str)
-            - confirms: True si precio confirma o es neutral
-            - price_change_pct: Cambio de precio en %
-            - reason: Descripción del resultado
+        Returns: (allows, price_change_pct, reason)
         """
         try:
             candles_1m = self.market_data.get_candles('1m')
             if not candles_1m or len(candles_1m) < lookback_candles + 1:
-                return True, 0.0, "Not enough data - allowing entry"
+                return True, 0.0, "Not enough data — allowing"
             
             recent = candles_1m[-(lookback_candles + 1):]
             price_start = recent[0]['close']
             price_end = recent[-1]['close']
             price_change_pct = (price_end - price_start) / price_start * 100
             
-            # 🔥 FIX #53: Also get the range extremes
             recent_high = max(c.get('high', c['close']) for c in recent)
             recent_low = min(c.get('low', c['close']) for c in recent)
             current_price = price_end
             
-            # Distance from extremes
             dist_from_high_pct = (recent_high - current_price) / current_price * 100
             dist_from_low_pct = (current_price - recent_low) / current_price * 100
             
-            # 🔥 FIX #79 (Feb 07): Raised threshold from 0.20% to 0.50%
-            # Problem: 0.20% is too sensitive - normal volatility blocks good entries
-            # Evidence: System blocked SHORT while price dropped $600 because of 0.2% bounces
-            CONTRADICT_THRESHOLD = 0.50  # Was 0.20, now 0.50 (less sensitive)
-            # 🔥 FIX #53: If price made a significant extreme and retraced, be cautious
-            EXTREME_THRESHOLD = 0.60  # Was 0.35, now 0.60 (less sensitive)
+            CONTRADICT_THRESHOLD = 0.15  # Moving ≥ 0.15% AGAINST = hard block
             
             if direction == 'SHORT':
-                # 🔥 FIX #53: Block if price made significant recent HIGH (just rallied)
-                if dist_from_high_pct < 0.10 and price_change_pct > 0:
-                    # Price is at/near recent high and climbing → don't short the top of a rally
-                    return False, price_change_pct, f"SHORT blocked: at recent HIGH (dist={dist_from_high_pct:.2f}%, change={price_change_pct:.2f}%)"
-                
+                # Block: at tip of rally AND still climbing
+                if dist_from_high_pct < 0.05 and price_change_pct > 0.05:
+                    return False, price_change_pct, f"SHORT blocked: at recent HIGH (dist={dist_from_high_pct:.2f}%)"
+                # Block: price clearly moving UP
                 if price_change_pct > CONTRADICT_THRESHOLD:
-                    # Price is UP but we want SHORT → CONTRADICTION
-                    return False, price_change_pct, f"SHORT contradicted: price UP {price_change_pct:.2f}% (${price_start:.0f}→${price_end:.0f})"
-                elif price_change_pct < -CONTRADICT_THRESHOLD:
-                    # Price is DOWN and we want SHORT → CONFIRMS
+                    return False, price_change_pct, f"SHORT contradicted: price UP {price_change_pct:.2f}%"
+                # Allow: price moving down = confirmed
+                if price_change_pct <= -0.05:
                     return True, price_change_pct, f"SHORT confirmed: price DOWN {abs(price_change_pct):.2f}%"
-                else:
-                    # Neutral - but check if we just had a rally that retraced
-                    if dist_from_high_pct > EXTREME_THRESHOLD:
-                        # Price recently made a high and pulled back significantly
-                        # This could be good for SHORT (failed rally)
-                        return True, price_change_pct, f"SHORT opportunity: retraced from high ({dist_from_high_pct:.2f}%)"
-                    return True, price_change_pct, f"Neutral: price change {price_change_pct:.2f}%"
+                # Allow: neutral / flat
+                return True, price_change_pct, f"SHORT neutral: price {price_change_pct:+.2f}%"
                     
             elif direction == 'LONG':
-                # 🔥 FIX #53: Block if price made significant recent LOW (just dumped)
-                if dist_from_low_pct < 0.10 and price_change_pct < 0:
-                    # Price is at/near recent low and falling → don't long the bottom of a dump
-                    return False, price_change_pct, f"LONG blocked: at recent LOW (dist={dist_from_low_pct:.2f}%, change={price_change_pct:.2f}%)"
-                
+                # Block: at tip of dump AND still falling
+                if dist_from_low_pct < 0.05 and price_change_pct < -0.05:
+                    return False, price_change_pct, f"LONG blocked: at recent LOW (dist={dist_from_low_pct:.2f}%)"
+                # Block: price clearly moving DOWN
                 if price_change_pct < -CONTRADICT_THRESHOLD:
-                    # Price is DOWN but we want LONG → CONTRADICTION
-                    return False, price_change_pct, f"LONG contradicted: price DOWN {abs(price_change_pct):.2f}% (${price_start:.0f}→${price_end:.0f})"
-                elif price_change_pct > CONTRADICT_THRESHOLD:
-                    # Price is UP and we want LONG → CONFIRMS
+                    return False, price_change_pct, f"LONG contradicted: price DOWN {abs(price_change_pct):.2f}%"
+                # Allow: price moving up = confirmed
+                if price_change_pct >= 0.05:
                     return True, price_change_pct, f"LONG confirmed: price UP {price_change_pct:.2f}%"
-                else:
-                    # Neutral - but check if we just had a dump that bounced
-                    if dist_from_low_pct > EXTREME_THRESHOLD:
-                        # Price recently made a low and bounced significantly
-                        # This could be good for LONG (failed breakdown)
-                        return True, price_change_pct, f"LONG opportunity: bounced from low ({dist_from_low_pct:.2f}%)"
-                    return True, price_change_pct, f"Neutral: price change {price_change_pct:.2f}%"
+                # Allow: neutral / flat
+                return True, price_change_pct, f"LONG neutral: price {price_change_pct:+.2f}%"
             
             return True, price_change_pct, "Unknown direction"
             
         except Exception as e:
             logger.debug(f"Price confirmation check error: {e}")
-            return True, 0.0, f"Error checking: {e}"
+            return True, 0.0, f"Error checking — allowing"
     
     # =========================================================================
     # 🔥 UNIFIED TRADING INTELLIGENCE (Feb 04, 2026)
@@ -5791,7 +5744,7 @@ class SignalEngine:
             return True, f"{bypass_type} override active"
         
         # Compression breakout bypasses RANGE filters
-        # 🔥 FIX #95 (Feb 09): Aceptar todos los tipos de anticipation
+        # Aceptar todos los tipos de anticipation
         if filter_name.startswith('RANGE'):
             valid_anticipation_signals = ['COMPRESSION_BREAKOUT', 'TREND_PULLBACK', 'FAILED_TEST', 'MOMENTUM_EXHAUSTION']
             has_breakout = (
@@ -5807,7 +5760,7 @@ class SignalEngine:
     
     async def _check_position_has_stops(self) -> bool:
         """
-        🔒 FIX (Jan 17, 2026): Check if current position has SL/TP protection on exchange
+        Check if current position has SL/TP protection on exchange
         
         Returns True if at least SL exists, False otherwise.
         Used by STATE OVERRIDE to detect orphan positions without protection.
@@ -5876,14 +5829,14 @@ class SignalEngine:
             
             # Calculate R realized (use stored risk or estimate)
             r_realized = 0.0
-            # 🔥 FIX: Use _last_entry_data risk or estimate from position
+            # Use _last_entry_data risk or estimate from position
             if hasattr(self, '_last_entry_data') and self._last_entry_data and 'risk_usd' in self._last_entry_data:
                 risk = self._last_entry_data.get('risk_usd', 0)
                 if risk > 0:
                     r_realized = pnl / risk
             elif self.risk_engine.has_open_position():
                 # Estimate from position's initial stop
-                # 🔥 FIX: Access position directly (no get_position method)
+                # Access position directly (no get_position method)
                 pos = self.risk_engine.position
                 if pos:
                     risk_per_unit = abs(pos.entry_price - pos.initial_stop_loss)
@@ -5926,7 +5879,7 @@ class SignalEngine:
         )
         
         # Update engine state from result
-        # 🔥 FIX: Ensure int type for consecutive_losses
+        # Ensure int type for consecutive_losses
         self._consecutive_losses = int(result.new_consecutive_losses)
         self._daily_losses_count = int(result.new_daily_losses_count)
         self._countertrend_losses_session = result.new_countertrend_losses
@@ -6038,11 +5991,11 @@ class SignalEngine:
                 )
             
             # =========================================================================
-            # 🔥 FIX #11: BREAKEVEN TRADES DON'T COUNT (Feb 02, 2026)
+            # BREAKEVEN TRADES DON'T COUNT
             # =========================================================================
             # If trade closed with |PnL| < 0.15R, it's a "breakeven" that didn't
             # develop. Don't punish the session limit for it - refund the slot.
-            # 
+
             # Example: Entry @ $77,144 → Exit @ $77,152 = -0.04R (breakeven)
             # This shouldn't consume a session trade slot.
             # =========================================================================
@@ -6269,7 +6222,7 @@ class SignalEngine:
     def _check_bos_against_position(self, direction: str, candles_5m: list) -> bool:
         """BOS detection - delegates to position_manager with edge-triggered logging
         
-        🔧 FIX #127 (Feb 09, 2026): Use unified BOS detection from position_manager
+        Uses unified BOS detection from position_manager.
         """
         if not candles_5m or len(candles_5m) < 5:
             return False
@@ -6292,11 +6245,11 @@ class SignalEngine:
         """Emergency close all positions (market order)"""
         logger.critical("EMERGENCY POSITION CLOSE")
         
-        # 🔐 FIX #2: Hard-lock during emergency exit
+        # Hard-lock during emergency exit
         self.reconciler.notify_exit_started("EMERGENCY_CLOSE")
         
         try:
-            # 🔥 FIX #8: Cancel all pending orders FIRST to avoid SL/TP triggering during close
+            # Cancel all pending orders FIRST to avoid SL/TP triggering during close
             try:
                 await self.execution.cancel_all_orders(self.symbol)
                 logger.info("✅ All pending orders cancelled before emergency close")
@@ -6311,7 +6264,7 @@ class SignalEngine:
                 if candles_1m and len(candles_1m) > 0:
                     current_price = candles_1m[-1]['close']
                 
-                # 🔒 FIX (Jan 14, 2026): Get real size from exchange for emergency close
+                # Get real size from exchange for emergency close
                 close_size = position.size
                 try:
                     exchange_pos = await self.execution.get_position(self.symbol)
@@ -6363,10 +6316,10 @@ class SignalEngine:
                 
                 # Record close in state machine
                 self.state_machine.record_trade_close(pnl, pnl > 0, exit_reason='EMERGENCY_CLOSE')
-                # 🔒 FIX (Jan 22, 2026): Also update daily PnL for DD tracking
+                # Also update daily PnL for DD tracking
                 self.state_machine.update_daily_pnl(pnl)
                 
-                # 🔥 FIX (Jan 25, 2026): Record for kill-switch tracking
+                # Record for kill-switch tracking
                 from datetime import datetime, UTC
                 self._record_trade_result('EMERGENCY_CLOSE', pnl, datetime.now(UTC))
                 
@@ -6410,7 +6363,7 @@ class SignalEngine:
         """
         Emergency close triggered by daily drawdown limit.
         
-        FIX #1 (Jan 13, 2026): When daily loss limit is hit:
+        When daily loss limit is hit:
         1. Cancel ALL pending orders
         2. Close ANY open position at market
         3. Set system to halt state
@@ -6666,7 +6619,7 @@ class SignalEngine:
 
     async def _periodic_reconciliation(self):
         """
-        FIX #4 (Jan 13, 2026): Periodic reconciliation with exchange.
+        Periodic reconciliation with exchange.
         
         Runs every 30s to ensure local state matches exchange reality.
         Handles:
@@ -6722,8 +6675,7 @@ class SignalEngine:
                             self.state_machine.transition_to(BotState.IDLE, "Ghost position - synced with exchange")
                     
                     elif disc_type == 'phantom_position_cleared':
-                        # 🔥 FIX (Jan 14, 2026): Position was closed by exchange TP/SL
-                        # This is the MAIN case for TP/SL notifications!
+                        # Position was closed by exchange TP/SL — main case for TP/SL notifications
                         logger.critical(f"📤 PHANTOM POSITION CLEARED: Position closed by exchange (likely TP/SL)")
                         
                         local_size = d.get('local_size', 0)
@@ -6735,7 +6687,7 @@ class SignalEngine:
                         r_realized = 0.0
                         exit_type = "EXCHANGE_TP_SL"
                         exit_price = 0.0
-                        entry_price = 0.0  # 🔥 FIX: Track entry for notification
+                        entry_price = 0.0  # Track entry for notification
                         
                         # Get last known price
                         candles = self.market_data.get_candles('1m')
@@ -6745,7 +6697,7 @@ class SignalEngine:
                         # If we still have position info in risk_engine, calculate PnL
                         if self.risk_engine.position:
                             pos = self.risk_engine.position
-                            entry_price = getattr(pos, 'entry_price', 0.0)  # 🔥 FIX: Get entry price
+                            entry_price = getattr(pos, 'entry_price', 0.0)  # Get entry price
                             if hasattr(pos, 'calculate_pnl') and exit_price > 0:
                                 pnl_estimate = pos.calculate_pnl(exit_price)
                             if hasattr(pos, 'entry_price') and hasattr(pos, 'initial_stop_loss'):
@@ -6760,7 +6712,7 @@ class SignalEngine:
                         
                         # Record trade close
                         self.state_machine.record_trade_close(pnl_estimate, pnl_estimate > 0, exit_reason=exit_type)
-                        self.state_machine.update_daily_pnl(pnl_estimate)  # 🔥 FIX: Update daily PnL tracking
+                        self.state_machine.update_daily_pnl(pnl_estimate)  # Update daily PnL tracking
                         
                         # 🔥 SEND TELEGRAM NOTIFICATION
                         if self.output_manager:
@@ -6771,7 +6723,7 @@ class SignalEngine:
                                     'reason': exit_type,
                                     'pnl': pnl_estimate,
                                     'r_realized': r_realized,
-                                    'entry_price': entry_price,  # 🔥 FIX: Include entry price
+                                    'entry_price': entry_price,  # Include entry price
                                     'exit_price': exit_price,
                                     'direction': local_side,
                                     'size': local_size,
@@ -6785,12 +6737,12 @@ class SignalEngine:
                         await self.risk_engine.clear_position("phantom position cleared by exchange")
                         self._reset_trade_state("Phantom position cleared by exchange")
                         
-                        # 🔥 FIX #262: Smart cooldown after phantom close
+                        # Smart cooldown after phantom close
                         # ANTES: Sin cooldown → edge armed 2 segundos después → trade desesperado
                         # AHORA: Mismo cooldown que un trade normal cerrado por exchange
                         phantom_cooldown = OperatingMode.get_smart_cooldown(exit_type, r_realized)
                         logger.info(
-                            f"⏱️ FIX #262: Phantom close cooldown: {phantom_cooldown}min "
+                            f"⏱️ Phantom close cooldown: {phantom_cooldown}min "
                             f"(exit={exit_type}, r={r_realized:.2f})"
                         )
                         self.state_machine.start_cooldown(phantom_cooldown)
@@ -6806,7 +6758,7 @@ class SignalEngine:
             if pos_store_pos and not pos_store_pos.is_flat:
                 # Exchange has position
                 if not local_pos:
-                    # 🔥 FIX (Feb 4, 2026): Actively recover from desync, don't just log
+                    # Actively recover from desync, don't just log
                     # This prevents MFE/trailing/add-to-winner using stale or null state
                     logger.warning("⚠️ Position store has position but risk engine doesn't - FORCING RECOVERY")
                     try:
@@ -6848,7 +6800,7 @@ class SignalEngine:
                     logger.warning(f"🧟 Zombie cleanup: {zombie_result['cancelled']} orders cancelled")
                     
                     # =========================================================================
-                    # 🔥 FIX #173 (Feb 11, 2026): ZOMBIE CLEANUP STATE MACHINE SYNC
+                    # ZOMBIE CLEANUP STATE MACHINE SYNC
                     # If zombie cleanup cancelled our pending entry order, we MUST:
                     # 1. Clear pending_order_id
                     # 2. Transition from WAIT_FILL → IDLE
@@ -6859,7 +6811,7 @@ class SignalEngine:
                         if zombie.get('cancelled') and self.pending_order_id:
                             # Check if zombie was our pending order
                             if zombie_id == self.pending_order_id or (zombie_id and zombie_id.startswith(self.pending_order_id[:12])):
-                                logger.critical(f"🧟 FIX #173: ZOMBIE was our PENDING ORDER! Forcing WAIT_FILL → IDLE")
+                                logger.critical(f"🧟 ZOMBIE was our PENDING ORDER! Forcing WAIT_FILL → IDLE")
                                 self._reset_trade_state("Zombie cleanup cancelled our entry order")
                                 if self.state_machine.state == BotState.WAIT_FILL:
                                     self.state_machine.transition_to(BotState.IDLE, "Zombie cleanup")

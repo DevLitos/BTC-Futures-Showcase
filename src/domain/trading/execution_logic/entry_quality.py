@@ -1,7 +1,7 @@
 """
 Entry Quality Gate - Hard Rules That Invalidate Trades Before Score
 
-🔥 FIX (Jan 22, 2026): Three Layer Entry System
+Three Layer Entry System
 
 LAYER 1: GATE (Hard Rules) - This module
 - Microtrend contradiction >= 85% → BLOCK
