@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 class TradeJournal:
     """Persists trading activity to disk for recovery and audit.
-    
+
     Critical for production:
     - Recover open positions after restart
     - Audit trail for all decisions
@@ -33,7 +33,7 @@ class TradeJournal:
 
     def save_state(self, state: dict[str, Any]) -> None:
         """Save runtime state for recovery."""
-        state["saved_at"] = datetime.now(timezone.utc).isoformat()
+        state["saved_at"] = datetime.now(UTC).isoformat()
         with open(self._state_file, "w") as f:
             json.dump(state, f, indent=2, default=str)
 
@@ -52,25 +52,27 @@ class TradeJournal:
         """Persist open positions for recovery."""
         data = []
         for pos in positions:
-            data.append({
-                "position_id": pos.position_id,
-                "symbol": pos.symbol,
-                "side": pos.side.value,
-                "entry_price": pos.entry_price,
-                "size": pos.size,
-                "stop_loss": pos.stop_loss,
-                "take_profit": pos.take_profit,
-                "status": pos.status.value,
-                "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
-                "strategy_name": pos.strategy_name,
-                "signal_type": pos.signal_type,
-                "metadata": pos.metadata,
-                "trailing_stop_activated": pos.trailing_stop_activated,
-            })
-        
+            data.append(
+                {
+                    "position_id": pos.position_id,
+                    "symbol": pos.symbol,
+                    "side": pos.side.value,
+                    "entry_price": pos.entry_price,
+                    "size": pos.size,
+                    "stop_loss": pos.stop_loss,
+                    "take_profit": pos.take_profit,
+                    "status": pos.status.value,
+                    "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
+                    "strategy_name": pos.strategy_name,
+                    "signal_type": pos.signal_type,
+                    "metadata": pos.metadata,
+                    "trailing_stop_activated": pos.trailing_stop_activated,
+                }
+            )
+
         with open(self._positions_file, "w") as f:
-            json.dump({"positions": data, "updated_at": datetime.now(timezone.utc).isoformat()}, f, indent=2)
-        
+            json.dump({"positions": data, "updated_at": datetime.now(UTC).isoformat()}, f, indent=2)
+
         logger.debug("Saved %d open positions", len(positions))
 
     def load_open_positions(self) -> list[dict[str, Any]]:
@@ -88,7 +90,7 @@ class TradeJournal:
     def log_signal(self, signal: Signal, action: str, reason: str = "") -> None:
         """Log a signal event."""
         entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "event": "signal",
             "action": action,
             "reason": reason,
@@ -106,7 +108,7 @@ class TradeJournal:
     def log_trade(self, position: Position, event: str, details: dict[str, Any] | None = None) -> None:
         """Log a trade event (open, close, update)."""
         entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "event": event,
             "position_id": position.position_id,
             "symbol": position.symbol,
@@ -136,10 +138,10 @@ class TradeJournal:
         """Calculate today's PnL from trade log."""
         if not self._trades_file.exists():
             return 0.0
-        
-        today = datetime.now(timezone.utc).date()
+
+        today = datetime.now(UTC).date()
         daily_pnl = 0.0
-        
+
         try:
             with open(self._trades_file) as f:
                 for line in f:
@@ -150,17 +152,17 @@ class TradeJournal:
                             daily_pnl += entry.get("realized_pnl") or 0
         except Exception as e:
             logger.error("Failed to calculate daily PnL: %s", e)
-        
+
         return daily_pnl
 
     def get_daily_trades(self) -> int:
         """Count today's trades."""
         if not self._trades_file.exists():
             return 0
-        
-        today = datetime.now(timezone.utc).date()
+
+        today = datetime.now(UTC).date()
         count = 0
-        
+
         try:
             with open(self._trades_file) as f:
                 for line in f:
@@ -171,5 +173,5 @@ class TradeJournal:
                             count += 1
         except Exception:
             pass
-        
+
         return count

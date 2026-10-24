@@ -12,14 +12,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
+COPY README.md ./
 COPY uv.lock ./
 COPY src ./src
 COPY main.py ./main.py
 
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir .
+    pip install --no-cache-dir . && \
+    useradd --create-home --uid 1000 trader && \
+    chown -R trader:trader /app
 
-RUN useradd -m -u 1000 trader && chown -R trader:trader /app
 USER trader
 
 EXPOSE 8000

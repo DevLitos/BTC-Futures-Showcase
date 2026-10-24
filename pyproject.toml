@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "daytrader-connectors"
 version = "3.0.0"
-description = "Connectors-only runtime base for BTC futures trading stack"
-readme = "docs/ARCHITECTURE_CONNECTORS_ONLY_2026-03-30.md"
+description = "BTC futures research runtime with Kraken connectivity and backtesting"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "ccxt>=4.0.0",

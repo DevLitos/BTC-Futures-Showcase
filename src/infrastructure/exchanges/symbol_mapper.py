@@ -6,7 +6,7 @@ from __future__ import annotations
 class SymbolMapper:
     @staticmethod
     def to_rest_symbol(exchange_name: str, symbol: str) -> str:
-        if exchange_name == "krakenfutures" and symbol == "BTC/USD":
+        if exchange_name == "krakenfutures" and symbol in {"BTC/USD", "PF_XBTUSD"}:
             return "BTC/USD:USD"
         return symbol
 

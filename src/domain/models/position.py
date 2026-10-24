@@ -3,27 +3,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
 
 class PositionSide(Enum):
     """Side of the position."""
+
     LONG = "LONG"
     SHORT = "SHORT"
 
 
 class PositionStatus(Enum):
     """Current status of a position."""
-    PENDING = "PENDING"      # Signal received, waiting for entry
-    OPEN = "OPEN"            # Position is active
-    CLOSING = "CLOSING"      # Close order sent
-    CLOSED = "CLOSED"        # Position fully closed
+
+    PENDING = "PENDING"  # Signal received, waiting for entry
+    OPEN = "OPEN"  # Position is active
+    CLOSING = "CLOSING"  # Close order sent
+    CLOSED = "CLOSED"  # Position fully closed
 
 
 class ExitReason(Enum):
     """Reason for closing a position."""
+
     TAKE_PROFIT = "TAKE_PROFIT"
     STOP_LOSS = "STOP_LOSS"
     TRAILING_STOP = "TRAILING_STOP"
@@ -36,7 +39,7 @@ class ExitReason(Enum):
 @dataclass(slots=True)
 class Position:
     """Represents an open or closed trading position.
-    
+
     Attributes:
         position_id: Unique identifier
         symbol: Trading pair
@@ -47,6 +50,7 @@ class Position:
         take_profit: Current take profit price
         status: Current position status
     """
+
     position_id: str
     symbol: str
     side: PositionSide
@@ -62,7 +66,7 @@ class Position:
     strategy_name: str = ""
     signal_type: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
-    
+
     # Tracking fields
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
@@ -157,7 +161,7 @@ class Position:
         """Mark position as closed."""
         self.exit_price = exit_price
         self.exit_reason = reason
-        self.closed_at = closed_at or datetime.utcnow()
+        self.closed_at = closed_at or datetime.now(UTC)
         self.status = PositionStatus.CLOSED
 
     @property

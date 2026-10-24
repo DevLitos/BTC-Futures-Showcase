@@ -54,7 +54,7 @@ trade_logs/
 *.json
 !config/*.json
 
-# Documentation (not needed in container)
+# Documentation and repository metadata are not needed in the runtime image.
 *.md
 !README.md
 docs/
@@ -95,6 +95,3 @@ secrets/
 # Backtest data
 backtest_data/
 historical_data/
-
-# uv lock file (not needed in container)
-uv.lock

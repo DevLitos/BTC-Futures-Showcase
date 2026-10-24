@@ -10,7 +10,7 @@ from typing import Self
 @dataclass(frozen=True, slots=True)
 class Candle:
     """Immutable OHLCV candle representation.
-    
+
     Attributes:
         timestamp: Candle open time (UTC)
         open: Opening price
@@ -21,6 +21,7 @@ class Candle:
         symbol: Trading pair symbol
         timeframe_minutes: Candle duration in minutes
     """
+
     timestamp: datetime
     open: float
     high: float
@@ -89,8 +90,9 @@ class Candle:
     def from_dict(cls, data: dict) -> Self:
         """Create Candle from dictionary."""
         return cls(
-            timestamp=data["timestamp"] if isinstance(data["timestamp"], datetime) 
-                      else datetime.fromisoformat(str(data["timestamp"]).replace("Z", "+00:00")),
+            timestamp=data["timestamp"]
+            if isinstance(data["timestamp"], datetime)
+            else datetime.fromisoformat(str(data["timestamp"]).replace("Z", "+00:00")),
             open=float(data["open"]),
             high=float(data["high"]),
             low=float(data["low"]),
@@ -104,9 +106,10 @@ class Candle:
 @dataclass(slots=True)
 class CandleBuffer:
     """Rolling buffer of candles for indicator calculation.
-    
+
     Maintains a fixed-size buffer of recent candles.
     """
+
     max_size: int
     _candles: list[Candle]
 

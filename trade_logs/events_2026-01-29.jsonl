@@ -1,1 +1,0 @@
-{"timestamp": "2026-01-29T04:32:08.153474+00:00", "event_type": "trade_closed", "entry": 87869.0, "exit": 88074.0, "size": 0.0063, "pnl": -1.2915, "reason": "TIME_INVALIDATION_MAX_LOSS", "r": -0.6144887697341098, "mfe_r": 0.2517905202812938, "mae_r": 0.6144887697341098, "direction": "SHORT", "regime": "NORMAL"}

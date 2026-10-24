@@ -10,6 +10,7 @@ from typing import Any
 
 class SignalDirection(Enum):
     """Direction of a trading signal."""
+
     LONG = "LONG"
     SHORT = "SHORT"
     FLAT = "FLAT"
@@ -17,6 +18,7 @@ class SignalDirection(Enum):
 
 class SignalStrength(Enum):
     """Strength/confidence of the signal."""
+
     WEAK = "WEAK"
     MODERATE = "MODERATE"
     STRONG = "STRONG"
@@ -24,6 +26,7 @@ class SignalStrength(Enum):
 
 class SignalType(Enum):
     """Type of signal based on strategy pattern."""
+
     FVG = "FVG"
     IFVG = "IFVG"
     ORDER_BLOCK = "ORDER_BLOCK"
@@ -34,7 +37,7 @@ class SignalType(Enum):
 @dataclass(frozen=True, slots=True)
 class Signal:
     """Immutable trading signal from a strategy.
-    
+
     Attributes:
         timestamp: When the signal was generated
         direction: LONG, SHORT, or FLAT
@@ -46,6 +49,7 @@ class Signal:
         strategy_name: Name of the strategy that generated it
         metadata: Additional signal-specific data
     """
+
     timestamp: datetime
     direction: SignalDirection
     signal_type: SignalType
@@ -64,7 +68,7 @@ class Signal:
             raise ValueError("stop_loss must be positive")
         if self.take_profit <= 0:
             raise ValueError("take_profit must be positive")
-        
+
         if self.direction == SignalDirection.LONG:
             if self.stop_loss >= self.entry_price:
                 raise ValueError("LONG signal: stop_loss must be below entry_price")
@@ -115,6 +119,7 @@ class Signal:
 @dataclass(slots=True)
 class SignalEvaluation:
     """Result of evaluating a signal against current market state."""
+
     signal: Signal
     is_triggered: bool
     triggered_at: datetime | None = None

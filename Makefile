@@ -1,9 +1,9 @@
 .PHONY: help install run test lint format clean docker-build docker-run
 
 help:
-	@echo "Connectors-only Runtime - Comandos"
+	@echo "BTC Runtime - Comandos"
 	@echo "  make install      Instalar dependencias"
-	@echo "  make run          Ejecutar runtime connectors-only"
+	@echo "  make run          Ejecutar runtime (MODE=live o MODE=backtest)"
 	@echo "  make test         Ejecutar tests"
 	@echo "  make lint         Ruff check"
 	@echo "  make format       Ruff format + fix"
@@ -35,11 +35,11 @@ clean:
 
 
 docker-build:
-	docker build -t daytrader-connectors:latest .
+	docker build -t btc-research-runtime:latest .
 
 
 docker-run:
 	docker run --rm -it \
 		--env-file .env.secrets \
 		-p 8000:8000 \
-		daytrader-connectors:latest
+		btc-research-runtime:latest

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Protocol, Sequence
+from typing import Protocol
 
 from src.domain.models.candle import Candle
 from src.domain.models.signal import Signal
@@ -13,7 +14,7 @@ from src.domain.models.signal import Signal
 @dataclass(frozen=True, slots=True)
 class StrategyConfig:
     """Configuration parameters for a strategy.
-    
+
     Attributes:
         name: Strategy identifier
         enabled: Whether strategy is active
@@ -22,6 +23,7 @@ class StrategyConfig:
         lookback_periods: Number of candles needed for analysis
         params: Strategy-specific parameters
     """
+
     name: str
     enabled: bool = True
     risk_reward_min: float = 2.0
@@ -32,7 +34,7 @@ class StrategyConfig:
 
 class StrategyProtocol(Protocol):
     """Protocol defining the strategy interface.
-    
+
     Strategies are stateless: they receive candle data and return signals.
     They do NOT maintain internal state between calls.
     """
@@ -54,10 +56,10 @@ class StrategyProtocol(Protocol):
 
     def evaluate(self, candles: Sequence[Candle]) -> list[Signal]:
         """Analyze candles and generate trading signals.
-        
+
         Args:
             candles: Sequence of candles (oldest first)
-            
+
         Returns:
             List of signals (may be empty if no setups found)
         """
@@ -66,13 +68,13 @@ class StrategyProtocol(Protocol):
 
 class Strategy(ABC):
     """Abstract base class for trading strategies.
-    
+
     Subclasses implement specific pattern detection logic.
     All strategies must be:
     - Stateless: No internal state between evaluate() calls
     - Pure: Same input produces same output
     - Independent: No external dependencies or side effects
-    
+
     Example:
         class MyStrategy(Strategy):
             def _evaluate_impl(self, candles):
@@ -112,12 +114,12 @@ class Strategy(ABC):
 
     def evaluate(self, candles: Sequence[Candle]) -> list[Signal]:
         """Analyze candles and generate signals.
-        
+
         Validates input and delegates to _evaluate_impl.
-        
+
         Args:
             candles: Sequence of candles (oldest first)
-            
+
         Returns:
             List of signals or empty list
         """
@@ -133,12 +135,12 @@ class Strategy(ABC):
     @abstractmethod
     def _evaluate_impl(self, candles: Sequence[Candle]) -> list[Signal]:
         """Implementation of pattern detection.
-        
+
         Override in subclasses with specific logic.
-        
+
         Args:
             candles: Validated sequence of candles
-            
+
         Returns:
             List of potential signals
         """
@@ -147,9 +149,9 @@ class Strategy(ABC):
     def _filter_signals(self, signals: list[Signal]) -> list[Signal]:
         """Filter signals based on strategy criteria."""
         return [
-            s for s in signals
-            if s.risk_reward_ratio >= self._config.risk_reward_min
-            and s.risk_pct <= self._config.max_risk_pct
+            s
+            for s in signals
+            if s.risk_reward_ratio >= self._config.risk_reward_min and s.risk_pct <= self._config.max_risk_pct
         ]
 
     def get_param(self, key: str, default: float | int | str | bool) -> float | int | str | bool:

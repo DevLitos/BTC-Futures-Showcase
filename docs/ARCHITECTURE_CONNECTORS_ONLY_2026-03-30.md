@@ -1,7 +1,7 @@
-# Arquitectura actual (connectors-only)
+# Arquitectura actual
 
 ## Objetivo
-Runtime mínimo para conectividad y observabilidad, sin lógica de señales/estrategia/ejecución de trades.
+Runtime de investigación para conectividad, observabilidad, backtesting y ejecución live explícita. El nombre histórico "connectors-only" ya no describe todo el código activo.
 
 ## Capas
 
@@ -13,13 +13,14 @@ Runtime mínimo para conectividad y observabilidad, sin lógica de señales/estr
   - Publica métricas de salud WS/REST.
   - Incluye circuit-breaker y backoff adaptativo para probes REST.
   - Integra event bus interno para eventos de conectividad.
+  - Orquesta señales, riesgo, posiciones, journal y ejecución cuando live está habilitado.
 - **Infrastructure / Ingest**: `src/infrastructure/ingest/websocket/kraken_websocket.py`
   - Conexión WS con reconexión automática.
   - Buffer circular de trades.
   - Contadores de mensajes/reconexiones.
   - Publicación de eventos (`ws_connected`, `ws_disconnected`, `ws_reconnect`, `ws_message`).
 - **Infrastructure / Exchanges**: `src/infrastructure/exchanges/kraken/execution.py`
-  - Conector REST mínimo para probes de salud (`fetch_ticker`).
+  - Conector REST para probes de salud (`fetch_ticker`), órdenes y cierres `reduceOnly`.
   - Normaliza símbolos por exchange vía `src/infrastructure/exchanges/symbol_mapper.py`.
 - **Monitoring**: `src/infrastructure/monitoring/metrics.py`
   - Métricas Prometheus de build, mensajes WS, reconexiones, salud y estado del circuit-breaker.
@@ -47,16 +48,17 @@ Runtime mínimo para conectividad y observabilidad, sin lógica de señales/estr
 - **Observabilidad mínima viable**: métricas de liveness, throughput y salud del circuit-breaker sin acoplar lógica de trading.
 - **Normalización explícita de símbolos**: evita errores por formatos diferentes entre WS y REST.
 
-## Redundancia eliminada en esta iteración
+## Estado de la migración
 
-- `Runtime` monolítico incrustado en `main.py` (movido a capa `application/runtime`).
-- Gestión de lifecycle dispersa (unificada en métodos privados de `Runtime`).
-- Residuos de ejecución (`__pycache__`) borrados del workspace.
-- Árbol legacy no usado movido a `deprecated/connectors_legacy/src/`.
+- `Runtime` monolítico incrustado en `main.py` fue movido a `application/runtime`.
+- La gestión de lifecycle está unificada en métodos privados de `Runtime`.
+- El árbol `deprecated/` se conserva como material histórico y no forma parte del flujo activo.
 
 ## Riesgos abiertos
 
-- El símbolo de health-check REST depende del exchange (`HEALTH_SYMBOL`, default `BTC/USD:USD`).
+- Los símbolos WS y REST son distintos por diseño (`WS_SYMBOL` y `REST_SYMBOL`).
+- El health-check REST depende del exchange (`HEALTH_SYMBOL`, default `BTC/USD:USD`).
+- Una discrepancia de posición al arrancar bloquea nuevas señales hasta revisión manual.
 - El event bus es en memoria (sin persistencia de eventos).
 
 ## Próxima expansión natural (sin romper esta base)

@@ -1,14 +1,15 @@
-# Runbook — Connectors-only Runtime
+# Runbook — BTC Runtime
 
 ## Arranque
 
+El modo debe elegirse explícitamente. El modo `live` puede operar con dinero real; el modo `backtest` usa datos históricos. Este proyecto no implementa paper trading.
+
 ```bash
-make run
+MODE=backtest make run
 ```
 
-Verificar logs esperados:
+En backtest se esperan logs de descarga/procesamiento histórico. En live se espera:
 
-- `CONNECTORS-ONLY MODE`
 - `ws connected: krakenfutures`
 
 ## Parada
@@ -19,6 +20,7 @@ Verificar logs esperados:
 ## Health y observabilidad
 
 - Endpoint de métricas: `http://localhost:8000/metrics`
+- Grafana: no está implementado en este repositorio; las métricas deben conectarse manualmente a Prometheus/Grafana.
 - Circuit breaker:
   - `connectors_health_circuit_open`
   - `connectors_health_circuit_failures`
@@ -46,4 +48,4 @@ make clean
 
 ## Alcance
 
-Este runbook aplica únicamente al runtime connectors-only. La lógica de trading se implementará encima de esta base.
+Este runbook cubre el runtime activo, incluidos conectores, estrategias, riesgo, gestión de posiciones y backtest. La documentación histórica de `deprecated/` no define el comportamiento actual.
